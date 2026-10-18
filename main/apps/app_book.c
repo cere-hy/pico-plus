@@ -138,6 +138,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "push_sink.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -6564,6 +6565,15 @@ static void book_on_exit(app_ctx_t* ctx) {
     shelf_category_remember(ctx);
     s_category_menu=false;
     (void)ctx;
+    // 惊喜2 反向通道：离开的若是手机推来的虚拟书，就 notify EVT_READ(0x14)——
+    // 「推→读→已读」连招的最后一环，手机收到后清剪贴板。放在退出处而非翻开处：
+    // 读没读完只有退出这一刻才说得上，且不影响阅读页任何既有路径。
+    // Surprise 2's reverse channel: if the book being left is the phone-pushed
+    // virtual book, notify EVT_READ(0x14) — the last step of the
+    // push->read->read chain, which clears the phone's clipboard. Placed on exit
+    // rather than on open: "finished reading" is only knowable at exit, and no
+    // existing reader path is touched.
+    if (s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0) push_sink_notify_read();
     // 离开阅读即退出全工程唯一的横屏语境：物理旋转若停在 LANDSCAPE，后续任何
     // 页面（Home/菜单/其他 app）都按竖屏绘制——真机实证长按退出后 Home 竖屏
     // 布局画在横屏物理屏上（半屏错位）。这里兜底复位；唯一一次刷新由 app_loop
