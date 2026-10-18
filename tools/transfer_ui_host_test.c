@@ -9,6 +9,33 @@
 #include "../main/apps/app_transfer.c"
 #include <assert.h>
 #include "../components/read_pico_transfer/transfer_signature.h"
+/* 中文：武装页 Step 4 依赖的宿主替身。app_content_open.h 与 dict_popup.h 的真身
+   就在 main/apps/，quote Include 永远先中真身，替身目录遮蔽不了它们；这里按
+   usb_storage_* 的同形制在测试文件里出定义与旋钮（dict_lookup.h 在 main/dict/，
+   仍由 tools/transfer_ui_stubs/dict_lookup.h 遮蔽）。
+   English: the host doubles the arm page's Step 4 needs. The real
+   app_content_open.h and dict_popup.h live in main/apps/, so a quote include
+   always hits the real ones and the stub directory cannot shadow them; the
+   doubles and their knobs therefore live here, same shape as usb_storage_*
+   (dict_lookup.h lives in main/dict/ and is still shadowed by the stub). */
+const app_desc_t app_book = {0};
+static char test_book_open_path[160];
+static bool test_book_open_ok = true;
+bool app_book_request_open(const char *path) {
+    if (!path || !test_book_open_ok) return false;
+    snprintf(test_book_open_path, sizeof(test_book_open_path), "%s", path);
+    return true;
+}
+static char test_dict_word[64];
+static bool test_dict_open_ok = true;
+void dict_popup_set_anchor(int col, bool split) { (void)col; (void)split; }
+bool dict_popup_open(const char *word) {
+    snprintf(test_dict_word, sizeof(test_dict_word), "%s", word ? word : "");
+    return test_dict_open_ok;
+}
+void dict_popup_reset(void) { test_dict_word[0] = 0; }
+void dict_popup_draw(uint8_t *fb) { (void)fb; }
+dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y) { (void)x; (void)y; return DICT_POPUP_TAP_MISSED; }
 static bool test_usb_active;
 static esp_err_t test_usb_stop_error;
 esp_err_t usb_storage_start(void) { test_usb_active = true; return ESP_OK; }
@@ -155,6 +182,159 @@ static void password_caret_regression(app_ctx_t *ctx) {
     assert(on_tick(ctx)==APP_REDRAW_NONE&&!strcmp(s_password,"abcde"));ctx->touch=NULL;ctx->now_ms=0;
     clear_password();ui_keyboard_begin(&s_password_input,true);
 }
+// 手机推送武装页回归（Step 4）：开虚拟书、单词卡模态、活区刷新与陈事件清扫。
+// The phone-push arm page regression (Step 4): the virtual book, the modal word
+// card, live-region refresh and the stale-event sweep.
+static void push_arm_regression(app_ctx_t *ctx) {
+    // 进武装页：默认 30 分钟窗口；on_enter 把活区簿记对齐当前状态，无变化不刷。
+    // Entering the arm page: the default 30-minute window; on_enter aligns the
+    // live-region bookkeeping with the current state, so no change means no redraw.
+    test_push_state = PUSH_STATE_WINDOW;
+    snprintf(test_push_adv, sizeof(test_push_adv), "PicoPush-1a2b");
+    test_push_left_ms = 30u * 60u * 1000u;
+    app_transfer_request_push();
+    on_enter(ctx);
+    assert(s_view == TRANSFER_PUSH && test_push_armed);
+    assert(test_push_arm_calls == 1 && test_push_arm_window == 30 * 60 * 1000);
+    ctx->now_ms = 1000;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    // 倒计时走动 → 只重绘活区（DU 区域更新）；同值不重复刷。
+    // The countdown moves - repaint only the live regions (a DU area update);
+    // identical values never repaint twice.
+    test_push_left_ms -= 500;
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_AREA);
+    assert(s_area.x == 36 && s_area.y == 168 && s_area.width == 612 && s_area.height == 496);
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    // 推送成功：开虚拟书——标题覆盖成推送标题、清旧进度、切阅读页，且不抢全刷。
+    // A push succeeds: open the virtual book - override the display title with
+    // the pushed one, drop stale progress, switch to the reader, and do not
+    // steal the single full refresh.
+    test_push_open = true;
+    snprintf(test_push_title, sizeof(test_push_title), "被推送的书");
+    test_push_type = 0;
+    test_book_open_path[0] = 0;
+    test_book_title_path[0] = test_book_title[0] = test_progress_forget_path[0] = 0;
+    ctx->request_app = NULL;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    assert(ctx->request_app == &app_book);
+    assert(!strcmp(test_book_open_path, "/sdcard/.readpico/push.txt"));
+    assert(!strcmp(test_book_title_path, "/sdcard/.readpico/push.txt"));
+    assert(!strcmp(test_book_title, "被推送的书"));
+    assert(!strcmp(test_progress_forget_path, "/sdcard/.readpico/push.txt"));
+    // 开书请求失败：留页给准话，不黑屏不跳走。/ The open request fails: stay on
+    // the page with a plain sentence, no black screen and no jump.
+    test_book_open_ok = false;
+    ctx->request_app = NULL;
+    test_push_open = true;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(s_view == TRANSFER_PUSH && ctx->request_app == NULL);
+    assert(!strcmp(s_push_note, "打开推送内容失败，请重试"));
+    test_book_open_ok = true;
+    // 单词卡命中：查词、开卡；卡片是模态的——按下不刷屏，点击问 chip（宿主恒
+    // 未命中）后关卡片。/ A word-card hit: look it up and open the card; the
+    // card is modal - a press never repaints, a tap asks the chip (always a
+    // miss on the host) and then closes the card.
+    s_push_note[0] = 0;
+    test_push_word_card = true;
+    snprintf(test_push_word, sizeof(test_push_word), "serendipity");
+    test_dict_open_ok = true;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(s_push_word_card && !strcmp(test_dict_word, "serendipity"));
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    ui_gesture_event_t press = {.type = UI_GESTURE_PRESS, .x0 = 300, .y0 = 700, .x = 300, .y = 700};
+    assert(on_gesture(ctx, &press) == APP_REDRAW_NONE);
+    press.type = UI_GESTURE_TAP;
+    assert(on_gesture(ctx, &press) == APP_REDRAW_PAGE);
+    assert(!s_push_word_card && !test_dict_word[0]);
+    // 未收录：词典在但没这个词；词典不在：另一句准话。两者都不留白卡。
+    // A miss: the dictionary is there but the word is not; no dictionary: a
+    // different plain sentence. Neither leaves a blank card.
+    test_dict_open_ok = false;
+    test_dict_ready_flag = true;
+    test_push_word_card = true;
+    snprintf(test_push_word, sizeof(test_push_word), "zzzznotaword");
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!s_push_word_card && !strcmp(s_push_note, "未收录：zzzznotaword"));
+    test_dict_ready_flag = false;
+    test_push_word_card = true;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!s_push_word_card && !strcmp(s_push_note, "词典不可用，无法查词"));
+    // 错误码 → 用户文案；待武装失败 → 回方法页并留话。
+    // Error codes to plain sentences; a failed pending arm returns to the
+    // method page with a message.
+    s_push_note[0] = 0;
+    test_push_err = true;
+    test_push_err_code = PUSH_ERR_CHECKSUM;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!strcmp(s_push_note, "内容校验失败，请重新发送"));
+    test_push_start_failed = true;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(s_view == TRANSFER_METHODS && !strcmp(s_method_message, "蓝牙启动失败，请重试"));
+    // 插电常开切换：cancel + 重武装（window 0）；cancel 补的 closed 当场吃掉，
+    // 页面留住，且不做内容相同的重复刷新。/ The charger-held switch: cancel and
+    // re-arm (window 0); the closed posted by the cancel is swallowed on the
+    // spot, the page stays, and no identical repeat refresh follows.
+    app_transfer_request_push();
+    on_enter(ctx);
+    assert(s_view == TRANSFER_PUSH);
+    test_push_state = PUSH_STATE_WINDOW;
+    snprintf(test_push_adv, sizeof(test_push_adv), "PicoPush-1a2b");
+    test_push_left_ms = 30u * 60u * 1000u;
+    test_pmu_snapshot.charging = true;
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_AREA);
+    int arms = test_push_arm_calls;
+    tap(ctx, control_rect(0));
+    assert(test_push_arm_calls == arms + 1 && test_push_arm_window == 0);
+    assert(test_push_armed && !test_push_closed && s_view == TRANSFER_PUSH);
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    assert(s_view == TRANSFER_PUSH);
+    // 未充电时常开按钮不可切。/ The hold button does nothing off the charger.
+    test_pmu_snapshot.charging = false;
+    arms = test_push_arm_calls;
+    tap(ctx, control_rect(0));
+    assert(test_push_arm_calls == arms && s_view == TRANSFER_PUSH);
+    // 退出接收：cancel 之后 closed 把页面带回方法页。/ Exit receive: after the
+    // cancel the closed event walks the page back to the method page.
+    tap(ctx, control_rect(2));
+    assert(!test_push_armed);
+    assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
+    // 离页再进：nav 切走时 cancel 补的 closed 是陈事件，on_enter 清扫后页面
+    // 不再被立刻扔回方法页。/ Leaving and returning: the closed posted by the
+    // nav-away cancel is stale; after on_enter's sweep the page is no longer
+    // thrown straight back to the method page.
+    app_transfer_request_push();
+    on_enter(ctx);
+    assert(s_view == TRANSFER_PUSH && test_push_armed && !test_push_closed);
+    ui_gesture_event_t nav = {.type = UI_GESTURE_TAP, .x0 = 20, .y0 = 1150, .x = 20, .y = 1150};
+    assert(on_gesture(ctx, &nav) == APP_REDRAW_NONE);
+    assert(!test_push_armed && test_push_closed);
+    app_transfer_request_push();
+    on_enter(ctx);
+    assert(s_view == TRANSFER_PUSH && test_push_armed && !test_push_closed);
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE && s_view == TRANSFER_PUSH);
+    // 新鲜的 closed（会话自行收官）仍然把页面放回去。/ A fresh closed (the
+    // session ended on its own) still walks the page back.
+    test_push_armed = false;
+    test_push_closed = true;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
+    // 双保险：武装标志丢了（事件漏接的极端时序）也能把页面放回去。
+    // The safety net: a lost armed flag (the extreme timing of a missed event)
+    // still walks the page back.
+    app_transfer_request_push();
+    on_enter(ctx);
+    assert(s_view == TRANSFER_PUSH);
+    test_push_armed = false;
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
+    transfer_on_exit(ctx);
+}
+
 int main(void) {
     assert(transfer_signature_valid("",0)&&transfer_signature_valid("中文🙂",10));
     assert(!transfer_signature_valid("a\0b",3)&&!transfer_signature_valid("\xed\xa0\x80",3));
@@ -352,5 +532,6 @@ int main(void) {
     test_scan_count = 8; test_scan_error = ESP_OK;
     network_ui_tick(&ctx);
     wifi_recovery_regression(&ctx);
+    push_arm_regression(&ctx);
     puts("transfer_ui_host_test: PASS");
 }

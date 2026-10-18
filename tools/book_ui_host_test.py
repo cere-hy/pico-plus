@@ -447,6 +447,16 @@ unit += function("ble_pt_action_for_usage", source.parents[2] / "components/ble_
 # 生词本：on_enter / book_on_exit 会调用它，这里用空实现顶掉，测试不验证 TF 卡落盘。
 # Vocabulary log: on_enter / book_on_exit call it; no-op stand-ins keep the card out of the test.
 unit += (Path(__file__).resolve().parent / "vocab_log_stubs.h").read_text(encoding="utf-8") + "\n"
+# 手机推流反向通道：book_on_exit 在离开推送虚拟书时 notify EVT_READ(0x14)，
+# 这里给出路径宏与空实现——本测试只验证退出路径不被它带偏，notify 本身由
+# push_sink 宿主测试覆盖。
+# Phone push reverse channel: book_on_exit notifies EVT_READ(0x14) when leaving
+# the pushed virtual book; the path macro and a no-op stand in here. This test
+# only pins that the exit path is not derailed by it - the notify itself is
+# covered by the push_sink host test.
+unit += '#define PUSH_DIR "/sdcard/.readpico"\n'
+unit += '#define PUSH_TEXT_PATH PUSH_DIR "/push.txt"\n'
+unit += 'static void push_sink_notify_read(void){}\n'
 for name in ("inline_ink_gray", "reader_margin_width", "reader_margin_levels", "reader_margin_level_for", "reader_margin_for_level", "slider_index", "reader_margin_input", "reader_area", "reader_fullscreen_progress_area", "body_rect_for_tracking", "body_rect", "progress_rect", "copy_text", "reader_footer_strip_number", "favorite_key", "favorite_read_handle", "shelf_hidden_key", "shelf_hidden_read_handle", "shelf_hidden_load", "shelf_hidden_save", "shelf_rows", "row_rect", "shelf_category_add", "shelf_category_init", "shelf_category_matches", "shelf_category_remember", "shelf_category_restore", "shelf_categories_recount", "shelf_matches", "compare_books", "sort_shelf", "shelf_reserve", "delete_retry_find", "delete_retry_reserve", "delete_retry_discard", "scan_shelf_dir", "shelf_backfill_visit", "shelf_backfill_read_books", "scan_shelf", "refresh_cached_progress",             "pending_find", "pending_reserve", "pending_restore", "pending_discard", "pending_mark_latest", "pending_drop_invalidated", "pending_flush", "reader_page_offset", "save_progress", "retry_progress", "layout_name", "manage_panel", "manage_rect", "batch_rect", "manage_back_rect", "bulk_filter_rect", "bulk_nav_rect", "bulk_nav_hit", "leaves", "selected_count", "clear_selection", "toggle_selection", "select_page", "bookmark_compact", "search_begin", "refresh_search_matches", "search_finish", "refresh_capacity", "manage_apply", "manage_action", "batch_apply", "batch_action", "bulk_turn_page", "bulk_finish", "bulk_action", "bulk_control_at", "menu_handle_enabled", "reader_manual_refresh", "apply_reader_option", "reader_return", "reader_key_action", "on_key", "on_key_long", "draw_wrapped_name", "open_requested_book", "on_enter", "book_on_exit"):
     unit += function(name) + "\n"
 for name in ("book_remote_direction", "shelf_turn_page", "shelf_page_arrow_rect", "reader_swipe_direction"):

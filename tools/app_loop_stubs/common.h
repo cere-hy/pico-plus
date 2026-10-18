@@ -76,3 +76,17 @@ void read_pico_sd_start_probe(void);
 static inline int epd_rotated_display_width(void) { return 684; }
 static inline int epd_rotated_display_height(void) { return 1216; }
 void epd_fill_triangle(int,int,int,int,int,int,uint8_t,uint8_t*);
+
+// 中文：push_sink 头文件金丝雀：本文件被众多替身头共享，放在末尾 include——
+// 它 include 的 esp_err.h 会绕回本文件（pragma once 命中在途包含），彼时
+// esp_err_t 须已定义；同时验证 push_sink.h 在无 ESP-IDF 的环境里可独立解析。
+// English: canary include for push_sink.h, placed last because this header is
+// shared by many shims: its esp_err.h include loops back here (pragma once hits
+// the in-progress include), so esp_err_t must already be defined; this also
+// checks push_sink.h parses standalone without ESP-IDF.
+// 函数替身不在本文件：真实头给的是外建原型，static inline 定义会与之冲突；
+// 定义由 tools/app_loop_host_test.c 出（与 ble_pt_sync/ble_pt_poll 同形制）。
+// No function doubles here: the real header declares extern prototypes that a
+// static inline definition would clash with; definitions live in
+// tools/app_loop_host_test.c, same shape as ble_pt_sync/ble_pt_poll.
+#include "push_sink.h"

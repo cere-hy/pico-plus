@@ -118,6 +118,12 @@ static int xTaskCreatePinnedToCore(void(*fn)(void*),const char*name,int stack,vo
 }
 void ble_pt_scan_stop(void){s_scanning=false;}
 void ble_pt_disconnect(void){s_connected=false;}
+// 推流钩子在本宿主里无操作：它只是让 ble_page_turner 在栈起停时通知 push_sink，
+// 真实行为由 run_push_sink_host_tests.sh（第 13 runner）与整机构建覆盖。
+// The push hook is inert here: it merely lets ble_page_turner notify push_sink on
+// stack up/down; the real behaviour is covered by run_push_sink_host_tests.sh
+// (runner 13) and the full-tree build.
+static void push_sink_on_stack_stop(void){}
 static int s_ble_scroll,s_ble_learning;
 static char s_ble_feedback[64];
 void ble_pt_crumb(uint8_t id){(void)id;}

@@ -17,8 +17,10 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_FAIL -1
 #define ESP_ERR_INVALID_ARG 0x102
+#define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NO_MEM 0x101
 #define ESP_ERR_NOT_FINISHED 0x107
+#define ESP_ERR_NOT_ALLOWED 0x10E
 typedef struct { int x,y,width,height; } EpdRect;
 typedef enum { APP_REDRAW_NONE, APP_REDRAW_AREA, APP_REDRAW_PAGE, APP_REDRAW_FULL, APP_REDRAW_DONE } app_redraw_t;
 struct app_desc;
@@ -145,7 +147,11 @@ static inline void ui_wifi_qr_draw(uint8_t* fb,EpdRect r) {(void)fb;(void)r;}
 
 static inline int read_pico_transfer_forget_wifi(void) { ++test_forget_count; if (test_wifi_running) return ESP_FAIL; if (!test_forget_error) test_configured=false; return test_forget_error; }
 
-static inline int book_progress_forget(const char* path) {(void)path;return ESP_OK;}
+// 进度清除的记录缓冲：虚拟书回归据此断言「清旧进度」。
+// Recording buffer for the progress clear: the virtual-book regression asserts
+// "drop stale progress" against it.
+static char test_progress_forget_path[160];
+static inline int book_progress_forget(const char* path) {snprintf(test_progress_forget_path,sizeof(test_progress_forget_path),"%s",path?path:"");return ESP_OK;}
 typedef struct {uint32_t file_size;} book_progress_t;
 static inline bool book_progress_load(const char* path,uint32_t size,book_progress_t* out) {(void)path;(void)size;(void)out;return false;}
 static inline bool book_progress_save(const char* path,const book_progress_t* progress) {(void)path;(void)progress;return true;}
@@ -156,3 +162,110 @@ static char test_signature[96];
 static bool test_signature_fail;
 static inline const char *app_settings_status_signature(void){return test_signature;}
 static inline void app_settings_set_status_signature(const char *text){if(!test_signature_fail)snprintf(test_signature,sizeof(test_signature),"%s",text);}
+
+/* 中文：push_sink 武装页的宿主替身。类型与常量按真实 push_session.h/
+   push_proto.h 逐项对表（见 tools/push_sink_host_test.c 的帧对表），函数替身是
+   static inline，与真实头文件的外建原型互斥，故本目录另有 push_sink.h 整头遮蔽
+   （include 本文件）。Step 4 起替身升级为旋钮驱动：未注入时保持「未武装、无
+   来件」的惰性形态，配网/传书既有回归不受影响；武装页回归经 test_push_* 旋钮
+   按序注入事件与状态快照，驱动开书/单词卡/收摊各分支。
+   English: host shims for the push_sink arm page. Types and constants mirror
+   push_session.h/push_proto.h item by item; the function doubles are static
+   inline and therefore mutually exclusive with the real header's extern
+   prototypes, which is why push_sink.h in this directory shadows the whole
+   header (it includes this file). Since Step 4 the doubles are knob-driven:
+   with nothing injected they keep the inert "never armed, never receives"
+   shape so the existing provisioning regression is unaffected, while the
+   arm-page regression injects events and state snapshots through the
+   test_push_* knobs to drive the open-book, word-card and teardown branches. */
+typedef enum {
+    PUSH_STATE_IDLE = 0,    ///< 未武装 / not armed
+    PUSH_STATE_ARMED,       ///< 已点接收，等广播起来 / receive pressed, awaiting advertising
+    PUSH_STATE_WINDOW,      ///< 窗口期：广播中，等手机连接 / window open: advertising
+    PUSH_STATE_CONNECTED,   ///< 手机已连接，未开始传输 / phone connected, no transfer yet
+    PUSH_STATE_RECEIVING,   ///< BEGIN 已接受，正文流式中 / BEGIN accepted, body streaming
+    PUSH_STATE_PROCESSING,  ///< END 已到，等 CRC 对账 / END arrived, awaiting the CRC verdict
+    PUSH_STATE_COOLDOWN,    ///< 推送成功后的续推宽限 / post-push grace for a follow-up push
+} push_state_t;
+#define PUSH_TITLE_MAX 64u ///< 标题 UTF-8 上限（含结尾 0）/ title cap including NUL
+#define PUSH_DIR "/sdcard/.readpico"
+#define PUSH_PART_PATH PUSH_DIR "/push.part"
+#define PUSH_TEXT_PATH PUSH_DIR "/push.txt"
+enum {
+    PUSH_ERR_NOT_ARMED = 1, ///< 设备未进入接收态 / the device is not receiving
+    PUSH_ERR_BAD_FRAME = 2, ///< 帧结构非法 / malformed frame
+    PUSH_ERR_TOO_LARGE = 3, ///< 超过 512 KB 硬上限 / beyond the 512 KB hard cap
+    PUSH_ERR_CHECKSUM = 4,  ///< CRC32 不符 / CRC32 mismatch
+    PUSH_ERR_NO_CARD = 5,   ///< TF 卡不可用 / card unavailable
+    PUSH_ERR_LOW_BATTERY = 6, ///< 电量不足且未充电 / low battery, not charging
+    PUSH_ERR_BUSY = 7,      ///< 上一条推送未收官 / the previous push is still open
+    PUSH_ERR_FETCH = 8,     ///< URL 抓取失败（M1 不触发）/ URL fetch failed (not in M1)
+    PUSH_ERR_NO_DICT = 9,   ///< 词典不可用，单词卡取消 / no dictionary, word card cancelled
+};
+
+/* 中文：push_sink 事件旋钮：宿主回归按序注入一次性事件与状态快照，驱动武装页
+   的分支。/ English: push_sink event knobs: the host regression injects
+   one-shot events and state snapshots in sequence to drive the arm page's
+   branches. */
+static bool test_push_armed;
+static push_state_t test_push_state = PUSH_STATE_IDLE;
+static char test_push_adv[64];
+static uint32_t test_push_left_ms, test_push_recv, test_push_total;
+static bool test_push_closed, test_push_start_failed, test_push_open, test_push_word_card, test_push_err;
+static char test_push_title[64], test_push_word[64];
+static uint8_t test_push_type;
+static int test_push_err_code;
+static int test_push_arm_calls, test_push_arm_window, test_push_cancel_calls;
+
+static inline esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
+    (void)token;
+    ++test_push_arm_calls;
+    test_push_arm_window = (int)window_ms;
+    test_push_armed = true;
+    return ESP_OK;
+}
+static inline void push_sink_cancel(void) {
+    ++test_push_cancel_calls;
+    // 对齐真实组件：cancel 从武装态出发，状态机走 ADV_OFF，补一个 closed。
+    // Mirror the real glue: a cancel from an armed state walks the machine
+    // through ADV_OFF and posts one closed event.
+    if (test_push_armed) test_push_closed = true;
+    test_push_armed = false;
+}
+static inline bool push_sink_armed(void) { return test_push_armed; }
+static inline push_state_t push_sink_state(void) { return test_push_state; }
+static inline const char *push_sink_adv_name(void) { return test_push_adv; }
+static inline uint32_t push_sink_window_left_ms(void) { return test_push_left_ms; }
+static inline void push_sink_progress(uint32_t *received, uint32_t *total) {
+    if (received) *received = test_push_recv;
+    if (total) *total = test_push_total;
+}
+static inline bool push_sink_take_closed(void) {
+    if (!test_push_closed) return false;
+    test_push_closed = false;
+    return true;
+}
+static inline bool push_sink_take_start_failed(void) {
+    if (!test_push_start_failed) return false;
+    test_push_start_failed = false;
+    return true;
+}
+static inline bool push_sink_take_open(char *title, size_t cap, uint8_t *type) {
+    if (!test_push_open) return false;
+    test_push_open = false;
+    if (title && cap) snprintf(title, cap, "%s", test_push_title);
+    if (type) *type = test_push_type;
+    return true;
+}
+static inline bool push_sink_take_word_card(char *word, size_t cap) {
+    if (!test_push_word_card) return false;
+    test_push_word_card = false;
+    if (word && cap) snprintf(word, cap, "%s", test_push_word);
+    return true;
+}
+static inline bool push_sink_take_err(int *code) {
+    if (!test_push_err) return false;
+    test_push_err = false;
+    if (code) *code = test_push_err_code;
+    return true;
+}

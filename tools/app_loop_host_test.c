@@ -610,6 +610,14 @@ void ble_pt_sync(bool enabled) { (void)enabled; }
 void ble_pt_poll(void) {}
 bool pico_online_busy(void) { return online_busy; }
 
+/* 中文：push_sink 调度面替身。宿主默认未武装：翻页器连接、睡眠调度与对话框
+   逻辑因此不受推流影响；武装页的渲染路径由 transfer_ui 回归单独覆盖。
+   English: scheduling shims for push_sink. The host defaults to unarmed, so the
+   page-turner link, sleep scheduling and dialog logic stay unaffected; the arm
+   page's rendering paths are covered by the transfer_ui regression alone. */
+bool push_sink_armed(void) { return false; }
+void push_sink_poll(void) {}
+
 uint8_t app_settings_auto_lock_minutes(void){return idle_minutes;}
 uint32_t ble_pt_input_serial(void){return 0;}
 

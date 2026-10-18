@@ -65,6 +65,11 @@ static void app_font_begin_lock(app_lock_font_t *s){assert(panel[0]==(feedback_s
 static void app_font_end_lock(app_lock_font_t *s){assert(s->active);++font_end;}
 static bool read_pico_transfer_pause_for_sleep(void){++pause;return transfer_ok;}
 static void read_pico_transfer_resume_after_sleep(void){++resume;}
+// 中文：push_sink 武装期闸门（Step 3）：宿主默认未武装，enter_lock_and_sleep 的
+// 既有路径全部可走；拒绝休眠的那一分支由 transfer_ui 回归与组件测试另行覆盖。
+// English: the push_sink arm gate (Step 3): the host defaults to unarmed so every
+// existing enter_lock_and_sleep path runs; the armed refusal is covered elsewhere.
+static bool push_sink_armed(void){return false;}
 static void pico_boot_clear_resume(void){++clear_resume;}
 static void app_lock_wait_key_idle(int ms){assert(ms==800);}
 static app_wake_source_t app_light_sleep_wait_timed(void *acc,unsigned ms){assert(acc==(void*)1&&ms==600000);return timeout?APP_WAKE_TIMEOUT:APP_WAKE_KEY;}
