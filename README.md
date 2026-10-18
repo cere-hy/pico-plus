@@ -6,6 +6,8 @@
 > 本项目与 MindReset 官方无关，也不是官方发布。固件按"原样"提供，刷机有风险，
 > 请阅读文末[免责声明](#七免责声明)。
 
+Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
+
 **当前版本：v1.0（内部代号 gen10，固件版本号 0.3.3-rc95）**
 
 ---
@@ -192,7 +194,8 @@ python -m esptool --chip esp32s3 -b 460800 \
 
 ## 八、致谢
 
-- 基于 [MindReset 官方开源示例固件](https://github.com/MindReset/read_pico_firmware) 开发；
+- 基于 [MindReset 官方开源示例固件](https://github.com/MindReset/read_pico_firmware) 开发
+  （Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware)）；
 - 词典数据来自 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）；
 - 网页刷机基于 [esp-web-tools](https://github.com/espressif/esp-web-tools)（Apache-2.0）；
 - 感谢上游项目与所有第三方组件作者，完整许可清单见 `licenses/` 与 `THIRD_PARTY_NOTICES.md`。
