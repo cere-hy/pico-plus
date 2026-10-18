@@ -69,22 +69,34 @@ CONFIG_BT_NIMBLE_ENABLED=y
 # host 的全部动态分配走 PSRAM，内部 RAM 留给面板 DMA 与显示。
 # The host allocates from PSRAM, leaving internal RAM to the panel DMA and the display.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
-# 只做 central；用不到的角色连缓冲一起编掉。
-# Central only; the unused roles and their buffers are compiled out.
+# 双角色：翻页器是 central（HID 主机），手机推流是 peripheral（GATT server + 广播）。
+# M1 的 MAX_CONNECTIONS 仍为 1：武装推流窗口内不连翻页器，入口文案明示，退出自动恢复。
+# Dual role: the page-turner is a central (HID host) and phone push is a peripheral
+# (GATT server + broadcaster). M1 keeps MAX_CONNECTIONS at 1: arming push drops the
+# turner link for the window (the entry page says so) and sync restores it on exit.
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_MAX_BONDS=4
 # bond 密钥必须落 NVS，否则每次重启都要重新配对，自动重连形同虚设。这项默认是 n。
 # Bond keys must reach NVS, or every reboot re-pairs and auto-reconnect is useless. Defaults to n.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
-CONFIG_BT_NIMBLE_MAX_CCCDS=2
-CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=23
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=6
-CONFIG_BT_NIMBLE_ACL_BUF_COUNT=6
+# 翻页器的 HID 输入报告占两个 CCCD；推流的 STATUS 通知特征再占一个。留 4 个不挤。
+# The turner's HID input reports take two CCCDs; the push STATUS notify takes one. Four leaves room.
+CONFIG_BT_NIMBLE_MAX_CCCDS=4
+# MTU 247：推流每包 244 字节载荷，23 的话每包 20 字节、速度差一个数量级。连接由设备主导，
+# 传输期请求 15ms/latency 0，结束回退省电参数。
+# MTU 247: push payloads of 244 B per write; at 23 each write carries 20 B, an order of magnitude
+# slower. The device drives connection parameters: 15 ms/latency 0 while transferring, then back.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
+# 推流吞吐：ATT 写与 ACL 数据各多一倍缓冲。每块约 260 B 内部 RAM，增量几 KB，可承受。
+# Push throughput: double the ATT and ACL data buffers. Each block is ~260 B of internal RAM,
+# a few KB total, affordable.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=12
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
 # 控制器只能用内部 RAM——它跑在硬件路径上，读不到 PSRAM。这组值是 CrossMux 在同一块
 # 板子上验证过的：BLE_MAX_ACT 是"同时允许几个控制器活动"，扫描与建立连接各占一个，
