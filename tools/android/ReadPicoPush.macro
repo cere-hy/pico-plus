@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ReadPico 安卓 BLE 推流 · MacroDroid 宏导出
+  ============================================================
+  作用：复制文字 / 收到分享 → 自动连墨水屏 → 推送并全屏显示。
+  协议：与 components/push_sink/include/push_proto.h 逐字段一致（冻结）。
+  帧字节由下方「JavaScript」动作现算（算法同 push_frames.js / push_pico.py，已对表）。
+
+  使用：
+    1. MacroDroid → 左侧「宏」→ 三点菜单 → 导入 → 选本文件。
+    2. 按需改触发器（已默认：剪贴板含文本 / 收到广播 com.readpico.PUSH）。
+    3. 首次运行授权蓝牙与位置权限（Android BLE 扫描需要位置权限）。
+    4. 墨水屏先开「手机推送」得到广播名 PicoPush-XXXX，手机即可秒推。
+
+  依赖：MacroDroid 需支持「Bluetooth LE」动作（v5+）。若版本无原生 BLE，
+        把「JavaScript」动作算出的 hex 改走 Tasker/ nRF Connect（见 nrf-connect-manual.md）。
+
+  GATT（写死）：
+    服务  e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10
+    5f11  PUSH_DATA   write-no-response   ← DATA 分片
+    5f12  PUSH_CTRL   write               ← BEGIN / END / ABORT
+    5f13  PUSH_STATUS read + notify       ← 设备回执
+  广播名 PicoPush-XXXX（XXXX=token 大写十六进制）
+-->
+<MacroDroid version="5.0" logtofile="false">
+  <macros>
+    <macro>
+      <macroName>ReadPicoPush</macroName>
+      <trigger>
+        <!-- 触发器1：剪贴板出现新文本（复制即推）-->
+        <ClipboardChangedTrigger>
+          <clipTextIgnoreCase>false</clipTextIgnoreCase>
+          <clipText></clipText>
+          <caseInsensitive>false</caseInsensitive>
+        </ClipboardChangedTrigger>
+        <!-- 触发器2：收到广播（第三方/快捷指令用）-->
+        <IntentReceivedTrigger>
+          <action>com.readpico.PUSH</action>
+          <intentTarget>0</intentTarget>
+        </IntentReceivedTrigger>
+      </trigger>
+      <actionBlock>
+        <!-- 1) JavaScript 动作：把 %cliptext（或广播 extra "text"）变成各帧 hex -->
+        <JavaScriptAction>
+          <script>
+// ===== ReadPico 帧构建（与 push_frames.js / push_pico.py 同算法）=====
+function pushCrc32(bytes){let c=~0>>>0;for(let i=0;i&lt;bytes.length;i++){c^=bytes[i];for(let k=0;k&lt;8;k++){c=(c&amp;1)?(0xEDB88320^(c&gt;&gt;&gt;1)):(c&gt;&gt;&gt;1);}}return (~c)>>>0;}
+function le16(n){return [n&amp;0xFF,(n&gt;&gt;&gt;8)&amp;0xFF];}
+function le32(n){return [n&amp;0xFF,(n&gt;&gt;&gt;8)&amp;0xFF,(n&gt;&gt;&gt;16)&amp;0xFF,(n&gt;&gt;&gt;24)&amp;0xFF];}
+function utf8(str){return Array.from(new TextEncoder().encode(str));}
+const PM=64,PDM=241,M0=0x50,M1=0x43,VER=0x01,B=0x01,E=0x02,RQ=0x03;
+const type = (typeof wordMode!=="undefined"&amp;&amp;wordMode)?4:(typeof urlMode!=="undefined"&amp;&amp;urlMode?3:0);
+const rawText = (typeof clipText!=="undefined")?clipText:(typeof text!=="undefined"?text:"");
+const title = (typeof clipTitle!=="undefined")?clipTitle:(typeof wordMode!=="undefined"&amp;&amp;wordMode?rawText:rawText.slice(0,40));
+const token = (typeof tokenHex!=="undefined")?parseInt(tokenHex,16):0;
+const body = (type===4||type===3)?[]:utf8(rawText);
+const crc = pushCrc32(body);
+let begin=[M0,M1,B,VER,type,...le16(token),...le32(body.length),...le32(crc),...le32(1)];
+const t=utf8(title).slice(0,PM-1);
+begin=begin.slice(0,19).concat(t,new Array(19+PM-19-t.length).fill(0));
+while(begin.length&lt;83)begin.push(0);
+let chunks=[];let seq=0;
+for(let off=0;off&lt;body.length;off+=PDM){const p=body.slice(off,off+PDM);chunks.push([...le16(seq&amp;0xFFFF),p.length,...p]);seq++;}
+if(body.length===0)chunks.push([...le16(0),0]);
+const toHex=bs=&gt;bs.map(b=&gt;b.toString(16).padStart(2,"0")).join("");
+var beginHex=toHex(begin);
+var dataHexes=chunks.map(toHex);
+var endHex=toHex([M0,M1,E,VER]);
+// 把结果暴露给 MacroDroid 局部变量
+setMacroDroidVariable("beginHex",beginHex);
+setMacroDroidVariable("endHex",endHex);
+setMacroDroidVariable("dataHexes",dataHexes.join("|"));
+          </script>
+          <varName></varName>
+        </JavaScriptAction>
+
+        <!-- 2) Bluetooth LE：连设备（按广播名 PicoPush-XXXX 过滤）-->
+        <BluetoothLEAction>
+          <bleAction>1</bleAction>            <!-- 1=Connect -->
+          <deviceNameFilter>PicoPush-</deviceNameFilter>
+          <timeout>10</timeout>
+        </BluetoothLEAction>
+
+        <!-- 3) Bluetooth LE：使能 5f13 STATUS 通知 -->
+        <BluetoothLEAction>
+          <bleAction>4</bleAction>            <!-- 4=Enable Notify -->
+          <characteristicUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f13</characteristicUUID>
+        </BluetoothLEAction>
+
+        <!-- 4) Bluetooth LE：写 BEGIN 到 5f12 -->
+        <BluetoothLEAction>
+          <bleAction>2</bleAction>            <!-- 2=Write -->
+          <characteristicUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f12</characteristicUUID>
+          <dataHex>%beginHex%</dataHex>
+        </BluetoothLEAction>
+
+        <!-- 5) Bluetooth LE：循环写 DATA 到 5f11（MacroDroid 用「重复动作」遍历 dataHexes）-->
+        <BluetoothLEAction>
+          <bleAction>2</bleAction>
+          <characteristicUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f11</characteristicUUID>
+          <dataHex>%dataHexes%</dataHex>     <!-- 实际用「遍历列表」逐条写入，分隔符 | -->
+          <splitList>true</splitList>
+          <splitDelimiter>|</splitDelimiter>
+        </BluetoothLEAction>
+
+        <!-- 6) Bluetooth LE：写 END 到 5f12 -->
+        <BluetoothLEAction>
+          <bleAction>2</bleAction>
+          <characteristicUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f12</characteristicUUID>
+          <dataHex>%endHex%</dataHex>
+        </BluetoothLEAction>
+
+        <!-- 7) 等待设备 STATUS 回执（DONE=12 / ERR=13）。MacroDroid 读 5f13 通知并提示 -->
+        <BluetoothLEAction>
+          <bleAction>3</bleAction>            <!-- 3=Read / Wait notify -->
+          <characteristicUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f13</characteristicUUID>
+          <timeout>15</timeout>
+        </BluetoothLEAction>
+
+        <!-- 8) 成功提示（DONE 时墨水屏已自动全屏显示）-->
+        <ToastAction>
+          <message>已推送到墨水屏</message>
+          <duration>1</duration>
+        </ToastAction>
+      </actionBlock>
+    </macro>
+  </macros>
+  <categories></categories>
+</MacroDroid>

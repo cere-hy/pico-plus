@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ReadPico 安卓 BLE 推流 · Tasker 任务导出
+  ============================================================
+  作用：复制文字 / 分享 → 自动连墨水屏 → 推送并全屏显示。
+  协议：与 components/push_sink/include/push_proto.h 逐字段一致（冻结）。
+  帧字节由下方「JavaScriptlet」动作现算（算法同 push_frames.js / push_pico.py，已对表）。
+
+  使用：
+    1. Tasker → 右下 + → 导入 → 选本文件（任务名 ReadPicoPush）。
+    2. 触发器自行添加：如「事件 → 变量设值 %CLIP」或「状态 → 剪贴板」，
+       或建一个「任务快捷方式」放到桌面 / 通知栏 / 悬浮球。
+    3. 首次运行授权蓝牙（Android 12+ 还需位置权限才能扫描 BLE）。
+    4. 墨水屏先开「手机推送」得到广播名 PicoPush-XXXX。
+
+  重要：Tasker 各版本的「Bluetooth LE」动作 schema 略有差异，导入后请核对
+        connect / write / notify 三个动作的「服务/特征 UUID」是否落到了正确字段。
+        UUID 与帧字节是铁打的，见下方常量。若 Tasker 版本无原生 GATT 写，
+        把 JavaScriptlet 算出的 %begin_hex / %data_hex / %end_hex 改走 nRF Connect
+        （nrf-connect-manual.md）或 MacroDroid。
+
+  GATT（写死）：
+    服务  e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10
+    5f11  PUSH_DATA   write-no-response
+    5f12  PUSH_CTRL   write
+    5f13  PUSH_STATUS read + notify
+  广播名 PicoPush-XXXX（XXXX=token 大写十六进制）
+-->
+<TaskerData sr="" dvi="1" tv="6.1.0">
+  <Task sr="taskReadPicoPush">
+    <cdate>0</cdate>
+    <edate>0</edate>
+    <id>1</id>
+    <nme>ReadPicoPush</nme>
+    <pri>10</pri>
+    <rty>2</rty>
+
+    <!-- 动作 1：JavaScriptlet 计算各帧 hex，存入 Tasker 变量 -->
+    <Action sr="act0" ve="1">
+      <code>129</code> <!-- JavaScriptlet -->
+      <se>false</se>
+      <code129>
+// ===== ReadPico 帧构建（与 push_frames.js / push_pico.py 同算法）=====
+function pushCrc32(bytes){let c=~0&gt;&gt;&gt;0;for(let i=0;i&lt;bytes.length;i++){c^=bytes[i];for(let k=0;k&lt;8;k++){c=(c&amp;1)?(0xEDB88320^(c&gt;&gt;&gt;1)):(c&gt;&gt;&gt;1);}}return (~c)&gt;&gt;&gt;0;}
+function le16(n){return [n&amp;0xFF,(n&gt;&gt;&gt;8)&amp;0xFF];}
+function le32(n){return [n&amp;0xFF,(n&gt;&gt;&gt;8)&amp;0xFF,(n&gt;&gt;&gt;16)&amp;0xFF,(n&gt;&gt;&gt;24)&amp;0xFF];}
+function utf8(s){return Array.from(new TextEncoder().encode(s));}
+var PM=64,PDM=241,M0=0x50,M1=0x43,VER=0x01,B=0x01,E=0x02;
+var type = (typeof global!=="undefined"&amp;&amp;global.wordMode)||0;
+var rawText = (typeof global!=="undefined"&amp;&amp;global.pushText)?global.pushText:(typeof cliptext!=="undefined"?cliptext:"");
+var token = (typeof global!=="undefined"&amp;&amp;global.tokenHex)?parseInt(global.tokenHex,16):0;
+var title = (typeof global!=="undefined"&amp;&amp;global.pushTitle)?global.pushTitle:rawText.slice(0,40);
+var body = (type===4||type===3)?[]:utf8(rawText);
+var crc = pushCrc32(body);
+var begin=[M0,M1,B,VER,type].concat(le16(token),le32(body.length),le32(crc),le32(1));
+var t=utf8(title).slice(0,PM-1);
+begin=begin.slice(0,19).concat(t,new Array(19+PM-19-t.length).fill(0));
+while(begin.length&lt;83)begin.push(0);
+var chunks=[],seq=0;
+for(var off=0;off&lt;body.length;off+=PDM){var p=body.slice(off,off+PDM);chunks.push(le16(seq&amp;0xFFFF).concat([p.length],p));seq++;}
+if(body.length===0)chunks.push(le16(0).concat([0]));
+var toHex=function(bs){return bs.map(function(b){return b.toString(16).padStart(2,"0");}).join("");};
+// 输出到 Tasker 变量（JavaScriptlet 末尾赋值即回写）
+begin_hex = toHex(begin);
+end_hex = toHex([M0,M1,E,VER]);
+data_hex = chunks.map(toHex).join("|");
+      </code129>
+      <input></input>
+      <output>begin_hex,end_hex,data_hex</output>
+    </Action>
+
+    <!-- 动作 2：Bluetooth LE 连接（按广播名 PicoPush- 过滤）-->
+    <Action sr="act1" ve="1">
+      <code>430</code> <!-- Bluetooth LE（请按已装 Tasker 版本核对 code）-->
+      <BLEAction>connect</BLEAction>
+      <BLEDeviceName>PicoPush-</BLEDeviceName>
+      <BLETimeout>10</BLETimeout>
+    </Action>
+
+    <!-- 动作 3：Bluetooth LE 使能 5f13 STATUS 通知 -->
+    <Action sr="act2" ve="1">
+      <code>430</code>
+      <BLEAction>notify_enable</BLEAction>
+      <BLEServiceUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10</BLEServiceUUID>
+      <BLECharUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f13</BLECharUUID>
+    </Action>
+
+    <!-- 动作 4：Bluetooth LE 写 BEGIN 到 5f12 -->
+    <Action sr="act3" ve="1">
+      <code>430</code>
+      <BLEAction>write</BLEAction>
+      <BLEServiceUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10</BLEServiceUUID>
+      <BLECharUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f12</BLECharUUID>
+      <BLEData>%begin_hex%</BLEData>
+      <BLEResponse>true</BLEResponse>
+    </Action>
+
+    <!-- 动作 5：Bluetooth LE 循环写 DATA 到 5f11（用「For」遍历 data_hex，分隔符 |）-->
+    <Action sr="act4" ve="1">
+      <code>430</code>
+      <BLEAction>write</BLEAction>
+      <BLEServiceUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10</BLEServiceUUID>
+      <BLECharUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f11</BLECharUUID>
+      <BLEData>%data_hex%</BLEData>
+      <BLEResponse>false</BLEResponse>
+    </Action>
+
+    <!-- 动作 6：Bluetooth LE 写 END 到 5f12 -->
+    <Action sr="act5" ve="1">
+      <code>430</code>
+      <BLEAction>write</BLEAction>
+      <BLEServiceUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10</BLEServiceUUID>
+      <BLECharUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f12</BLECharUUID>
+      <BLEData>%end_hex%</BLEData>
+      <BLEResponse>true</BLEResponse>
+    </Action>
+
+    <!-- 动作 7：等待设备回执（DONE=12 / ERR=13），用「Bluetooth LE 读/通知」或「等待通知」-->
+    <Action sr="act6" ve="1">
+      <code>430</code>
+      <BLEAction>read_notify</BLEAction>
+      <BLEServiceUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10</BLEServiceUUID>
+      <BLECharUUID>e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f13</BLECharUUID>
+      <BLETimeout>15</BLETimeout>
+    </Action>
+
+    <!-- 动作 8：提示 -->
+    <Action sr="act7" ve="1">
+      <code>550</code> <!-- Flash 提示 -->
+      <IntMathVar>%push_result</IntMathVar>
+      <IntMathText>已推送到墨水屏</IntMathText>
+    </Action>
+
+  </Task>
+</TaskerData>
