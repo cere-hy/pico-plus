@@ -29,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "push_sink.h"
 #include "read_pico_crashlog.h"
 
 #include "host/ble_gap.h"
@@ -1479,6 +1480,10 @@ static void on_sync(void) {
         return;
     }
     ble_hs_id_infer_auto(0, &s_own_addr_type);
+    // 推流接收端与翻页器共用这套栈：GATT 服务在这里注册，待武装/中断的广播
+    // 也在这里续上。/ The push sink shares this stack: its GATT services are
+    // registered here, and a pending or interrupted advertisement resumes here.
+    push_sink_on_stack_sync();
 }
 
 static void host_task(void *param) {
@@ -1560,6 +1565,10 @@ static esp_err_t start_locked(void) {
 
 static esp_err_t stop_locked(void) {
     if (!s_running) return ESP_OK;
+    // 先告诉推流端：广播停掉、句柄作废，但 .part 与 NVS 会话留着，栈回来后续传。
+    // Tell the push sink first: advertising stops and handles are invalidated, but
+    // the partial file and NVS session survive for resume once the stack returns.
+    push_sink_on_stack_stop();
     ble_pt_scan_stop();
     ble_pt_disconnect();
     // 让断开走完再拆 host；bond 留在 NVS，下次 start() 重新载入。
@@ -1776,8 +1785,33 @@ void ble_pt_reset_failure(void) {
 #define REPEAT_DELAY_MS 500
 #define REPEAT_PERIOD_MS 120
 
+// 推流武装期让位（裁定 c）：翻页器链路就地断，但重连目标留着——退出武装后
+// poll 的自动重连会把它接回来。特意不用 ble_pt_disconnect()：那个函数清掉
+// s_reconnect_addr，退出武装后就再也回不来了。
+// Yield to the push sink while armed (ruling c): the page-turner link drops in
+// place but the reconnect target stays, so poll's auto-reconnect brings it back
+// once the arm ends. ble_pt_disconnect() is deliberately avoided: it clears
+// s_reconnect_addr and the remote would never return after the arm.
+static void turner_yield_locked(void) {
+    s_step = STEP_IDLE;  // 建立流程就地结束，退出武装后由重连逻辑重启 / end the bring-up here
+    s_pending_addr[0] = 0;
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGI(TAG, "yielding the link to a push");
+        ble_gap_terminate(s_conn_handle, 0x13);
+    }
+}
+
 static void poll_locked(void) {
     if (!s_running) return;
+
+    // 推流武装期：整段 poll 让位。手机推流期间翻页器既不重连也不发包，
+    // 射频整个归推流用。/ While armed for push: the whole poll yields. During a
+    // phone push the page-turner neither reconnects nor sends, and the radio
+    // belongs to the push alone.
+    if (push_sink_turner_paused()) {
+        if (s_link_up || s_connecting) turner_yield_locked();
+        return;
+    }
 
     // 自动重连：翻页器会自己省电断开，或走出范围。链路曾经建立过就记下目标，掉线后按
     // 退避重试。必须排除「正在扫描」——扫描页是持续扫描，两者同时抢控制器就会互相打架，
