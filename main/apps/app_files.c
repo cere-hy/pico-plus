@@ -97,7 +97,10 @@ static const char *folder_root(int folder) {
 static int visible_rows(void) { return s_folder == 3 ? 7 : FILE_ROWS; }
 static int root_rows(void) { return 5; }
 static EpdRect home_transfer_rect(int index) {
-    return (EpdRect){36 + index * 208, 346, 196, 100};
+    // 二期 M1 起四张传输卡（WiFi/热点/USB/手机推送）横排，卡宽随之收窄。
+    // Since phase 2 M1 four transfer cards (WiFi/hotspot/USB/phone push) share
+    // the row, so each card narrows.
+    return (EpdRect){36 + index * 162, 346, 154, 100};
 }
 
 // 存储卡卡片的位置，绘制与命中测试共用一份，免得两处各写一个坐标。
@@ -606,9 +609,9 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             if (capacity.width > 0) ui_fill_round_rect(fb, capacity, 3, 0x68);
         }
         ui_text(fb, 42, 308, 21, "传输文件", EPD_DRAW_ALIGN_LEFT, false);
-        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输"};
-        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑"};
-        for (int i = 0; i < 3; ++i) {
+        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输", "手机推送"};
+        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑", "蓝牙发送"};
+        for (int i = 0; i < 4; ++i) {
             EpdRect card = home_transfer_rect(i);
             ui_fill_round_rect(fb, card, 20, UI_GRAY_WHITE);
             ui_draw_control_frame(fb, card, 20, UI_GRAY_BLACK);
@@ -977,11 +980,12 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         s_sd_format_confirm = false;
         s_sd_notice[0] = 0;
     }
-    for (int i = 0; !long_press && i < 3; ++i) if (ui_rect_hit(home_transfer_rect(i), ev->x0, ev->y0)) {
+    for (int i = 0; !long_press && i < 4; ++i) if (ui_rect_hit(home_transfer_rect(i), ev->x0, ev->y0)) {
         extern const app_desc_t app_transfer;
         if (i == 0) app_transfer_request_wifi_upload();
         else if (i == 1) app_transfer_request_hotspot_start();
-        else app_transfer_request_usb_start();
+        else if (i == 2) app_transfer_request_usb_start();
+        else app_transfer_request_push();
         ctx->request_app = &app_transfer;
         return APP_REDRAW_NONE;
     }

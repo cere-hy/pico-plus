@@ -35,15 +35,20 @@
 #include <strings.h>
 
 #include "app.h"
+#include "app_content_open.h"
 #include "book_store.h"
 #include "book_progress.h"
 #include "book_title.h"
+#include "dict_lookup.h"
+#include "dict_popup.h"
 #include "display.h"
 #include "e0470_epaper_waveform.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
+#include "push_sink.h"
+#include "read_pico_pmu.h"
 #include "settings.h"
 #include "ttf_font.h"
 #include "ui_gesture.h"
@@ -71,6 +76,21 @@ static bool s_qr_url, s_qr_ready;
 static char s_usb_message[96];
 static bool s_usb_requested, s_wifi_setup_requested, s_wifi_settings_only;
 static bool s_wifi_upload_requested, s_hotspot_requested, s_direct_entry, s_usb_entry;
+// 手机 BLE 推流（二期 M1）：s_push_requested 由入口置位，on_enter 据此武装；
+// s_push_poll_ms 节流武装页刷新，s_push_note 是页内动态消息（错误/已接收占位）。
+// Phone BLE push (phase 2 M1): s_push_requested is set by the entry and on_enter
+// arms on it; s_push_poll_ms throttles the arm-page refresh and s_push_note is
+// the page's live message (errors / received placeholders).
+static bool s_push_requested;
+static int64_t s_push_poll_ms;
+static char s_push_note[96];
+// Step 4：单词卡开关与活区比对簿记。/ Step 4: the word-card switch and the
+// live-region comparison bookkeeping.
+static bool s_push_word_card;
+static push_state_t s_push_last_state = PUSH_STATE_IDLE;
+static uint32_t s_push_last_left_s = 1; // 初值取不到的值，首拍必重绘 / an impossible first value so the first tick repaints
+static uint32_t s_push_last_recv = 1, s_push_last_total = 1;
+static char s_push_last_adv[64];
 static bool s_usb_start_pending;
 static int64_t s_usb_retry_ms;
 static bool s_usb_host_connected;
@@ -178,6 +198,15 @@ void app_transfer_request_hotspot_start(void) {
     s_wifi_settings_only = false;
 }
 
+// 手机推送入口（二期 M1）：进页即武装。其它入口只置标志，武装动作在 on_enter，
+// 与 WiFi/热点入口同款——页面没真正显示之前不碰射频。
+// The phone-push entry (phase 2 M1): entering the page arms it. Like the WiFi and
+// hotspot entries it only sets a flag; the arming happens in on_enter, so nothing
+// touches the radio before the page is actually on screen.
+void app_transfer_request_push(void) {
+    s_push_requested = true;
+}
+
 static void clear_qr(void) {
     ui_wifi_qr_clear();
     s_qr_ready = false;
@@ -193,7 +222,7 @@ static void prepare_qr(void) {
         : ui_wifi_qr_prepare(s_status.ssid, READ_PICO_TRANSFER_PASSWORD);
 }
 
-typedef enum { TRANSFER_METHODS, TRANSFER_HOME, TRANSFER_NETWORKS, TRANSFER_PASSWORD } transfer_view_t;
+typedef enum { TRANSFER_METHODS, TRANSFER_HOME, TRANSFER_NETWORKS, TRANSFER_PASSWORD, TRANSFER_PUSH } transfer_view_t;
 #define NETWORK_ROWS 4
 #define PASSWORD_MAX 64
 static transfer_view_t s_view;
@@ -228,32 +257,34 @@ static void draw_methods(uint8_t *fb) {
     ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
     transfer_header(fb, "Wifi/热点传书", NULL);
     ui_text(fb, 42, 180, 21, "选择方式", EPD_DRAW_ALIGN_LEFT, false);
-    EpdRect card = {36, 224, 612, 224};
+    EpdRect card = {36, 224, 612, 336};
     ui_fill_round_rect(fb, card, 24, UI_GRAY_WHITE);
     ui_draw_round_rect(fb, card, 24, 0x60);
-    ui_draw_round_rect(fb, (EpdRect){37, 225, 610, 222}, 23, 0x60);
-    static const char *titles[] = {"WiFi传书", "热点传书"};
+    ui_draw_round_rect(fb, (EpdRect){37, 225, 610, 334}, 23, 0x60);
+    static const char *titles[] = {"WiFi传书", "热点传书", "手机推送"};
     static const char *details[] = {
         "与手机或电脑连接同一个无线网络",
-        "由墨水屏创建临时网络，离线也能传书"
+        "由墨水屏创建临时网络，离线也能传书",
+        "安卓复制文字，通过蓝牙发送到墨水屏"
     };
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         EpdRect row = method_control_rect(i);
         if (s_pressed == i) ui_draw_pressed_round_rect(fb, row, 0);
         if (i) ui_fill_rect_fast((EpdRect){68, row.y, 548, 2}, 0x80, fb);
         int cy = row.y + row.height / 2;
         if (i == 0) ui_nav_wifi_icon(fb, 72, cy, 30, 0x6a);
         else if (i == 1) ui_draw_icon(fb, 72, cy, 48, UI_ICON_RADIO_TOWER, 0x6a);
+        else ui_draw_icon(fb, 72, cy, 40, UI_ICON_BLUETOOTH, 0x6a);
         ui_text(fb, 112, row.y + 21, 27, titles[i], EPD_DRAW_ALIGN_LEFT, false);
         ui_text(fb, 112, row.y + 64, 19, details[i], EPD_DRAW_ALIGN_LEFT, false);
         ui_text_vc(fb, 617, cy, 29, "›", EPD_DRAW_ALIGN_CENTER, false);
     }
     if (s_method_message[0]) {
-        ui_fill_round_rect(fb, (EpdRect){36, 478, 612, 76}, 20, 0xd8);
-        ui_text_vc(fb, 342, 516, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+        ui_fill_round_rect(fb, (EpdRect){36, 584, 612, 76}, 20, 0xd8);
+        ui_text_vc(fb, 342, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
     }
-    ui_text(fb, 42, 594, 19, "浏览器传书支持 EPUB、TXT、字体和图片文件。", EPD_DRAW_ALIGN_LEFT, false);
-    ui_text(fb, 42, 634, 18, "传输完成后，新内容会自动出现在书架或字体列表。", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 42, 694, 19, "浏览器传书支持 EPUB、TXT、字体和图片文件。", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 42, 734, 18, "传输完成后，新内容会自动出现在书架或字体列表。", EPD_DRAW_ALIGN_LEFT, false);
     ui_nav_draw(fb, 2);
 }
 
@@ -761,6 +792,332 @@ static EpdRect control_rect(int id) {
     return (EpdRect){0};
 }
 
+/* ---- 手机推送武装页 / The phone-push arm page ---- */
+
+// 武装入口的默认窗口：30 分钟。充电时常开（window 0）由页内按钮切换。
+// The arm entry's default window: 30 minutes. Charger-held (window 0) is the
+// in-page button's job.
+#define PUSH_ENTRY_WINDOW_MS (30u * 60u * 1000u)
+
+static const char *push_state_text(push_state_t st) {    switch (st) {
+    case PUSH_STATE_ARMED: return "正在开启接收…";
+    case PUSH_STATE_WINDOW: return "等待手机连接";
+    case PUSH_STATE_CONNECTED: return "手机已连接";
+    case PUSH_STATE_RECEIVING: return "正在接收推送…";
+    case PUSH_STATE_PROCESSING: return "正在校验内容…";
+    case PUSH_STATE_COOLDOWN: return "推送已完成";
+    default: return "接收未开启";
+    }
+}
+
+static bool push_charging_now(void) {
+    const pmu_snapshot_t *p = read_pico_pmu_get();
+    return p && p->present && pmu_battery_charging(p);
+}
+
+static void draw_push(uint8_t *fb) {
+    ui_clear_page(fb);
+    ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
+    transfer_header(fb, "接收推送", NULL);
+
+    // 广播名卡：手机在蓝牙列表里认的就是这一行。/ The adv-name card: this is the
+    // line the phone picks from its Bluetooth list.
+    EpdRect name = {36, 168, 612, 116};
+    ui_fill_round_rect(fb, name, 24, UI_GRAY_WHITE);
+    ui_draw_round_rect(fb, name, 24, 0x98);
+    const char *adv = push_sink_adv_name();
+    char name_line[80];
+    snprintf(name_line, sizeof(name_line), "%s", adv[0] ? adv : "正在生成名称…");
+    fit_label(name_line, 30, 500);
+    ui_text(fb, 64, 196, 30, name_line, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 64, 246, 19, "在手机蓝牙列表中选择这个名称", EPD_DRAW_ALIGN_LEFT, false);
+
+    // 状态卡：状态、窗口/进度、进度条。/ The status card: state, window/progress
+    // and the progress bar.
+    EpdRect status = {36, 308, 612, 224};
+    ui_fill_round_rect(fb, status, 24, UI_GRAY_WHITE);
+    ui_draw_round_rect(fb, status, 24, 0x98);
+    const push_state_t st = push_sink_state();
+    ui_text(fb, 64, 336, 27, push_state_text(st), EPD_DRAW_ALIGN_LEFT, false);
+    char sub[128];
+    uint32_t received = 0, total = 0;
+    push_sink_progress(&received, &total);
+    if (st == PUSH_STATE_RECEIVING && total) {
+        snprintf(sub, sizeof(sub), "已接收 %.1f / %.1f KB", received / 1024.0, total / 1024.0);
+    } else if (st == PUSH_STATE_COOLDOWN) {
+        snprintf(sub, sizeof(sub), "共 %u 字节，可继续等待下一条", (unsigned)total);
+    } else {
+        const uint32_t left = push_sink_window_left_ms();
+        snprintf(sub, sizeof(sub), "%s", left ? "窗口剩余时间见下方提示" : "充电时常开中，拔电即退出");
+    }
+    ui_text(fb, 64, 386, 19, sub, EPD_DRAW_ALIGN_LEFT, false);
+    if (s_push_note[0]) {
+        fit_label(s_push_note, 19, 520);
+        ui_text(fb, 64, 424, 19, s_push_note, EPD_DRAW_ALIGN_LEFT, false);
+    } else if (st == PUSH_STATE_RECEIVING && total) {
+        EpdRect track = {64, 430, 556, 12};
+        ui_fill_round_rect(fb, track, 6, 0xc8);
+        uint64_t width = (uint64_t)received * track.width / total;
+        if (width > (uint64_t)track.width) width = track.width;
+        track.width = (int)width;
+        ui_fill_round_rect(fb, track, 6, UI_GRAY_BLACK);
+    }
+    char window[96];
+    const uint32_t left_ms = push_sink_window_left_ms();
+    if (left_ms) snprintf(window, sizeof(window), "接收窗口剩余 %u 分 %02u 秒，超时自动退出",
+                          (unsigned)(left_ms / 60000u), (unsigned)((left_ms / 1000u) % 60u));
+    else snprintf(window, sizeof(window), "充电时常开：没有超时，拔下充电器即退出");
+    ui_text(fb, 64, 486, 18, window, EPD_DRAW_ALIGN_LEFT, false);
+
+    // 裁定 c 的明示文案：用户必须知道这会暂停翻页器。/ Ruling c's plain notice:
+    // the user has to know this pauses the page-turner.
+    ui_text(fb, 42, 556, 18, "开启后将暂停翻页器连接，退出接收后自动恢复。", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 42, 586, 18, "接收期间屏幕不会自动锁屏，推送到会自动亮屏。", EPD_DRAW_ALIGN_LEFT, false);
+
+    // 常开开关（仅插电时可切；传输中不切，避免 cancel 丢会话簿记）。
+    // The hold switch (charger only; never mid-transfer, a cancel would drop the
+    // session bookkeeping).
+    EpdRect hold = control_rect(0);
+    const bool held = push_sink_window_left_ms() == 0 && push_charging_now();
+    const bool can_hold = push_charging_now() &&
+        (st == PUSH_STATE_WINDOW || st == PUSH_STATE_CONNECTED);
+    ui_fill_round_rect(fb, hold, 18, s_pressed == 0 ? 0x60 : (can_hold ? UI_GRAY_WHITE : 0xe8));
+    ui_draw_round_rect(fb, hold, 18, can_hold ? 0x92 : 0xc0);
+    ui_text_vc(fb, hold.x + hold.width / 2, hold.y + hold.height / 2, 20,
+               held ? "常开已开启" : can_hold ? "切换充电时常开" : "常开需充电",
+               EPD_DRAW_ALIGN_CENTER, can_hold);
+
+    EpdRect back = control_rect(2);
+    if (s_pressed == 2) ui_draw_pressed_round_rect(fb, back, UI_BTN_RADIUS);
+    ui_draw_button(fb, back, "退出接收", false);
+    ui_nav_draw(fb, 2);
+    // 单词卡盖在武装页之上：模态卡片，卡外点击由 push_gesture 关掉。
+    // The word card paints over the arm page: a modal card; taps outside are
+    // closed by push_gesture.
+    if (s_push_word_card) dict_popup_draw(fb);
+}
+
+// 错误码 → 用户看得懂的一句话。/ Error code to one plain sentence.
+static const char *push_err_text(int code) {
+    switch (code) {
+    case PUSH_ERR_NOT_ARMED: return "接收未开启，请在设备上点开始";
+    case PUSH_ERR_BAD_FRAME: return "内容格式不符，推送被拒绝";
+    case PUSH_ERR_TOO_LARGE: return "内容超过 512 KB 上限";
+    case PUSH_ERR_CHECKSUM: return "内容校验失败，请重新发送";
+    case PUSH_ERR_NO_CARD: return "TF 卡不可用，无法保存";
+    case PUSH_ERR_LOW_BATTERY: return "电量不足且未在充电";
+    case PUSH_ERR_BUSY: return "上一条推送还没处理完";
+    case PUSH_ERR_NO_DICT: return "设备上没有可用词典，单词卡已取消";
+    default: return "推送失败，请重试";
+    }
+}
+
+// 关掉单词卡并释放其内容。/ Close the word card and release its content.
+static void push_word_card_close(void) {
+    if (!s_push_word_card) return;
+    s_push_word_card = false;
+    dict_popup_reset();
+}
+
+// 武装成功后的陈事件清扫：closed/start_failed 只在会话走到 IDLE 或待武装超时
+// 时补，若它们早于本次武装就是上一回合的遗物（离页 cancel、待武装失败后重进），
+// 吃了它，别把用户扔回方法页。/ Stale-event sweep after a successful arm: closed
+// and start_failed are posted only when a session reaches IDLE or a pending arm
+// times out, so anything posted before this arm belongs to a previous round
+// (leaving the page cancels; a failed pending arm followed by a re-entry).
+// Swallow it instead of throwing the user back to the method page.
+static void push_drain_stale_events(void) {
+    (void)push_sink_take_closed();
+    (void)push_sink_take_start_failed();
+    (void)push_sink_take_open(NULL, 0, NULL);
+    (void)push_sink_take_word_card(NULL, 0);
+    (void)push_sink_take_err(NULL);
+}
+
+// 武装页的活区：广播名卡、状态卡与常开按钮——倒计时/进度/状态只在这三块变。
+// The arm page's live regions: the adv-name card, the status card and the hold
+// button - the countdown, progress and state only ever change in these three.
+static EpdRect push_dynamic_rect(void) {
+    return ui_rect_union(ui_rect_union((EpdRect){36, 168, 612, 116},
+                                       (EpdRect){36, 308, 612, 224}),
+                         control_rect(0));
+}
+
+// 把活区簿记对齐当前推流状态：调用方刚整页画过或刚武装时用，避免下一拍做
+// 内容相同的重复刷新。/ Align the live-region bookkeeping with the current push
+// state: for callers that just painted the full page or just armed, so the next
+// tick does not repeat an identical refresh.
+static void push_sync_live_bookkeeping(void) {
+    s_push_last_state = push_sink_state();
+    s_push_last_left_s = push_sink_window_left_ms() / 1000u;
+    uint32_t received = 0, total = 0;
+    push_sink_progress(&received, &total);
+    s_push_last_recv = received;
+    s_push_last_total = total;
+    snprintf(s_push_last_adv, sizeof(s_push_last_adv), "%s", push_sink_adv_name());
+}
+
+// 武装页轮询：消费 push_sink 的一次性 UI 事件，500ms 节流刷新倒计时与进度。
+// The arm page's pump: consume the push sink's one-shot UI events and refresh the
+// countdown and progress at a 500 ms cadence.
+static app_redraw_t push_tick(app_ctx_t *ctx) {
+    // closed/start_failed 决定去留；open/word_card/err 只换页内文案。
+    // closed/start_failed decide the page's fate; the rest swap the message.
+    if (push_sink_take_closed()) {
+        push_word_card_close();
+        s_view = TRANSFER_METHODS;
+        return APP_REDRAW_PAGE;
+    }
+    if (push_sink_take_start_failed()) {
+        push_word_card_close();
+        s_view = TRANSFER_METHODS;
+        snprintf(s_method_message, sizeof(s_method_message), "蓝牙启动失败，请重试");
+        return APP_REDRAW_PAGE;
+    }
+    char title[PUSH_TITLE_MAX];
+    uint8_t type = 0;
+    if (push_sink_take_open(title, sizeof(title), &type)) {
+        // 虚拟书：标题覆盖成推送标题、清掉旧进度，再切阅读页——「收完统一写
+        // push.txt → 一次全刷」的全刷落在 app_book 的开书路径上，武装页不抢。
+        // Virtual book: override the display title with the pushed one, drop
+        // stale progress, then switch to the reader - the single full refresh
+        // belongs to app_book's open path, so the arm page does not steal it.
+        (void)book_title_set(PUSH_TEXT_PATH, title);
+        (void)book_progress_forget(PUSH_TEXT_PATH);
+        extern const app_desc_t app_book;
+        if (app_book_request_open(PUSH_TEXT_PATH)) {
+            ctx->request_app = &app_book;
+            return APP_REDRAW_NONE;
+        }
+        snprintf(s_push_note, sizeof(s_push_note), "打开推送内容失败，请重试");
+        return APP_REDRAW_PAGE;
+    }
+    char word[PUSH_TITLE_MAX];
+    if (push_sink_take_word_card(word, sizeof(word))) {
+        // 单词卡：查词并开卡片；未收录或词典不在给一句准话，不黑屏不白卡。
+        // Word card: look the word up and open the card; a miss or a missing
+        // dictionary gets a definite sentence, never a blank card.
+        dict_popup_set_anchor(0, false);
+        if (dict_popup_open(word)) {
+            s_push_word_card = true;
+            return APP_REDRAW_PAGE;
+        }
+        if (dict_ready()) snprintf(s_push_note, sizeof(s_push_note), "未收录：%s", word);
+        else snprintf(s_push_note, sizeof(s_push_note), "词典不可用，无法查词");
+        return APP_REDRAW_PAGE;
+    }
+    int code = 0;
+    if (push_sink_take_err(&code)) {
+        snprintf(s_push_note, sizeof(s_push_note), "%s", push_err_text(code));
+        return APP_REDRAW_PAGE;
+    }
+    if (ctx->now_ms - s_push_poll_ms < 500) return APP_REDRAW_NONE;
+    s_push_poll_ms = ctx->now_ms;
+    // 双保险：closed 事件万一漏接（极端时序），节流刷新也会把页面放回去。
+    // A safety net: if the closed event were ever missed (extreme timing), the
+    // throttled refresh still walks the page back.
+    if (!push_sink_armed()) {
+        push_word_card_close();
+        s_view = TRANSFER_METHODS;
+        return APP_REDRAW_PAGE;
+    }
+    // 活区没动就不刷：倒计时每秒才走一格，30 分钟窗口里每 500ms 一次全页 GL16
+    // 等于几千次全闪，防闪烁不许这么干；有动就只重绘活区 + DU 区域更新。
+    // Nothing moved, nothing to paint: the countdown steps once a second, so a
+    // full GL16 every 500 ms would mean thousands of full flashes across a
+    // 30-minute window - the no-flicker ruling forbids that. When something did
+    // move, repaint only the live regions and present a DU area update.
+    const push_state_t st = push_sink_state();
+    const uint32_t left_s = push_sink_window_left_ms() / 1000u;
+    uint32_t received = 0, total = 0;
+    push_sink_progress(&received, &total);
+    const char *adv = push_sink_adv_name();
+    if (st == s_push_last_state && left_s == s_push_last_left_s &&
+        received == s_push_last_recv && total == s_push_last_total &&
+        !strcmp(adv, s_push_last_adv)) return APP_REDRAW_NONE;
+    s_push_last_state = st;
+    s_push_last_left_s = left_s;
+    s_push_last_recv = received;
+    s_push_last_total = total;
+    snprintf(s_push_last_adv, sizeof(s_push_last_adv), "%s", adv);
+    draw_push(ctx->fb);
+    s_area = push_dynamic_rect();
+    s_settle = false;
+    return APP_REDRAW_AREA;
+}
+
+// 武装页手势：常开开关、退出接收、按下反馈。/ The arm page's gestures: the hold
+// switch, the exit button and press feedback.
+static app_redraw_t push_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    // 单词卡是模态的：开着时所有点击先问卡片——chip 命中切换保存、卡片留着，
+    // 其余点击关卡片；按下反馈一律吞掉（卡片盖着的按钮不给人按的错觉）。
+    // The word card is modal: while it is open every tap asks the card first -
+    // a chip hit toggles the save and keeps the card, any other tap closes it;
+    // press feedback is swallowed outright (no illusion of pressing a button
+    // the card covers).
+    if (s_push_word_card) {
+        // 非点击不动屏幕（按下反馈一律吞掉：卡片盖着的按钮不给人按的错觉）；
+        // 点击才问 chip，命中切换保存、未命中关卡片，两者都要重绘。
+        // Non-taps change nothing on screen (press feedback is swallowed: no
+        // illusion of pressing a button the card covers); only a tap asks the
+        // chip - a hit toggles the save, a miss closes the card - and either
+        // way the page repaints once.
+        if (ev->type != UI_GESTURE_TAP) return APP_REDRAW_NONE;
+        (void)dict_popup_tap(ev->x0, ev->y0);
+        push_word_card_close();
+        s_pressed = -1;
+        return APP_REDRAW_PAGE;
+    }
+    int old = s_pressed;
+    int origin = -1;
+    if (ui_rect_hit(control_rect(0), ev->x0, ev->y0)) origin = 0;
+    else if (ui_rect_hit(control_rect(2), ev->x0, ev->y0)) origin = 2;
+    s_pressed = ev->type == UI_GESTURE_PRESS ? origin : -1;
+    if (ev->type != UI_GESTURE_TAP || old < 0 || old != origin) {
+        if (old == s_pressed) return APP_REDRAW_NONE;
+        render(ctx, ctx->fb);
+        s_settle = false;
+        s_area = control_rect(old >= 0 ? old : s_pressed);
+        return APP_REDRAW_AREA;
+    }
+    if (origin == 0) {
+        // 充电时常开：cancel 当前窗口再以 window 0 重新武装。仅 WINDOW/CONNECTED
+        // 可切（draw_push 已置灰，这里再挡一次）；传输中切会丢会话簿记。
+        // Charger-held: cancel the window and re-arm with window 0. Only from
+        // WINDOW/CONNECTED (draw_push greys the button; checked again here) -
+        // switching mid-transfer would drop the session bookkeeping.
+        if (!push_charging_now()) return APP_REDRAW_NONE;
+        const push_state_t st = push_sink_state();
+        if (st != PUSH_STATE_WINDOW && st != PUSH_STATE_CONNECTED) return APP_REDRAW_NONE;
+        push_sink_cancel();
+        if (push_sink_arm(0, 0) != ESP_OK) {
+            // cancel 之后 closed 会把页面带回方法页，原因写到方法页的消息位上，
+            // 别只留在武装页的便签里。/ After the cancel the closed event walks
+            // the page back to the method page, so the reason goes to the
+            // method page's message slot, not just the arm page's note.
+            snprintf(s_method_message, sizeof(s_method_message), "切换常开失败");
+            snprintf(s_push_note, sizeof(s_push_note), "切换常开失败");
+            return APP_REDRAW_PAGE;
+        }
+        // cancel 补的 closed 是旧会话的收尾信号，重武装是有意为之：吃掉它，
+        // 否则下一拍就把用户扔回方法页。/ The closed posted by the cancel ends
+        // the old session; the re-arm is deliberate: swallow the event, or the
+        // next tick would throw the user back to the method page.
+        push_drain_stale_events();
+        s_push_note[0] = 0;
+        // 全页重画已经画上新 token，簿记对齐当前值，别让 500ms 后再补一次
+        // 内容相同的 DU 区域刷新。/ The full repaint already shows the new
+        // token: align the bookkeeping so the 500 ms tick does not repeat an
+        // identical DU area refresh.
+        push_sync_live_bookkeeping();
+        return APP_REDRAW_PAGE;
+    }
+    // 退出接收：cancel 之后 closed 事件会把页面带回方法页。
+    // Exit: after the cancel the closed event walks the page back.
+    push_sink_cancel();
+    return APP_REDRAW_NONE;
+}
+
 static void render(app_ctx_t* ctx, uint8_t* fb) {
     (void)ctx;
     if (s_usb_entry) {
@@ -802,6 +1159,7 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     if (s_view == TRANSFER_METHODS) { draw_methods(fb); return; }
     if (s_view == TRANSFER_NETWORKS) { draw_networks(fb); return; }
     if (s_view == TRANSFER_PASSWORD) { draw_password(fb); return; }
+    if (s_view == TRANSFER_PUSH) { draw_push(fb); return; }
     ui_clear_page(fb);
     transfer_header(fb, s_mode == READ_PICO_TRANSFER_MODE_AP ? "热点传书" : "WiFi 传书", NULL);
     EpdRect connection = {36, 168, 612, 132};
@@ -869,6 +1227,8 @@ static void on_enter(app_ctx_t* ctx) {
     s_usb_host_connected = false;
     s_usb_capacity_bytes = 0;
     s_method_message[0] = 0;
+    s_push_note[0] = 0;
+    s_push_poll_ms = 0;
     s_view = TRANSFER_METHODS;
     s_direct_entry = s_usb_requested || s_wifi_upload_requested || s_hotspot_requested;
     s_usb_entry = s_usb_requested;
@@ -925,6 +1285,30 @@ static void on_enter(app_ctx_t* ctx) {
         } else {
             (void)enter_networks();
         }
+    } else if (s_push_requested) {
+        // 手机推送入口：直接武装。电量不足（组件层门槛）或被别的会话占住时
+        // 退回方法页并说明原因。/ The phone-push entry: arm outright. A low
+        // battery (the glue-side gate) or a busy session falls back to the
+        // method page with the reason shown.
+        s_push_requested = false;
+        const esp_err_t err = push_sink_arm(0, PUSH_ENTRY_WINDOW_MS);
+        if (err == ESP_ERR_NOT_ALLOWED) {
+            snprintf(s_method_message, sizeof(s_method_message), "电量不足，无法开启接收");
+            return;
+        }
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            snprintf(s_method_message, sizeof(s_method_message), "接收开启失败（%d）", err);
+            return;
+        }
+        s_view = TRANSFER_PUSH;
+        // 新回合干净开局：单词卡收掉、陈事件清扫（离页 cancel 补的 closed、
+        // 上一回合待武装失败补的 start_failed 等）、活区簿记对齐当前值。
+        // A clean slate for the new round: drop the word card, sweep stale
+        // events (the closed posted by leaving the page, the previous round's
+        // start_failed, and so on) and align the live-region bookkeeping.
+        push_word_card_close();
+        push_drain_stale_events();
+        push_sync_live_bookkeeping();
     } else {
         s_wifi_settings_only = false;
     }
@@ -952,6 +1336,7 @@ static bool stop_upload_if_idle(void) {
 static void transfer_on_media_lost(app_ctx_t* ctx) {
     (void)ctx;
     if (s_root.is_flash) return;
+    if (s_view == TRANSFER_PUSH) push_word_card_close();
     stop_session();
     s_start_pending = s_scan_pending = false;
     s_view = s_direct_entry ? TRANSFER_HOME : TRANSFER_METHODS;
@@ -966,6 +1351,11 @@ static void transfer_on_media_lost(app_ctx_t* ctx) {
 static void transfer_on_exit(app_ctx_t* ctx) {
     (void)ctx;
     s_usb_start_pending = false;
+    // 离页即收摊：武装中的推流随页面一起退，手机侧看到断连即知会话暂停。
+    // Leaving the page closes the arm: a push in progress leaves with the page,
+    // and the phone reads the disconnect as a paused session.
+    if (s_view == TRANSFER_PUSH) push_word_card_close();
+    if (push_sink_armed() || push_sink_state() != PUSH_STATE_IDLE) push_sink_cancel();
     if (usb_storage_active()) {
         esp_err_t err = usb_storage_stop();
         if (err == ESP_OK) s_any_changed = true;
@@ -1024,6 +1414,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         return APP_REDRAW_PAGE;
     }
     if (usb_storage_active()) return APP_REDRAW_NONE;
+    if (s_view == TRANSFER_PUSH) return push_tick(ctx);
     if (s_view == TRANSFER_METHODS) return APP_REDRAW_NONE;
     if (s_view != TRANSFER_HOME) return network_ui_tick(ctx);
     if (s_start_pending) {
@@ -1101,7 +1492,7 @@ static int hit_control(uint16_t x, uint16_t y) {
 }
 
 static int hit_method(uint16_t x, uint16_t y) {
-    for (int i = 0; i < 2; ++i) if (ui_rect_hit(method_control_rect(i), x, y)) return i;
+    for (int i = 0; i < 3; ++i) if (ui_rect_hit(method_control_rect(i), x, y)) return i;
     return -1;
 }
 
@@ -1138,6 +1529,11 @@ static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
         } else if (origin == 1) {
             if (start_hotspot_service()) return APP_REDRAW_PAGE;
             snprintf(s_method_message, sizeof(s_method_message), "传输正在结束，请稍后再试");
+        } else if (origin == 2) {
+            // 手机推送：只置标志，武装动作交给 on_enter——页面没真正显示之前
+            // 不碰射频。/ Phone push: only the flag is set; on_enter does the
+            // arming, so nothing touches the radio before the page shows.
+            app_transfer_request_push();
         }
         return APP_REDRAW_PAGE;
     }
@@ -1156,6 +1552,10 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
         int tab = ui_nav_hit(ev->x0, ev->y0);
         if (tab >= 0 && tab == ui_nav_hit(ev->x, ev->y)) {
             if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
+            // 武装页先收摊再切走：BLE 栈该跟着翻页器设置走，不该为看不见的
+            // 推流续着。/ Leave the arm before navigating away: the BLE stack
+            // follows the page-turner setting, not a push no longer on screen.
+            if (s_view == TRANSFER_PUSH) { push_word_card_close(); push_sink_cancel(); }
             s_pressed = -1;
             ui_nav_request(ctx, tab);
             return APP_REDRAW_NONE;
@@ -1164,6 +1564,7 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
     if (ev->type == UI_GESTURE_TAP && ev->y0 < 160 && ev->x0 < 120) {
         if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, false);
         if (s_view == TRANSFER_PASSWORD) { clear_password(); s_view = TRANSFER_NETWORKS; return APP_REDRAW_PAGE; }
+        if (s_view == TRANSFER_PUSH) { push_word_card_close(); push_sink_cancel(); s_view = TRANSFER_METHODS; return APP_REDRAW_PAGE; }
         if (s_view == TRANSFER_NETWORKS) {
             if (s_wifi_settings_only) { ctx->request_return = true; return APP_REDRAW_NONE; }
             if (s_direct_entry) { ctx->request_return = true; return APP_REDRAW_NONE; }
@@ -1179,6 +1580,7 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
         return APP_REDRAW_NONE;
     }
     if (s_view == TRANSFER_METHODS) return method_gesture(ctx, ev);
+    if (s_view == TRANSFER_PUSH) return push_gesture(ctx, ev);
     if (s_view != TRANSFER_HOME) return provisioning_gesture(ctx, ev);
     int old = s_pressed;
     int origin = hit_control(ev->x0, ev->y0);
@@ -1218,6 +1620,15 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
 static app_redraw_t on_key(app_ctx_t *ctx, int key) {
     if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, key == UI_KEY_2);
     if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
+    // 武装页：任何离页按键都先收摊，再按既有规则走。/ The arm page: any leaving
+    // key closes the arm first, then follows the existing rules.
+    if (s_view == TRANSFER_PUSH) {
+        push_word_card_close();
+        push_sink_cancel();
+        if (key == UI_KEY_2) { ui_nav_request(ctx, 0); return APP_REDRAW_NONE; }
+        s_view = TRANSFER_METHODS;
+        return APP_REDRAW_PAGE;
+    }
     if (key == UI_KEY_2) { ui_nav_request(ctx, 0); return APP_REDRAW_NONE; }
     if (s_view == TRANSFER_PASSWORD) { clear_password(); s_view = TRANSFER_NETWORKS; return APP_REDRAW_PAGE; }
     if (s_view == TRANSFER_NETWORKS) {
