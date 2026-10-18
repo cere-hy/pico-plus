@@ -56,6 +56,7 @@
 #include "read_pico_board.h"
 #include "read_pico_buzzer.h"
 #include "ble_page_turner.h"
+#include "push_sink.h"
 #include "read_pico_pmu.h"
 #include "read_pico_transfer.h"
 #include "sc7a20h_lab.h"
@@ -469,6 +470,17 @@ void enter_lock_and_sleep(
 ) {
     bool feedback_visible = s_lock_feedback_visible;
     s_lock_feedback_visible = false;
+    // 推流武装期拒绝锁屏：深睡没有 BLE 唤醒源（sleep.c 的深睡路径连栈都拆了），
+    // 睡下去手机推什么都是丢；用户此刻正是在等一条推送。调用方照常重绘原页，
+    // 与 transfer busy 的推迟同款处理。/ Refuse locking while a push arm is open:
+    // deep sleep has no BLE wake source (the deep-sleep path even tears the stack
+    // down), so anything the phone pushes would be lost - and waiting for a push
+    // is exactly what the user is doing. The caller repaints as usual, the same
+    // way a busy transfer postpones the lock.
+    if (push_sink_armed()) {
+        ESP_LOGW(TAG, "lock refused: push sink armed");
+        return;
+    }
     // Refuse to interrupt an active upload. The caller repaints its page when
     // this function returns, and the user can lock again after the transfer.
     bool radio_paused = read_pico_transfer_pause_for_sleep();

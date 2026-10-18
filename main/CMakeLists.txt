@@ -17,6 +17,12 @@ set(main_requires
     bt
     # 蓝牙翻页器本体。/ The page-turner itself.
     ble_page_turner
+    # 手机 BLE 推流接收端。与 ble_page_turner 共用一套 NimBLE 栈生命周期（外设
+    # 角色 + 射频互斥），同样必须进依赖图否则 Kconfig 不加载。
+    # The phone BLE push sink. It shares the NimBLE stack lifecycle with
+    # ble_page_turner (peripheral role + radio mutex) and must stay in the
+    # dependency graph for the same Kconfig reason.
+    push_sink
     continuous_du
     e0470_epaper_waveform
     e0470_page_turn

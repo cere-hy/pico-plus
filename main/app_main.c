@@ -38,6 +38,8 @@
 #include "read_pico_pmu.h"
 #include "read_pico_pmu_protocol.h"
 #include "read_pico_transfer.h"
+#include "push_sink.h"
+#include "dict/dict_lookup.h"
 #include "settings.h"
 #include "sleep.h"
 #include "ttf_font.h"
@@ -179,6 +181,13 @@ void app_main(void) {
     char interrupted[PICO_BOOT_PATH_MAX];
     if (pico_boot_interrupted_book(interrupted, sizeof(interrupted))) first = &app_boot_recovery;
     rp_boot_mark("resume");
+    // 推流接收端：建互斥锁、从 NVS 装回半成品会话簿记（.part 对账在武装时做）。
+    // 词典探针让单词卡在 BEGIN 前置闸门就能拒绝（ERR(9)），不用等推完。
+    // The push sink: build the mutex and reload any partial session from NVS
+    // (the .part reconciliation happens on arm). The dictionary probe lets word
+    // cards be refused at the BEGIN pre-check (ERR(9)) instead of after a push.
+    push_sink_init();
+    push_sink_set_dict_probe(dict_ready);
     app_loop_run(&(app_loop_config_t){
         .hl = &hl,
         .fb = framebuffer,

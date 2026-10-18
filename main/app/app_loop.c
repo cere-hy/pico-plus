@@ -45,6 +45,7 @@
 #include "app_content_open.h"
 #include "boot_state.h"
 #include "ble_page_turner.h"
+#include "push_sink.h"
 #include "ota_online.h"
 #include "continuous_du.h"
 #include "display.h"
@@ -1060,8 +1061,20 @@ void app_loop_run(const app_loop_config_t* config) {
             pico_online_busy();
         // 飞行模式下蓝牙同样停摆；解除后按原设置自动恢复。
         // Flight mode halts Bluetooth too; clearing it restores whatever the setting asks for.
-        ble_pt_sync(app_settings_ble_turner() && !wifi_busy && !app_settings_flight_mode());
+        // 推流武装期同理要栈：手机在等一条推送，武装入口本身可能就是翻页器
+        // 设置关着时点的——BLE 栈必须为推流保持运行（on_sync 会注册 GATT 服务）。
+        // An open push arm needs the stack for the same reason: the phone is
+        // waiting for a push, and the arm entry may have been tapped with the
+        // page-turner setting off - the BLE stack must stay up for the push
+        // (on_sync registers the GATT services).
+        ble_pt_sync((app_settings_ble_turner() || push_sink_armed()) && !wifi_busy && !app_settings_flight_mode());
         ble_pt_poll();
+        // 推流轮询：驱动窗口/宽限到期、拔电看守、待武装超时。放在 poll 之后，
+        // 翻页器让位闸（ble_pt_poll 内）先执行，射频先归推流。
+        // Push poll: window/grace expiry, the unplug watch and the pending-arm
+        // timeout. It runs after ble_pt_poll so the page-turner's yield gate
+        // (inside that poll) hands the radio over first.
+        push_sink_poll();
         if (s_quick.open || quick_input_owned) {
             // 覆盖层期间丢弃页内蓝牙输入，关闭后不重放翻页或学习事件。
             // Discard page BLE input while covered, without replaying turns or learning edges after closing.
@@ -1079,9 +1092,13 @@ void app_loop_run(const app_loop_config_t* config) {
         uint32_t ble_input = ble_pt_input_serial();
         if (ble_input != last_ble_input) { last_ble_input = ble_input; last_input_ms = ctx.now_ms; }
         unsigned requested_idle = app_settings_auto_lock_minutes();
+        // 武装期不锁屏：深睡没有 BLE 唤醒源，睡下去这条推送就收不到了，而用户
+        // 此刻正是在等它。/ No locking while a push arm is open: deep sleep has
+        // no BLE wake source, so a sleep would lose the push the user is
+        // waiting for.
         bool idle_blocked = usb_storage_active() || wifi_busy || current == &app_transfer ||
             current->holds_pmu || power_dialog_open || touch.touched ||
-            ctx.request_app || ctx.request_menu || ctx.request_return;
+            ctx.request_app || ctx.request_menu || ctx.request_return || push_sink_armed();
         if (idle_blocked || requested_idle != idle_minutes) last_input_ms = ctx.now_ms;
         idle_minutes = requested_idle;
         if (!idle_blocked && ctx.now_ms >= s_lock_ignore_until_ms &&
