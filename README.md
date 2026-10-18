@@ -19,10 +19,17 @@
 |---|---|
 | 横屏显示 | 界面支持横屏摆放，握持阅读更接近普通书籍 |
 | 双栏排版 | 一页左右两栏，翻页次数减半；可在阅读设置中开关 |
-| 离线词典 | 阅读中取词查义，无需联网（内置 ECDICT 英汉词典数据） |
+| 离线词典 | 阅读中取词查义，无需联网（**词典文件需自行下载并放到 TF 卡，见下方重要提示**） |
 | 生词本 | 查过的词自动记录，随时复习 |
 | 更快的翻页 | 纯文字翻页不闪黑、不擦白，局部刷新 |
 | 水波纹翻页 | 翻页带水波纹动画效果（可选） |
+
+> ## ⚠️ 重要：离线词典必须自备词典文件
+>
+> **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件：
+> 需自行下载 `dict.bin`，并放入 TF 卡根目录的 `dict` 文件夹下
+> （即 `/sdcard/dict/dict.bin`），**否则无法使用查词功能**。
+> 下载地址与详细步骤见[第四节「刷完之后」](#四刷完之后把书放进设备)。
 
 原版的传书、WiFi、USB 存储、TF 卡读写等能力全部保留（见[第四节](#四刷完之后把书放进设备)）。
 
@@ -62,7 +69,8 @@
 ### 方法 2：Windows 一键刷机脚本
 
 1. 下载本仓库 Release 中的 `release-v1.0-gen10.zip` 并解压
-   （内含 4 个 `.bin` 文件、一个「一键刷机.bat」批处理和一份说明文本）；
+   （内含 4 个 `.bin` 文件、一个「一键刷机.bat」批处理和一份说明文本；
+   **词典文件不在这个包里**，需另外下载，见[第四节](#四刷完之后把书放进设备)）；
 2. 安装 Python（到 [python.org](https://www.python.org/downloads/) 下载，
    安装时**务必勾选 "Add Python to PATH"**）；
 3. 按 `Win + R`，输入 `cmd` 回车，执行：
@@ -117,7 +125,26 @@ python -m esptool --chip esp32s3 -b 460800 \
 - **USB**：设备开启 USB 存储模式后，直接当 U 盘拖入书籍；
 - **TF 卡**：把书拷到 TF 卡，在设备文件管理中打开。
 
-词典与生词本：阅读时选中单词即可查词，查过的词自动进生词本。
+### 离线词典设置（不设置就无法查词）
+
+> **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件，
+> 必须按下面的步骤放置，否则无法使用查词功能。
+
+1. 下载词典文件（二选一，推荐第一个）：
+   - [`dict.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin)
+     ——推荐，约 8.9 MB，12.4 万词，SHA-256 `2bb228e4…9ee7`；
+   - [`dict-full.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin)
+     ——词库更全，约 23 MB，40 万词，SHA-256 `7c17cca7…f61b`；
+2. 如果下载的是 `dict-full.bin`，先把它**重命名为 `dict.bin`**；
+3. 把 `dict.bin` 复制到 TF 卡的 `dict` 文件夹下，即 **`/sdcard/dict/dict.bin`**
+   （没有 `dict` 文件夹就新建一个；设备插卡启动后也会自动创建该文件夹）；
+4. TF 卡插回设备并重启，之后阅读时选中单词即可查词，查过的词自动进生词本。
+
+> **命名与位置必须严格一致**：文件名叫 `dict.bin`，放在 `/sdcard/dict/` 目录下，
+> 其他名字、其他位置都不会生效；`dict` 文件夹里只放一个词典文件，放多个时打开哪一个不确定。
+>
+> 词典数据由 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）转换生成，
+> 你也可以用仓库里的 `tools/build_dict.py` 自行构建词典。
 
 ## 五、开发者说明
 
@@ -136,6 +163,7 @@ python -m esptool --chip esp32s3 -b 460800 \
   - `main/` 固件主体——`book/` 文本解析与排版引擎、`dict/` 词典与生词本、`apps/` 各应用；
   - `components/` 硬件与功能组件——`read_pico_transfer/` 为 WiFi 传书组件；
   - `web-flasher/` 网页刷机页（manifest + 固件 bin）；
+  - `tools/build_dict.py` 词典构建工具（ECDICT CSV → 设备用 RPD1 `dict.bin`）；
 - 内部机制约定（虚拟书、传书策略、波形等）见 `docs/ONBOARDING.md`、`docs/HANDOFF.md` 与 `AGENTS.md`。
 
 ## 六、未来规划
