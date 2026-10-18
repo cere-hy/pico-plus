@@ -29,8 +29,9 @@ Based on the original work by [MindReset/read_pico_firmware](https://github.com/
 > ## ⚠️ 重要：离线词典必须自备词典文件
 >
 > **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件：
-> 需自行下载 `dict.bin`，并放入 TF 卡根目录的 `dict` 文件夹下
-> （即 `/sdcard/dict/dict.bin`），**否则无法使用查词功能**。
+> 需自行下载 `dict.bin`，并放入 TF 卡根目录下的 `dict` 文件夹里
+> （设备内路径记为 `/sdcard/dict/dict.bin`，其中 `/sdcard` 是 TF 卡在设备里的
+> 挂载点名，不是让你在卡上建 `sdcard` 文件夹），**否则无法使用查词功能**。
 > 下载地址与详细步骤见[第四节「刷完之后」](#四刷完之后把书放进设备)。
 
 原版的传书、WiFi、USB 存储、TF 卡读写等能力全部保留（见[第四节](#四刷完之后把书放进设备)）。
@@ -138,12 +139,17 @@ python -m esptool --chip esp32s3 -b 460800 \
    - [`dict-full.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin)
      ——词库更全，约 23 MB，40 万词，SHA-256 `7c17cca7…f61b`；
 2. 如果下载的是 `dict-full.bin`，先把它**重命名为 `dict.bin`**；
-3. 把 `dict.bin` 复制到 TF 卡的 `dict` 文件夹下，即 **`/sdcard/dict/dict.bin`**
-   （没有 `dict` 文件夹就新建一个；设备插卡启动后也会自动创建该文件夹）；
+3. 把 `dict.bin` 复制到 **TF 卡根目录下的 `dict` 文件夹**里：在电脑上插入 TF 卡
+   （或读卡器），打开这个卡盘，在最上层建一个名为 `dict` 的文件夹，把 `dict.bin`
+   放进去——放好后卡里就是 `dict/dict.bin` 这一层结构，**不需要、也不要在卡上
+   建 `sdcard` 文件夹**（没有 `dict` 文件夹就新建一个；设备插卡启动后也会自动创建）；
 4. TF 卡插回设备并重启，之后阅读时选中单词即可查词，查过的词自动进生词本。
 
-> **命名与位置必须严格一致**：文件名叫 `dict.bin`，放在 `/sdcard/dict/` 目录下，
-> 其他名字、其他位置都不会生效；`dict` 文件夹里只放一个词典文件，放多个时打开哪一个不确定。
+> **命名与位置必须严格一致**：文件名叫 `dict.bin`，放在 TF 卡**根目录**的 `dict`
+> 文件夹下。文档里出现的设备内部路径 `/sdcard/dict/dict.bin` 中的 `/sdcard` 只是
+> 固件里 TF 卡的**挂载点名**（卡插到电脑上，看到的就是卡盘根目录本身），不是让你
+> 在卡上再建一层 `sdcard` 文件夹；其他名字、其他位置都不会生效。`dict` 文件夹里
+> 只放一个词典文件，放多个时打开哪一个不确定。
 >
 > 词典数据由 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）转换生成，
 > 你也可以用仓库里的 `tools/build_dict.py` 自行构建词典。

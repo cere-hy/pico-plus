@@ -121,12 +121,15 @@
       （约 8.9 MB，推荐；需要更全词库可下载
       <a href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin">dict-full.bin</a>
       并重命名为 <code>dict.bin</code>）；</li>
-    <li>把文件命名为 <code>dict.bin</code>，复制到 TF 卡的 <code>dict</code> 文件夹下，
-      即 <code>/sdcard/dict/dict.bin</code>（没有该文件夹就新建一个）；</li>
+    <li>把文件命名为 <code>dict.bin</code>，复制到 <b>TF 卡根目录下的 <code>dict</code> 文件夹</b>里：
+      在电脑上打开 TF 卡盘，在最上层建一个 <code>dict</code> 文件夹，把文件放进去
+      （<b>不需要建 <code>sdcard</code> 文件夹</b>——设备内路径
+      <code>/sdcard/dict/dict.bin</code> 里的 <code>/sdcard</code> 只是固件中 TF 卡的挂载点名，
+      卡插到电脑上看到的就是卡盘根目录本身）；</li>
     <li>TF 卡插回设备并重启，之后阅读时选中单词即可查词。</li>
   </ol>
-  <p>文件名称与位置必须严格一致（<code>dict.bin</code> → <code>/sdcard/dict/</code>），
-     其他名字或位置不生效。详细说明见仓库 README 第四节。</p>
+  <p>文件名称与位置必须严格一致：<code>dict.bin</code> 放在 TF 卡根目录的 <code>dict</code>
+     文件夹下，其他名字或位置不生效。详细说明见仓库 README 第四节。</p>
 </section>
 
 <section class="faq">
@@ -136,7 +139,8 @@
   <p><b>提示浏览器不支持？</b>必须使用电脑版 <b>Chrome</b> 或 <b>Edge</b> 浏览器；暂不支持手机浏览器和 Safari。</p>
   <p><b>烧到一半失败？</b>重新插拔 USB 后重试；反复失败可换数据线或换 USB 口。</p>
   <p><b>刷完为什么查不了词？</b>词典文件没放。本固件不包含词典数据，
-     需按上方「刷完之后必做」把 <code>dict.bin</code> 放进 TF 卡的 <code>/sdcard/dict/</code>。</p>
+     需按上方「刷完之后必做」把 <code>dict.bin</code> 放进 TF 卡根目录的 <code>dict</code>
+     文件夹（设备内路径记为 <code>/sdcard/dict/</code>，无需建 <code>sdcard</code> 文件夹）。</p>
   <p><b>刷完想升级/重刷？</b>可以再次使用本页面；也可以把 <code>Read_Pico.bin</code> 重命名为
      <code>Pico-update.bin</code> 放到 TF 卡根目录，在设备上「设置 → 升级和恢复」中安装
      （注意：相同版本会被设备拒绝重装，此时请用本页面重刷）。</p>
