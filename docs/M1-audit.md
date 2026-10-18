@@ -58,8 +58,15 @@ Seg  Length   Load addr (vaddr)  File offs (paddr)   Memory types
   6  0x00030  0x600fe000         0x003dc03c          RTC_DRAM, RTC_IRAM
 ```
 
-- **seg1 vaddr `0x3fc9c700` —— 三代不变锚保持**（gen8/gen9/gen10 同为 `0x3fc9c700`）；
-  seg1 paddr（file offs）`0x00232e48`。
+- **seg1 vaddr `0x3fc9c700` —— 四代不变锚保持**（gen8/gen9/gen10/gen11 同为 `0x3fc9c700`）。
+- seg1 **File offs `0x00232e48`**（esptool 报的是**段头**偏移）；
+  真机 boot 日志的 **seg1 paddr 预测值 = `0x00242e50`** —— 公式
+  `paddr = File offs + 8(段头) + 0x10000(ota_0 基址)`，
+  **由 gen5/gen6/gen10 三轮真机日志实证**（gen10：File offs `0x00232038` →
+  实测日志 `paddr=00242040` ✓，见 `realhw-session-20261016/prod-log-gen10-round1.txt`）。
+  相对 gen10 的 paddr 差 **+0x810 = 2,064 B**，与 seg0(DROM) 增长顺移一致，量级合理。
+- 术语纪律：本文档此前把 esptool 的 File offs 直接称作 paddr，**两者相差段头 8B**，
+  已就地更正；真机日志对表须用 paddr 口径（`0x242e50`），不要用 File offs。
 - 镜像内部标识：`Project name: Read_Pico` / `App version: 0.3.3-pico11` /
   `Compile time: Oct 18 2026 15:34:25` / `Validation hash: 98008f3b…dd5ffd (valid)`。
 - 相对 gen10（4,013,568 B）：**+33,440 B**，全部归因 M1 的 push_sink 组件 + 武装页
@@ -172,6 +179,27 @@ android-tools/nrf-connect-manual.md   手动验证手册
 包内 `App version` 读数 `0.3.3-pico11` ✓。
 
 ---
+
+## 四之二、烧录防呆：flash.sh EXPECTED 同步 + 双路径干跑（gen11 烧前最后一件）
+
+> 边界更正：发布管线（`/workspace/read-pico-realhw/production/`）本就在工作区内，
+> 此前「gen11 打包由用户发布环境收口」的表述是**边界判错**，standing SOP 不该跳。
+
+- **gen10 归档**：`Read_Pico.bin` → `Read_Pico.bin.gen10-9e573c84`（4,013,568 B，勿烧）。
+- **四 bin 换入 gen11**：Read_Pico.bin（4,047,008）/ bootloader.bin / partition-table.bin /
+  ota_data_initial.bin；实测 sha256 与第三节锚定表一致。
+- **EXPECTED 同步**：`9e573c84…` → **`6490999f…4e817e`**。
+- **flash.sh 头部锚定注释同步**：gen11 段表（seg1 vaddr / len / File offs / 预测 paddr）、
+  体积 +33,440 B、版本串 `0.3.3-pico11`、bootloader 非确定性归因、partition/ota 逐字节不变。
+- **双路径干跑**（留痕 `read-pico-realhw/realhw-session-20261019/flash-dryrun-gen11-20261019.txt`）：
+
+| 路径 | 操作 | 结果 | exit |
+|------|------|------|------|
+| 1 | EXPECTED = gen11 正确值 | `sha256 OK: 6490999f… (production build, anchor verified)` → esptool 止于无串口设备 | **2**（沙箱无设备，与 gen10 轮同形态） |
+| 2 | EXPECTED 篡改为 gen10 值 | `FATAL: Read_Pico.bin sha256 mismatch - refusing to flash.` | **1** ✅ 拒烧 |
+| 复验 | 还原回 gen11 值 | `sha256 OK` | 2 |
+
+烧录防呆有效：锚定值不符必定拒烧。gen8/gen9/gen10 三轮同形态，本轮补齐 gen11。
 
 ## 五、工程卫生：M1 已本地提交（不推送）
 
