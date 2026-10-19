@@ -1,7 +1,8 @@
-# 二期 M1「安卓 BLE 蓝牙推流」· gen11 审计报告
+# 二期 M1「安卓 BLE 蓝牙推流」· gen11 审计报告 + gen12 修复附录
 
-> 范围：六步执行序终步审计 + 用户审计意见核销。基线 `master` @ `ae6cf52`。
+> 范围：六步执行序终步审计 + 用户审计意见核销 + gen12 真机缺陷回归修复。基线 `main` @ `ae6cf52`。
 > gen11 可烧录包（含四 bin + 安卓四件套）：**`/workspace/read-pico-gen11.zip`**。
+> gen12 修复包（GATT 服务空白，见第七节）：**`/workspace/read-pico-gen12.zip`**。
 > 编译与打包由本沙箱完成（用户侧为纯 Windows，无 ESP-IDF 工具链）。
 
 ---
@@ -160,13 +161,15 @@ bin 内实测 `App version: 0.3.3-pico11` ✓。
 
 ## 四、gen11 交付包
 
-`/workspace/read-pico-gen11.zip`（2.2 MB，11 条目，`unzip -t` 完整性通过）
+`/workspace/read-pico-gen11.zip`（2.2 MB，**12 条目**，`unzip -t` 完整性通过；
+条目数含 `android-tools/` 目录项；`flash.sh` 为第四节之二同步后补入，提交 `13b2c4d`）
 
 ```
 Read_Pico.bin            4,047,008 B   ← 0x10000
 bootloader.bin              21,232 B   ← 0x0
 partition-table.bin          3,072 B   ← 0x8000
 ota_data_initial.bin         8,192 B   ← 0xb10000
+flash.sh                               烧录脚本（EXPECTED 锚定自检 + 拒烧防呆）
 烧录说明-NOTES.md                      偏移/锚定/新功能/真机轮八项
 android-tools/push_pico.py            参考实现（--selftest/--hex/--scan）
 android-tools/push_frames.js          帧构建 JS（Tasker/MacroDroid 内嵌）
@@ -224,3 +227,80 @@ android-tools/nrf-connect-manual.md   手动验证手册
 6. 充电常开：插电不计时；**拔电即退出**。
 7. 翻页器让位：开启期间暂停，退出自动接回。
 8. 防闪烁：收完统一写盘、一次全刷（死线④）。
+9. **（gen12 起前置项）Services 页验收**：连上后 Services 页须显示推流服务
+   `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10`，展开含三特征 `…5f11`（写）/
+   `…5f12`（写）/ `…5f13`（读+通知）；扫描列表广播即带该服务 UUID。
+   gen11 此处空白（根因见第七节），boot 日志 seg1 paddr 对表 `0x00242f90`。
+
+---
+
+## 七、gen12 修复附录：GATT 服务空白（gen11 真机缺陷回归）
+
+> 触发：gen11 真机轮反馈「BLE 能连上 `PicoPush-XXXX`，但 nRF Connect 的 Services 页空白，
+> 看不到推流服务」。本节记录根因的源码实证链、修复形态与 gen12 门禁全表。
+
+### 7.1 根因：NimBLE GATT 注册时序（源码实证，非猜测）
+
+- `ble_hs_start()`（`host/src/ble_hs.c:815`）在 host 启动路径里**一次性**调用
+  `ble_gatts_start()`，**然后**才 `ble_hs_sync()` 触发 sync 回调。
+- `ble_gatts_start()` 消费 `ble_gatts_add_svcs()` 排进的定义队列，末尾
+  `ble_gatts_free_svc_defs()` 把队列整个释放；属性表与句柄由它分配填充。
+- 两阶段启动链：`ble_hs_init()`（nimble_port_init 内）enqueue stage1 → host 任务
+  stage2 → `ble_hs_start()` → `ble_gatts_start()` → `ble_hs_sync()` → sync_cb。
+  `BLE_HS_AUTO_START` 启用，stage2 必定消费队列。
+- gen11 的 `register_gatt()` 排在 **sync 回调里**——排在一场**已经散会**的队列后面：
+  `add_svcs` 返回 0 只代表**排队成功**，而消费队列的 `ble_gatts_start()` 早已跑完。
+  注册成功的唯一实证是三个句柄非 0；排队成功 ≠ 注册成功。
+
+### 7.2 修复形态（三处，均按用户指定：常驻注册 + 显式 start + 三次调用错误日志 + adv 带 UUID）
+
+| # | 落点 | 内容 |
+|---|------|------|
+| 1 | `push_sink.c` 新增 `push_sink_gatt_register()` + `queue_svcs()` | `ble_gatts_count_cfg()`（累加上限，必须在 start 前调）→ `ble_gatts_add_svcs()`，**两步返回码都查**，失败 `ESP_LOGE` 留证；`ble_page_turner.c` `start_locked()` 在 `bonds_load()` 之后、`xTaskCreatePinnedToCore(host_task)` 之前调用，让 host 自己的 `ble_gatts_start()` 自然消费 |
+| 2 | `push_sink_on_stack_sync()` 改 `gatt_ensure_registered()` | 以 `s_data/ctrl/status_handle` 全非 0 为注册实证；未注册则**显式** `ble_gatts_start()` 补一次（第三次调用），成功/失败分别 `ESP_LOGI`/`ESP_LOGE` 打印三句柄。源码路径上不该触发（AUTO_START 下 stage2 必消费）；真触发即排队或注册失败，日志会喊 |
+| 3 | `adv_start()` | 广播数据带 128-bit 服务 UUID（`fields.uuids128`），nRF Connect 扫描列表连上前即可见 `e2f5a1c0…` |
+
+**簿记语义修正**：`s_gatt_registered` → `s_gatt_queued`（定义已排队 ≠ 已注册）；
+`push_sink_on_stack_stop()` 同步改。每启动周期恰好排队一次：`start_locked` 失败回退走
+`nimble_port_deinit()`（`ble_gatts_stop` → `ble_gatts_free_svc_defs` 清队列），
+stop 事件 FIFO 晚于 stage2，`s_running` 早退守卫兜底。
+
+**设计权衡（为何不是另两种形态）**：显式 start 前置于 host 启动会被 stage2 的二次
+start 清表（`ble_gatts_free_mem` + 空队列重注册）；仅靠 sync 回调兜底则依赖 host 已
+启动且 sync 完成的时序。故取「常驻排队让 host 自己的 start 消费（主路径）+ sync 里
+以句柄为证的防御性显式 start（兜底）」。另实证：本构建无人调用
+`ble_svc_gap_init()`，队列中只有我们的服务，兜底 start 无误伤面。
+
+**协议注释澄清（零行为变更）**：PUSH_DATA 特性位保持 `F_WRITE`，但 gen11 协议变更
+记录（第二节）已裁定走 write-no-response——NimBLE ATT 服务端对两种写一视同仁
+（`ble_att_svr_rx_write_no_rsp` 与 `rx_write` 均汇入 `write_handle → ha_cb`，
+`MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1` 已实证），故 WNR 与手动 WWR 都能到达
+`push_access_cb`。注释已按此重写，消除「位上是 WWR」与「协议是 WNR」的表观矛盾。
+
+### 7.3 gen12 门禁全表
+
+| 项 | 结果 |
+|----|------|
+| 13/13 宿主 runner | **全绿**（`for s in tools/run_*.sh` 逐个 exit 0）；push_sink **168 checks / 0 red** |
+| 整树干净重建 | `idf.py clean && build` **exit 0** |
+| 全量警告 | **8 条 = 基线同集**（`ui_pinpad.c`×1 + `app_book.c`×7，unused-function；M1 与 gen12 零新增） |
+| 版本串 | `0.3.3-pico11` → **`0.3.3-pico12`**（CMakeLists.txt / README.md / web-flasher/manifest.json 三处），bin 内实测 `App version: 0.3.3-pico12` |
+| 镜像体积 | **4,048,208 B**（0x3dc550）；**+1,200 B = 4,048,208 − 4,047,008**（双操作数）；分区 0x580000，余 30% |
+| seg1 双锚 | vaddr **`0x3fc9c700`（五代不变）** / len **`0x08a8c`（与 gen11 持平）** / File offs **`0x00232f88`**（gen11 `0x00232e48`，+320B，与 seg0 DROM 增长顺移一致）；boot 日志 paddr 预测 **`0x00242f90`** = `0x00232f88 + 8 + 0x10000`（公式 gen5/gen6/gen10 三轮实证） |
+| 镜像 sha256 | **`219e0529d20193c24f0cb6a93d09eeb53d7d6fff85aa6cdc4d5a8cd849729d1c`**；bootloader / partition-table / ota_data_initial 与 gen11 逐字节不变 |
+| 宿主测试适配 | `tools/ble_turner_host_test.py` 补 `push_sink_gatt_register` 桩（start_locked 被抽取编译，隐式声明触发 -Werror） |
+| flash.sh 防呆 | EXPECTED 同步 gen12 值 + 锚点注释块重写 + gen11 bin 归档 `Read_Pico.bin.gen11-6490999f`；双路径 dry run：锚对 → `sha256 OK` 放行至 esptool（exit 2，沙箱无串口）；篡改 → `FATAL … refusing to flash`（exit 1）✅ 拒烧 |
+| 交付包 | `/workspace/read-pico-gen12.zip` **12 条目**（四 bin + flash.sh + NOTES + android-tools/ 五件），`unzip -t` 通过；包内 bin 与 production 逐字节一致；安卓四件套与 gen11 逐字节相同（协议未变） |
+
+**注释改动的哈希插曲（诚实记录）**：先编 gen12（`a4c975a1`）→ 后改注释 → 增量重建得
+`219e0529`。逐字节比对仅 **65 B** 差异（`0xB0–0xCF` app_desc 内嵌 ELF 哈希 +
+`0x3DC52F–0x3DC54F` 镜像尾校验和），系 DWARF 行表平移所致，非代码行为变化。
+处置：**以 `219e0529` 为最终锚**，重部署 bin / EXPECTED / dry run / zip——
+保证发出的 bin 与提交源码严格同源。
+
+### 7.4 真机验收点（八项判读之前先看）
+
+1. Services 页显示服务 `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10` + 三特征（5f11/5f12/5f13）——本条即 gen11 缺陷的修复判据。
+2. 扫描列表广播可见服务 UUID（连上前确认对面是推流服务）。
+3. boot 日志 seg1 paddr 对表 `00242f90`；`App version: 0.3.3-pico12`。
+4. 通过后再走第六节八项判读（判读项 2 以 EVT_READ 为前置、项 4 测 WNR 下 RESUME）。
