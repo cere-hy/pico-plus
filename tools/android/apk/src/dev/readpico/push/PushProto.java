@@ -215,7 +215,12 @@ public final class PushProto {
             case ERR_BAD_FRAME:   return "帧魔数/版本/长度非法";
             case ERR_TOO_LARGE:   return "正文超过 512KB 上限";
             case ERR_CHECKSUM:    return "CRC32 校验不符";
-            case ERR_NO_CARD:     return "TF 卡不可用";
+            // gen16：ERR(5) 的语义不止「TF 卡不可用」——固件 do_commit 的 rename
+            // 失败（旧版 FatFs 不覆盖目标名时）也回它。文案写宽，别误导用户去查卡。
+            // gen16: ERR(5) means more than "card unavailable" - the firmware's
+            // commit rename failure also answers it. Keep the label broad so
+            // users don't chase the wrong cause.
+            case ERR_NO_CARD:     return "设备存储写入失败（TF 卡缺失、写保护或提交失败）";
             case ERR_LOW_BATTERY: return "电量不足且未充电";
             case ERR_BUSY:        return "已有一次推送在处理";
             case ERR_FETCH:       return "URL 抓取失败";

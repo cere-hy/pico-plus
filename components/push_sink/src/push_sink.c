@@ -849,9 +849,12 @@ static void do_verify(void) {
 }
 
 // COMMIT：正文原子改名成 push.txt；单词卡不落盘（title 即单词，UI 直接查词典）。
+// 返回 false = 提交失败（错误已回手机），调用方必须拦住开书动作。
 // COMMIT: atomically rename the body to push.txt; word cards never land on disk
-// (the title is the word and the UI looks it up directly).
-static void do_commit(void) {
+// (the title is the word and the UI looks it up directly). Returns false = the
+// commit failed (the error is already replied); the caller must then suppress
+// the book-open action.
+static bool do_commit(void) {
     part_close();
     bool ok = true;
     if (s_sess.begin.type == PUSH_TYPE_WORD) {
@@ -862,22 +865,41 @@ static void do_commit(void) {
         if (!dict_available()) {
             nvs_clear_session();
             reply_err(PUSH_ERR_NO_DICT);
-            return;
+            return false;
         }
     } else {
+        // gen16 根因：FatFs 的 f_rename **不覆盖已存在目标**（目标存在即 FR_EXIST
+        // → EEXIST）——POSIX 的「原子替换」语义它没有。首轮推送 push.txt 尚不存在
+        // 一切正常；**第二轮起 rename 必失败** → reply_err(ERR(5)) 被 APK 显示成
+        // 「TF 卡不可用」（文案误导，实际是 EEXIST）。gen15 真机铁证：
+        // `verify ok: sz=30 crc=0x15542824` 紧跟 `commit rename: File exists`。
+        // 修法：改名前先清掉旧目标。同目录 rename 只挪目录项，remove→rename 之间
+        // 的丢失窗口只在掉卡场景出现，可接受。
+        // gen16 root cause: FatFs's f_rename **never overwrites an existing
+        // target** (an existing name yields FR_EXIST -> EEXIST) - the POSIX
+        // "atomic replace" semantics simply are not there. The first push works
+        // (no push.txt yet); **every later one fails the rename** ->
+        // reply_err(ERR(5)), which the APK renders as "TF card unavailable" (a
+        // misleading label: it is really EEXIST). gen15 hardware proof:
+        // `verify ok: sz=30 crc=0x15542824` immediately followed by
+        // `commit rename: File exists`. Fix: clear the target before renaming.
+        // A same-directory rename only moves a directory entry, so the
+        // remove->rename loss window only materialises if the card is yanked.
+        (void)remove(PUSH_TEXT_PATH);
         ok = rename(PUSH_PART_PATH, PUSH_TEXT_PATH) == 0;
         if (!ok) ESP_LOGE(TAG, "commit rename: %s", strerror(errno));
     }
     nvs_clear_session();
     if (!ok) {
-        // 改名失败（卡满/掉卡）：.part 留着可人工恢复，回 ERR(5)。
-        // Rename failed (full or missing card): keep the partial for manual
-        // recovery and reply ERR(5).
+        // 改名失败（掉卡）：.part 留着可人工恢复，回 ERR(5)。
+        // Rename failed (card yanked): keep the partial for manual recovery and
+        // reply ERR(5).
         reply_err(PUSH_ERR_NO_CARD);
-        return;
+        return false;
     }
     conn_params_apply(PUSH_CONN_ITVL_SLOW, PUSH_CONN_LATENCY_SLOW);
     reply_done();
+    return true;
 }
 
 static void exec_actions(uint32_t act) {
@@ -900,7 +922,19 @@ static void exec_actions(uint32_t act) {
         conn_params_apply(PUSH_CONN_ITVL_FAIR, PUSH_CONN_LATENCY_FAST);
         reply_ready();
     }
-    if (act & PUSH_ACT_RESUME) reply_resume();
+    if (act & PUSH_ACT_RESUME) {
+        // gen16（审计裁定落地）：gen15 起手机 sid 逐次唯一，正常流程**不该**走到
+        // 自动 RESUME——走到即意味着 sid 被复活/复用（或崩溃恢复的合法续传）。
+        // 该分支保留为诊断通道：留全字段警告供追查，绝不静默。
+        // gen16 (audit ruling landed): sids are unique per push since gen15, so
+        // the automatic RESUME path should never trigger in normal flow - if it
+        // does, a sid was revived/reused (or this is a legit post-crash resume).
+        // The branch stays as a diagnostic channel: log everything, never silently.
+        ESP_LOGW(TAG, "resume path taken: sid=%08lx offset=%u next_seq=%u",
+                 (unsigned long)s_sess.begin.session_id,
+                 (unsigned)s_sess.received, (unsigned)s_sess.next_seq);
+        reply_resume();
+    }
     if (act & PUSH_ACT_APPEND) {
         if (!part_append(s_rx_payload, s_rx_len)) {
             // 写盘失败：簿记已经前进，唯独取消能让 offset 重新诚实。
@@ -931,7 +965,18 @@ static void exec_actions(uint32_t act) {
         }
     }
     if (act & PUSH_ACT_VERIFY) do_verify();
-    if (act & PUSH_ACT_COMMIT) do_commit();
+    if (act & PUSH_ACT_COMMIT) {
+        // gen16：提交失败必须拦住开书。do_verify() 递归进入 exec_actions 时 act 里
+        // COMMIT 与 OPEN_BOOK/WORD_CARD 同位携带——此前 rename 失败（EEXIST）只回了
+        // ERR(5)，OPEN_BOOK 照样把**旧的** push.txt 弹出来（gen15 真机现象：
+        // 「弹出的永远是首次写入的内容」）。提交不掉 = 内容没落盘 = 无书可开。
+        // gen16: a failed commit must not open the book. do_verify() re-enters
+        // exec_actions with COMMIT and OPEN_BOOK/WORD_CARD carried together -
+        // previously a failed rename (EEXIST) only replied ERR(5) while OPEN_BOOK
+        // still popped the OLD push.txt (gen15 on hardware: "it always opens the
+        // first push's content"). No commit = nothing landed = nothing to open.
+        if (!do_commit()) act &= ~(uint32_t)(PUSH_ACT_OPEN_BOOK | PUSH_ACT_WORD_CARD);
+    }
     if (act & PUSH_ACT_ERR) {
         // gen14 诊断：session 层拒绝（token/type/total_len/跳号/校验）留痕。
         // gen14 diagnostics: session-level refusals (token/type/total_len/seq
