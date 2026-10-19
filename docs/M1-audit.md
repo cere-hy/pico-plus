@@ -239,11 +239,13 @@ android-tools/nrf-connect-manual.md   手动验证手册
 9. **（gen12 起前置必验三项，全过才进八项判读）**：
    - **① Services 页验收**：连上后 Services 页须显示推流服务
      `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10`，展开含三特征 `…5f11`（写）/
-     `…5f12`（写）/ `…5f13`（读+通知）；扫描列表广播即带该服务 UUID。
-     gen11 此处空白（根因见第七节）。
-   - **② boot 日志 seg1 paddr 对表 `0x00242f90`**（seg1 段头 File offs
-     `0x00232f88` + 8 + ota_0 基址 `0x10000`；公式 gen5/gen6/gen10 三轮实证，
-     gen12 重建后实测 seg1 段头与数据逐字节不变，锚继续有效）。
+     `…5f12`（写）/ `…5f13`（读+通知）；主动扫描时扫描记录（scan response）里
+     带该服务 UUID（gen13 起 UUID 移驻 scan response，adv data 只放 flags +
+     名字，见 7.6）。gen11 此处空白（根因见第七节）。
+   - **② boot 日志 seg1 paddr 对表 `0x00242ff0`**（seg1 段头 File offs
+     `0x00232fe8` + 8 + ota_0 基址 `0x10000`；公式 gen5/gen6/gen10 三轮实证；
+     gen13 重建后 File offs 较 gen12 `0x00232f88` +96B 系 seg0 DROM 增长顺移，
+     vaddr `0x3fc9c700` 与 len `0x08a8c` 六代不变，锚随 gen13 换值）。
    - **③ 推送全链成功（gen12 新增必验）**：用交付的 ReadPicoPush APK（或
      nRF Connect 手工通道）实际推一段文字，看到「设备已校验 CRC32 并开书」。
      **安卓端写 5f11/5f12 vs 固件 WWR 属性的跨路径从未真机验证过**（gen11 被
@@ -376,3 +378,93 @@ production bin → EXPECTED → dry run → zip」全链，不得沿用旧哈希
 （记录「为何不走 MacroDroid」），但**不再进交付 zip**、不再投入维护；
 `ReadPicoPush.macro` / `ReadPicoPush.tasker.xml` 头部已标注「不可导入，参考流程图」。
 用户手机（荣耀 / Android 16 / 无 Play）的安装路径：APK 直接侧载，允许未知来源即可。
+
+---
+
+## 7.6 gen13 修复附录：广播数据溢出导致设备完全不可扫描（gen12 真机阻断级回归）
+
+> 2026-10-19 晚。gen12 烧录后真机反馈：UI 正常（`PicoPush-8C92` + 29 分钟倒计时），
+> 但手机系统蓝牙、第三方 BLE 助手、交付的 APK **全部搜不到设备**；同一第三方助手
+> 在 gen11 上可搜可连——手机侧无问题，设备侧广播从未启动。
+
+### 7.6.1 根因（串口日志 + NimBLE 源码双重实证）
+
+真机串口日志关键行（每次进入「接收推送」页必出）：
+
+```
+W (42947) push_sink: adv set fields failed
+```
+
+且全程**没有** `advertising as PicoPush-XXXX` 行——`ble_gap_adv_start()` 从未被调用。
+
+NimBLE 源码实证（`host/src/ble_gap.c` / `ble_hs_adv.c` / `hci_common.h`）：
+`ble_gap_adv_set_fields()` 把字段序列化进 `BLE_HS_ADV_MAX_SZ` =
+`BLE_HCI_MAX_ADV_DATA_LEN` = **31 字节**的缓冲区，超出即返回 `BLE_HS_EMSGSIZE`
+（`ble_hs_adv_set_flat_mbuf` / `set_array_uuid128` 写超即拒）。
+
+字节账（gen12 adv data）：
+
+| 字段 | AD 结构大小 |
+|------|------------|
+| Flags | 1+1+1 = 3 B |
+| Complete Local Name「PicoPush-8C92」 | 1+1+13 = 15 B |
+| Complete List of 128-bit UUIDs（gen12 新增） | 1+1+16 = 18 B |
+| **合计** | **36 B > 31 B → 拒收** |
+
+即 7.2 修复形态里的「广播带 Service UUID」一项把广播包撑爆：`ble_gap_adv_set_fields`
+失败 → `adv_start()` 早退（旧代码静默 return，连 rc 都不打）→ 广播没起来；
+而状态机在 `ble_gap_adv_set_fields` **之前**已完成 ARM，UI 武装页照常渲染倒计时——
+**假武装**：应用层一切正常，射频层面设备不存在。gen11 无 UUID 字段（3+15=18B）所以可扫。
+
+### 7.6.2 gen13 修法（三处，全部有实证）
+
+1. **UUID 移驻 scan response**：`ble_gap_adv_rsp_set_fields()` 是独立 31B 载荷，
+   UUID 放那里（0x07 结构 18B），adv data 回到 gen11 实证可用的 flags + 名字
+   （18B，字节级同构）。主动扫描的 nRF Connect / 安卓扫描器 / 交付 APK 的
+   ScanRecord 仍能看到 `e2f5a1c0…`（gen12 的意图不丢，代价为零）。
+2. **rc 全部打印**：`adv set fields rc=%d` / `adv rsp set fields rc=%d` /
+   `adv start rc=%d`——失败不再静默，串口一眼可判。
+3. **失败不留假武装**：任一广播步骤失败即 CANCEL 武装 + UI 收 `start_failed`
+   （「蓝牙启动失败，请重试」）。为此 `app_transfer.c` `push_tick` 调整优先级：
+   `start_failed` 先于 `closed` 判（失败路径两者会同时置位，CANCEL 的 ADV_OFF
+   顺带发 closed），并吞掉同路的 closed 标志防闪两帧。
+
+### 7.6.3 纪律入册：adv data 31 字节预算
+
+- **adv data 硬上限 31 B**（`BLE_HCI_MAX_ADV_DATA_LEN`），序列化超限即
+  `BLE_HS_EMSGSIZE` 拒收，且**不是运行时才发现的问题**——加字段前先算总长。
+- push_sink `adv_start()` 内已钉死预算注释：flags(3) + name(≤15) = 18B，
+  余量 ≥ 13B；再想加 adv data 字段，先过 31B 这条线，否则就是 7.6.1 这个坑。
+- **「加个字段而已」从来不是小改动**：广播包是控制器级硬约束，不是软件缓冲区。
+
+### 7.6.4 gen13 门禁全表
+
+| 项 | 值 |
+|----|----|
+| 版本串 | `0.3.3-pico12` → **`0.3.3-pico13`**（CMakeLists.txt / README.md / web-flasher/manifest.json 三处），bin 内 esptool 实测 `App version: 0.3.3-pico13` |
+| 镜像体积 | **4,048,512 B**（0x3dc680）；**+304 B = 4,048,512 − 4,048,208**（双操作数，vs gen12），scan-response 代码与日志串增量；分区 0x580000，余 30% |
+| seg1 双锚 | vaddr **`0x3fc9c700`（六代不变）** / len **`0x08a8c`（与 gen12 持平）** / File offs **`0x00232fe8`**（gen12 `0x00232f88`，+96B，seg0 DROM 增长顺移）；boot 日志 paddr 预测 **`0x00242ff0`** = `0x00232fe8 + 8 + 0x10000` |
+| 镜像 sha256 | **`03e59a07c8d09034e0ac564e770d1fe35ed32014a8706077f0927a4b69b5cad7`** |
+| bootloader | 21,232 B 同尺寸；哈希 `e9498911…`（gen12 `1427993bda…`）——逐字节 diff 实证仅 39B：0x54 处内嵌构建时间串 6B（`13:26:51`→`20:02:38`）+ 0x52cf–0x52ef 尾部摘要 33B，零行为变化（既定非确定性归因，本轮新增实证） |
+| 宿主测试 | 13/13 runner 全绿（push_sink 168 checks / 0 red；transfer_ui PASS，含 start_failed 优先级用例） |
+| 构建 | fullclean exit 0；警告 **8 条与基线同集**（ui_pinpad×1 + app_book×7，全 unused-function） |
+| flash.sh 防呆 | EXPECTED 同步 `03e59a07`（锚点注释块含 7.6 归因）+ gen12 bin 归档 `Read_Pico.bin.gen12-6e1d15c1`；双路径 dry run 重跑：锚对 → `sha256 OK` 放行至 esptool（沙箱无端口 exit 2）；篡改 → `FATAL … refusing to flash`（exit 1）✅ |
+| APK | 重建（扫描重试加固，见 7.6.5）：25,046 B，sha256 `a688ccf977577128609cb57df563a14fb9559edae4ffef3f2bd7b54f87901662`，25/25 对表 + badging + 签名校验过 |
+
+### 7.6.5 附带：APK 扫描重试加固（真机日志发现）
+
+用户回传的 APK 日志里有连续两发 `扫描启动失败（code=1）`。Android 的
+`SCAN_FAILED_ALREADY_STARTED`(1) 是**异步**经 `onScanFailed` 送达的（`startScan`
+同步返 true），成因是上一轮 12s 超时后扫描器未停净就再起。修法：`onScanFailed`
+对 code=1 只唤醒等待循环不判死刑；`scanForDevice` 改重试循环（最多 3 轮，
+每轮先 `stopScan` 再等 200ms 重启），硬失败码照常立即报出。
+
+### 7.6.6 本轮教训（诚实留档）
+
+- gen12 的 7.2 修复形态四条里，三条（常驻注册 / 显式 start / 错误日志）经真机
+  验证有效，但**第四条「adv 带 UUID」是未过 31B 预算就上的字段**，直接打飞广播。
+  教训：凡改广播内容，先算字节账；且「UI 正常」从来不等于「射频正常」——假武装
+  状态下倒计时照跑，只有扫才暴露。gen13 的 start_failed 出口就是堵这个感知盲区。
+- 上一轮交付 APK 时我自己写明「BLE 状态机未经运行时验证」，用户真机一测就同时
+  暴露了两侧问题（设备不可扫 + 手机侧重试缺失）。**未经运行时验证的交付物，
+  第一次真机 run 必然伴随排错轮**，交付话术里应始终带这条边界。

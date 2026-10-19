@@ -200,6 +200,7 @@ static void exec_actions(uint32_t act);
 static int push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int push_gap_cb(struct ble_gap_event *event, void *arg);
+static void ui_post_start_failed(void); // adv_start 失败即报，UI 别显假倒计时 / report an adv failure, no fake countdown
 
 static uint32_t ms_now(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
@@ -430,6 +431,22 @@ static void adv_stop(void) {
 // 起广播；成功即补喂 ADV_UP。栈没起来时由调用方走 pending 路径，不会到这里。
 // Start advertising; feed ADV_UP on success. With the stack down the caller takes
 // the pending path and never reaches here.
+//
+// gen13 教训（真机回归）：adv data 硬上限 31 字节（BLE_HCI_MAX_ADV_DATA_LEN），
+// NimBLE 序列化超出即 EMSGSIZE 拒收。gen12 曾把 128-bit 服务 UUID 塞进 adv
+// data：flags(3) + 完整名「PicoPush-XXXX」(15) + UUID(18) = 36B > 31，
+// ble_gap_adv_set_fields 失败 → 广播从未起来，而武装已成功、UI 照显倒计时
+// （假武装，任何扫描器都搜不到）。修法：adv data 只放 flags + 名字（= gen11
+// 实证可用的 18B），服务 UUID 移居 scan response（独立 31B 载荷，主动扫描的
+// nRF Connect / 安卓扫描器 / 本项目 APK 都能在扫描记录里看到 e2f5a1c0…）。
+// gen13 lesson (real regression): adv data is hard-capped at 31 bytes
+// (BLE_HCI_MAX_ADV_DATA_LEN); NimBLE rejects overflow with EMSGSIZE. gen12
+// put the 128-bit UUID in adv data (3 + 15 + 18 = 36 > 31), so set-fields
+// failed, advertising never started, yet the arm had already succeeded and
+// the UI showed a countdown with no radio underneath (a fake arm invisible
+// to every scanner). Adv data now carries flags + name only (the proven 18
+// bytes of gen11); the UUID rides the scan response (a separate 31-byte
+// payload delivered to active scanners).
 static void adv_start(void) {
     snprintf(s_adv_name, sizeof(s_adv_name), "%s%04X", PUSH_ADV_NAME_PREFIX, s_sess.token);
     struct ble_hs_adv_fields fields;
@@ -438,16 +455,33 @@ static void adv_start(void) {
     fields.name = (const uint8_t *)s_adv_name;
     fields.name_len = (uint8_t)strlen(s_adv_name);
     fields.name_is_complete = 1;
-    // 广播数据里带服务 UUID：nRF Connect 在扫描列表就能看到 e2f5a1c0…，
-    // 连上之前先确认对面就是推流服务（gen12 与常驻注册一并补上）。
-    // Advertise the service UUID: nRF Connect shows e2f5a1c0... in the scan
-    // list, confirming this is the push service even before connecting
-    // (gen12, alongside the resident registration).
-    fields.uuids128 = &s_svc_uuid;
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
-    if (ble_gap_adv_set_fields(&fields) != 0) {
-        ESP_LOGW(TAG, "adv set fields failed");
+    // adv data 预算（钉死，防再犯）：flags(3) + name ≤ 13+2 = 18B，余量 ≥ 13B。
+    // 再想往 adv data 加字段前，先算总长 ≤ 31，否则就是这个坑。
+    // Adv-data budget (pinned against recurrence): flags(3) + name(15) = 18B,
+    // leaving >= 13B. Size any future adv-data field against the 31B cap.
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        // 失败不留假武装：取消武装并让 UI 收 start_failed（「蓝牙启动失败，
+        // 请重试」），而不是一个没有射频支撑的倒计时。
+        // No fake arm on failure: cancel and surface start_failed to the UI
+        // instead of a countdown with no radio underneath.
+        ESP_LOGW(TAG, "adv set fields rc=%d", rc);
+        exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+        ui_post_start_failed();
+        return;
+    }
+    // 服务 UUID 放 scan response（0x07 Complete List of 128-bit UUIDs，18B）。
+    // The service UUID rides the scan response (0x07 complete 128-bit list).
+    struct ble_hs_adv_fields rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    rsp.uuids128 = &s_svc_uuid;
+    rsp.num_uuids128 = 1;
+    rsp.uuids128_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "adv rsp set fields rc=%d", rc);
+        exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+        ui_post_start_failed();
         return;
     }
     const struct ble_gap_adv_params params = {
@@ -459,17 +493,18 @@ static void adv_start(void) {
         .filter_policy = 0,
         .high_duty_cycle = 0,
     };
-    const int rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params,
-                                     push_gap_cb, NULL);
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &params,
+                           push_gap_cb, NULL);
     if (rc != 0) {
         // 广播起不来（控制器被占等）：取消本次武装，UI 收 start_failed。
         // Advertising failed to start (controller busy): cancel the arm and let
         // the UI take start_failed.
         ESP_LOGW(TAG, "adv start rc=%d", rc);
         exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+        ui_post_start_failed();
         return;
     }
-    ESP_LOGI(TAG, "advertising as %s", s_adv_name);
+    ESP_LOGI(TAG, "advertising as %s (svc in scan rsp)", s_adv_name);
     if (s_sess.state == PUSH_STATE_ARMED) {
         exec_actions(push_session_event(&s_sess, PUSH_EVT_ADV_UP, NULL));
     }

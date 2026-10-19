@@ -89,6 +89,7 @@ public class MainActivity extends Activity {
     private volatile int foundToken = -1;
     private volatile String foundName = null;
     private String failReason = null;
+    private volatile int scanFailedCode = -1; // 最近一次 onScanFailed 的 code，-1 = 无
 
     /* ---- BLE 回调 ---- */
 
@@ -183,6 +184,21 @@ public class MainActivity extends Activity {
         @Override
         public void onScanFailed(int errorCode) {
             synchronized (lock) {
+                scanFailedCode = errorCode;
+                // SCAN_FAILED_ALREADY_STARTED(1) 可恢复：上一轮扫描还没停净。
+                // 唤醒等待循环（不置 failReason），由 scanForDevice 的重试逻辑
+                // 停一次再起——否则会白等满 12 秒。
+                // SCAN_FAILED_ALREADY_STARTED (1) is recoverable: the previous
+                // scan has not fully stopped. Wake the waiter (without setting
+                // failReason) so the retry loop in scanForDevice can stop and
+                // restart - otherwise we would idle out the full 12 seconds.
+                if (errorCode == 1) {
+                    if (foundAddr == null) {
+                        scanDone = true;
+                        lock.notifyAll();
+                    }
+                    return;
+                }
                 if (foundAddr == null && failReason == null) {
                     failReason = "扫描启动失败（code=" + errorCode + "）";
                     scanDone = true;
@@ -567,34 +583,67 @@ public class MainActivity extends Activity {
         }
         ScanSettings settings = new ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build();
-        uiLog("扫描 PicoPush-XXXX 广播（最多 12 秒）……");
-        synchronized (lock) {
-            scanDone = false;
-            foundAddr = null;
-        }
-        scanner.startScan(null, settings, scanCb);
-        long deadline = System.currentTimeMillis() + SCAN_TIMEOUT_MS;
-        synchronized (lock) {
-            while (!scanDone && failReason == null) {
-                long rem = deadline - System.currentTimeMillis();
-                if (rem <= 0) {
-                    break;
-                }
-                try {
-                    lock.wait(Math.min(rem, 250));
-                } catch (InterruptedException e) {
-                    break;
+        // 上一轮扫描停净是异步的：紧接着再 startScan 会收
+        // SCAN_FAILED_ALREADY_STARTED(1)。真机日志见过连续两发 code=1——
+        // 不是权限问题，是没停净。最多重试 3 轮，每轮先停再等 600ms。
+        // The previous scan stops asynchronously: an immediate restart collects
+        // SCAN_FAILED_ALREADY_STARTED (1). Real logs showed two code=1s back to
+        // back - not a permission problem, just an unstopped scan. Up to three
+        // attempts, each stopping first and waiting 600 ms.
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            uiLog(attempt == 1
+                    ? "扫描 PicoPush-XXXX 广播（最多 12 秒）……"
+                    : "重试扫描（第 " + attempt + " 次，先停上一轮）……");
+            synchronized (lock) {
+                scanDone = false;
+                foundAddr = null;
+                failReason = null;
+                scanFailedCode = -1;
+            }
+            scanner.stopScan(scanCb); // 幂等：没在扫也是安全调用 / idempotent
+            sleepQuiet(200);
+            scanner.startScan(null, settings, scanCb);
+            long deadline = System.currentTimeMillis() + SCAN_TIMEOUT_MS;
+            synchronized (lock) {
+                while (!scanDone && failReason == null) {
+                    long rem = deadline - System.currentTimeMillis();
+                    if (rem <= 0) {
+                        break;
+                    }
+                    try {
+                        lock.wait(Math.min(rem, 250));
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                 }
             }
-        }
-        scanner.stopScan(scanCb);
-        if (foundAddr != null) {
-            return true;
-        }
-        if (failReason == null) {
+            scanner.stopScan(scanCb);
+            if (foundAddr != null) {
+                return true;
+            }
+            if (failReason != null) {
+                return false; // 硬失败（非 code=1），onScanFailed 已写明原因
+            }
+            if (scanFailedCode == 1 && attempt < 3) {
+                continue; // 可恢复：停一次等一会儿再来 / recoverable: stop, wait, retry
+            }
+            if (scanFailedCode == 1) {
+                failReason = "扫描反复启动失败（code=1），请退出应用重进";
+                return false;
+            }
             failReason = "12 秒内未发现 PicoPush-XXXX 广播（请先在墨水屏开启「接收推送」）";
+            return false;
         }
+        failReason = "扫描反复启动失败，请退出应用重进";
         return false;
+    }
+
+    private static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /* ---- 权限 ---- */

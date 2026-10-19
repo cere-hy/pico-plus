@@ -1,6 +1,6 @@
 {
   "name": "ReadPico",
-  "version": "0.3.3-pico12",
+  "version": "0.3.3-pico13",
   "new_install_prompt_erase": true,
   "builds": [
     {

@@ -961,17 +961,25 @@ static void push_sync_live_bookkeeping(void) {
 // The arm page's pump: consume the push sink's one-shot UI events and refresh the
 // countdown and progress at a 500 ms cadence.
 static app_redraw_t push_tick(app_ctx_t *ctx) {
-    // closed/start_failed 决定去留；open/word_card/err 只换页内文案。
-    // closed/start_failed decide the page's fate; the rest swap the message.
+    // start_failed/closed 决定去留；open/word_card/err 只换页内文案。
+    // start_failed/closed decide the page's fate; the rest swap the message.
+    // start_failed 先于 closed 查：广播起不来时两个标志都会置位（CANCEL 的
+    // ADV_OFF 顺带发 closed），「蓝牙启动失败，请重试」比裸回方法页信息量大，
+    // 且两者互斥出现只可能是失败路径，正常收官只置 closed。
+    // start_failed is checked before closed: when advertising cannot start,
+    // both flags get set (CANCEL's ADV_OFF posts closed on the way out) and
+    // the failure message is strictly more informative; the two coexist only
+    // on the failure path - a normal close sets closed alone.
+    if (push_sink_take_start_failed()) {
+        push_word_card_close();
+        (void)push_sink_take_closed(); // 吞掉同路的 closed，别闪两帧 / swallow the paired closed flag
+        s_view = TRANSFER_METHODS;
+        snprintf(s_method_message, sizeof(s_method_message), "蓝牙启动失败，请重试");
+        return APP_REDRAW_PAGE;
+    }
     if (push_sink_take_closed()) {
         push_word_card_close();
         s_view = TRANSFER_METHODS;
-        return APP_REDRAW_PAGE;
-    }
-    if (push_sink_take_start_failed()) {
-        push_word_card_close();
-        s_view = TRANSFER_METHODS;
-        snprintf(s_method_message, sizeof(s_method_message), "蓝牙启动失败，请重试");
         return APP_REDRAW_PAGE;
     }
     char title[PUSH_TITLE_MAX];

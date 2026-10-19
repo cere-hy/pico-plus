@@ -8,7 +8,7 @@
 
 Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
 
-**当前版本：v1.0（内部代号 gen12，固件版本号 0.3.3-pico12）**
+**当前版本：v1.0（内部代号 gen13，固件版本号 0.3.3-pico13）**
 
 ---
 
