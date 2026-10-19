@@ -548,3 +548,69 @@ STATUS、设备侧毫无痕迹。时间线重建（串口双周期）证明 APK�
   TX 完成事件的 status 处置，否则失败全静默。
 - **第三方工具与 APK 同症状 = 强信号**：本次两个独立客户端同病，直接排除了「APK
   客户端bug」分支，把侦查聚焦到固件侧——排错时应优先寻找这种交叉验证点。
+
+## 7.8 gen15 修复附录：链路跑通但 VERIFY 判负（FATFS 目录项 size 未回写）
+
+### 7.8.1 现象（gen14 真机，2026-10-19 夜）
+
+gen14 的两个 bug 均已治愈——串口只有一句 `W (42631) push_sink: session refused err=4`，
+**没有任何拒帧诊断**（`ctrl hdr rejected` / `begin decode rejected` / `data rejected`
+全无），且 `conn_params_apply(FAST)` 与紧随的 notify 证明 **BEGIN 被接受并回了 READY**，
+之后又有一帧 PROGRESS notify（DATA 已收），APK 也确实收到了 STATUS——**Bug 2 的
+notify 链路已被真机证活**。链路走到 END → VERIFY 才判负：设备 UI「内容校验失败，
+请重新发送」，手机端 CRC32 校验不符。`err=4` = `PUSH_ERR_CHECKSUM`。
+
+### 7.8.2 根因（三重源码/sdkconfig 实证）
+
+| 证据 | 结论 |
+|---|---|
+| `components/fatfs/vfs/vfs_fat.c` 全文 **零个 "flush"** | FATFS VFS **未注册 `.flush_p`**：`fflush()` 只把 newlib 缓冲推进 `f_write`，**不触发 `f_sync`** |
+| sdkconfig `# CONFIG_FATFS_IMMEDIATE_FSYNC is not set` | `f_write` 之后也不补 `f_sync` |
+| FatFs `ff.c:4345`：`f_close(){ res = f_sync(fp); ...}` | 只有 **close / 显式 fsync** 才回写目录项的 size |
+
+`do_verify()` 原实现在 `s_part` 写句柄**仍打开**时 `fflush()` → `stat()` → `fopen("rb")` 回读。
+目录项 size 从未更新，于是：`stat()` 读目录项拿到过期值 → `sz != received` → `ok=false`；
+`fopen("rb")` 读到 0 字节 → `crc(0) != BEGIN.crc32` → 同样判负。两条口径同时炸在 err=4。
+
+**为何 168 项宿主测试全绿也测不出来**：Linux 的 `write()` **即时更新 inode size**，
+`fflush()` 后 `stat()` 立刻可见正确长度；FATFS 必须 `f_sync` 才更新目录项。这是典型的
+「宿主 ≠ 目标」语义差，且**落在文件层——纯函数宿主测试零覆盖**。
+
+**附带隐患（同一处代码）**：`CONFIG_FATFS_FS_LOCK=0`，`ffconf.h` 明文要求
+"avoid illegal open, remove and rename to the open objects"，原代码正是写句柄未关就
+二次 `fopen("rb")`。`do_commit()` 早就正确（`part_close()` 后 `rename`），只有
+`do_verify()` 漏了——同一函数族内的**不一致**本身就是可查信号。
+
+### 7.8.3 gen15 修法（三处）
+
+1. **`do_verify()` 回读前 `part_close()`**（核心）：`f_close` 内部第一行即 `f_sync`
+   （`ff.c:4345` 实证），目录项落盘 → `stat()`/回读取到真值；同时消除非法双开。
+2. **新增 `part_sync()`**（`fflush` + `fsync`），NVS 检查点对齐调用，固定顺序
+   「先 NVS 后 sync」——崩溃后 `.part` 可见长度只会落后于记账、绝不超前，续传安全。
+   这让 `part_append` 那句「崩溃后 .part 不会比 NVS 记账多出未落地的字节」**真正成立**
+   （此前只有 `fflush`，并不落地）。
+3. **VERIFY 五项判据全量留痕**：`sz / received / total / crc_file / crc_want`，
+   成败都打，一次真机即可归位败因。
+
+### 7.8.4 附带修复：常量 session_id 造成的「一次失败 → 永久续传」卡死
+
+真机日志形态：首推失败后**连续 4 次重连均为「连上 → 订阅 → 一次 notify → 立刻断开」**。
+两个事实撞在一起：① APK `SESSION_ID` 是常量 1；② 设备端 `CONNECTED + BEGIN` 有
+「同 sid 且 `has_part` → 直接 RESUME」分支。首推失败留下 `.part`（设计如此，供续传），
+此后每次推送都命中该分支被判为续传，而 APK gen14 起遇非 0 offset 就放弃 → **永久卡死**。
+**修法**：session_id 逐次生成（非零且每次不同）。新 sid → 判新会话 → 旧 `.part` 作废 →
+正常 READY；续传能力不丢（同一推送断连重连 sid 相同仍走 RESUME）。
+
+### 7.8.5 本轮教训（诚实留档）
+
+1. **「宿主绿」不等于「目标绿」，尤其跨文件系统语义差**。本轮根因是 Linux 与 FATFS 对
+   「写后多快可见长度」的约定不同。凡代码依赖**文件元数据**（size/mtime）而非仅内容，
+   必须逐条确认目标 FS 的语义，不能拿宿主行为当围栏。
+2. **文件层是宿主测试的盲区，必须点名登记**。纯函数测试覆盖编解码与状态机，而
+   `part_*` / `do_verify` 属胶水、零覆盖——本轮 err=4 正落在此。已把「文件层只能真机验」
+   写进已知项，避免下次再默认它被门禁罩住。
+3. **同族函数内的写法不一致是可查信号**。`do_commit()` 先 `part_close()` 再 `rename`，
+   `do_verify()` 却裸 `stat()`——同族不一致往往就是漏掉的那一条。
+4. **「链路跑通了」与「结果正确」是两件事**。gen14 修好了传输（BEGIN 接受、notify 到达），
+   gen15 才修好正确性（VERIFY）。真机验收必须走到**最终业务结果**（开书），
+   停在「通知到达」会放过这一整类错误。

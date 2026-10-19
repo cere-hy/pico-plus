@@ -72,7 +72,20 @@ public class MainActivity extends Activity {
     private static final long CONNECT_TIMEOUT_MS = 20000;
     private static final long STEP_TIMEOUT_MS = 20000;
     private static final long FINAL_TIMEOUT_MS = 60000; // END 后设备要校验+落盘，放宽
-    private static final int SESSION_ID = 1;
+    // gen15：session_id 必须每次推送都不同。设备端 CONNECTED+BEGIN 有一条
+    // 「同 sid 且 has_part → 直接 RESUME」的分支；sid 恒定（原为 1）时，只要有一次
+    // 推送失败留下 .part，此后**每一次**推送都会命中该分支被判成续传，而本客户端
+    // 明确不支持续传（gen14 起遇到非 0 offset 就提示重发并放弃）→ 永久卡死。
+    // gen14 真机铁证：首推 CRC 失败后，连续 4 次重连都只有「一次 notify 随即断开」。
+    // gen15: the session id must differ per push. The device's CONNECTED+BEGIN path
+    // resumes whenever the same sid arrives while a partial is on disk; with a
+    // constant sid (previously 1), a single failed push poisons every later push
+    // into a resume this client cannot serve (since gen14 it bails out on any
+    // non-zero offset) - a permanent deadlock. gen14 hardware evidence: after the
+    // first CRC failure, four reconnects each ended after a single notify.
+    private static int nextSessionId() {
+        return ((int) (System.nanoTime() >>> 1)) | 1; // 非零、逐次不同 / non-zero, distinct
+    }
 
     private EditText input;
     private CheckBox wordCard;
@@ -418,8 +431,9 @@ public class MainActivity extends Activity {
                 return;
             }
 
+            final int pushSid = nextSessionId();
             byte[] begin = PushProto.encodeBegin(body.length, PushProto.crc32(body),
-                    SESSION_ID, foundToken, ptype, title);
+                    pushSid, foundToken, ptype, title);
             uiLog("发送 BEGIN（" + begin.length + " 字节，标题「" + title + "」）……");
             if (!writeChar(cCtrl, begin)) {
                 return;

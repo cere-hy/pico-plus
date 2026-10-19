@@ -310,12 +310,30 @@ static bool part_open_fresh(void) {
     return s_part != NULL;
 }
 
+// FATFS 上真正的「落地」是 f_sync（回写目录项的 size）；fflush 只到 f_write，
+// 目录项不动 —— stat()/回读看到的仍是旧长度（gen15 真机 err=4 的根因，详见 do_verify）。
+// On FATFS real durability is f_sync (it rewrites the size in the directory
+// entry); fflush() stops at f_write and leaves the entry stale, so stat() and
+// readback still see the old length (the gen15 err=4 root cause - see do_verify).
+static bool part_sync(void) {
+    if (!s_part) return false;
+    if (fflush(s_part) != 0) return false;
+    return fsync(fileno(s_part)) == 0;
+}
+
 static bool part_append(const uint8_t *data, size_t len) {
     if (!part_open_append()) return false;
     if (len == 0) return true;
     const size_t n = fwrite(data, 1, len, s_part);
-    (void)fflush(s_part); // 逐包落盘：崩溃后 .part 不会比 NVS 记账多出未落地的字节
-                          // Flush per packet: after a crash the file never runs ahead of NVS
+    // 逐包把 newlib 缓冲推进 FATFS（f_write）。注意这不是 f_sync：目录项 size 未回写，
+    // 真正的落地由 part_sync() 在 NVS 检查点对齐执行 —— 崩溃后 .part 的可见长度
+    // 不会跑到 NVS 记账前面（只会停在更旧的检查点，续传因此安全）。
+    // Push the newlib buffer into FATFS (f_write) per packet. This is NOT f_sync:
+    // the directory entry is still stale. Real durability comes from part_sync()
+    // at the NVS checkpoints, so after a crash the visible length never runs
+    // ahead of the NVS counters (it only falls back to an older checkpoint, which
+    // is what makes resume safe).
+    (void)fflush(s_part);
     return n == len;
 }
 
@@ -767,8 +785,32 @@ static void do_verify(void) {
     // A NULL partial means the bookkeeping lost the file: fail the verdict
     // (which returns to CONNECTED and keeps the partial - safe). fflush(NULL)
     // is UB; never let a bare pointer run.
-    bool ok = s_part != NULL && fflush(s_part) == 0;
+    // gen15 根因修复：ESP-IDF 的 FATFS VFS **没有注册 .flush_p**（vfs_fat.c 全文零
+    // "flush"），fflush() 只把 newlib 缓冲推进 f_write —— 不触发 f_sync；且 sdkconfig
+    // 实证 `CONFIG_FATFS_IMMEDIATE_FSYNC is not set`，f_write 后也不补 f_sync。
+    // 于是**目录项的 size 字段永不更新**，紧随其后的 stat()（读目录项）与 fopen("rb")
+    // 回读拿到的全是过期值：长度对账必然不等、CRC 必然不符 —— 这就是真机 err=4
+    // (PUSH_ERR_CHECKSUM) 的来处。宿主 Linux 的 write() 即时更新 inode size，
+    // 168 项宿主测试因此永远测不出来（same blind spot as the file layer itself）。
+    // 修法：回读前 fclose（f_close 内部走 f_sync，目录项落盘），顺带消掉 FATFS
+    // FS_LOCK=0 下「同一文件两次打开」的非法打开（ffconf.h 明文禁止）。
+    // gen15 root-cause fix: ESP-IDF's FATFS VFS registers **no .flush_p** (zero
+    // "flush" in vfs_fat.c), so fflush() only pushes the newlib buffer into f_write
+    // without f_sync, and `CONFIG_FATFS_IMMEDIATE_FSYNC` is off (sdkconfig) so
+    // f_write does not sync either. The **directory entry never learns the new
+    // size**, so the stat() and fopen("rb") readback right after it read stale
+    // values: the length reconciliation can never match and the CRC can never
+    // agree - the source of the on-hardware err=4 (PUSH_ERR_CHECKSUM). Linux
+    // updates the inode size on write(), which is why 168 host checks missed it.
+    // Fix: fclose before the readback (f_close runs f_sync internally), which
+    // also removes the duplicate open that ffconf.h forbids under FS_LOCK=0.
+    bool ok = s_part != NULL;
+    if (ok) {
+        (void)fflush(s_part);
+        part_close(); // f_close -> f_sync：目录项落盘 / commits the directory entry
+    }
     const long sz = part_size();
+    uint32_t crc_file = 0;
     if (ok && sz != (long)s_sess.received) ok = false; // 文件与记账不符 / file disagrees with bookkeeping
     if (ok && sz == (long)s_sess.begin.total_len) {
         FILE *r = fopen(PUSH_PART_PATH, "rb");
@@ -781,10 +823,21 @@ static void do_verify(void) {
             while ((n = fread(buf, 1, sizeof(buf), r)) > 0) crc = push_crc32_continue(crc, buf, n);
             const bool read_ok = ferror(r) == 0;
             (void)fclose(r);
+            crc_file = crc;
             ok = read_ok && crc == s_sess.begin.crc32;
         }
     } else if (ok) {
         ok = false; // 长度不等：保留 .part 等续传 / length mismatch: keep the partial for resume
+    }
+    // gen15 诊断：VERIFY 五项判据全量留痕，一次真机即可把败因归位到具体口径。
+    // gen15 diagnostics: log every VERIFY criterion so one hardware run pins the
+    // failure to a specific quantity.
+    if (!ok) {
+        ESP_LOGW(TAG, "verify FAIL: sz=%ld received=%u total=%u crc_file=0x%08x crc_want=0x%08x",
+                 sz, (unsigned)s_sess.received, (unsigned)s_sess.begin.total_len,
+                 (unsigned)crc_file, (unsigned)s_sess.begin.crc32);
+    } else {
+        ESP_LOGI(TAG, "verify ok: sz=%ld crc=0x%08x", sz, (unsigned)crc_file);
     }
     // 判定前落一盘 NVS：此刻崩溃，重连后 RESUME_也能续上。/ Checkpoint before the
     // verdict: a crash here still resumes after reconnect.
@@ -859,7 +912,15 @@ static void exec_actions(uint32_t act) {
         }
         if (++s_pkts_since_ckpt >= PUSH_NVS_CHECKPOINT_EVERY) {
             s_pkts_since_ckpt = 0;
+            // gen15：NVS 与 .part 的**可见长度**必须同步推进。FATFS 下可见长度只有
+            // f_sync 才会回写目录项，所以这里补一次 part_sync()。顺序固定为「先 NVS
+            // 后 sync」：崩溃后 .part 的可见长度只会落后于记账、绝不会超前，续传安全。
+            // gen15: NVS and the **visible length** of the partial must advance
+            // together. On FATFS only f_sync rewrites the directory entry, hence
+            // part_sync(). Order is fixed - NVS first, then sync - so after a crash
+            // the visible length can only lag behind the counters, never run ahead.
             nvs_save_session();
+            (void)part_sync();
         }
     }
     if (act & PUSH_ACT_PROGRESS) {
