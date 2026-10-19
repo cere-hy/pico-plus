@@ -468,3 +468,83 @@ NimBLE 源码实证（`host/src/ble_gap.c` / `ble_hs_adv.c` / `hci_common.h`）�
 - 上一轮交付 APK 时我自己写明「BLE 状态机未经运行时验证」，用户真机一测就同时
   暴露了两侧问题（设备不可扫 + 手机侧重试缺失）。**未经运行时验证的交付物，
   第一次真机 run 必然伴随排错轮**，交付话术里应始终带这条边界。
+
+## 7.7 gen14 修复附录：gen13 真机推送全链不通（双 bug：prep queue 深度 + notify 静默失败）
+
+### 7.7.1 现象（gen13 真机测试，2026-10-19 夜）
+
+gen13 治愈了 gen12 的不可扫描回归（广播 / 扫描 / 连接 / 服务发现 / MTU 247 全通），
+但**推送链路一步都没走通**：设备端弹「内容格式不符，推送被拒绝」（= `PUSH_ERR_BAD_FRAME`），
+手机端「等待设备 STATUS 超时」。串口关键行：
+
+```
+E (402329) NimBLE: ble_att_svr_insert_prep_entry rc=6
+```
+
+### 7.7.2 Bug 1 根因：NimBLE prepare-write 队列深度 4（源码 + sdkconfig 双重实证）
+
+- `ble_att_svr_insert_prep_entry` rc=6 = `BLE_HS_ENOMEM`，来自
+  `ble_att_svr_prep_alloc` 返回 NULL（ble_att_svr.c:2681-2700）：prep entry 池
+  `os_mempool_init(&ble_att_svr_prep_entry_pool, MYNEWT_VAL(BLE_ATT_SVR_MAX_PREP_ENTRIES))`
+  取空（ble_att_svr.c:3570-3586）。
+- sdkconfig 实证 `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4`。
+- 字节账（MTU 23 长写按每包 20 字节有效载荷切分）：83 B BEGIN = `ceil(83/20)` = **5 个**
+  prepare entry；241 B DATA = **13 个**。默认 4 个必炸，且失败只打 LOGD（release 不可见）。
+- 下游依赖：每个 prep entry 的 `bape_value` mbuf 经 `ble_hs_mbuf_l2cap_pkt()` 从
+  **MSYS_1 池**领取（块大小 256 B，原 12 块）——只加队列深度会换个地方 ENOMEM，
+  故 MSYS_1 同步 12 → 20。
+
+### 7.7.3 Bug 2 根因：notify 空口失败全静默
+
+`ble_gatts_notify_custom` 返回 0 仅代表 HCI 命令入本地队列；真正空口结果在
+`BLE_GAP_EVENT_NOTIFY_TX` 的 `status`。gen13 对该 status 零处置 → 手机永远等不到
+STATUS、设备侧毫无痕迹。时间线重建（串口双周期）证明 APK（MTU 247、BEGIN 一次写完）
+与第三方 BLE 助手（无 MTU 协商）**两个独立客户端同症状**，确认与 Bug 1 并列的第二病灶。
+
+### 7.7.4 用户三假设裁定（诚实留档）
+
+| 假设 | 裁定 |
+|------|------|
+| ① PUSH_CTRL 特征 Max Attribute Length 不够 83 字节 | **说法修正、方向命中**：ESP-IDF NimBLE 的 `ble_gatt_chr_def` **没有** Max Attribute Length 字段，属性值经 access_cb 的 `os_mbuf_append` 动态处理；实质限制是 prep 队列深度 + MSYS_1 池 |
+| ② PushProto.java 与 push_proto.c 字节序/填充不一致 | **排除**：逐字段对表 magic/op/ver/type/token(u16LE)/total(u32LE)/crc(u32LE)/sid(u32LE)/title[64] 全一致，PUSH_BEGIN_LEN=83 两侧一致；25/25 对表 + 168 项 host test 佐证 |
+| ③ rc=6 是属性值太长或 prepare write 队列不够 | **命中（后半句）**：队列深度 4 < 5，非属性值长度问题 |
+
+### 7.7.5 gen14 修法（设备侧，五处 + 诊断日志）
+
+1. `CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES` 4 → 16（sdkconfig / sdkconfig.defaults /
+   sdkconfig.ci 三处同步，附字节账注释）。
+2. `CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT` 12 → 20（同上三处）。
+3. notify 失败可见 + 重投：mbuf 失败与 `rc != 0` 升级 `ESP_LOGW`；`NOTIFY_TX` 的
+   status != 0 同样留痕（conn_handle/attr_handle）；100 ms oneshot esp_timer 重投
+   `s_last_status`，每连接周期配额 3 次。**锁序纪律**：DISCONNECT 持 `s_lock` 只翻旗
+   不 `esp_timer_stop`（timer 回调要拿同一把锁，会死锁）；fire 持锁发完、出锁后 delete
+   （oneshot 已触发，允许回调内删自己）。
+4. APK 侧加固：MTU < 32 明确失败（不再带 23 硬发后莫名超时）；RESUME 续传语义识别
+   （offset/next_seq，next_seq=0 提示重新完整发送）。
+5. 写入口全路径诊断日志：ctrl hdr rejected / begin decode rejected / begin precheck /
+   data state / data decode rejected / op rejected / ACT_ERR——下次被拒日志直接指明
+   败在哪个检查，不再只有一句「格式不符」。
+
+**协议零变化**：本轮只动队列容量、失败可见性与客户端加固，帧格式一个字节未改。
+
+### 7.7.6 gen14 门禁全表
+
+| 门禁 | 结果 |
+|------|------|
+| 宿主机测试（runner 13/13，push_sink 168 checks） | 全绿 |
+| APK 协议对表 | 25/25 |
+| fullclean 重建 | exit 0，8 警告同基线（ui_pinpad 1 + app_book 7，零新增） |
+| APK 重建 + badging + 签名 | 过（25,046 B，sha256 `3756ee89…`） |
+| flash.sh EXPECTED 重锚 + 双路径 dry run | 正确 exit 2 / 篡改 exit 1 |
+| 镜像锚 | `Read_Pico.bin` 4,049,984 B（0x3DCC40）sha256 `214541c2…`；+1,472 B（双操作数 vs gen13 4,048,512）；seg1 vaddr `0x3fc9c700`（七代不变）/ len `0x08a8c` 持平 / File offs `0x00233248`（gen13 `0x00232fe8`，+96B）；boot 日志 paddr 预测 `0x00243250`；版本串 `0.3.3-pico14`；bootloader 21,232 B 哈希 `0e84dd68…` |
+
+### 7.7.7 本轮教训（诚实留档）
+
+- **「默认配置够用」是隐性假设**：NimBLE 的 `BLE_ATT_SVR_MAX_PREP_ENTRIES=4` 对
+  常规 GATT 够用，但本协议 83 B BEGIN + MTU 23 长写路径需要 5 个。凡引入长写队列
+  依赖，先按「最大帧长 / 单包有效载荷」算 entry 数，再对池容量做门禁。
+- **「API 返回 0」从来不等于「空口成功」**：notify 的双阶段语义（入队 ≠ 送达）与
+  gen12 的「UI 正常 ≠ 射频正常」同构。凡 fire-and-forget 的射频操作，必须有
+  TX 完成事件的 status 处置，否则失败全静默。
+- **第三方工具与 APK 同症状 = 强信号**：本次两个独立客户端同病，直接排除了「APK
+  客户端bug」分支，把侦查聚焦到固件侧——排错时应优先寻找这种交叉验证点。

@@ -171,6 +171,22 @@ static uint32_t s_pmu_refresh_ms;     // 上次 PMU 刷新时刻 / last PMU refr
 static uint8_t s_last_status[PUSH_STATUS_MAX]; // 最近一条 STATUS（读特征的回退通道）
 static size_t s_last_status_len;               // the last STATUS (the read fallback)
 
+// gen14：notify 空口失败重投。/ gen14: retry when a notify fails on air.
+// ble_gatts_notify_custom 返回 0 只代表 HCI 命令入了队，真正的空口结果在
+// BLE_GAP_EVENT_NOTIFY_TX 的 status；两个失败点过去都只打 LOGD（release 不可见），
+// 真机症状正是「设备明明处理了，手机就是等不到 STATUS」——gen13 485E 第二周期
+// 与第三方调试助手「收: 0」都指向这里。现在失败升级 LOGW，并用 esp_timer 延迟
+// 100ms 重发 s_last_status，每个连接周期 3 次配额。
+// A zero return from ble_gatts_notify_custom only means the HCI command was
+// queued; the real air result is NOTIFY_TX's status. Both failure points used
+// to log at LOGD only (invisible in release) - exactly the "the device clearly
+// processed it, yet the phone waits forever" symptom seen on gen13 hardware
+// (485E second cycle) and with the third-party debugger ("received: 0").
+// Failures now escalate to LOGW and re-send s_last_status after 100 ms via
+// esp_timer, three attempts per connection cycle.
+static esp_timer_handle_t s_notify_retry_timer;
+static uint8_t s_notify_retry_left;
+
 // ACT_APPEND 需要的刚收载荷：写回调的帧缓冲在回调期间有效。/ The just-received
 // payload ACT_APPEND needs: the write callback's frame buffer lives for the call.
 static const uint8_t *s_rx_payload;
@@ -322,6 +338,57 @@ static void status_remember(const uint8_t *frame, size_t n) {
     s_last_status_len = n;
 }
 
+// gen14：重投三件套。/ gen14: the retry trio.
+// 锁序注意：cancel 只翻旗（DISCONNECT 持 s_lock 调它，不能在这里 esp_timer_stop——
+// timer 回调要拿同一把锁，会死锁）；fire 持锁发完再 unlock 后 delete（oneshot
+// 已触发，ESP-IDF 允许回调内删自己）。
+// Lock-order note: cancel only flips a flag (DISCONNECT calls it under s_lock and
+// must not esp_timer_stop here - the timer callback takes the same lock and would
+// deadlock); fire sends under the lock, then deletes after unlocking (the one-shot
+// has already fired and ESP-IDF allows deleting it from inside its callback).
+static void notify_retry_fire(void *arg);
+static void notify_status(const uint8_t *frame, size_t n);
+
+static void notify_retry_schedule(void) {
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    if (s_notify_retry_left == 0) return;     // 配额用尽：诊断日志已留痕 / quota spent
+    if (s_notify_retry_timer != NULL) return; // 已在排队 / already queued
+    const esp_timer_create_args_t args = {
+        .callback = &notify_retry_fire,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "pp_notify",
+    };
+    if (esp_timer_create(&args, &s_notify_retry_timer) != ESP_OK) {
+        s_notify_retry_timer = NULL;
+        return;
+    }
+    if (esp_timer_start_once(s_notify_retry_timer, 100000) != ESP_OK) { // 100 ms
+        esp_timer_delete(s_notify_retry_timer);
+        s_notify_retry_timer = NULL;
+        return;
+    }
+    --s_notify_retry_left;
+}
+
+static void notify_retry_fire(void *arg) {
+    (void)arg;
+    lock();
+    esp_timer_handle_t t = s_notify_retry_timer;
+    s_notify_retry_timer = NULL; // 先摘下：notify_status 失败会重新排 / detach first
+    const bool alive = s_conn_handle != BLE_HS_CONN_HANDLE_NONE
+                       && s_last_status_len > 0;
+    if (alive) notify_status(s_last_status, s_last_status_len); // 失败会再排
+    unlock();
+    if (t != NULL) esp_timer_delete(t);
+}
+
+static void notify_retry_cancel(void) {
+    // 只翻旗：timer 到点若发现没连接或没配额就自我了解。/ Flag only: the timer
+    // dissolves itself when it finds no connection or no quota left.
+    s_notify_retry_left = 0;
+}
+
 // 乐观通知：NimBLE 的 notify 不检查 CCCD（ble_gatts_notify_custom 直接读属性发
 // 通知），订阅态只用来记日志。没订阅的手机按规范应忽略通知；只读的客户端走
 // 读 PUSH_STATUS 的回退通道（on_access 里回 s_last_status）。
@@ -337,9 +404,19 @@ static void notify_status(const uint8_t *frame, size_t n) {
         return;
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, (uint16_t)n);
-    if (!om) return;
+    if (!om) {
+        // gen14：mbuf 领不到过去是静默 return——真机就是「处理了但没通知」。
+        // gen14: a failed mbuf allocation used to return silently - on hardware
+        // that is exactly "processed but never notified".
+        ESP_LOGW(TAG, "notify 0x%02x: mbuf alloc failed, retry scheduled", frame[0]);
+        notify_retry_schedule();
+        return;
+    }
     const int rc = ble_gatts_notify_custom(s_conn_handle, s_status_handle, om);
-    if (rc != 0) ESP_LOGD(TAG, "notify 0x%02x rc=%d", frame[0], rc);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "notify 0x%02x rc=%d, retry scheduled", frame[0], rc);
+        notify_retry_schedule();
+    }
 }
 
 static void reply_ready(void) {
@@ -794,7 +871,13 @@ static void exec_actions(uint32_t act) {
     }
     if (act & PUSH_ACT_VERIFY) do_verify();
     if (act & PUSH_ACT_COMMIT) do_commit();
-    if (act & PUSH_ACT_ERR) reply_err(s_sess.last_err);
+    if (act & PUSH_ACT_ERR) {
+        // gen14 诊断：session 层拒绝（token/type/total_len/跳号/校验）留痕。
+        // gen14 diagnostics: session-level refusals (token/type/total_len/seq
+        // gap/checksum) leave a trace too.
+        ESP_LOGW(TAG, "session refused err=%d", s_sess.last_err);
+        reply_err(s_sess.last_err);
+    }
     if (act & PUSH_ACT_ADV_ON) adv_start();
     if (act & PUSH_ACT_ADV_OFF) {
         adv_stop();
@@ -822,6 +905,15 @@ static int begin_precheck(const push_begin_t *b) {
 static void on_ctrl_write(const uint8_t *data, size_t len) {
     uint8_t op;
     if (!push_ctrl_header_decode(data, len, &op)) {
+        // gen14 诊断：把拒帧现场全打出来——真机一测便知是 len 短了、魔数歪了还是
+        // 版本对不上。gen13 真机 ERR(2) 无法归位到具体检查（静态对表全绿），补此日志。
+        // gen14 diagnostics: dump the rejected frame's context - one real-hardware
+        // run tells a short len from a bad magic or version. gen13's on-hardware
+        // ERR(2) could not be attributed to a specific check (all static tables
+        // agreed), so this log exists.
+        ESP_LOGW(TAG, "ctrl hdr rejected: len=%u head=%02x %02x %02x %02x",
+                 (unsigned)len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
+                 len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
         reply_err(PUSH_ERR_BAD_FRAME);
         return;
     }
@@ -841,11 +933,18 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         }
         push_begin_t b;
         if (!push_begin_decode(data, len, &b)) {
+            // gen14 诊断：len 不足 83、魔数/op/版本错都会落这里。打出现场。
+            // gen14 diagnostics: a len under 83 or a bad magic/op/version lands
+            // here; print the scene.
+            ESP_LOGW(TAG, "begin decode rejected: len=%u head=%02x %02x %02x %02x",
+                     (unsigned)len, data[0], data[1], data[2], data[3]);
             reply_err(PUSH_ERR_BAD_FRAME);
             return;
         }
         const int err = begin_precheck(&b);
         if (err != PUSH_ERR_NONE) {
+            ESP_LOGW(TAG, "begin precheck err=%d type=%u token=%04x total=%u",
+                     err, (unsigned)b.type, (unsigned)b.token, (unsigned)b.total_len);
             reply_err(err);
             return;
         }
@@ -880,6 +979,8 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
         return;
     default:
+        // gen14 诊断：op 不在 1/2/3/4。/ gen14: op outside 1/2/3/4.
+        ESP_LOGW(TAG, "ctrl op %u rejected: len=%u", (unsigned)op, (unsigned)len);
         reply_err(PUSH_ERR_BAD_FRAME);
         return;
     }
@@ -894,6 +995,11 @@ static void on_data_write(const uint8_t *data, size_t len) {
     // Body packets are taken only while RECEIVING; any other state means the
     // phone is out of order, so refuse explicitly instead of ignoring it.
     if (s_sess.state != PUSH_STATE_RECEIVING) {
+        // gen14 诊断：非 RECEIVING 态收到 DATA，打状态与来帧。
+        // gen14 diagnostics: DATA in a non-RECEIVING state; log state and frame.
+        ESP_LOGW(TAG, "data rejected: state=%u len=%u head=%02x %02x %02x",
+                 (unsigned)s_sess.state, (unsigned)len,
+                 len > 0 ? data[0] : 0, len > 1 ? data[1] : 0, len > 2 ? data[2] : 0);
         reply_err(PUSH_ERR_BAD_FRAME);
         return;
     }
@@ -901,6 +1007,11 @@ static void on_data_write(const uint8_t *data, size_t len) {
     const uint8_t *payload;
     size_t n;
     if (!push_data_decode(data, len, &seq, &payload, &n)) {
+        // gen14 诊断：len<3 或声明长于实长。/ gen14: len<3 or a declared length
+        // longer than the actual payload.
+        ESP_LOGW(TAG, "data decode rejected: len=%u head=%02x %02x %02x",
+                 (unsigned)len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
+                 len > 2 ? data[2] : 0);
         reply_err(PUSH_ERR_BAD_FRAME);
         return;
     }
@@ -966,6 +1077,7 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         }
         lock();
         s_conn_handle = event->connect.conn_handle;
+        s_notify_retry_left = 3; // gen14：每个连接周期 3 次重投配额 / 3 retries per cycle
         ESP_LOGI(TAG, "phone connected");
         exec_actions(push_session_event(&s_sess, PUSH_EVT_CONNECT, NULL));
         unlock();
@@ -976,6 +1088,10 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         lock();
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_status_subscribed = false;
+        // gen14：断开即撤重投配额，防 timer 到点往下一个连接周期野发。
+        // gen14: drop the retry quota on disconnect so the timer cannot fire
+        // into the next connection cycle.
+        notify_retry_cancel();
         exec_actions(push_session_event(&s_sess, PUSH_EVT_DISCONNECT, NULL));
         // 断连即存档：.part 已逐包落盘，NVS 记账对齐到这一刻，跨重启续传的锚点。
         // Checkpoint on drop: the partial is already flushed per packet and the
@@ -1013,7 +1129,17 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
 
     case BLE_GAP_EVENT_NOTIFY_TX:
         if (event->notify_tx.status != 0) {
-            ESP_LOGD(TAG, "notify tx status %d", event->notify_tx.status);
+            // gen14：空口发送失败过去只打 LOGD（release 不可见）——真机症状正是
+            // 「设备处理了、手机等不到 STATUS 超时」。升级 LOGW 并排重投。
+            // gen14: an on-air failure used to log at LOGD only (invisible in
+            // release) - exactly the "device processed it, the phone times out
+            // waiting for STATUS" symptom. Escalate to LOGW and schedule a retry.
+            ESP_LOGW(TAG, "notify tx failed status=%d conn=%u attr=%u, retry scheduled",
+                     event->notify_tx.status, (unsigned)event->notify_tx.conn_handle,
+                     (unsigned)event->notify_tx.attr_handle);
+            lock();
+            notify_retry_schedule();
+            unlock();
         }
         return 0;
 

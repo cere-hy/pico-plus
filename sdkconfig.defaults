@@ -94,10 +94,25 @@ CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=247
 # 推流吞吐：ATT 写与 ACL 数据各多一倍缓冲。每块约 260 B 内部 RAM，增量几 KB，可承受。
 # Push throughput: double the ATT and ACL data buffers. Each block is ~260 B of internal RAM,
 # a few KB total, affordable.
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=12
+# gen14：MSYS_1 12->20。prep-write 长写的每个 prepare entry 从 MSYS_1 池领一个 mbuf
+# （ble_att_svr_prep_alloc -> ble_hs_mbuf_l2cap_pkt -> os_msys_get_pkthdr(0)），
+# 16 个 entry 同时排队需要 16 个 block，12 个会在第 13 个上 ENOMEM。
+# gen14: MSYS_1 12->20. Every prepare-write entry takes one MSYS_1 mbuf
+# (ble_att_svr_prep_alloc -> ble_hs_mbuf_l2cap_pkt -> os_msys_get_pkthdr(0));
+# 16 queued entries need 16 blocks - 12 runs out at the 13th with ENOMEM.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=20
 CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 CONFIG_BT_NIMBLE_ACL_BUF_COUNT=12
-CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
+# gen14：prep 队列深度 4->16。gen13 真机日志实锤 rc=6（BLE_HS_ENOMEM）：手机与设备
+# MTU 协商失败时（有效 MTU 23），83 B 的 BEGIN 由客户端走 Prepare Write 长写，
+# 每包 20 B 需 5 个 entry、241 B 的 DATA 需 13 个——默认 4 个必炸，且失败只打
+# LOGD（release 不可见）。16 覆盖 DATA 长写的 13 并留 3 个余量。
+# gen14: prep queue depth 4->16. gen13 real-hardware log proved rc=6 (BLE_HS_ENOMEM):
+# when the MTU exchange fails (effective MTU 23), the 83 B BEGIN goes out as a
+# Prepare Write long write needing 5 entries at 20 B each, and a 241 B DATA needs
+# 13 - the default 4 always overflows, and the failure only logs at LOGD
+# (invisible in release builds). 16 covers the 13 of a DATA long write plus slack.
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=16
 # 控制器只能用内部 RAM——它跑在硬件路径上，读不到 PSRAM。这组值是 CrossMux 在同一块
 # 板子上验证过的：BLE_MAX_ACT 是"同时允许几个控制器活动"，扫描与建立连接各占一个，
 # 压到 1 会让扫描和连接互相排斥，起不来。文件/图片/壁纸列表等搬进 PSRAM 之后 DIRAM

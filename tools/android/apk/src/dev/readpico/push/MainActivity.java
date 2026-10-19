@@ -9,11 +9,19 @@
  *
  * 推送流程（与 push_pico.py / ReadPicoPush.bsh 一致）：
  *   扫描 PicoPush-XXXX（12s） -> 连接 -> 协商 MTU 247 -> 发现服务 ->
- *   订阅 5f13 通知 -> 写 BEGIN 到 5f12 -> 等 READY -> DATA×N 写 5f11（WWR，
+ *   订阅 5f13 通知 -> 写 BEGIN 到 5f12 -> 等 READY/RESUME -> DATA×N 写 5f11（WWR，
  *   逐包等 ATT 回执） -> 写 END 到 5f12 -> 等 DONE/ERR。
  *   写入方式实证修正记录（gen12）：固件 5f11/5f12 特性位一直是 F_WRITE（WWR），
  *   F_WRITE_NO_RSP 从未在固件出现；ATT 逐包回执是第一道防线，设备侧 RESUME
  *   是第二道防线。
+ *   gen14 加固：MTU 协商失败（<32）明确失败重试，不闷头走 Prepare Write 长写
+ *   （固件 prep 队列已加深到 16 治 rc=6，但各安卓栈长写行为参差）；RESUME 帧
+ *   进 STATUS 候选（offset 0 按 READY 继续，非 0 明确提示重新完整发送）。
+ *   gen14 hardening: a failed MTU exchange (<32) fails explicitly for a retry
+ *   instead of silently entering a Prepare Write long write (the firmware prep
+ *   queue is now 16 deep to fix rc=6, but Android long-write behaviour varies);
+ *   RESUME joins the STATUS candidates (offset 0 continues as READY, non-zero
+ *   prompts a full resend).
  *
  * English: minimal single-activity push client for the ReadPico e-ink device.
  * Pure framework APIs; protocol codec lives in PushProto.java.
@@ -361,6 +369,20 @@ public class MainActivity extends Activity {
             waitFlag(MTU_WAIT, 8000); // 失败不致命：退回默认 23，分片变小
             int chunk = PushProto.chunkForMtu(mtuValue);
             uiLog("MTU=" + mtuValue + "，每包 " + chunk + " 字节");
+            // gen14：MTU 协商失败（有效 23）时 83 字节 BEGIN 要走 Prepare Write 长写。
+            // 固件侧 prep 队列已加深到 16（gen14 修 rc=6），但各安卓栈对长写的处理
+            // 参差（gen13 真机：长写第 5 包设备侧 ENOMEM，客户端表现还是白等），明确
+            // 失败让用户重试比闷头走长写可靠。
+            // gen14: with the MTU exchange failed (effective 23) the 83 B BEGIN
+            // needs a Prepare Write long write. The firmware prep queue is now 16
+            // deep (gen14 fixes rc=6), but Android stacks differ in long-write
+            // handling (gen13 on hardware: the 5th packet hit device-side ENOMEM
+            // while the client just sat there) - an explicit failure with a retry
+            // hint beats a silent long write.
+            if (mtuValue < 32) {
+                uiLog("MTU 协商失败（" + mtuValue + "），本次无法发送，请重试");
+                return;
+            }
 
             uiLog("发现 GATT 服务……");
             gatt.discoverServices();
@@ -402,7 +424,14 @@ public class MainActivity extends Activity {
             if (!writeChar(cCtrl, begin)) {
                 return;
             }
-            byte[] st = waitStatus(new int[] { PushProto.ST_READY, PushProto.ST_ERR }, STEP_TIMEOUT_MS);
+            // gen14：RESUME 进候选。设备有半成品簿记（上一轮断开前收过包）时会先答
+            // RESUME 而不是 READY；gen13 只等 READY/ERR，RESUME 被当非目标帧丢弃，
+            // 白等 20 秒超时。/ gen14: RESUME joins the candidates. A device with
+            // partial bookkeeping answers RESUME before READY; gen13 waited for
+            // READY/ERR only, dropped RESUME as a non-target frame and idled out
+            // the full 20 s timeout.
+            byte[] st = waitStatus(new int[] { PushProto.ST_READY, PushProto.ST_RESUME,
+                    PushProto.ST_ERR }, STEP_TIMEOUT_MS);
             if (st == null) {
                 return;
             }
@@ -410,7 +439,24 @@ public class MainActivity extends Activity {
                 uiLog("设备拒绝：" + PushProto.errText(PushProto.statusBody(st)[0] & 0xFF));
                 return;
             }
-            long sid = PushProto.readySessionId(st);
+            if (PushProto.statusOp(st) == PushProto.ST_RESUME) {
+                // RESUME body：offset(u32 LE) + next_seq(u16 LE)。offset 0 = 设备没有
+                // 可续的字节，等价于 READY（同 sid 重发 BEGIN 的续传路径）；非 0 = 要求
+                // 从中间续传，本版本客户端不做断点续发，明确告知重新完整发送。
+                // RESUME body: offset(u32 LE) + next_seq(u16 LE). offset 0 means
+                // nothing to resume (same as READY); non-zero asks for a mid-stream
+                // resume this client version does not implement - say so.
+                final long off = PushProto.resumeOffset(st);
+                final long nseq = PushProto.resumeNextSeq(st);
+                if (off != 0 || nseq != 0) {
+                    uiLog("设备要求从 " + off + " 字节续传（seq " + nseq + "），"
+                            + "请重新完整发送");
+                    return;
+                }
+                uiLog("设备有旧会话簿记，按重发处理……");
+            }
+            final long sid = PushProto.statusOp(st) == PushProto.ST_READY
+                    ? PushProto.readySessionId(st) : -1L;
             uiLog("设备就绪（session=" + (sid < 0 ? "?" : Long.toHexString(sid))
                     + "），正文 " + body.length + " 字节，开始传输……");
 

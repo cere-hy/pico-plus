@@ -165,6 +165,29 @@ public final class PushProto {
         return (getU32(body, 0)) & 0xFFFFFFFFL;
     }
 
+    /**
+     * RESUME 帧 body：offset(u32 LE) + next_seq(u16 LE)（gen14 新增解析）。
+     * offset 是设备 .part 里已落盘的字节数；不足 4 字节返回 -1。
+     * RESUME body: offset (u32 LE) + next_seq (u16 LE). The offset is the number
+     * of bytes already flushed to the device's partial file.
+     */
+    public static long resumeOffset(byte[] frame) {
+        byte[] body = statusBody(frame);
+        if (body.length < 4) {
+            return -1L;
+        }
+        return getU32(body, 0) & 0xFFFFFFFFL;
+    }
+
+    /** RESUME 帧 body 的 next_seq（u16 LE，偏移 4）；不足 6 字节返回 -1。 */
+    public static long resumeNextSeq(byte[] frame) {
+        byte[] body = statusBody(frame);
+        if (body.length < 6) {
+            return -1L;
+        }
+        return (body[4] & 0xFF) | ((body[5] & 0xFF) << 8);
+    }
+
     /* ---- 广播名 -> token ---- */
 
     /** 从广播名 PicoPush-XXXX 解析 token（十六进制后缀）；非本服务广播名返回 null。 */
