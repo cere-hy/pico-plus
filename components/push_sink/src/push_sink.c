@@ -503,21 +503,26 @@ static const struct ble_gatt_svc_def s_svcs[] = {
             {
                 .uuid = &s_data_uuid.u,
                 .access_cb = push_access_cb,
-                // 特性位保持 F_WRITE（WWR），但协议层已裁定 PUSH_DATA 走
-                // write-no-response（docs/M1-audit.md「协议变更记录」，gen11 生效）：
-                // NimBLE 的 ATT 服务端对两种写操作一视同仁——ble_att_svr.c 的
-                // ble_att_svr_rx_write_no_rsp 与 ble_att_svr_rx_write 都汇入
-                // write_handle → ha_cb（MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1，
-                // 已实证），故手机端 WNR 写与 nRF 手动 WWR 写都能到达
-                // push_access_cb。位上的 WWR 只是发现时看到的属性，不是闸门。
-                // Keep F_WRITE here, but the wire protocol for PUSH_DATA is
-                // write-no-response (docs/M1-audit.md protocol-change record,
-                // effective gen11): NimBLE's ATT server treats both write ops
-                // alike - ble_att_svr_rx_write_no_rsp and ble_att_svr_rx_write
-                // both funnel into write_handle -> ha_cb (BLE_ATT_SVR_WRITE_NO_RSP
-                // = 1, source-verified), so the phone's WNR writes and nRF
-                // Connect's manual WWR writes both reach push_access_cb. The
-                // WWR bit is the discovered property, not a gate.
+                // 特性位是 F_WRITE（WWR，写请求）。实证修正记录（gen12，见
+                // docs/M1-audit.md 第二节）：F_WRITE_NO_RSP 从未在本仓库固件源码
+                // 出现——所谓「WWR → WNR 漂移」从未发生，位一直是 WWR，ATT 逐包
+                // 确认从未退场。NimBLE 的 ATT 服务端对两种写一视同仁（ble_att_svr.c
+                // 的 ble_att_svr_rx_write_no_rsp 与 ble_att_svr_rx_write 都汇入
+                // write_handle → ha_cb，MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1，
+                // 已实证），故手机端 WNR 写与手动 WWR 写都能到达 push_access_cb；
+                // 但位上的 WWR 就是 WWR（不是"仅发现时看到的属性"），手机端默认
+                // 走 WWR：ATT 逐包回执为第一道防线，RESUME 为第二道。
+                // Keep F_WRITE (WWR) here. Verified correction (gen12, see
+                // docs/M1-audit.md section 2): F_WRITE_NO_RSP never appears in
+                // this repo's firmware source - the claimed "WWR -> WNR drift"
+                // never happened, the bit has always been WWR and per-packet
+                // ATT confirmation never left. NimBLE's ATT server treats both
+                // write ops alike (ble_att_svr_rx_write_no_rsp and rx_write
+                // both funnel into write_handle -> ha_cb, BLE_ATT_SVR_WRITE_NO_RSP
+                // = 1, source-verified), so both phone-side WNR and manual WWR
+                // writes reach push_access_cb; the bit simply is WWR, and the
+                // phone defaults to WWR (per-packet ATT acks first line of
+                // defense, RESUME second).
                 .flags = BLE_GATT_CHR_F_WRITE,
                 .val_handle = &s_data_handle,
             },

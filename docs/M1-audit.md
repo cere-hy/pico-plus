@@ -94,29 +94,38 @@ Seg  Length   Load addr (vaddr)  File offs (paddr)   Memory types
 
 ---
 
-## 二、协议变更记录（PUSH_DATA：WWR → write-no-response）
+## 二、实证修正记录（PUSH_DATA 写模式：所谓「WWR → WNR 漂移」从未发生）
 
-> 审计裁定：草案 §3.1 原定 Write-With-Response，实现改为 write-no-response 且未声明，
-> 属「设计变更被静默冻结」。裁决：**接受**，附三条件——协议冻结的前提是冻结的是**记录过的**协议。
+> 本节由 gen11 的「协议变更记录」**改写**而来。gen11 曾记录「PUSH_DATA 由 WWR 改为
+> write-no-response」并裁决「接受 + 三条件」。**gen12 源码实证表明：该裁决的前提
+> 不成立——漂移从未发生，固件特性位一直是 WWR。** 三个事实并列如下，全部一手实证。
 
-**变更内容**：`PUSH_DATA`（`…5f11`）由 Write-With-Response 改为 write-no-response。
-`PUSH_CTRL`（`…5f12`）仍为 write（有响应），`PUSH_STATUS`（`…5f13`）仍为 read + notify。
+### 三事实并列
 
-**变更原因**：
-1. 端到端完整性不依赖链路层确认 —— 已由**应用层四层防线**承担：seq 连续性检查（保序）、
-   长度对账、CRC32 校验、RESUME 续传（补包）。
-2. 四件套的宏路径（Tasker / MacroDroid 原生 BLE 写能力弱，已声明事实）对 WNR 更友好。
-3. 吞吐预期更优（免去逐包 ATT 往返）。
+| # | 事实 | 证据 |
+|---|------|------|
+| F1 | gen11 汇报与四件套曾称 PUSH_DATA（`…5f11`）为 write-no-response | gen11 审计旧第二节、`push_pico.py:99` 旧注释等 |
+| F2 | **固件特性位从未是 WNR**：WNR 标志（`BLE_GATT_CHR_F_WRITE_NO_RSP`）在本仓库固件源码中零出现；`push_sink.c` 注册 5f11/5f12 的特性位一直是 `BLE_GATT_CHR_F_WRITE`（WWR） | gen12 轮全仓检索 + `push_sink.c` 特征定义 |
+| F3 | NimBLE ATT 服务端对两种写一视同仁：`ble_att_svr_rx_write_no_rsp` 与 `rx_write` 都汇入 `write_handle → ha_cb`（`MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1` 已实证） | ESP-IDF NimBLE 源码 + gen12 构建配置 |
 
-**条件落实**：
-- **① 可靠性模型修订已文档化（本节即记录）**：§3.4 三层防线之第一层（ATT 逐包确认）
-  **退场**，重传职责**移交 RESUME 机制**。变更日期 2026-10-18，随 gen11 首次生效。
-- **② 速率承诺保守化**：文档维持 **8–25 KB/s** 保守值并标注「**WNR 实测后更新**」；
-  §3.6 吞吐数学随真机数据重算，不在真机轮前据 WNR 理论值上修。
-- **③ M2 路线图同步**：原「Write-Without-Response 提速」条目已被本变更**部分消费**，
-  改为「**视真机吞吐决定是否引入窗口 ACK**」。
+### 结论与处置
 
-**附带同步**：BEGIN 83B 中的 `token(u16)` 字段系开工指令 a（token = 广播名后缀本身）的落地，
+- **撤销 gen11 裁决的条件①**：「ATT 逐包确认退场、重传职责移交 RESUME」的前提是
+  固件走 WNR。固件实际是 WWR——**ATT 逐包确认从未退场**，该条件整条撤销。
+- **保留 RESUME 作为第二道防线**：断连补包继续有效；gen12 真机验收按
+  **WWR + RESUME 双重防线**口径执行（见第六节项 4）。
+- **条件②（速率承诺保守化）保留**：文档维持 8–25 KB/s 保守值；WWR 路径下有逐包
+  往返，吞吐数学待真机数据重算，不在真机轮前据理论上修。
+- **条件③（M2 路线图）保留**：「视真机吞吐决定是否引入窗口 ACK」不变。
+- **最终协议方向：不定稿，待真机数据。** gen12 真机轮须验证「安卓端写 ↔ 固件 WWR
+  属性」这条从未真机跑过的跨路径（见第六节新增必验项「推送全链成功」）；若真机
+  暴露问题，再议是否让固件补 WNR 位——那是协议变更，走变更流程，不在本轮暗度。
+- **四件套 + 源码注释同步修正**：`push_pico.py` / Tasker XML / nRF Connect 手册 /
+  `push_sink.c` 特征注释均已按本记录改写；手机端默认走 WWR 写（ATT 逐包回执）。
+
+### 附带同步（不变）
+
+BEGIN 83B 中的 `token(u16)` 字段系开工指令 a（token = 广播名后缀本身）的落地，
 草案 §3.2 帧表原无此字段 —— 已同步进协议文档与四件套，按**记录过的**协议处理，不另计漂移。
 
 ---
@@ -222,15 +231,25 @@ android-tools/nrf-connect-manual.md   手动验证手册
 1. 推送后**自动唤醒全屏显示**，不需点屏（死线③）。
 2. **连招**（以 EVT_READ 为前置）：复制 → 推 → 读 → 退出推送书 → 手机收到「已读」→ 剪贴板清空。
 3. 中文长文（多包）**不掉字不乱序**（死线②）。
-4. **断点续传**（重要度上升）：中途断连 → 重连自动续推（本包测的是 WNR 下的 RESUME 路径）。
+4. **断点续传**（重要度上升）：中途断连 → 重连自动续推。口径改为「**WWR + RESUME 双重防线**」：手机端逐包等 ATT 回执（第一道防线，gen12 起推送通道默认 WWR，见第二节实证修正），设备侧 NVS 检查点 + RESUME 快进（第二道防线）。
 5. 单词卡：推送单词 → 弹词典卡片，不开整书。
 6. 充电常开：插电不计时；**拔电即退出**。
 7. 翻页器让位：开启期间暂停，退出自动接回。
 8. 防闪烁：收完统一写盘、一次全刷（死线④）。
-9. **（gen12 起前置项）Services 页验收**：连上后 Services 页须显示推流服务
-   `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10`，展开含三特征 `…5f11`（写）/
-   `…5f12`（写）/ `…5f13`（读+通知）；扫描列表广播即带该服务 UUID。
-   gen11 此处空白（根因见第七节），boot 日志 seg1 paddr 对表 `0x00242f90`。
+9. **（gen12 起前置必验三项，全过才进八项判读）**：
+   - **① Services 页验收**：连上后 Services 页须显示推流服务
+     `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10`，展开含三特征 `…5f11`（写）/
+     `…5f12`（写）/ `…5f13`（读+通知）；扫描列表广播即带该服务 UUID。
+     gen11 此处空白（根因见第七节）。
+   - **② boot 日志 seg1 paddr 对表 `0x00242f90`**（seg1 段头 File offs
+     `0x00232f88` + 8 + ota_0 基址 `0x10000`；公式 gen5/gen6/gen10 三轮实证，
+     gen12 重建后实测 seg1 段头与数据逐字节不变，锚继续有效）。
+   - **③ 推送全链成功（gen12 新增必验）**：用交付的 ReadPicoPush APK（或
+     nRF Connect 手工通道）实际推一段文字，看到「设备已校验 CRC32 并开书」。
+     **安卓端写 5f11/5f12 vs 固件 WWR 属性的跨路径从未真机验证过**（gen11 被
+     Services 空白阻断在本项之前）；若失败，**第一嫌疑即写入类型/属性不匹配**
+     （客户端误用 write-without-response，或设备侧属性与预期不符），按第七节
+     附录 7.5 的通道说明逐段排查。本项不过 → 其余判读项全部失去意义。
 
 ---
 
@@ -271,11 +290,16 @@ start 清表（`ble_gatts_free_mem` + 空队列重注册）；仅靠 sync 回调
 以句柄为证的防御性显式 start（兜底）」。另实证：本构建无人调用
 `ble_svc_gap_init()`，队列中只有我们的服务，兜底 start 无误伤面。
 
-**协议注释澄清（零行为变更）**：PUSH_DATA 特性位保持 `F_WRITE`，但 gen11 协议变更
-记录（第二节）已裁定走 write-no-response——NimBLE ATT 服务端对两种写一视同仁
-（`ble_att_svr_rx_write_no_rsp` 与 `rx_write` 均汇入 `write_handle → ha_cb`，
-`MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1` 已实证），故 WNR 与手动 WWR 都能到达
-`push_access_cb`。注释已按此重写，消除「位上是 WWR」与「协议是 WNR」的表观矛盾。
+**协议注释澄清（零行为变更，2026-10-19 按实证修正重写）**：PUSH_DATA 特性位保持
+`F_WRITE`（WWR，写请求）。gen11 汇报曾称协议已裁定 write-no-response——**源码实证该
+前提从未成立**：`BLE_GATT_CHR_F_WRITE_NO_RSP` 在仓库源码零出现，固件 5f11/5f12 特性位
+从实现第一天就是 `BLE_GATT_CHR_F_WRITE`，ATT 逐包确认从未退场（详见第二节三事实）。
+NimBLE ATT 服务端对两种写一视同仁（`ble_att_svr_rx_write_no_rsp` 与 `rx_write` 均汇入
+`write_handle → ha_cb`，`MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1` 已实证），故客户端选
+WWR 或 WNR 都能到达 `push_access_cb`；本工程所有客户端通道**默认 WWR**
+（response=True）：逐包 ATT 回执是第一道防线，设备侧 RESUME 是第二道。注释已按此重写，
+「位上是 WWR」与「协议是 WNR」的表观矛盾连同错误前提一并撤销。**最终协议方向
+（是否引入 WNR 快速档）不定稿，待真机数据**。
 
 ### 7.3 gen12 门禁全表
 
@@ -287,20 +311,68 @@ start 清表（`ble_gatts_free_mem` + 空队列重注册）；仅靠 sync 回调
 | 版本串 | `0.3.3-pico11` → **`0.3.3-pico12`**（CMakeLists.txt / README.md / web-flasher/manifest.json 三处），bin 内实测 `App version: 0.3.3-pico12` |
 | 镜像体积 | **4,048,208 B**（0x3dc550）；**+1,200 B = 4,048,208 − 4,047,008**（双操作数）；分区 0x580000，余 30% |
 | seg1 双锚 | vaddr **`0x3fc9c700`（五代不变）** / len **`0x08a8c`（与 gen11 持平）** / File offs **`0x00232f88`**（gen11 `0x00232e48`，+320B，与 seg0 DROM 增长顺移一致）；boot 日志 paddr 预测 **`0x00242f90`** = `0x00232f88 + 8 + 0x10000`（公式 gen5/gen6/gen10 三轮实证） |
-| 镜像 sha256 | **`219e0529d20193c24f0cb6a93d09eeb53d7d6fff85aa6cdc4d5a8cd849729d1c`**；bootloader / partition-table / ota_data_initial 与 gen11 逐字节不变 |
+| 镜像 sha256 | **`6e1d15c16fe8a4c97c11cede6fa89276c82639c0afc46fdfe3d9835c7e7e2dbd`**（2026-10-19 重建重锚，见下「两轮重锚记录」）；bootloader / partition-table / ota_data_initial 与 gen11 逐字节不变 |
 | 宿主测试适配 | `tools/ble_turner_host_test.py` 补 `push_sink_gatt_register` 桩（start_locked 被抽取编译，隐式声明触发 -Werror） |
-| flash.sh 防呆 | EXPECTED 同步 gen12 值 + 锚点注释块重写 + gen11 bin 归档 `Read_Pico.bin.gen11-6490999f`；双路径 dry run：锚对 → `sha256 OK` 放行至 esptool（exit 2，沙箱无串口）；篡改 → `FATAL … refusing to flash`（exit 1）✅ 拒烧 |
+| flash.sh 防呆 | EXPECTED 同步 `6e1d15c1`（含两轮重锚注释块）+ gen11 bin 归档 `Read_Pico.bin.gen11-6490999f`；双路径 dry run（本轮重跑）：锚对 → `sha256 OK` 放行至 esptool（stub python 收到 `0x0/0x8000/0x10000/0xb10000` 四偏移，exit 0）；篡改 2 字节 → `FATAL … refusing to flash`（exit 1）✅ 拒烧 |
 | 交付包 | `/workspace/read-pico-gen12.zip` **12 条目**（四 bin + flash.sh + NOTES + android-tools/ 五件），`unzip -t` 通过；包内 bin 与 production 逐字节一致；安卓四件套与 gen11 逐字节相同（协议未变） |
 
-**注释改动的哈希插曲（诚实记录）**：先编 gen12（`a4c975a1`）→ 后改注释 → 增量重建得
-`219e0529`。逐字节比对仅 **65 B** 差异（`0xB0–0xCF` app_desc 内嵌 ELF 哈希 +
-`0x3DC52F–0x3DC54F` 镜像尾校验和），系 DWARF 行表平移所致，非代码行为变化。
-处置：**以 `219e0529` 为最终锚**，重部署 bin / EXPECTED / dry run / zip——
-保证发出的 bin 与提交源码严格同源。
+**两轮重锚记录（诚实记录，2026-10-19 收官）**：gen12 先后重建两次，两次都只由
+**零行为变更**触发，哈希插曲的归因链完整留痕：
+
+- **第一轮**：先编 gen12（`a4c975a1`）→ 后改 push_sink.c 注释 → 增量重建得
+  `219e0529`。逐字节 diff 仅 65 B（`0xB0–0xCF` app_desc 内嵌 ELF 哈希 +
+  `0x3DC52F–0x3DC54F` 镜像尾校验和），系 DWARF 行表平移，非代码行为变化。
+- **第二轮（本轮协议审计）**：第二节实证修正重写 push_sink.c 5f11 注释
+  （「协议层已裁定 write-no-response」→ WWR 实证修正记录）后全链重建 →
+  `6e1d15c1`。新旧 bin 逐字节 diff 仅 **69 B**：app descriptor 内嵌构建时间戳串
+  （`0x71–0x77`，`05:26:54` → `08:31:46`）+ 尾部 5 B。**seg1 段头（0x232f88）与
+  seg1 数据逐字节相同**（python 直读两 bin 断言），故 paddr `0x00242f90`、
+  vaddr `0x3fc9c700`、len `0x08a8c、体积 4,048,208 B 全部不变。
+
+处置：**以 `6e1d15c1` 为最终锚**，重部署 bin / flash.sh EXPECTED（含重锚注释）/
+双路径 dry run / 交付 zip——保证发出的 bin 与提交源码严格同源。ESP-IDF 构建
+**非位级可复现**（镜像内嵌构建时间戳），此后任何重建必须重走「sha256 →
+production bin → EXPECTED → dry run → zip」全链，不得沿用旧哈希。
 
 ### 7.4 真机验收点（八项判读之前先看）
 
 1. Services 页显示服务 `e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10` + 三特征（5f11/5f12/5f13）——本条即 gen11 缺陷的修复判据。
 2. 扫描列表广播可见服务 UUID（连上前确认对面是推流服务）。
 3. boot 日志 seg1 paddr 对表 `00242f90`；`App version: 0.3.3-pico12`。
-4. 通过后再走第六节八项判读（判读项 2 以 EVT_READ 为前置、项 4 测 WNR 下 RESUME）。
+4. **推送全链成功（gen12 新增必验，第一优先级）**：用交付的 ReadPicoPush APK
+   （`tools/android/apk/ReadPicoPush.apk`）推一段文字 → 设备开书。安卓端写
+   5f11/5f12 vs 固件 WWR 属性的跨路径从未真机验证；失败第一嫌疑 = 写入类型/
+   属性不匹配（排查顺序：APK 是否默认 WWR → nRF Connect 手工写选「Write」
+   而非「Write without response」→ 设备侧属性位）。
+5. 通过后再走第六节八项判读（判读项 2 以 EVT_READ 为前置、项 4 口径为
+   「WWR + RESUME 双重防线」）。
+
+### 7.5 安卓推送通道定型：MacroDroid 不可用 → Termux 否决 → APK 交付（2026-10-19）
+
+> 背景：gen11 起规划用 MacroDroid 作零开发推送通道。本轮用户侧导入
+> `ReadPicoPush.macro` 失败（荣耀 / Android 16 / 无 Google Play，提示
+> 「导入失败，无法导入宏」），排查后通道选型彻底改写。
+
+**三条通道的实证结论**：
+
+| 通道 | 结论 | 根因（全部官方/源码实证） |
+|------|------|--------------------------|
+| MacroDroid `.macro` 导入 | **任何版本都导不进**，非兼容问题 | ① `.macro` 容器须 JSON 而非 XML（仓库内 `.macro` 为 XML 示意）；② MacroDroid **无原生 BLE GATT 写动作**；③ 其 JS 引擎（Rhino）无 `TextEncoder`，拼不出二进制帧 |
+| MacroDroid Java Code 动作（`ReadPicoPush.bsh` 后备方案） | **技术上跑得通但主动放弃** | BeanShell 解释器 + 仅 Java 1.4 语法 + 后台线程阻塞等蓝牙回调可行；沙箱 9 场景全过（含抓出 `byte[]` 赋 int 字面量抛 `ArrayStoreException` 的真机必炸坑）。但硬用脚本调底层 API 既难维护又不稳定，用户裁定不再投入 |
+| Termux + Python（`push_pico.py`） | **一票否决** | `push_pico.py` 真机推送依赖 `bleak`；bleak 走 BlueZ/dbus，而 **Android 用 Fluoride 栈，不暴露 BlueZ GATT 接口**，Termux 里装 bleak 也连不上。要用 Python 调 BLE 只能 pyjnius 桥接回同一套 Android Java API——把 Java 代码套层 Python 壳，更慢更脆 |
+| **原生 APK（选定）** | **已交付** | `tools/android/apk/`：单 Activity、纯框架 API、零第三方依赖；协议层 `PushProto.java` 与 `push_proto.h`/`push_pico.py` 逐字段对表，宿主机 **25/25 断言全过**（向量由 `test/gen-vectors.py` 从参考实现生成，不手抄字节） |
+
+**APK 交付形态**（`tools/android/apk/`，构建脚本 `build-apk.sh`，全手动链不依赖 Gradle）：
+
+- `javac --release 8`（对表 `platforms;android-34/android.jar`）→ **PushProto 宿主机对表测试** → `d8 --min-api 26` → `aapt package` → `aapt add classes.dex` → `zipalign` → `apksigner`（debug keystore 首次自动生成）。
+- 产物 `ReadPicoPush.apk`（25 KB，debug 签名可侧载；`aapt dump badging` 与 `apksigner verify` 通过，启动项 `dev.readpico.push.MainActivity`）。
+- minSdk 26 / targetSdk 34；Android 12+ 走 `BLUETOOTH_SCAN`（neverForLocation）+ `BLUETOOTH_CONNECT` 运行时权限，Android 8~11 走 `ACCESS_FINE_LOCATION`。
+- 推送流程与 Python/bsh 参考实现同构：扫 `PicoPush-XXXX`（12s）→ 连接（TRANSPORT_LE）→ MTU 247 → 发现服务 → 订阅 5f13（CCCD）→ BEGIN 写 5f12 → 等 READY → DATA×N 写 5f11（**WWR 逐包等回执**）→ END 写 5f12 → 等 DONE/ERR；空正文（单词卡）也发 seq=0 空包对齐有正文路径。
+- 界面：输入框（启动自动读剪贴板）+「读取剪贴板」+「发送到墨水屏」+ 日志区 + 单词卡模式开关；标题取首行 40 字符（协议层另有 63 字节硬截断 + 续字节剥离）。
+- 已知边界：沙箱无模拟器/无真机，BLE 状态机未经运行时验证——这正是第六节前置必验③存在的原因；协议字节层已 25/25 对表，风险集中在 Android GATT 回调接线（标准模式）。
+
+**四件套处置**：`push_pico.py` / `nrf-connect-manual.md` 的 WNR 措辞已按第二节实证
+修正清零；`ReadPicoPush.bsh` + `MacroDroid手动搭建教程.md` 保留在仓库作**调查留痕**
+（记录「为何不走 MacroDroid」），但**不再进交付 zip**、不再投入维护；
+`ReadPicoPush.macro` / `ReadPicoPush.tasker.xml` 头部已标注「不可导入，参考流程图」。
+用户手机（荣耀 / Android 16 / 无 Play）的安装路径：APK 直接侧载，允许未知来源即可。

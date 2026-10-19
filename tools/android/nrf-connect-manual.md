@@ -1,8 +1,9 @@
 # ReadPico 安卓 BLE 推流 · nRF Connect 手动验证手册
 
 > 适用对象：开发者/测试，想不写代码就验证固件 `push_sink` 是否正确收包、唤醒、开书。
-> 配套工具：`push_pico.py`（桌面自动推送 + 帧生成）、`ReadPicoPush.tasker.xml` / `ReadPicoPush.macro`（安卓自动化）。
+> 配套工具：`push_pico.py`（桌面自动推送 + 帧生成）、`ReadPicoPush.bsh` + `MacroDroid手动搭建教程.md`（安卓免电脑自动推送）、`ReadPicoPush.tasker.xml` / `ReadPicoPush.macro`（参考草图/流程图，macro 不可导入）。
 > 协议冻结：本手册的 UUID / opcode / 帧布局与 `components/push_sink/include/push_proto.h` 完全一致，单方面改动会破坏已发货固件。
+> 写入方式（实证修正记录，gen12）：5f11/5f12 固件特性均为 **WWR（Write With Response，写请求）**；源码实证固件从未出现 WNR 属性位，两种写固件都接收，但验收默认走 WWR（ATT 逐包回执）。旧文档"PUSH_DATA 是 write-no-response"的记录已撤销，最终协议方向待真机数据定案（见 `docs/M1-audit.md`）。
 
 ---
 
@@ -35,8 +36,8 @@
 
    ```
    服务 Service : e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10
-     ├─ 5f11  PUSH_DATA    (Write, Write Without Response)   ← 发正文分片
-     ├─ 5f12  PUSH_CTRL    (Write)                            ← 发 BEGIN/END/ABORT
+     ├─ 5f11  PUSH_DATA    (Write / WWR，写请求)              ← 发正文分片
+     ├─ 5f12  PUSH_CTRL    (Write / WWR，写请求)              ← 发 BEGIN/END/ABORT
      └─ 5f13  PUSH_STATUS  (Read, Notify)                    ← 收设备回执
    ```
 
@@ -83,6 +84,7 @@ END (写 5f12):
 | 4 | **5f12** PUSH_CTRL | 手机→设备 | `END` = `50430201` | `DONE` = `12` + total_len(4B LE) |
 
 - DATA 每包载荷上限 **241 字节**（MTU 247 时）。超出请拆成多包，seq 从 0 连续递增。
+- **写入方式选「Write（带响应/WWR）」**：nRF Connect 点特征的下写按钮后，写入类型选带响应的写（有的版本显示为 ↑↩ 或下拉可选 "Write without response"——**不要选**后者）。固件两种都收，但验收口径是 WWR：ATT 逐包回执是第一道防线，RESUME 回归是第二道。
 - 设备只在 `RECEIVING` 态接收 DATA；其余态写 DATA 会回 `ERR(0x13 0x02)` = `BAD_FRAME`。
 - 若 CRC32 不符，设备回 `ERR(0x13 0x04)` = `CHECKSUM`；此时可重发 `RESUME_QUERY`(`50430301`)，设备回 `RESUME`=`11`+received(4B)+next_seq(2B)，手机从该 offset 续传。
 
@@ -140,4 +142,5 @@ CRC32 = IEEE 反射式 0xEDB88320（与 `zlib.crc32` 同款）。
 
 - `push_pico.py --selftest`：离线对表 CRC/帧布局（不连蓝牙也能跑）。
 - `push_pico.py --text "..." --scan`：桌面真机一键推送（需 bleak）。
-- `ReadPicoPush.tasker.xml` / `ReadPicoPush.macro`：安卓「复制即推」自动化，帧字节由内嵌 JS（`push_frames.js` 同算法）现算，与本文档、与固件完全一致。
+- `ReadPicoPush.bsh` + `MacroDroid手动搭建教程.md`：安卓 MacroDroid「复制即推」全自动通道（Java Code 动作 / BeanShell，已完整测试：帧字节与本文档逐字节一致）。
+- `ReadPicoPush.tasker.xml` / `ReadPicoPush.macro`：参考草图/流程图（macro 文件不可导入 MacroDroid，原因见其头注；帧算法可移植）。

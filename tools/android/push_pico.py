@@ -96,7 +96,12 @@ PUSH_STATUS_MAX = 16
 
 # GATT 服务与特征（草案 3.1，写死）
 PUSH_SERVICE_UUID = "e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f10"
-PUSH_DATA_UUID = "e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f11"   # write-no-response
+# 实证修正记录（gen12）：固件 5f11/5f12 特性位一直是 F_WRITE（WWR，写请求），
+# F_WRITE_NO_RSP 从未在固件出现——"PUSH_DATA 是 write-no-response"的旧注释已撤销。
+# NimBLE 对 WWR/WNR 两种写一视同仁（都汇入 write_handle），但本客户端默认走
+# WWR（response=True）：ATT 逐包回执是第一道防线，设备侧 RESUME 是第二道。
+# 最终协议方向待真机数据定案（见 docs/M1-audit.md）。
+PUSH_DATA_UUID = "e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f11"   # WWR 属性；客户端 response=True
 PUSH_CTRL_UUID = "e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f12"   # write (response)
 PUSH_STATUS_UUID = "e2f5a1c0-9b7d-4e3f-8a61-3c9d2b7e5f13"  # read + notify
 
@@ -294,22 +299,23 @@ class PushClient:
             raise PushError(body_st[0])
         await self._ble.disconnect()
 
-    async def _stream(self, body: bytes):
+    async     def _stream(self, body: bytes):
         view = memoryview(body)
         off = 0
         seq = 0
+        # WWR 写（response=True）：与固件 5f11 特性属性一致，逐包 ATT 回执。
+        # 固件对 WNR 写也一视同仁，但默认走 WWR（实证修正记录见文件头常量区）。
         while off < len(body):
             piece = bytes(view[off:off + self.chunk])
             await self._ble.write_gatt_char(
-                PUSH_DATA_UUID, encode_data(seq, piece), response=False)
+                PUSH_DATA_UUID, encode_data(seq, piece), response=True)
             off += len(piece)
             seq += 1
-        # 空正文（单词卡/URL）也要发一包 seq=0 长度 0 吗？不需要——设备靠
-        # total_len==0 直接判定，END 后即校验；此处仅在 len>0 时写 DATA。
+        # 空正文（单词卡/URL）也发一包 seq=0 长度 0，对齐「有正文」路径的可测性
+        # （设备 seq 0 长度 0 合法；total_len==0 时设备本就靠 END 后校验）。
         if len(body) == 0:
-            # 仍写一包空 DATA 以对齐「有正文」路径的可测性（设备 seq 0 长度 0 合法）。
             await self._ble.write_gatt_char(
-                PUSH_DATA_UUID, encode_data(0, b""), response=False)
+                PUSH_DATA_UUID, encode_data(0, b""), response=True)
 
 
 # --------------------------------------------------------------------------
