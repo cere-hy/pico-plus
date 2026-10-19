@@ -1546,6 +1546,24 @@ static esp_err_t start_locked(void) {
     // CONFIG_BT_NIMBLE_NVS_PERSIST.
 
     bonds_load();
+    // 常驻注册推流 GATT 服务：必须排在 host 任务创建之前——NimBLE 的
+    // ble_hs_start()（host 启动路径，ble_hs.c）在 ble_hs_sync() 触发 sync 回调
+    // 之前就一次性调用 ble_gatts_start() 消费 add_svcs 的队列。排在 host 任务
+    // 之后（旧代码排在 sync 回调里）等于白排：add_svcs 返回 0，属性表里却没有
+    // 我们的服务，手机端表现为「能连上、Services 页空白」。失败不拦翻页器：
+    // push_sink 的 sync 兜底会再试，日志留证。
+    // Resident registration of the push GATT service: it must happen before the
+    // host task is created - NimBLE's ble_hs_start() (host start path,
+    // ble_hs.c) calls ble_gatts_start() once, before ble_hs_sync() fires the
+    // sync callback, and that is what consumes the add_svcs queue. Queueing
+    // after the host task (where the old code queued, inside the sync
+    // callback) queues in vain: add_svcs returns 0 yet the attribute table
+    // never holds our service - the phone-side symptom "connects fine,
+    // Services page blank". Failure does not block the page-turner: push_sink's
+    // sync fallback retries and the log keeps the evidence.
+    if (push_sink_gatt_register() != ESP_OK) {
+        ESP_LOGW(TAG, "push gatt register failed; sync fallback will retry");
+    }
     // 检查任务分配结果，失败时完整回收，避免假启动及停止死等。/ Check task allocation and unwind failures instead of claiming a running host.
     if (xTaskCreatePinnedToCore(host_task, "nimble_host", CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE,
                                NULL, configMAX_PRIORITIES - 4, &s_host_task,

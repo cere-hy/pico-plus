@@ -124,6 +124,12 @@ void ble_pt_disconnect(void){s_connected=false;}
 // stack up/down; the real behaviour is covered by run_push_sink_host_tests.sh
 // (runner 13) and the full-tree build.
 static void push_sink_on_stack_stop(void){}
+// 常驻注册的桩：gen12 起 start_locked 在 host 任务创建前调用它；本宿主里直接
+// 放行，真实行为由 run_push_sink_host_tests.sh（第 13 runner）与整机构建覆盖。
+// Stub for the resident registration: since gen12 start_locked calls it before
+// the host task is created; it passes here, with the real behaviour covered by
+// run_push_sink_host_tests.sh (runner 13) and the full-tree build.
+static esp_err_t push_sink_gatt_register(void){return ESP_OK;}
 static int s_ble_scroll,s_ble_learning;
 static char s_ble_feedback[64];
 void ble_pt_crumb(uint8_t id){(void)id;}

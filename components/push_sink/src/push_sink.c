@@ -153,7 +153,8 @@ static bool s_charger_held;           // 充电时常开：poll 看守拔电 / c
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t s_own_addr_type;
-static bool s_gatt_registered;
+static bool s_gatt_queued;              // 服务定义已排进 NimBLE 注册队列（本启动周期）
+                                         // the definitions are queued this start cycle
 static uint16_t s_data_handle, s_ctrl_handle, s_status_handle;
 static bool s_stack_up;                 // 栈是否在运行（钩子维护，替代对 ble_pt_running 的依赖）
                                          // whether the stack runs (kept by the hooks, no ble_page_turner dependency)
@@ -437,6 +438,14 @@ static void adv_start(void) {
     fields.name = (const uint8_t *)s_adv_name;
     fields.name_len = (uint8_t)strlen(s_adv_name);
     fields.name_is_complete = 1;
+    // 广播数据里带服务 UUID：nRF Connect 在扫描列表就能看到 e2f5a1c0…，
+    // 连上之前先确认对面就是推流服务（gen12 与常驻注册一并补上）。
+    // Advertise the service UUID: nRF Connect shows e2f5a1c0... in the scan
+    // list, confirming this is the push service even before connecting
+    // (gen12, alongside the resident registration).
+    fields.uuids128 = &s_svc_uuid;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
     if (ble_gap_adv_set_fields(&fields) != 0) {
         ESP_LOGW(TAG, "adv set fields failed");
         return;
@@ -468,6 +477,24 @@ static void adv_start(void) {
 
 /* ---- GATT 服务 / The GATT service ---- */
 
+// 注册时序（gen12 修复，源码实证）：NimBLE 的 ble_hs_start()（host/src/ble_hs.c）
+// 在 host 启动路径里**一次性**调用 ble_gatts_start()，然后才 ble_hs_sync() 触发
+// sync 回调；ble_gatts_start() 消费 ble_gatts_add_svcs() 排进的定义队列，末尾
+// 还把队列整个释放。所以定义必须在 host 任务启动**之前**排队（start_locked 里
+// nimble_port_init() 之后、xTaskCreatePinnedToCore 之前，见 push_sink_gatt_register
+// 的调用点）；排在 sync 回调里（旧代码的位置）等于排在一场已经散会的队列后面，
+// add_svcs 返回 0 也不会有任何属性进表——手机端正是「能连上、Services 页空白」。
+// Registration timing (gen12 fix, source-verified): NimBLE's ble_hs_start()
+// (host/src/ble_hs.c) calls ble_gatts_start() exactly once on the host start
+// path and only then ble_hs_sync() fires the sync callback; ble_gatts_start()
+// consumes the queue filled by ble_gatts_add_svcs() and frees it afterwards.
+// Definitions must therefore be queued BEFORE the host task starts (in
+// start_locked, between nimble_port_init() and xTaskCreatePinnedToCore - see the
+// push_sink_gatt_register call site). Queueing inside the sync callback (where
+// the old code did it) is queueing after the meeting has adjourned: add_svcs
+// returns 0 yet nothing enters the attribute table - exactly the phone-side
+// symptom "connects fine, Services page blank".
+
 static const struct ble_gatt_svc_def s_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -476,8 +503,22 @@ static const struct ble_gatt_svc_def s_svcs[] = {
             {
                 .uuid = &s_data_uuid.u,
                 .access_cb = push_access_cb,
-                .flags = BLE_GATT_CHR_F_WRITE, // Write-With-Response：ATT 层保序不丢
-                                                // Write-with-response: the ATT layer keeps order and loss
+                // 特性位保持 F_WRITE（WWR），但协议层已裁定 PUSH_DATA 走
+                // write-no-response（docs/M1-audit.md「协议变更记录」，gen11 生效）：
+                // NimBLE 的 ATT 服务端对两种写操作一视同仁——ble_att_svr.c 的
+                // ble_att_svr_rx_write_no_rsp 与 ble_att_svr_rx_write 都汇入
+                // write_handle → ha_cb（MYNEWT_VAL_BLE_ATT_SVR_WRITE_NO_RSP=1，
+                // 已实证），故手机端 WNR 写与 nRF 手动 WWR 写都能到达
+                // push_access_cb。位上的 WWR 只是发现时看到的属性，不是闸门。
+                // Keep F_WRITE here, but the wire protocol for PUSH_DATA is
+                // write-no-response (docs/M1-audit.md protocol-change record,
+                // effective gen11): NimBLE's ATT server treats both write ops
+                // alike - ble_att_svr_rx_write_no_rsp and ble_att_svr_rx_write
+                // both funnel into write_handle -> ha_cb (BLE_ATT_SVR_WRITE_NO_RSP
+                // = 1, source-verified), so the phone's WNR writes and nRF
+                // Connect's manual WWR writes both reach push_access_cb. The
+                // WWR bit is the discovered property, not a gate.
+                .flags = BLE_GATT_CHR_F_WRITE,
                 .val_handle = &s_data_handle,
             },
             {
@@ -498,17 +539,76 @@ static const struct ble_gatt_svc_def s_svcs[] = {
     {0},
 };
 
-static int register_gatt(void) {
-    if (s_gatt_registered) return 0;
-    const int rc = ble_gatts_add_svcs(s_svcs);
-    if (rc < 0) {
+// 把服务定义排进注册队列：先 count_cfg（累加上限，供 start 分配属性表池），
+// 再 add_svcs（仅排队，真正注册发生在 ble_gatts_start）。两步都查返回码。
+// Queue the definitions: count_cfg first (accumulates the limits the start
+// uses to size the attribute-table pools), then add_svcs (queueing only;
+// registration happens in ble_gatts_start). Both return codes are checked.
+static int queue_svcs(void) {
+    int rc = ble_gatts_count_cfg(s_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "count cfg rc=%d", rc);
+        return rc;
+    }
+    rc = ble_gatts_add_svcs(s_svcs);
+    if (rc != 0) {
         ESP_LOGE(TAG, "add svcs rc=%d", rc);
         return rc;
     }
-    s_gatt_registered = true;
-    ESP_LOGI(TAG, "gatt up: data=%u ctrl=%u status=%u",
-             (unsigned)s_data_handle, (unsigned)s_ctrl_handle, (unsigned)s_status_handle);
     return 0;
+}
+
+// 三个句柄是否都已就位（注册成功的实证；0 不是合法 ATT 句柄）。
+// Whether all three handles landed (the proof of registration; 0 is not a
+// legal ATT handle).
+static bool gatt_registered(void) {
+    return s_data_handle != 0 && s_ctrl_handle != 0 && s_status_handle != 0;
+}
+
+esp_err_t push_sink_gatt_register(void) {
+    ensure_init();
+    lock();
+    // 每个启动周期排一次：start_locked 的失败回退会走 nimble_port_deinit()
+    // 把队列清空（ble_gatts_stop -> ble_gatts_free_svc_defs），下一周期重排。
+    // Queue once per start cycle: start_locked's rollback runs
+    // nimble_port_deinit(), which empties the queue (ble_gatts_stop ->
+    // ble_gatts_free_svc_defs), so the next cycle queues afresh.
+    if (queue_svcs() != 0) {
+        unlock();
+        return ESP_FAIL;
+    }
+    s_gatt_queued = true;
+    unlock();
+    ESP_LOGI(TAG, "gatt queued (registered when the host starts)");
+    return ESP_OK;
+}
+
+// sync 回调里的兜底：host 自己的 ble_gatts_start() 跑完之后核对句柄，没注册上
+// 就显式补一次 start（源码路径上不该发生——AUTO_START 下 stage2 必定消费队列；
+// 真发生了说明排队失败或注册失败，日志会喊）。仅当队列里没有定义时才补排队。
+// Fallback in the sync callback: after the host's own ble_gatts_start() has
+// run, verify the handles and, if the service never landed, call
+// ble_gatts_start() explicitly. On the source-verified path this cannot
+// trigger (stage2 always consumes the queue under AUTO_START); if it does,
+// queueing or registration failed and the log says so. Re-queue only when the
+// definitions are not already queued.
+static void gatt_ensure_registered(void) {
+    if (gatt_registered()) return;
+    if (!s_gatt_queued) {
+        if (queue_svcs() == 0) s_gatt_queued = true;
+    }
+    const int rc = ble_gatts_start();
+    if (rc != 0) {
+        ESP_LOGE(TAG, "gatts start rc=%d", rc);
+        return;
+    }
+    if (gatt_registered()) {
+        ESP_LOGI(TAG, "gatt up (explicit start): data=%u ctrl=%u status=%u",
+                 (unsigned)s_data_handle, (unsigned)s_ctrl_handle, (unsigned)s_status_handle);
+    } else {
+        ESP_LOGE(TAG, "gatt still down after explicit start: data=%u ctrl=%u status=%u",
+                 (unsigned)s_data_handle, (unsigned)s_ctrl_handle, (unsigned)s_status_handle);
+    }
 }
 
 /* ---- 动作执行 / Action execution ---- */
@@ -924,10 +1024,12 @@ void push_sink_on_stack_sync(void) {
     lock();
     s_stack_up = true;
     (void)ble_hs_id_infer_auto(0, &s_own_addr_type);
-    if (register_gatt() != 0) {
-        unlock();
-        return;
-    }
+    // 常驻注册已把定义排在 host 启动之前，host 自己的 ble_gatts_start() 此时
+    // 应当已经消费；这里实证核对句柄，万一没注册上就显式补一次 start。
+    // The resident registration queued the definitions before the host
+    // started, so the host's own ble_gatts_start() should have consumed them
+    // by now; verify the handles and, failing that, start explicitly.
+    gatt_ensure_registered();
     if (s_pending_arm) {
         // 待武装续上：ARM（→ADV_ON→广播→ADV_UP→WINDOW）。
         // Complete a pending arm: ARM -> ADV_ON -> advertising -> ADV_UP -> WINDOW.
@@ -959,7 +1061,7 @@ void push_sink_on_stack_stop(void) {
     adv_stop();
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_status_subscribed = false;
-    s_gatt_registered = false;
+    s_gatt_queued = false;
     s_data_handle = s_ctrl_handle = s_status_handle = 0;
     // 状态机与 .part/NVS 都不动：栈回来后续传。/ Neither the machine nor the
     // partial/NVS session is touched: resume works after the stack returns.

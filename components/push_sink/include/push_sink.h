@@ -96,10 +96,26 @@ void push_sink_progress(uint32_t *received, uint32_t *total);
 
 /* ---- 栈钩子（ble_page_turner 调用）/ Stack hooks (called by ble_page_turner) ---- */
 
-/// 栈同步完成（on_sync 末尾调）：注册 GATT 服务，续上待武装或把中断的广播找回来。
-/// Stack sync done (called at the end of on_sync): register the GATT services,
-/// complete a pending arm and bring back an interrupted advertisement.
+/// 栈同步完成（on_sync 末尾调）：实证核对 GATT 注册结果（没注册上就显式补一次
+/// ble_gatts_start），续上待武装或把中断的广播找回来。
+/// Stack sync done (called at the end of on_sync): verify the GATT
+/// registration empirically (calling ble_gatts_start() explicitly if it never
+/// landed), complete a pending arm and bring back an interrupted advertisement.
 void push_sink_on_stack_sync(void);
+
+/// 常驻注册 GATT 服务：把服务定义排进 NimBLE 的注册队列。必须在
+/// nimble_port_init() 之后、host 任务创建之前调用——NimBLE 的 ble_hs_start()
+/// 在 host 启动时一次性调用 ble_gatts_start() 消费该队列，且发生在 sync 回调
+/// 之前；排在 sync 回调里的定义永远排不上（gen12 修复：手机端「能连上、
+/// Services 页空白」的根因）。失败不影响翻页器：日志留证，sync 里还会兜底。
+/// Register the GATT service residently: queue the definitions into NimBLE's
+/// registration queue. Must be called after nimble_port_init() and before the
+/// host task is created: NimBLE's ble_hs_start() calls ble_gatts_start()
+/// exactly once at host start, before the sync callback; definitions queued in
+/// the sync callback never make it (gen12 fix - the root cause of the phone
+/// symptom "connects fine, Services page blank"). Failure does not affect the
+/// page-turner: it is logged and the sync path retries as a fallback.
+esp_err_t push_sink_gatt_register(void);
 
 /// 栈即将拆除（stop_locked 开头调）：停广播、作废句柄。.part 与 NVS 会话保留，
 /// 供栈回来后续传。/ The stack is about to be torn down (called at the start of
