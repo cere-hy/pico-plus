@@ -13,15 +13,18 @@
 #include "dict_lookup.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 
 #define DICT_DIR "/sdcard/dict"
+#define TAG "dict"
 #define DICT_MAGIC "RPD1"
 #define DICT_HEADER_SIZE 64u
 #define DICT_REC_BYTES 6u
@@ -67,11 +70,24 @@ static bool read_at(uint32_t off, void* buf, size_t len) {
 }
 
 static bool try_open(const char* path) {
+    // gen17 诊断：把尝试的完整绝对路径与 errno 打出来。此前单词卡 ERR(9) 只能看到
+    // 「无词典」，无法区分「卡上没有文件」「路径错」还是「文件不是 RPD1」——
+    // 一律被折叠成一个 err=9，用户被误导去查卡。
+    // gen17 diagnostics: log the full absolute path attempted and the errno. Word
+    // cards previously reported only ERR(9) "no dictionary", which folded
+    // "no file on the card", "wrong path" and "not an RPD1 file" into one code
+    // and sent users to inspect their card for no reason.
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) {
+        ESP_LOGW(TAG, "open failed: %s errno=%d (%s)", path, errno, strerror(errno));
+        return false;
+    }
     char header[DICT_HEADER_SIZE];
     if (fread(header, 1, sizeof(header), f) != sizeof(header) ||
         memcmp(header, DICT_MAGIC, 4) != 0) {
+        ESP_LOGW(TAG, "not an RPD1 dictionary: %s (magic=%02x %02x %02x %02x)", path,
+                 (unsigned char)header[0], (unsigned char)header[1],
+                 (unsigned char)header[2], (unsigned char)header[3]);
         fclose(f);
         return false;
     }
@@ -176,6 +192,8 @@ static bool try_open(const char* path) {
     s_dict.sparse = sparse;
     s_dict.sparse_count = count;
     snprintf(s_dict.path, sizeof(s_dict.path), "%s", path);
+    ESP_LOGI(TAG, "opened: %s entries=%u block_log2=%u sparse=%u", s_dict.path,
+             (unsigned)entries, (unsigned)block_log2, (unsigned)count);
     return true;
 }
 
@@ -188,6 +206,10 @@ bool dict_open(void) {
     }
     DIR* dir = opendir(DICT_DIR);
     if (!dir) {
+        // gen17：目录打不开就报出绝对路径与 errno（区分「卡未挂载」「目录不存在」
+        // 「路径拼错」三种可能）。/ gen17: report the absolute path and errno so a
+        // missing mount, a missing directory and a mistyped path are distinguishable.
+        ESP_LOGW(TAG, "opendir failed: %s errno=%d (%s)", DICT_DIR, errno, strerror(errno));
         s_open_failed_ms = (uint32_t)(esp_timer_get_time() / 1000);
         return false;
     }

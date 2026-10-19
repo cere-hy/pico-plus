@@ -186,8 +186,30 @@ void app_main(void) {
     // The push sink: build the mutex and reload any partial session from NVS
     // (the .part reconciliation happens on arm). The dictionary probe lets word
     // cards be refused at the BEGIN pre-check (ERR(9)) instead of after a push.
+    //
+    // gen17 根因修复：探针**必须是 dict_warm，不能是 dict_ready**。
+    // `dict_ready()` 的语义是「词典句柄当前是否已经打开」（s_dict.file != NULL），
+    // **不是「卡上有没有词典文件」**。词典是惰加载的——只有查词/预热才会真正
+    // fopen。长按查词之所以正常，是因为 dict_popup 里写着
+    // `if (!dict_ready()) ready = dict_open();`，会自己打开；而推送的 BEGIN 前置
+    // 闸门只**读**这个状态、从不尝试打开，于是开机后一次词都没查过时，单词卡
+    // 必然误报 ERR(9)「无词典」——卡上明明有 /sdcard/dict/dict.bin。
+    // `dict_warm()` 才是正确语义：已打开则直接true，未打开则尝试 dict_open()，
+    // 且失败**不武装退避**（其注释即为「卡片可能还没就绪」的场景而写）。
+    // gen17 root-cause fix: the probe **must be dict_warm, not dict_ready**.
+    // `dict_ready()` means "is the dictionary handle currently open"
+    // (s_dict.file != NULL), **not** "does a dictionary exist on the card". The
+    // dictionary is loaded lazily - only a lookup or a warm-up actually opens it.
+    // Long-press lookup works because dict_popup does
+    // `if (!dict_ready()) ready = dict_open();`, i.e. it opens the file itself;
+    // the push BEGIN pre-check only **reads** that state and never tries to open,
+    // so a word card always misfired ERR(9) "no dictionary" right after boot -
+    // even though /sdcard/dict/dict.bin sat on the card the whole time.
+    // `dict_warm()` is the correct semantics: true if already open, otherwise try
+    // dict_open(), and a failure does **not** arm the back-off (its comment is
+    // written exactly for the "card may not be ready yet" case).
     push_sink_init();
-    push_sink_set_dict_probe(dict_ready);
+    push_sink_set_dict_probe(dict_warm);
     app_loop_run(&(app_loop_config_t){
         .hl = &hl,
         .fb = framebuffer,

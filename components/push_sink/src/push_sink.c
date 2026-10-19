@@ -1049,8 +1049,22 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         }
         const int err = begin_precheck(&b);
         if (err != PUSH_ERR_NONE) {
-            ESP_LOGW(TAG, "begin precheck err=%d type=%u token=%04x total=%u",
-                     err, (unsigned)b.type, (unsigned)b.token, (unsigned)b.total_len);
+            // gen17：err=9 的措辞必须诚实——它只说明「词典探针此刻判定不可用」，
+            // **不等于卡上没有 dict.bin**（gen16 就栽在这句上，把用户支去查卡）。
+            // 词典侧的 dict_open 会另行打印尝试的完整绝对路径与 errno，两边对着看。
+            // gen17: the err=9 wording must be honest - it only means "the
+            // dictionary probe says unavailable right now", **not** "there is no
+            // dict.bin on the card" (gen16 tripped on exactly that and sent the
+            // user to inspect their card). The dictionary side logs the full
+            // absolute path attempted plus errno separately; read the two together.
+            if (err == PUSH_ERR_NO_DICT) {
+                ESP_LOGW(TAG, "dict probe unavailable (NOT proof the card lacks a dict) "
+                              "type=%u token=%04x total=%u",
+                         (unsigned)b.type, (unsigned)b.token, (unsigned)b.total_len);
+            } else {
+                ESP_LOGW(TAG, "begin precheck err=%d type=%u token=%04x total=%u",
+                         err, (unsigned)b.type, (unsigned)b.token, (unsigned)b.total_len);
+            }
             reply_err(err);
             return;
         }
