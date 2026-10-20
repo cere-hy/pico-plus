@@ -1236,6 +1236,35 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     ui_nav_draw(fb, 2);
 }
 
+// gen19（真机 Bug2）：武装动作收敛成助手，进场（on_enter）与页内点击
+// （method_gesture）共用。gen18 只让 on_enter 消费 s_push_requested——用户已在
+// 本页内点「手机推送」时 on_enter 不会重跑，flag 挂死、按钮「每次都没反应」，
+// 只有退出重进才生效。页面已显示，武装当场执行。
+// gen19 (real-hw Bug2): the arming move lives in this helper, shared by entry
+// (on_enter) and the in-page tap (method_gesture). gen18 let only on_enter
+// consume s_push_requested - tapping "phone push" while already on this page
+// never re-ran on_enter, so the flag hung and the button did nothing until a
+// leave-and-reenter. The page is already showing: arm right now.
+static void push_arm_now(void) {
+    const esp_err_t err = push_sink_arm(0, PUSH_ENTRY_WINDOW_MS);
+    if (err == ESP_ERR_NOT_ALLOWED) {
+        snprintf(s_method_message, sizeof(s_method_message), "电量不足，无法开启接收");
+        return;
+    }
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        snprintf(s_method_message, sizeof(s_method_message), "接收开启失败（%d）", err);
+        return;
+    }
+    s_view = TRANSFER_PUSH;
+    // 新回合干净开局：单词卡收掉、陈事件清扫（离页补的 closed、上一回合
+    // 待武装失败补的 start_failed 等）、活区簿记对齐当前值。
+    // A clean slate for the new round: drop the word card, sweep stale events
+    // and align the live-region bookkeeping.
+    push_word_card_close();
+    push_drain_stale_events();
+    push_sync_live_bookkeeping();
+}
+
 static void on_enter(app_ctx_t* ctx) {
     (void)ctx;
     display_set_bulk_io(true);
@@ -1313,29 +1342,13 @@ static void on_enter(app_ctx_t* ctx) {
             (void)enter_networks();
         }
     } else if (s_push_requested) {
-        // 手机推送入口：直接武装。电量不足（组件层门槛）或被别的会话占住时
-        // 退回方法页并说明原因。/ The phone-push entry: arm outright. A low
-        // battery (the glue-side gate) or a busy session falls back to the
-        // method page with the reason shown.
+        // 手机推送入口：直接武装（push_arm_now）。电量不足（组件层门槛）或被
+        // 别的会话占住时退回方法页并说明原因。
+        // The phone-push entry: arm outright via push_arm_now. A low battery
+        // (the glue-side gate) or a busy session falls back to the method page
+        // with the reason shown.
         s_push_requested = false;
-        const esp_err_t err = push_sink_arm(0, PUSH_ENTRY_WINDOW_MS);
-        if (err == ESP_ERR_NOT_ALLOWED) {
-            snprintf(s_method_message, sizeof(s_method_message), "电量不足，无法开启接收");
-            return;
-        }
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-            snprintf(s_method_message, sizeof(s_method_message), "接收开启失败（%d）", err);
-            return;
-        }
-        s_view = TRANSFER_PUSH;
-        // 新回合干净开局：单词卡收掉、陈事件清扫（离页 cancel 补的 closed、
-        // 上一回合待武装失败补的 start_failed 等）、活区簿记对齐当前值。
-        // A clean slate for the new round: drop the word card, sweep stale
-        // events (the closed posted by leaving the page, the previous round's
-        // start_failed, and so on) and align the live-region bookkeeping.
-        push_word_card_close();
-        push_drain_stale_events();
-        push_sync_live_bookkeeping();
+        push_arm_now();
     } else if (push_sink_armed()) {
         // gen18（18-a 自动切回落点）：sink 正被后台保活——用户在读 push.txt，
         // 手机回连把用户从阅读器弹回本页。直接落武装视图接客，**不重新武装**
@@ -1397,22 +1410,19 @@ static void transfer_on_media_lost(app_ctx_t* ctx) {
 static void transfer_on_exit(app_ctx_t* ctx) {
     (void)ctx;
     s_usb_start_pending = false;
-    // 离页即收摊：武装中的推流随页面一起退，手机侧看到断连即知会话暂停。
-    // Leaving the page closes the arm: a push in progress leaves with the page,
-    // and the phone reads the disconnect as a paused session.
-    // gen18（18-a）例外：OPEN_BOOK(push.txt) 的交接离页不收摊——sink 转后台
-    // 属主继续保活，手机断开重连/宽限内再发都能直达（COOLDOWN→WINDOW/
-    // CONNECTED 既有转移，acceptance 判据「全程无 ERR(1)」）。用户手动退出
-    // 接收页照旧收摊。/ gen18 (18-a) exception: the OPEN_BOOK(push.txt)
-    // handoff exit keeps the arm under a background owner so a returning phone
-    // pushes straight through (existing COOLDOWN->WINDOW/CONNECTED moves; the
-    // acceptance criterion is "no ERR(1) throughout"). Manual exits close up.
-    const bool handed_off = s_push_handed_off;
+    // gen19（真机 Bug3）：离页一律不收摊。保活是产品语义——回到首页状态卡
+    // 继续显示「等待连接 · 剩 N 分钟」，会话由窗口到期自然收（≤30 分钟），
+    // 或系统级入口收（飞行模式/USB/关机/媒体丢失/拔电）。真机实证：推单词卡
+    // 后离页走了旧 cancel，状态卡直接「未开启」，与长文开书路径行为分裂。
+    // gen19 (real-hw Bug3): leaving the page never tears the session down.
+    // Keep-alive is the product semantics - the home status card keeps showing
+    // "waiting - N min left"; the window expiry closes it naturally (<=30 min)
+    // and system-level entries (flight mode / USB / shutdown / media lost /
+    // unplug) close it explicitly. Real-hw proof: the word-card exit hit the
+    // old cancel and the card flipped to "off", diverging from the long-text
+    // handoff path.
     s_push_handed_off = false;
     if (s_view == TRANSFER_PUSH) push_word_card_close();
-    if (!handed_off && (push_sink_armed() || push_sink_state() != PUSH_STATE_IDLE)) {
-        push_sink_cancel();
-    }
     if (usb_storage_active()) {
         esp_err_t err = usb_storage_stop();
         if (err == ESP_OK) s_any_changed = true;
@@ -1587,10 +1597,13 @@ static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
             if (start_hotspot_service()) return APP_REDRAW_PAGE;
             snprintf(s_method_message, sizeof(s_method_message), "传输正在结束，请稍后再试");
         } else if (origin == 2) {
-            // 手机推送：只置标志，武装动作交给 on_enter——页面没真正显示之前
-            // 不碰射频。/ Phone push: only the flag is set; on_enter does the
-            // arming, so nothing touches the radio before the page shows.
-            app_transfer_request_push();
+            // 手机推送：gen19（真机 Bug2）改为当场武装（push_arm_now）。
+            // gen18 只置 flag 等 on_enter 消费——用户已在页内，on_enter 不会
+            // 重跑，flag 挂死按钮无反应。/ Phone push: gen19 (real-hw Bug2)
+            // arms right now via push_arm_now; gen18's flag-for-on_enter hung
+            // forever because on_enter never re-runs while the page is open.
+            s_push_requested = false;
+            push_arm_now();
         }
         return APP_REDRAW_PAGE;
     }
@@ -1612,7 +1625,10 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
             // 武装页先收摊再切走：BLE 栈该跟着翻页器设置走，不该为看不见的
             // 推流续着。/ Leave the arm before navigating away: the BLE stack
             // follows the page-turner setting, not a push no longer on screen.
-            if (s_view == TRANSFER_PUSH) { push_word_card_close(); push_sink_cancel(); }
+            // gen19（Bug3）：切页不再收摊，保活语义统一（见 transfer_on_exit）。
+            // gen19 (Bug3): navigation no longer cancels; keep-alive semantics
+            // are unified (see transfer_on_exit).
+            if (s_view == TRANSFER_PUSH) push_word_card_close();
             s_pressed = -1;
             ui_nav_request(ctx, tab);
             return APP_REDRAW_NONE;
@@ -1621,7 +1637,10 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
     if (ev->type == UI_GESTURE_TAP && ev->y0 < 160 && ev->x0 < 120) {
         if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, false);
         if (s_view == TRANSFER_PASSWORD) { clear_password(); s_view = TRANSFER_NETWORKS; return APP_REDRAW_PAGE; }
-        if (s_view == TRANSFER_PUSH) { push_word_card_close(); push_sink_cancel(); s_view = TRANSFER_METHODS; return APP_REDRAW_PAGE; }
+        // gen19（Bug3）：接收页返回不再收摊（保活语义统一）；词卡收掉即可。
+        // gen19 (Bug3): back from the push view no longer cancels (unified
+        // keep-alive semantics); just drop the word card.
+        if (s_view == TRANSFER_PUSH) { push_word_card_close(); s_view = TRANSFER_METHODS; return APP_REDRAW_PAGE; }
         if (s_view == TRANSFER_NETWORKS) {
             if (s_wifi_settings_only) { ctx->request_return = true; return APP_REDRAW_NONE; }
             if (s_direct_entry) { ctx->request_return = true; return APP_REDRAW_NONE; }

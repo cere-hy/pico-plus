@@ -141,10 +141,10 @@ static bool continue_card_pressed(void) { return s_press_pending && s_pressed.he
 // fact, not the arming intent; a tap only jumps to the transfer page and never
 // silently arms (ruling 3). The card band sits between the continue-reading
 // card and the moon clock; the old separator moves down to make room.
-#define PUSH_CARD_RECT ((EpdRect){36,570,612,54})
-#define PUSH_CARD_HIT  ((EpdRect){24,562,636,70})
+#define PUSH_CARD_RECT ((EpdRect){36,566,612,64})
+#define PUSH_CARD_HIT  ((EpdRect){24,558,636,82})
 static EpdRect push_card_rect(void) { return PUSH_CARD_RECT; }
-static bool push_card_pressed(void) { return s_press_pending && s_pressed.height == 54; }
+static bool push_card_pressed(void) { return s_press_pending && s_pressed.height == 64; }
 static EpdRect control_feedback_area(EpdRect control) {
     return control.height == 378 ? (EpdRect){56,270,184,252} : control;
 }
@@ -445,15 +445,22 @@ static void draw_push_card(uint8_t *fb) {
     home_frame(fb, PUSH_CARD_RECT, 20);
     char state_text[48], sub_text[160];
     push_card_text(state_text, sizeof(state_text), sub_text, sizeof(sub_text));
-    label_on(fb, 60, 594, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
-    label_on(fb, 624, 594, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
+    // gen19（真机 Bug1）：卡高 54→64。原第二行 y=618、20px 字到 638，超出卡底
+    // 624——下半截白字画到白底上直接「蒸发」（截图症状）。新几何 566..630：
+    // 首行 576..598、副行 602..622，上下留白 10/8。
+    // gen19 (real-hw Bug1): card height 54->64. The old sub row at y=618 with a
+    // 20px font reached 638, past the 624 card bottom - the lower half of the
+    // white glyphs landed on the white background and vanished. New geometry
+    // 566..630: row 1 at 576..598, sub row at 602..622, margins 10/8.
+    label_on(fb, 60, 576, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
+    label_on(fb, 624, 576, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
     char name_line[64];
     const char *adv = push_sink_adv_name();
     if (live && adv && adv[0]) snprintf(name_line, sizeof(name_line), "%s", adv);
     else snprintf(name_line, sizeof(name_line), "点按去接收");
     fit(name_line, 20, 200);
-    label_on(fb, 60, 618, 20, sub_text, EPD_DRAW_ALIGN_LEFT, ink_dim, fill);
-    label_on(fb, 624, 618, 20, name_line, EPD_DRAW_ALIGN_RIGHT, ink_dim, fill);
+    label_on(fb, 60, 602, 20, sub_text, EPD_DRAW_ALIGN_LEFT, ink_dim, fill);
+    label_on(fb, 624, 602, 20, name_line, EPD_DRAW_ALIGN_RIGHT, ink_dim, fill);
 }
 static bool push_card_due(app_ctx_t *ctx) {
     // 250ms 节流：倒计时按分钟粒度、进度按 ~2Hz，都比这个慢；墨水屏不陪空转。
@@ -913,7 +920,32 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
     // 250ms 节流 + 快照比对，不变不刷。/ The gen18 status-card poll comes first:
     // a state change is a functional fact and outranks cosmetic clock refresh;
     // 250ms throttle plus snapshot diff - no change, no repaint.
-    if(s_view==HOME_ROOT&&push_card_due(ctx)){s_area=push_card_rect();return APP_REDRAW_AREA;}
+    // gen19（真机 Bug2）：手势进行中不刷状态卡。press 与 tap 之间一次 AREA 重绘
+    // 会取消未松手的手势（method_gesture 处同款教训）——武装期 250ms 轮询恰好
+    // 插进这个窗口，首页卡片点击概率性失效。触笔按着时同样让路。
+    // gen19 (real-hw Bug2): no status-card repaint while a gesture is live. An
+    // AREA repaint between press and tap cancels the un-released gesture (same
+    // lesson as method_gesture) - the armed 250ms poll lands exactly in that
+    // window, so home-card taps failed probabilistically. Also yield while the
+    // stylus is down.
+    if(s_view==HOME_ROOT&&!s_press_pending&&!(ctx->touch&&ctx->touch->touched)){
+        // gen19（真机 Bug5）：每次 COMMIT 成功后，把最新推送标题写回缓存并强制
+        // 刷新首页状态卡的「最近推送」——否则连续推送时这行文字卡在首推旧值。
+        // 单词卡不写 push.txt，push_sink 不会发此事件，故「最近」不会被孤词覆盖。
+        // gen19 (real-hw Bug5): after each COMMIT, write the newest push title
+        // back into the cache and force a home status-card repaint of "last
+        // push" - otherwise a continuous push freezes that line on the first
+        // push's old value. Word cards raise no such event, so a bare word never
+        // clobbers it.
+        char ctitle[PUSH_TITLE_MAX];
+        uint8_t ctype = 0;
+        if (push_sink_take_committed(ctitle, sizeof(ctitle), &ctype)) {
+            (void)book_title_set(PUSH_TEXT_PATH, ctitle);
+            s_area = push_card_rect();
+            return APP_REDRAW_AREA;
+        }
+        if (push_card_due(ctx)) { s_area = push_card_rect(); return APP_REDRAW_AREA; }
+    }
     if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
     if(s_view==HOME_COMPONENT&&s_component_pending)return APP_REDRAW_AREA;
     bool folder_preview=s_view==HOME_COMPONENT&&s_component_browse==APP_HOME_FOLDER;

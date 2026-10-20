@@ -6583,14 +6583,18 @@ static void book_on_exit(app_ctx_t* ctx) {
     // rather than on open: "finished reading" is only knowable at exit, and no
     // existing reader path is touched.
     if (s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0) push_sink_notify_read();
-    // gen18（18-a 收摊点）：离开手机推来的虚拟书 = 后台保活到此为止。
-    // 自动切回的交接离页除外——那时传书页正接手会话（s_push_handoff）。
-    // gen18 (18-a teardown point): leaving the phone-pushed virtual book ends
-    // the background keep-alive. The auto-switch-back handoff exit is exempt -
-    // the transfer page is taking the session over (s_push_handoff).
+    // gen19（真机 Bug3）：离开 push.txt 不再收摊——包括单词卡/空数据回合。
+    // 真机实证：单词卡在 book app 渲染，退出走了旧 cancel（`armed canceled by
+    // 退出阅读器，接收结束`），回首页状态卡直接「未开启」，与长文交接路径
+    // 行为分裂。保活语义统一：窗口到期/系统级入口收摊，离页不收。
+    // gen19 (real-hw Bug3): leaving push.txt no longer tears the session down -
+    // including word-card/empty-payload rounds. Real-hw proof: the word card
+    // renders inside the book app, so its exit hit the old cancel ("armed
+    // canceled by reader exit") and the home card flipped to "off", diverging
+    // from the long-text handoff path. Unified semantics: the window expiry
+    // and system-level entries close up; leaving a page never does.
     if (s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0) {
-        if (s_push_handoff) s_push_handoff = false; // 交接：摊子不收，传书页续命
-        else push_sink_cancel_why("退出阅读器，接收结束");
+        s_push_handoff = false; // 交接标记照旧清位，防旧标记过夜 / clear the stale handoff flag as before
     }
     // 离开阅读即退出全工程唯一的横屏语境：物理旋转若停在 LANDSCAPE，后续任何
     // 页面（Home/菜单/其他 app）都按竖屏绘制——真机实证长按退出后 Home 竖屏

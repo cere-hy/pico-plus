@@ -23,6 +23,7 @@
 #include "read_pico_board.h"
 #include "ota_online.h"
 #include "continuous_du.h"
+#include "push_sink.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -451,9 +452,36 @@ static enum EpdDrawError hl_update(
     return protected_area && result != EPD_DRAW_SUCCESS ? main_recover(hl, result) : result;
 }
 
+// gen19（真机 Bug4）：推送会话活跃（手机连着收数）时，BLE notify 突发与整屏
+// 扫描争用 PSRAM/总线带宽，18 MHz 供数断流——epdiy line buffer underrun →
+// 回落 12 MHz 重扫，一次刷新付两遍钱，且真机实证欠载后粘滞安全档拖慢后续
+// 全部翻页。策略：每次刷新入口按会话状态选档——会话活跃直接走安全档（省掉
+// 「先失败再回落」），会话结束恢复默认档。欠载兜底的粘滞语义保留：真欠载过
+// （s_pclk_sticky）的设备维持安全档直到重启，与 gen10 裁定一致。
+// gen19 (real-hw Bug4): while a push session is live, BLE notify bursts
+// contend with the scan for PSRAM/bus bandwidth and the 18 MHz line supply
+// starves - the epdiy underrun costs a failed attempt plus a 12 MHz rescan
+// (double latency) and, as real-hw proved, leaves the clock sticky-slow for
+// every later page turn. Policy: pick the clock by session state at each
+// refresh entry - active sessions go straight to the safe clock (no failed
+// attempt), idle restores the default. The underrun fallback keeps its sticky
+// semantics: a device that truly starved (s_pclk_sticky) stays safe until
+// reboot, per the gen10 ruling.
+static bool s_pclk_sticky;
+static void pclk_policy_refresh(void) {
+    const push_state_t st = push_sink_state();
+    const bool active = (st == PUSH_STATE_CONNECTED || st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING);
+    const int want = (active || s_pclk_sticky) ? DISPLAY_PCLK_SAFE_MHZ : DISPLAY_PCLK_DEFAULT_MHZ;
+    if (s_pclk_mhz == want) return;
+    s_pclk_mhz = want;
+    read_pico_epd_set_pclk(want);
+    ESP_LOGI(TAG, "pclk -> %d MHz (push session %s)", want, active ? "active" : "idle");
+}
+
 static enum EpdDrawError update_display_mode_unlocked(
     EpdiyHighlevelState* hl, enum EpdDrawMode mode
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     enum EpdDrawError result = hl_update(hl, &E0470_WAVEFORM, mode, false, NULL, false);
     rails_keepalive();
@@ -463,6 +491,7 @@ static enum EpdDrawError update_display_mode_unlocked(
 static enum EpdDrawError update_display_mode_diff_unlocked(
     EpdiyHighlevelState* hl, enum EpdDrawMode mode
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     enum EpdDrawError result = hl_update(hl, &E0470_WAVEFORM, mode, false, NULL, true);
     rails_keepalive();
@@ -470,6 +499,7 @@ static enum EpdDrawError update_display_mode_diff_unlocked(
 }
 
 static enum EpdDrawError update_display_fast_page_unlocked(EpdiyHighlevelState* hl) {
+    pclk_policy_refresh();
     enum EpdDrawError navigation;
     if (main_begin(hl, &navigation)) return navigation;
     enum EpdDrawError intercepted;
@@ -504,6 +534,7 @@ static enum EpdDrawError update_display_fast_page_unlocked(EpdiyHighlevelState* 
 static enum EpdDrawError update_display_from_white_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 ) {
+    pclk_policy_refresh();
     enum EpdDrawError intercepted;
     if (main_before_update(hl, &intercepted)) return intercepted;
     use_scan_for(waveform, mode);
@@ -539,6 +570,7 @@ bool display_take_white_exit(void) {
 }
 
 static enum EpdDrawError update_display_full_unlocked(EpdiyHighlevelState* hl) {
+    pclk_policy_refresh();
     s_full_refresh_requested = false;
     display_main_transition_cancel();
     epd_hl_waveform(hl, &E0470_WAVEFORM);
@@ -573,6 +605,7 @@ static enum EpdDrawError update_display_image_gray_unlocked(EpdiyHighlevelState*
 static enum EpdDrawError update_display_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, false, NULL, false);
@@ -585,6 +618,7 @@ static enum EpdDrawError update_display_area_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, false, &area, false);
@@ -597,6 +631,7 @@ static enum EpdDrawError update_display_area_diff_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, false, &area, true);
@@ -609,6 +644,7 @@ static enum EpdDrawError update_display_area_full_with_unlocked(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
 ) {
+    pclk_policy_refresh();
     epd_poweron();
     epd_hl_waveform(hl, waveform);
     enum EpdDrawError result = hl_update(hl, waveform, mode, true, &area, false);
@@ -638,6 +674,7 @@ static enum EpdDrawError update_display_water_turn_unlocked(EpdiyHighlevelState*
     // An interrupted scan may leave intermediate pixels. Rebuild the whole baseline from white.
     if (result & EPD_DRAW_EMPTY_LINE_QUEUE) {
         s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
+        s_pclk_sticky = true; // gen19：真欠载 → 安全档粘滞到重启（gen10 语义）
         read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
     }
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
@@ -658,6 +695,7 @@ static void guard_draw_result_unlocked(EpdiyHighlevelState* hl, enum EpdDrawErro
     if (!(result & EPD_DRAW_EMPTY_LINE_QUEUE)) return;
     display_main_transition_cancel();
     s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
+    s_pclk_sticky = true; // gen19：真欠载 → 安全档粘滞到重启（gen10 语义）
     read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
     use_scan_for(&E0470_WAVEFORM, MODE_GC16);
     epd_poweron();
