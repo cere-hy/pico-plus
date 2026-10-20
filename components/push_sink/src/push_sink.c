@@ -206,6 +206,9 @@ static struct {
     int err;
     bool closed;
     bool start_failed;
+    bool committed; // gen19（Bug5）：一次正文已落盘，待首页消费以刷新“最近推送” / a body committed, pending home consumption to refresh "last push"
+    char committed_title[PUSH_TITLE_MAX];
+    uint8_t committed_type;
 } s_ui;
 
 static bool (*s_dict_probe)(void); // 词典可用性探针 / the dictionary-availability probe
@@ -788,6 +791,18 @@ static void ui_post_start_failed(void) {
     portEXIT_CRITICAL(&s_ui_lock);
 }
 
+// gen19（Bug5）：正文落盘完成的一 Shot 投递。单词卡不写 push.txt，不触发——
+// 它的“最近”不该被一个孤词覆盖。/ Post the one-shot after a body lands. Word
+// cards write no push.txt, so they are skipped - a bare word must not clobber
+// the "last push" line.
+static void ui_post_committed(const char *title, uint8_t type) {
+    portENTER_CRITICAL(&s_ui_lock);
+    s_ui.committed = true;
+    snprintf(s_ui.committed_title, sizeof(s_ui.committed_title), "%s", title ? title : "");
+    s_ui.committed_type = type;
+    portEXIT_CRITICAL(&s_ui_lock);
+}
+
 // VERIFY：回读 .part 分段算 CRC，与 BEGIN 的 crc32/length 对账后喂 VERIFY 事件。
 // VERIFY: read the partial back in chunks, reconcile against the BEGIN crc32 and
 // length, then feed the VERIFY event.
@@ -988,6 +1003,7 @@ static void exec_actions(uint32_t act) {
         // still popped the OLD push.txt (gen15 on hardware: "it always opens the
         // first push's content"). No commit = nothing landed = nothing to open.
         if (!do_commit()) act &= ~(uint32_t)(PUSH_ACT_OPEN_BOOK | PUSH_ACT_WORD_CARD);
+        else if (s_sess.begin.type != PUSH_TYPE_WORD) ui_post_committed(s_sess.begin.title, s_sess.begin.type);
     }
     if (act & PUSH_ACT_ERR) {
         // gen14 诊断：session 层拒绝（token/type/total_len/跳号/校验）留痕。
@@ -1574,6 +1590,20 @@ bool push_sink_take_open(char *title, size_t cap, uint8_t *type) {
         s_ui.open = false;
         if (title && cap) snprintf(title, cap, "%s", s_ui.title);
         if (type) *type = s_ui.type;
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    return got;
+}
+
+bool push_sink_take_committed(char *title, size_t cap, uint8_t *type) {
+    ensure_init();
+    bool got = false;
+    portENTER_CRITICAL(&s_ui_lock);
+    if (s_ui.committed) {
+        got = true;
+        s_ui.committed = false;
+        if (title && cap) snprintf(title, cap, "%s", s_ui.committed_title);
+        if (type) *type = s_ui.committed_type;
     }
     portEXIT_CRITICAL(&s_ui_lock);
     return got;

@@ -155,6 +155,17 @@ void push_sink_poll(void);
 /// open-book request (title and type come with it).
 bool push_sink_take_open(char *title, size_t cap, uint8_t *type);
 
+/// 正文已成功落盘（COMMIT 完成）的一次性事件。首页状态卡据此把“最近推送”
+/// 标题同步成最新内容并触发局部重绘——否则连续推送时该文字会卡在首推旧值。
+/// 标题取自本次 BEGIN 的 title，type 为 PUSH_TYPE_*；单词卡（PUSH_TYPE_WORD）
+/// 不写 push.txt，不会触发此事件。
+/// One-shot raised when a body has just committed. The home status card uses
+/// it to sync the "last push" title to the newest content and repaint - without
+/// it a continuous push would freeze the line on the first push's old title.
+/// The title comes from this push's BEGIN and type is PUSH_TYPE_*; word cards
+/// (PUSH_TYPE_WORD) write no push.txt and never raise this event.
+bool push_sink_take_committed(char *title, size_t cap, uint8_t *type);
+
 /// 单词卡推送成功：取走单词（title 即单词）。/ Word-card push: take the word
 /// (the title is the word).
 bool push_sink_take_word_card(char *word, size_t cap);
