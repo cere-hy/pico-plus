@@ -272,9 +272,16 @@ public class MainActivity extends Activity {
         // the shortcut uses a translucent no-display theme so only a Toast shows.
         sShortcutMode = ACTION_PUSH_CLIPBOARD.equals(getIntent().getAction());
         if (sShortcutMode) {
-            // Theme_NoDisplay：完全不显示窗口（android-34 已无 Translucent_NoDisplay）。
-            // Theme_NoDisplay: no window at all (android-34 dropped Translucent_NoDisplay).
-            setTheme(android.R.style.Theme_NoDisplay);
+            // 对话框主题：快捷方式必须弹出一个**可见的小窗口**才行。
+            // 真机实测（荣耀 / Android 16）：无界面的透明 Activity 会被系统判为后台，
+            // 读剪贴板被隐私权限拦截（弹「允许读取剪贴板」后选「仅使用期间允许」仍无效）。
+            // 所以改为可见对话框 + 用户在窗口里点「发送」——有前台交互，系统放行。
+            // Dialog theme: the shortcut MUST show a visible small window. On real
+            // hardware (Honor / Android 16) a faceless translucent activity is treated
+            // as background and clipboard reads get blocked by the privacy guard (even
+            // after granting "only while in use"). A visible dialog plus an explicit tap
+            // on 发送 is foreground interaction, which the system allows.
+            setTheme(android.R.style.Theme_DeviceDefault_Dialog_MinWidth);
         }
         super.onCreate(savedInstanceState);
         if (sShortcutMode) {
@@ -397,26 +404,88 @@ public class MainActivity extends Activity {
             finish();
             return;
         }
-        String clip = readClipboardText();
-        if (clip == null || clip.trim().isEmpty()) {
-            toast("剪贴板是空的，先复制要推送的文字");
-            finish();
-            return;
+        showShortcutDialog();
+    }
+
+    // 极简确认弹窗：显示读到的字数预览，用户点「发送」才真正推送。
+    // **关键**：剪贴板在用户点「发送」的那一刻再读一次——那是明确的用户手势，
+    // 系统一定放行（弹窗打开时先读一次只是为了给预览，读不到也不阻塞）。
+    // Minimal confirm dialog: show a preview and push only after the user taps 发送.
+    // Key point: the clipboard is read AGAIN inside the tap handler - an explicit user
+    // gesture the system always allows. The read at dialog-open time is only for the
+    // preview and failing it must not block.
+    private void showShortcutDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(20);
+        box.setPadding(pad, pad, pad, pad);
+
+        TextView title = new TextView(this);
+        title.setText("一键推流");
+        title.setTextSize(18);
+        title.setPadding(0, 0, 0, dp(10));
+        box.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView info = new TextView(this);
+        info.setTextSize(14);
+        info.setPadding(0, 0, 0, dp(14));
+        String preview = readClipboardText();
+        if (preview == null || preview.trim().isEmpty()) {
+            info.setText("剪贴板暂时读不到内容。\n点「发送」时会在你的点击下重新读取。");
+        } else {
+            String head = preview.length() > 40 ? preview.substring(0, 40) + "…" : preview;
+            info.setText("已读取剪贴板（" + preview.length() + " 个字符）\n\n" + head);
         }
-        final String text = clip;
-        toast("正在推送到墨水屏……");
-        new Thread(new Runnable() {
+        box.addView(info, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        Button send = new Button(this);
+        send.setText("发送");
+        send.setOnClickListener(new View.OnClickListener() {
             @Override
-            public void run() {
-                try {
-                    doPush(text, false);
-                    toast("推送完成");
-                } catch (Throwable t) {
-                    toast("推送失败：" + t.getMessage());
+            public void onClick(View v) {
+                String text = readClipboardText();   // 用户手势内读取 / read inside the gesture
+                if (text == null || text.trim().isEmpty()) {
+                    toast("剪贴板是空的，先复制要推送的文字");
+                    return;
                 }
+                final String body = text;
+                toast("正在推送到墨水屏……");
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            doPush(body, false);
+                            toast("推送完成");
+                        } catch (Throwable t) {
+                            toast("推送失败：" + t.getMessage());
+                        }
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                finish();   // finish 必须回 UI 线程 / finish on the UI thread
+                            }
+                        });
+                    }
+                }).start();
+            }
+        });
+        box.addView(send, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        Button cancel = new Button(this);
+        cancel.setText("取消");
+        cancel.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
                 finish();
             }
-        }).start();
+        });
+        box.addView(cancel, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        setContentView(box);
     }
 
     // 直接读剪贴板文本（不写入 input 控件，快捷模式没有界面）。
