@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import struct
 import sys
+import time
 import zlib
 
 # --------------------------------------------------------------------------
@@ -59,6 +60,10 @@ PUSH_TOTAL_MAX = 512 * 1024 # 正文硬上限；超了 ERR(3)
 # CTRL 操作码
 PUSH_OP_BEGIN = 0x01
 PUSH_OP_END = 0x02
+# gen22：校时操作码（4 字节头 + UTC 秒 u32 LE）。BEGIN 帧冻结，故走独立 opcode。
+# gen22: time-sync opcode (4-byte header + UTC seconds u32 LE). BEGIN is frozen,
+# hence a separate opcode.
+PUSH_OP_SET_TIME = 0x05
 PUSH_OP_RESUME_QUERY = 0x03
 PUSH_OP_ABORT = 0x04
 
@@ -164,6 +169,20 @@ def encode_begin(total_len: int, crc: int, session_id: int, token: int,
 def encode_ctrl(op: int) -> bytes:
     """END/RESUME_QUERY/ABORT：仅 4 字节公共头。/ END/RESUME_QUERY/ABORT: 4-byte header."""
     return bytes([PUSH_MAGIC0, PUSH_MAGIC1, op & 0xFF, PUSH_VERSION])
+
+
+def encode_set_time(unix_seconds: int) -> bytes:
+    """gen22：SET_TIME 帧 = 4 字节头 + UTC 秒 u32 LE（共 8 字节）。
+
+    与固件侧 push_sink.c 一致：UTC 须落在 1704067200..4102444799（2024-01-01~
+    2100-01-01），否则设备回 ERR(2) 且不动时钟。/ Mirrors push_sink.c: the device
+    rejects anything outside 1704067200..4102444799 with ERR(2) and leaves the clock
+    alone.
+    """
+    if not (1704067200 <= unix_seconds <= 4102444799):
+        raise ValueError("unix_seconds out of the range the firmware accepts")
+    return bytes([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_SET_TIME, PUSH_VERSION]) + \
+        struct.pack("<I", unix_seconds & 0xFFFFFFFF)
 
 
 def encode_data(seq: int, payload: bytes) -> bytes:
@@ -275,6 +294,19 @@ class PushClient:
             if remaining <= 0:
                 raise RuntimeError("等待设备 STATUS 超时")
             await asyncio.sleep(0.02)
+
+    async def set_time(self, unix_seconds: int = 0):
+        """gen22：连接后下发 UTC 校准设备时钟（不需要武装，设备侧也校验范围）。
+
+        gen22: after connecting, push UTC to set the device clock (no arm needed; the
+        device validates the range too).
+        """
+        await self._connect()
+        stamp = int(unix_seconds) if unix_seconds else int(time.time())
+        await self._ble.write_gatt_char(PUSH_CTRL_UUID, encode_set_time(stamp),
+                                        response=True)
+        print(f"# SET_TIME 已发送 / sent: {stamp}")
+        await self._ble.disconnect()
 
     async def send_text(self, text: str, title: str = "", ptype: int = PUSH_TYPE_TEXT,
                         token: int = 0):
@@ -408,6 +440,8 @@ def _main(argv=None) -> int:
                     help="正文类型 0=text 1=markdown 2=html 3=url 4=word")
     ap.add_argument("--word", help="单词卡：单词本身（type 强制为 4）")
     ap.add_argument("--url", help="URL 推送（type 强制为 3，M1.5 起设备端抓取）")
+    ap.add_argument("--set-time", nargs="?", const=0, type=int, default=None,
+                    help="gen22：连接并下发 UTC 校准设备时钟（不给值则用本机当前时间）")
     ap.add_argument("--mtu", type=int, default=247)
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args(argv)
@@ -448,6 +482,23 @@ def _main(argv=None) -> int:
         print("END (写 5f12):")
         print("  " + encode_ctrl(PUSH_OP_END).hex())
         print("# 随后在 5f13 开启 Notify，等待 DONE(0x12) 或 ERR(0x13+code)")
+        return 0
+
+    # gen22：纯校时模式——连接即下发 UTC，不需要武装，也不推送正文。
+    # 地址解析复用主流程（--address，或 --scan 交互选择，同 _scan_pick）。
+    # gen22: time-only mode - connect, push UTC, disconnect. No arm, no body.
+    # Address resolution reuses the main flow (--address, or --scan to pick).
+    if args.set_time is not None:
+        import asyncio
+
+        async def _run_time():
+            addr = args.address
+            if args.scan or addr is None:
+                addr, _token = await _scan_pick()
+            cli = PushClient(addr, mtu=args.mtu, timeout=args.timeout)
+            await cli.set_time(args.set_time)
+
+        asyncio.run(_run_time())
         return 0
 
     # 决定正文/类型

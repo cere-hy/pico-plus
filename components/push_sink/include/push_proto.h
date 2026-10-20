@@ -32,6 +32,27 @@ extern "C" {
 #define PUSH_TOTAL_MAX (512u * 1024u) ///< 正文硬上限；超了 ERR(3) / hard body cap, ERR(3) beyond
 
 /// CTRL 操作码。/ CTRL opcodes.
+///
+/// ---- 协议变更记录（每新增/改动 opcode 必须登记；BEGIN 帧布局已冻结） ----
+/// Protocol change log (every opcode addition/change lands here; the BEGIN layout is frozen).
+///   gen14  0x01..0x04  BEGIN/END/RESUME_QUERY/ABORT（BEGIN 帧 83B 定长，此后冻结）
+///   gen22  0x05        SET_TIME：手机下发 UTC 秒（4B LE）校准设备时钟。
+///                      · 独立于「必须武装」闸门之外：连上即可校时（有意设计——校时
+///                        不携带 token，采用「连上即信任」模型；无 Wi-Fi 场景的唯一
+///                        高频校时通道，PMU 无外部晶振、深睡靠内部 RC 走时会漂）。
+///                      · sanity：长度 <8B 或 UTC 落在 1704067200..4102444799
+///                        （2024-01-01~2100-01-01）之外 → ERR(2)，时钟不动。
+///                      · 参考实现：PushProto.encodeSetTime（Java）、
+///                        push_pico.py encode_set_time / --set-time（Python）已同步。
+///   gen22  0x05        SET_TIME: the phone pushes UTC seconds (4 B LE) to set the clock.
+///                      · Deliberately outside the "must be armed" gate - any connection
+///                        may set the time (by design; it carries no token, i.e. a
+///                        "connected means trusted" model) because it is the only
+///                        high-frequency path when there is no WiFi.
+///                      · Sanity: len < 8 B or UTC outside 1704067200..4102444799
+///                        -> ERR(2) and the clock is untouched.
+///                      · Reference implementations kept in sync: PushProto.encodeSetTime
+///                        (Java) and push_pico.py encode_set_time / --set-time (Python).
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
