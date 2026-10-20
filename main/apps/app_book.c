@@ -4405,6 +4405,16 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
         return false;
     }
     copy_text(s_path, sizeof(s_path), path);
+    // gen21（裁决 A「打开即已读」）：push.txt 实际打开成功即清未读位。此处是
+    // 全部开书路径（首页大卡/传书自动开/书架点开）的唯一汇合点——传书页推完
+    // 自动开书随即清位（不亮假牌）；用户在别处收推则无人清位，回首页徽章亮。
+    // 上行 EVT_READ（notify_read）保持在 book_on_exit 原位，手机侧语义不变。
+    // gen21 (ruling A "open means read"): opening push.txt clears the unread
+    // flag. open_book_impl is the single funnel for every open path (home card,
+    // transfer auto-open, shelf tap) - the auto-open chain clears right away (no
+    // false badge), while a push landing elsewhere stays flagged until the home
+    // badge lights. The outbound EVT_READ stays in book_on_exit untouched.
+    if (strcmp(s_path, PUSH_TEXT_PATH) == 0) push_sink_clear_unread();
     s_reader_favorite = favorite_load(path);
     const char* filename = strrchr(path, '/');
     filename = filename ? filename + 1 : path;

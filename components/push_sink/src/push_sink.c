@@ -103,6 +103,7 @@ static const char *TAG = "push_sink";
 // NVS 命名空间与键。/ NVS namespace and key.
 #define PUSH_NVS_NS "rp_pushsink"
 #define PUSH_NVS_KEY_SESS "sess"
+#define PUSH_NVS_KEY_UNREAD "unread" // gen21 未读位（独立 u8 key，不动 sess blob 布局）
 #define PUSH_NVS_MAGIC 0x50534E31u // 'P','S','N','1'
 
 // .part 回读算 CRC 的分块大小。/ Chunk size for the partial-file CRC read-back.
@@ -209,6 +210,7 @@ static struct {
     bool committed; // gen19（Bug5）：一次正文已落盘，待首页消费以刷新“最近推送” / a body committed, pending home consumption to refresh "last push"
     char committed_title[PUSH_TITLE_MAX];
     uint8_t committed_type;
+    bool unread; // gen21：正文已落盘且尚未被打开（首页「有新内容」徽章）/ a body landed and not yet opened (home "new content" badge)
 } s_ui;
 
 static bool (*s_dict_probe)(void); // 词典可用性探针 / the dictionary-availability probe
@@ -232,6 +234,16 @@ static void ensure_init(void) {
     if (s_inited) return;
     s_lock = xSemaphoreCreateMutex();
     push_session_init(&s_sess);
+    // gen21：开机恢复未读位（独立 u8 key；读不到按 0）。
+    // gen21: restore the unread flag at boot (standalone u8 key; absent means 0).
+    {
+        nvs_handle_t h;
+        if (nvs_open(PUSH_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t u = 0;
+            if (nvs_get_u8(h, PUSH_NVS_KEY_UNREAD, &u) == ESP_OK) s_ui.unread = u != 0;
+            nvs_close(h);
+        }
+    }
     s_inited = true;
 }
 
@@ -286,6 +298,45 @@ static void nvs_clear_session(void) {
     nvs_erase_key(h, PUSH_NVS_KEY_SESS);
     nvs_commit(h);
     nvs_close(h);
+}
+
+/* ---- gen21 未读位 / gen21 unread flag ---- */
+
+// 仅写 NVS；s_ui.unread 本体由调用方在自旋锁内改。/ NVS write only; the caller
+// flips s_ui.unread itself inside the spinlock.
+static void nvs_save_unread(bool v) {
+    nvs_handle_t h;
+    if (nvs_open(PUSH_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, PUSH_NVS_KEY_UNREAD, v ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// 置位/清除共用：变了才写 NVS（幂等）。/ Shared set/clear: NVS write only on
+// change (idempotent).
+static void unread_set(bool v) {
+    bool changed = false;
+    portENTER_CRITICAL(&s_ui_lock);
+    if (s_ui.unread != v) {
+        s_ui.unread = v;
+        changed = true;
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    if (changed) nvs_save_unread(v);
+}
+
+bool push_sink_unread(void) {
+    ensure_init();
+    bool v;
+    portENTER_CRITICAL(&s_ui_lock);
+    v = s_ui.unread;
+    portEXIT_CRITICAL(&s_ui_lock);
+    return v;
+}
+
+void push_sink_clear_unread(void) {
+    ensure_init();
+    unread_set(false);
 }
 
 /* ---- .part 文件 / The partial file ---- */
@@ -1003,7 +1054,18 @@ static void exec_actions(uint32_t act) {
         // still popped the OLD push.txt (gen15 on hardware: "it always opens the
         // first push's content"). No commit = nothing landed = nothing to open.
         if (!do_commit()) act &= ~(uint32_t)(PUSH_ACT_OPEN_BOOK | PUSH_ACT_WORD_CARD);
-        else if (s_sess.begin.type != PUSH_TYPE_WORD) ui_post_committed(s_sess.begin.title, s_sess.begin.type);
+        else if (s_sess.begin.type != PUSH_TYPE_WORD) {
+            ui_post_committed(s_sess.begin.title, s_sess.begin.type);
+            // gen21：正文落盘即置未读（单词卡瞬时消费不置位）。若本拍 OPEN_BOOK
+            // 同拍自动开书，阅读器 open_book_impl 会随即清位——即推即读不亮假牌；
+            // 用户在首页/别处时无人清位，回首页徽章亮起。
+            // gen21: a landed body marks unread (word cards are consumed inline
+            // and never set it). If this same round auto-opens the book,
+            // open_book_impl clears it right away - push-and-read never shows a
+            // false badge; with the user elsewhere nobody clears it, so the home
+            // badge lights up.
+            unread_set(true);
+        }
     }
     if (act & PUSH_ACT_ERR) {
         // gen14 诊断：session 层拒绝（token/type/total_len/跳号/校验）留痕。

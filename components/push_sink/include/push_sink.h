@@ -189,6 +189,14 @@ bool push_sink_take_start_failed(void);
 /// phone-side clipboard clear trigger).
 void push_sink_notify_read(void);
 
+/// gen21 未读位：正文 COMMIT 落盘即置位（单词卡不置位），打开 push.txt 即清除；
+/// NVS 持久化，重启不丢。驱动首页状态条的反色「有新内容」徽章。
+/// gen21 unread flag: set when a body commit lands (word cards never set it),
+/// cleared when push.txt is opened; persisted in NVS across reboots. Drives the
+/// home status bar's inverted "new content" badge.
+bool push_sink_unread(void);
+void push_sink_clear_unread(void);
+
 /// 通知当前电量百分比（BATT）。/ Notify the current battery percent.
 void push_sink_notify_battery(void);
 

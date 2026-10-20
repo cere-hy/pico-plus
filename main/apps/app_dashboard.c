@@ -401,6 +401,7 @@ typedef struct {
     int state;
     uint32_t left_s;
     uint32_t received, total;
+    uint32_t unread; // gen21：未读位参与 memcmp 差分——置位/灭牌各刷一次 / unread joins the memcmp diff - one repaint each way
 } push_card_snap_t;
 static push_card_snap_t s_push_snap;
 static bool s_push_snap_valid;
@@ -422,17 +423,23 @@ static void push_card_text(char *state_text,size_t n) {
     push_sink_progress(&received, &total);
     const char *adv = push_sink_adv_name();
     const bool has_adv = push_sink_armed() && adv && adv[0];
+    // gen21：未读徽章在场时右侧切短式（去广播名），给 104px 徽章腾位。
+    // gen21: while the unread badge is up the right side shortens (no adv name)
+    // to make room for the 104px badge.
+    const bool short_form = push_sink_unread();
     switch (st) {
         case PUSH_STATE_ARMED:
         case PUSH_STATE_WINDOW:
-            if (has_adv) snprintf(state_text, n, "等待连接·剩 %lu 分钟 · %s",
+            if (short_form) snprintf(state_text, n, "等待连接·剩 %lu 分",
+                                     (unsigned long)((push_sink_window_left_ms() + 59999) / 60000));
+            else if (has_adv) snprintf(state_text, n, "等待连接·剩 %lu 分钟 · %s",
                                   (unsigned long)((push_sink_window_left_ms() + 59999) / 60000), adv);
             else snprintf(state_text, n, "等待连接 · 剩 %lu 分钟",
                           (unsigned long)((push_sink_window_left_ms() + 59999) / 60000));
             break;
         case PUSH_STATE_CONNECTED:
-            if (has_adv) snprintf(state_text, n, "手机已连接 · %s", adv);
-            else snprintf(state_text, n, "手机已连接");
+            if (short_form || !has_adv) snprintf(state_text, n, "手机已连接");
+            else snprintf(state_text, n, "手机已连接 · %s", adv);
             break;
         case PUSH_STATE_RECEIVING:
             snprintf(state_text, n, "接收中 %lu%%",
@@ -457,11 +464,30 @@ static void draw_push_card(uint8_t *fb) {
     ui_fill_round_rect(fb, PUSH_CARD_RECT, 20, fill);
     if (!live) ui_draw_round_rect(fb, PUSH_CARD_RECT, 20, 0xb0);
     home_frame(fb, PUSH_CARD_RECT, 20);
-    // 单行垂直居中：卡体 566..630（gen19 的 64px 高保留，命中区不动），
-    // 22px 字排 y=587。/ Single row, vertically centered: card 566..630 (the
-    // gen19 64px height stays, hit region untouched), 22px text at y=587.
-    label_on(fb, 60, 587, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
-    label_on(fb, 624, 587, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
+    // 单行垂直居中（gen21 修正）：卡体 566..630（h=64），`ui_text_fixed_context_aa_vc`
+    // 的第三参是 center_y（垂直中心）——gen20 按顶边式传了 587，文字实际中心比
+    // 卡体中心 598 高 11px，真机截图实证偏上。现统一以 598 为中心。
+    // Single row, vertically centered (gen21 fix): card 566..630 (h=64). The
+    // third arg of ui_text_fixed_context_aa_vc is center_y - gen20 passed 587
+    // computed top-edge style, putting the ink center 11px above the card's true
+    // center 598 (real-hw screenshot). Everything now centers on 598.
+    label_on(fb, 60, 598, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
+    const bool unread = push_sink_unread();
+    if (unread) {
+        // gen21 未读徽章：反色胶囊「有新内容」，右缘 624、垂直中心 598。
+        // 武装态＝白底黑字（黑条上最亮元素）；未开启态＝黑底白字。
+        // gen21 unread badge: inverted capsule "有新内容", right edge 624,
+        // vertical center 598. Armed = white on black (brightest thing on the
+        // bar); idle = black on white. Static - no blinking, e-ink discipline.
+        const EpdRect badge = {520, 582, 104, 32};
+        const uint8_t bfill = live ? 0xff : 0x00;
+        const uint8_t bink = live ? 0x00 : 0xff;
+        ui_fill_round_rect(fb, badge, 16, bfill);
+        label_on(fb, 532, 598, 20, "有新内容", EPD_DRAW_ALIGN_LEFT, bink, bfill);
+        label_on(fb, 508, 598, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
+    } else {
+        label_on(fb, 624, 598, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
+    }
 }
 static bool push_card_due(app_ctx_t *ctx) {
     // 250ms 节流：倒计时按分钟粒度、进度按 ~2Hz，都比这个慢；墨水屏不陪空转。
@@ -475,6 +501,7 @@ static bool push_card_due(app_ctx_t *ctx) {
         .state = (int)push_sink_state(),
         .left_s = (push_sink_window_left_ms() + 999) / 1000,
         .received = received, .total = total,
+        .unread = push_sink_unread() ? 1u : 0u,
     };
     if (s_push_snap_valid && !memcmp(&s_push_snap, &now, sizeof(now))) return false;
     s_push_snap = now;
