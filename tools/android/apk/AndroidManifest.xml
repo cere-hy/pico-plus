@@ -44,6 +44,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- gen22：桌面快捷方式「一键推流」（长按图标可见，可拖到桌面）。
+                 meta-data 必须挂在这个带 MAIN+LAUNCHER 的 Activity 上才会生效。
+                 gen22: launcher shortcut "一键推流". The meta-data must sit on the
+                 MAIN+LAUNCHER activity for the shortcuts to register. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
     </application>
 </manifest>

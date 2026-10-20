@@ -41,6 +41,7 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
@@ -71,6 +72,12 @@ import java.util.concurrent.TimeUnit;
 public class MainActivity extends Activity {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
+    // gen22 一键推流快捷方式：长按桌面图标 →「一键推流」→ 读剪贴板并直接推送，
+    // 不建界面（透明 Activity），只弹 Toast。
+    // gen22 one-tap push shortcut: long-press the launcher icon -> "一键推流" ->
+    // read the clipboard and push straight away, no layout (translucent), Toast only.
+    public static final String ACTION_PUSH_CLIPBOARD = "dev.readpico.push.ACTION_PUSH_CLIPBOARD";
+    private static boolean sShortcutMode = false;
     private static final int REQ_PERMS = 1;
     private static final int REQ_ENABLE_BT = 2;
     private static final long SCAN_TIMEOUT_MS = 12000;
@@ -260,7 +267,20 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // setTheme 必须在 super.onCreate 之前：快捷方式用透明无界面主题，
+        // 用户看不到任何窗口，只有 Toast。/ setTheme must precede super.onCreate:
+        // the shortcut uses a translucent no-display theme so only a Toast shows.
+        sShortcutMode = ACTION_PUSH_CLIPBOARD.equals(getIntent().getAction());
+        if (sShortcutMode) {
+            // Theme_NoDisplay：完全不显示窗口（android-34 已无 Translucent_NoDisplay）。
+            // Theme_NoDisplay: no window at all (android-34 dropped Translucent_NoDisplay).
+            setTheme(android.R.style.Theme_NoDisplay);
+        }
         super.onCreate(savedInstanceState);
+        if (sShortcutMode) {
+            runShortcutPush();
+            return;
+        }
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -343,6 +363,75 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         closeQuietly();
         super.onDestroy();
+    }
+
+    /* ---- gen22 一键推流（桌面快捷方式） ---- */
+
+    // 长按桌面图标点「一键推流」后走这里：无界面，读剪贴板 → 扫描连接 → 推送 → Toast 收尾。
+    // Android 10+ 禁止后台读剪贴板，所以必须由快捷方式拉起这个（透明的）Activity——
+    // 它处于前台，读剪贴板才合法；纯后台 Service 拿不到剪贴板内容。
+    // Entry for the launcher shortcut: no layout; read clipboard -> scan/connect ->
+    // push -> finish with a Toast. Android 10+ forbids background clipboard access,
+    // so the shortcut must raise this (translucent) Activity - it is foreground, which
+    // is what makes reading the clipboard legal.
+    private void runShortcutPush() {
+        // 只检查、不弹系统授权框：NoDisplay 的 Activity 上权限弹窗显示不出来，
+        // 弹了就会卡在这里。缺权限就提示用户先正常打开一次 App。
+        // Check only, never raise the system permission dialog: it cannot render on a
+        // NoDisplay activity and would hang here. Missing permissions -> ask the user
+        // to open the app normally once.
+        if (!hasBluetoothPermissions()) {
+            toast("请先打开 PicoPush 一次并授予蓝牙权限");
+            finish();
+            return;
+        }
+        BluetoothManager bm = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+        adapter = (bm == null) ? null : bm.getAdapter();
+        if (adapter == null) {
+            toast("本机没有蓝牙硬件");
+            finish();
+            return;
+        }
+        if (!adapter.isEnabled()) {
+            toast("请先开启手机蓝牙");
+            finish();
+            return;
+        }
+        String clip = readClipboardText();
+        if (clip == null || clip.trim().isEmpty()) {
+            toast("剪贴板是空的，先复制要推送的文字");
+            finish();
+            return;
+        }
+        final String text = clip;
+        toast("正在推送到墨水屏……");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    doPush(text, false);
+                    toast("推送完成");
+                } catch (Throwable t) {
+                    toast("推送失败：" + t.getMessage());
+                }
+                finish();
+            }
+        }).start();
+    }
+
+    // 直接读剪贴板文本（不写入 input 控件，快捷模式没有界面）。
+    // Read the clipboard directly (no EditText to fill in shortcut mode).
+    private String readClipboardText() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData data = cm.getPrimaryClip();
+            if (data == null || data.getItemCount() == 0) return null;
+            CharSequence cs = data.getItemAt(0).getText();
+            return cs == null ? null : cs.toString();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /* ---- 发送入口 ---- */
@@ -837,6 +926,15 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    // 快捷方式用：只判断权限是否已有，不触发请求。/ Shortcut path: report only, never request.
+    private boolean hasBluetoothPermissions() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            return checkSelfPermission("android.permission.BLUETOOTH_SCAN") == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission("android.permission.BLUETOOTH_CONNECT") == PackageManager.PERMISSION_GRANTED;
+        }
+        return checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") == PackageManager.PERMISSION_GRANTED;
+    }
+
     private void addIfMissing(List<String> need, String perm) {
         if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
             need.add(perm);
@@ -932,16 +1030,30 @@ public class MainActivity extends Activity {
     }
 
     private void uiLog(final String s) {
+        // gen22 快捷方式（shortcut）模式下不建界面，logView/logScroll 为 null：
+        // 日志只进 logcat，不能碰 UI，否则一键推流会空指针崩掉。
+        // gen22: in shortcut mode there is no layout, so logView/logScroll are null -
+        // send the line to logcat only; touching the UI would crash one-tap push.
+        if (sShortcutMode) {
+            android.util.Log.d("PicoPush", s);
+            return;
+        }
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                if (logView == null) {
+                    android.util.Log.d("PicoPush", s);
+                    return;
+                }
                 logView.append(s + "\n");
-                logScroll.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        logScroll.fullScroll(View.FOCUS_DOWN);
-                    }
-                });
+                if (logScroll != null) {
+                    logScroll.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            logScroll.fullScroll(View.FOCUS_DOWN);
+                        }
+                    });
+                }
             }
         });
     }
