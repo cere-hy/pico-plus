@@ -76,6 +76,10 @@ void tud_disconnect(void);
 void book_lock_collage_invalidate(void);
 bool book_cover_jobs_quiesce(unsigned timeout_ms);
 bool ui_avatar_quiesce(unsigned timeout_ms);
+/* gen18：USB 接管即取消推流接收（武装让位+留痕），见 usb_storage_start 顶部。
+   gen18: USB takeover cancels push receiving (the arm yields with a trace),
+   at the top of usb_storage_start. */
+void push_sink_cancel_why(const char *why);
 '''
 UNIT = r'''
 #include "usb_stub.h"
@@ -83,7 +87,7 @@ UNIT = r'''
 #include <stdio.h>
 static bool mounted=true,host,driver,msc,connected;
 static sdmmc_card_t *borrowed;
-static int stage,delete_error,usb_error,msc_error,busy,deletes,remounts,phy_restores;
+static int stage,delete_error,usb_error,msc_error,busy,deletes,remounts,phy_restores,push_cancel_calls;
 static int failed(int where){return stage==where?ESP_FAIL:ESP_OK;}
 void vTaskDelay(int ms){assert(ms>0);}
 const char *esp_err_to_name(int e){(void)e;return "test";}
@@ -118,12 +122,13 @@ void tud_disconnect(void){assert(driver);connected=false;}
 void book_lock_collage_invalidate(void){}
 bool book_cover_jobs_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
 bool ui_avatar_quiesce(unsigned timeout_ms){(void)timeout_ms;return true;}
+void push_sink_cancel_why(const char *why){(void)why;++push_cancel_calls;}
 static void stopped(void){assert(mounted&&!usb_storage_active()&&!usb_storage_connected());assert(!s_cleanup_pending&&!s_card&&!s_storage&&!host&&!driver&&!msc&&s_serial_phy);}
 static void retained(void){assert(!mounted&&usb_storage_active()&&!usb_storage_connected()&&s_cleanup_pending&&s_card&&host&&s_serial_phy);assert(usb_storage_start()==ESP_ERR_INVALID_STATE);}
 int main(void){
     usb_storage_phy_init();assert(phy_restores==1);usb_storage_phy_init();assert(phy_restores==1);
     assert(usb_storage_stop()==ESP_OK);stopped();
-    for(int i=0;i<3;++i){assert(usb_storage_start()==ESP_OK&&usb_storage_connected());busy=3;assert(usb_storage_stop()==ESP_OK);stopped();}
+    for(int i=0;i<3;++i){int cancels=push_cancel_calls;assert(usb_storage_start()==ESP_OK&&usb_storage_connected());assert(push_cancel_calls==cancels+1);busy=3;assert(usb_storage_stop()==ESP_OK);stopped();}
     assert(usb_storage_start()==ESP_OK);delete_error=ESP_FAIL;int before=remounts;
     assert(usb_storage_stop()==ESP_FAIL);retained();assert(borrowed&&remounts==before);
     delete_error=0;assert(usb_storage_stop()==ESP_OK);stopped();
@@ -147,7 +152,7 @@ with tempfile.TemporaryDirectory() as d:
     p = Path(d)
     (p/'usb_stub.h').write_text(STUB)
     for name in ('esp_err.h','driver/sdmmc_host.h','esp_log.h','esp_private/usb_phy.h',
-                 'freertos/FreeRTOS.h','freertos/task.h','read_pico_sd.h','sdmmc_cmd.h',
+                 'freertos/FreeRTOS.h','freertos/task.h','push_sink.h','read_pico_sd.h','sdmmc_cmd.h',
                  'tinyusb.h','tinyusb_default_config.h','tinyusb_msc.h','ttf_font.h',
                  'ui_avatar.h','book_cover_jobs.h','book_lock_collage.h'):
         header=p/name;header.parent.mkdir(parents=True,exist_ok=True);header.write_text('#include "usb_stub.h"\n')

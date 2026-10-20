@@ -213,6 +213,7 @@ static char test_push_adv[64];
 static uint32_t test_push_left_ms, test_push_recv, test_push_total;
 static bool test_push_closed, test_push_start_failed, test_push_open, test_push_word_card, test_push_err;
 static char test_push_title[64], test_push_word[64];
+static char test_push_close_why[48];
 static uint8_t test_push_type;
 static int test_push_err_code;
 static int test_push_arm_calls, test_push_arm_window, test_push_cancel_calls;
@@ -222,16 +223,23 @@ static inline esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
     ++test_push_arm_calls;
     test_push_arm_window = (int)window_ms;
     test_push_armed = true;
+    test_push_close_why[0] = 0; // 对齐真实组件：新回合清原因 / mirror: a fresh round clears the reason
     return ESP_OK;
 }
-static inline void push_sink_cancel(void) {
+static inline void push_sink_cancel_why(const char *why) {
     ++test_push_cancel_calls;
+    if (why && why[0]) snprintf(test_push_close_why, sizeof(test_push_close_why), "%s", why);
+    else test_push_close_why[0] = 0;
     // 对齐真实组件：cancel 从武装态出发，状态机走 ADV_OFF，补一个 closed。
     // Mirror the real glue: a cancel from an armed state walks the machine
     // through ADV_OFF and posts one closed event.
     if (test_push_armed) test_push_closed = true;
     test_push_armed = false;
 }
+static inline void push_sink_cancel(void) {
+    push_sink_cancel_why("已退出接收");
+}
+static inline const char *push_sink_last_close_why(void) { return test_push_close_why[0] ? test_push_close_why : NULL; }
 static inline bool push_sink_armed(void) { return test_push_armed; }
 static inline push_state_t push_sink_state(void) { return test_push_state; }
 static inline const char *push_sink_adv_name(void) { return test_push_adv; }
