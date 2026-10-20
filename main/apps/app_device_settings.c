@@ -33,6 +33,7 @@
 #include "app_content_open.h"
 #include "app_registry.h"
 #include "app_transfer_mode.h"
+#include "push_sink.h"
 #include "settings.h"
 #include "lock_pin_flow.h"
 #include "ui_pinpad.h"
@@ -1714,6 +1715,13 @@ static void flight_mode_toggle(void) {
     const bool on = !app_settings_flight_mode();
     app_settings_set_flight_mode(on);
     read_pico_transfer_set_rf_blocked(on);
+    // gen18：飞行模式是用户明示的「全射频关停」——武装中的推流必须让位并留痕，
+    // 否则栈停了、武装还在，倒计时照跑而手机搜不到设备（假武装，覆盖表第 6 行）。
+    // gen18: flight mode is the user's explicit all-radios-off - an open push
+    // arm must yield with a trace, otherwise the stack stops while the arm
+    // lives on: the countdown runs yet no phone can find the device (a false
+    // arm, coverage-table row 6).
+    if (on) push_sink_cancel_why("飞行模式已开启，接收暂停");
     if (!on) return;
     // 结束仍在跑的传书或 OTA 会话，让射频立刻下来；蓝牙栈同步拆掉，
     // 主循环的 ble_pt_sync() 随后也会按设置保持停摆。
@@ -2304,7 +2312,16 @@ static void on_before_lock(app_ctx_t *ctx) {
     if (s_page == SETTINGS_PIN_ENTRY) { pin_setup_close(); s_page = SETTINGS_LOCK_PIN; }
     s_upgrade_job = UPGRADE_JOB_NONE;
     (void)ctx; pico_online_cancel_join(); ble_pt_scan_stop(); s_ble_learning = 0;
-    (void)ble_pt_stop(2000);
+    // gen18：手动息屏（电源键）不杀蓝牙——武装期豁免。此前这里无条件拆栈，
+    // 而 enter_lock_and_sleep 的拒武装发生在其后：用户按一下电源键，推流广播
+    // 就被拆了等 sync 两秒才回来（覆盖表第 5 行）。缺的守卫补上。
+    // gen18: a manual screen-off (power key) must not kill Bluetooth - the
+    // armed period is exempt. This used to tear the stack down unconditionally
+    // while enter_lock_and_sleep's armed refusal comes after it: one power-key
+    // press dropped the push advertisement until sync restored it two seconds
+    // later (coverage-table row 5). The missing guard goes in.
+    if (!push_sink_armed()) (void)ble_pt_stop(2000);
+    else ESP_LOGI(TAG, "screen-off skipped ble stop: push sink armed");
 }
 static bool no_menu_handle(app_ctx_t *ctx) { (void)ctx; return false; }
 static void settings_media_lost(app_ctx_t *ctx) {

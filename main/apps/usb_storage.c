@@ -9,6 +9,7 @@
 #include "ui_avatar.h"
 #include "book_cover_jobs.h"
 #include "book_lock_collage.h"
+#include "push_sink.h"
 #include "usb_storage.h"
 #include <stdlib.h>
 #include "driver/sdmmc_host.h"
@@ -70,6 +71,14 @@ static void restore_local(void) {
 
 esp_err_t usb_storage_start(void) {
     book_lock_collage_invalidate();
+    // gen18：USB 存储要卸载本机 FAT 独享 TF 卡——武装中的推流让位并留痕。
+    // 不停 BLE 的话，手机推来的 BEGIN 会在 part_open_append 撞上「卡没了」，
+    // 回一个指错方向的 ERR(5)（覆盖表第 7 行；用户裁决：武装让位 + 提示）。
+    // gen18: USB storage unmounts the local FAT to take the card alone - an
+    // open push arm yields with a trace. Without stopping it, a pushed BEGIN
+    // hits "card gone" in part_open_append and gets a misleading ERR(5)
+    // (coverage-table row 7; the ruling: the arm yields, with a prompt).
+    push_sink_cancel_why("USB 传书已接管，接收暂停");
     if (!(book_cover_jobs_quiesce(2000) && ui_avatar_quiesce(2000))) return ESP_ERR_NOT_FINISHED;
     if (s_cleanup_pending) return ESP_ERR_INVALID_STATE;
     if (s_active) return ESP_OK;

@@ -411,6 +411,14 @@ esp_err_t app_enter_host_sleep(app_sleep_mode_t mode) {
     // 产品页用 on_before_lock 保存并收齐后台；保留阅读内存以便交接失败仍可回到原页。
     // Product pages checkpoint/join in on_before_lock; retain reader state so a failed handoff can resume the same page.
     if (pico_online_busy() || !(book_cover_jobs_quiesce(2000) && ui_avatar_quiesce(2000)) || !read_pico_transfer_pause_for_sleep()) return ESP_ERR_INVALID_STATE;
+    // gen18：深睡/关机没有 BLE 唤醒源，武装中的推流必须在此让位并留痕——
+    // 「armed canceled by power_off」。关机交接失败回到原页时，状态机是诚实的
+    // IDLE，不会对着一个已拆的栈继续倒数（覆盖表第 4 行）。
+    // gen18: deep sleep / power off has no BLE wake source, so an open push
+    // arm must yield here with a trace - "armed canceled by power_off". When a
+    // failed shutdown returns to the operable page the machine is an honest
+    // IDLE instead of counting down against a torn-down stack (row 4).
+    push_sink_cancel_why("关机/深睡，接收结束");
     (void)ble_pt_stop(2000);
     (void)app_sync_time_to_pmu();
     // 必须先断面板轨，再拉低 MODE，避免常开逻辑仍耗电。/ Drop panel rails before parking MODE on the always-on supply.
