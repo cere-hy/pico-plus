@@ -68,7 +68,8 @@ enum EpdRotation epd_get_rotation(void) {return rotation;}
 int epd_rotated_display_width(void) {return H;}
 int epd_rotated_display_height(void) {return W;}
 int64_t esp_timer_get_time(void) {return now_us;}
-void read_pico_epd_set_pclk(int mhz) {assert(mhz == DISPLAY_PCLK_SAFE_MHZ);}
+// gen19 双档策略：会话 idle 恢复默认档(18)，推送会话活跃或真欠载回落安全档(12)。/ gen19 dual-clock policy: idle restores the default, live push sessions or true underruns fall back to safe.
+void read_pico_epd_set_pclk(int mhz) {assert(mhz == DISPLAY_PCLK_SAFE_MHZ || mhz == DISPLAY_PCLK_DEFAULT_MHZ);}
 void read_pico_epd_use_scan(read_pico_epd_scan_t mode) {scan = mode;}
 void epd_lcd_set_prefill_lines(int lines) {prefill = lines;}
 void epd_poweron(void) {}
