@@ -311,6 +311,71 @@ static void split_dark_cover(cover_canvas_t *c, const char *title, const char *a
               font_px(c, 10), number, EPD_DRAW_ALIGN_RIGHT, 11, 4);
 }
 
+// gen22：push 虚拟书专属封面（第 4 版式）。原先 push.txt 无内嵌封面、按路径哈希
+// 落到深色版式（黑底白字占位观感），与书架里带内嵌封面的 epub 放一起很突兀。
+// 这里给推送书一张极简专属封面：纸纹浅底 + 「手机 → 电波 → 书」图形 + 底部书名，
+// 复用本文件的灰阶原语（fill/outline/paper_grain），不引入图片资源、不占固件体积。
+// gen22: dedicated cover for the push pseudo-book (4th template). push.txt has no
+// embedded art, so its path hash used to land on a dark template (black plate,
+// white type) that looked out of place beside epubs with real covers. This draws a
+// minimal "phone -> waves -> book" motif on grained paper using existing grayscale
+// primitives - no image asset, no firmware bloat.
+static void push_delivery(cover_canvas_t *c, const char *title, const char *author, uint64_t seed) {
+    uint8_t bg = 14;
+    fill(c, 0, 0, (int)c->width, (int)c->height, bg);
+    paper_grain(c, seed, bg);
+    outline(c, xy(6, c->width, 176), 4);
+    outline(c, xy(8, c->width, 176), 10);
+    // 手机（左）：机身 + 屏幕。/ handset: body plus screen.
+    int ph_x0 = xy(34, c->width, 176), ph_x1 = xy(64, c->width, 176);
+    int ph_y0 = xy(54, c->height, 240), ph_y1 = xy(118, c->height, 240);
+    fill(c, ph_x0, ph_y0, ph_x1, ph_y1, 5);
+    fill(c, ph_x0 + xy(3, c->width, 176), ph_y0 + xy(6, c->height, 240),
+         ph_x1 - xy(3, c->width, 176), ph_y1 - xy(10, c->height, 240), 12);
+    // 推送电波（中）：三条由密到疏的短横，读起来像向外发送。
+    // waves: three shortening bars read as an outgoing transmission.
+    for (int i = 0; i < 3; ++i) {
+        int y = xy(74, c->height, 240) + i * xy(12, c->height, 240);
+        int x0 = xy(70, c->width, 176) + i * xy(2, c->width, 176);
+        fill(c, x0, y, x0 + xy(10 - i * 2, c->width, 176), y + xy(2, c->height, 240),
+             (uint8_t)(9 - i * 2));
+    }
+    // 书（右）：封面 + 书脊 + 页面线。/ book: cover, spine, page rules.
+    int bk_x0 = xy(96, c->width, 176), bk_x1 = xy(140, c->width, 176);
+    int bk_y0 = xy(66, c->height, 240), bk_y1 = xy(112, c->height, 240);
+    fill(c, bk_x0, bk_y0, bk_x1, bk_y1, 7);
+    fill(c, bk_x0, bk_y0, bk_x0 + xy(4, c->width, 176), bk_y1, 3);
+    for (int i = 0; i < 3; ++i) {
+        int y = bk_y0 + xy(10, c->height, 240) + i * xy(12, c->height, 240);
+        fill(c, bk_x0 + xy(9, c->width, 176), y, bk_x1 - xy(6, c->width, 176),
+             y + xy(2, c->height, 240), 11);
+    }
+    // 书名。/ title block.
+    char lines[COVER_LINE_MAX][COVER_TEXT_CAP];
+    int px = title_lines(title, font_px(c, 34), font_px(c, 17),
+                         (int)c->width - xy(40, c->width, 176),
+                         xy(70, c->height, 240), xy(3, c->height, 240), 2, lines);
+    int step = px + xy(3, c->height, 240);
+    for (int i = 0; i < 2 && lines[i][0]; ++i)
+        draw_text(c, xy(20, c->width, 176), xy(150, c->height, 240) + i * step,
+                  px, lines[i], EPD_DRAW_ALIGN_LEFT, 2, bg);
+    if (author && *author)
+        draw_author(c, author, xy(20, c->width, 176), xy(196, c->height, 240),
+                    xy(120, c->width, 176), font_px(c, 14), EPD_DRAW_ALIGN_LEFT, 5, bg);
+    // 底部推送色条。/ bottom accent bar.
+    fill(c, xy(20, c->width, 176), xy(216, c->height, 240),
+         xy(76, c->width, 176), xy(219, c->height, 240), 6);
+}
+
+// push.txt 判定：只认路径末段，避免与 book/ 侧的模块常量耦合。
+// push.txt test: match the path tail only, keeping this module free of book/ constants.
+static bool is_push_identity(const char *identity) {
+    if (!identity || !*identity) return false;
+    const char *slash = strrchr(identity, '/');
+    const char *name = slash ? slash + 1 : identity;
+    return strcmp(name, "push.txt") == 0;
+}
+
 bool book_auto_cover_render(const char *identity, const char *title, const char *author,
                             unsigned width, unsigned height, uint8_t *out) {
     if (!out || !title || !*title || width < 96 || height < 128 ||
@@ -323,7 +388,8 @@ bool book_auto_cover_render(const char *identity, const char *title, const char 
     memset(scratch, 0xff, (size_t)stride * epd_height());
     cover_canvas_t canvas = {.fb = scratch, .width = width, .height = height, .stride = stride};
     uint64_t seed = cover_seed(identity);
-    switch (seed % 3u) {
+    if (is_push_identity(identity)) push_delivery(&canvas, title, author, seed);
+    else switch (seed % 3u) {
         case 0: dark_library(&canvas, title, author, seed); break;
         case 1: modern_whitespace(&canvas, title, author, seed); break;
         default: split_dark_cover(&canvas, title, author, seed); break;

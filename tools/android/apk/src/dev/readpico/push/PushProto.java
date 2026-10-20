@@ -36,6 +36,10 @@ public final class PushProto {
     public static final int OP_END = 0x02;
     public static final int OP_RESUME_QUERY = 0x03;
     public static final int OP_ABORT = 0x04;
+    // gen22：手机下发 UTC 秒给设备校时（不受武装限制，连上即可）。
+    // gen22: the phone pushes a UTC second count to set the device clock (not
+    // gated on an armed window - any connection can carry it).
+    public static final int OP_SET_TIME = 0x05;
 
     public static final int ST_READY = 0x10;
     public static final int ST_RESUME = 0x11;
@@ -99,6 +103,22 @@ public final class PushProto {
      * total_len(u32 LE) + crc32(u32 LE) + session_id(u32 LE) + title[64]。
      * title 按 UTF-8 字节截断到 63 并剥离尾随续字节（与 C 的 strnlen 行为一致）。
      */
+    /**
+     * gen22：SET_TIME 帧（8 字节）= 帧头 4B + UTC 秒 u32 LE。
+     * BEGIN 帧布局保持冻结，故校时走独立操作码；老固件收到未知 op 会拒绝，
+     * 不影响既有推送链。/ BEGIN stays frozen, so time sync uses its own opcode;
+     * older firmware rejects the unknown op without disturbing the push chain.
+     */
+    public static byte[] encodeSetTime(long unixSeconds) {
+        byte[] out = new byte[8];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_SET_TIME;
+        out[3] = (byte) VERSION;
+        putU32(out, 4, unixSeconds);
+        return out;
+    }
+
     public static byte[] encodeBegin(long totalLen, long crc, long sessionId,
                                      int token, int ptype, String title) {
         byte[] out = new byte[ BEGIN_LEN ];

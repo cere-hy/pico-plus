@@ -42,6 +42,7 @@
 #include "dict/dict_lookup.h"
 #include "settings.h"
 #include "sleep.h"
+#include "time_service.h"
 #include "ttf_font.h"
 #include "usb_storage.h"
 #include "app_font_context.h"
@@ -61,7 +62,14 @@ static void restore_time_from_pmu(void) {
     const pmu_snapshot_t *pmu = read_pico_pmu_get();
     if (!pmu || !pmu->time_ok || !pmu->time_synced || pmu->unix_millis >= 1000 ||
         pmu->unix_sec < 1704067200 || pmu->unix_sec > 4102444799U) return;
-    struct timeval tv = {.tv_sec = (time_t)pmu->unix_sec, .tv_usec = pmu->unix_millis * 1000};
+    // gen22：PMU 的本地秒是内部 RC 走出来的（无外部晶振，深睡期间 ESP 掉电全靠它），
+    // 直接采信会一天快几分钟；按学习到的 ppm 补偿后再喂给系统时钟。
+    // gen22: the PMU's local seconds come from an internal RC (no crystal; the ESP rail
+    // is dropped in sleep) and gain minutes a day. Compensate by the learned ppm before
+    // handing the value to the system clock.
+    uint32_t restored = pmu->unix_sec;
+    app_time_service_compensate(&restored);
+    struct timeval tv = {.tv_sec = (time_t)restored, .tv_usec = pmu->unix_millis * 1000};
     if (settimeofday(&tv, NULL) == 0) ESP_LOGI(TAG, "system clock restored from PMU");
 }
 

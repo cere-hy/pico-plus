@@ -200,6 +200,13 @@ void push_sink_clear_unread(void);
 /// 通知当前电量百分比（BATT）。/ Notify the current battery percent.
 void push_sink_notify_battery(void);
 
+/// gen22 蓝牙校时：取走一次手机下发的 UTC 真值（一次性，非线程重复消费）。
+/// 设备侧已在收到时写入系统时钟；本 API 交给 main 层登记漂移样本并同步 PMU。
+/// gen22 time-over-BLE: take one phone-supplied UTC truth (one-shot). The device
+/// already applied it to the system clock; main uses this to record the drift
+/// sample and sync the PMU.
+bool push_sink_take_time_sync(uint32_t *utc);
+
 #ifdef __cplusplus
 }
 #endif

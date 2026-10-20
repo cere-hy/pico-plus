@@ -31,9 +31,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -163,6 +165,12 @@ static bool s_status_subscribed;        // CCCD 订阅态（BLE_GAP_EVENT_SUBSCR
                                          // CCCD subscription state (maintained by BLE_GAP_EVENT_SUBSCRIBE)
 
 static char s_adv_name[32];           // 当前广播名 / the current advertising name
+// gen22 蓝牙校时：手机下发的真值暂存在这里，由 main 层（time_service）消费后
+// 做漂移学习并同步 PMU——组件不反向调用 main。/ Clock truth from the phone lands
+// here; main (time_service) consumes it for drift learning and PMU sync - the
+// component never calls back into main.
+static uint32_t s_remote_utc;
+static bool s_remote_utc_pending;
 static char s_close_why[48];          // gen18：最近一次收摊原因（UI 取回展示）
                                      // gen18: the most recent close-up reason (read back by the UI)
 
@@ -1113,6 +1121,26 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         reply_err(PUSH_ERR_BAD_FRAME);
         return;
     }
+    // gen22 蓝牙校时：SET_TIME 走在校准通道上，不受「必须武装」限制——手机只要连上
+    // 就能把真值带进来。这是没有 Wi-Fi 的场景里唯一的高频校时通道（PMU 无外部晶振、
+    // 深睡靠内部 RC 走时，一天能快几分钟）。BEGIN 帧布局保持冻结，故用独立操作码。
+    // gen22 time-over-BLE: SET_TIME rides its own channel and is NOT gated on being
+    // armed - any connected phone can bring the truth in. With no WiFi it is the only
+    // high-frequency calibration path (the PMU has no crystal and its internal RC gains
+    // minutes a day in sleep). The BEGIN layout stays frozen, hence a separate opcode.
+    if (op == PUSH_OP_SET_TIME) {
+        if (len < PUSH_CTRL_HDR_LEN + 4u) { reply_err(PUSH_ERR_BAD_FRAME); return; }
+        const uint8_t *body = data + PUSH_CTRL_HDR_LEN;
+        uint32_t utc = (uint32_t)body[0] | ((uint32_t)body[1] << 8) |
+                       ((uint32_t)body[2] << 16) | ((uint32_t)body[3] << 24);
+        if (utc < 1704067200u || utc > 4102444799u) { reply_err(PUSH_ERR_BAD_FRAME); return; }
+        s_remote_utc = utc;
+        s_remote_utc_pending = true;
+        struct timeval tv = {.tv_sec = (time_t)utc, .tv_usec = 0};
+        (void)settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "clock set from phone: %lu", (unsigned long)utc);
+        return;
+    }
     // 未武装：任何 CTRL 写入都回 ERR(1)，状态机看都不看。/ Unarmed: every CTRL
     // write gets ERR(1) without the machine ever seeing it.
     if (s_sess.state == PUSH_STATE_IDLE) {
@@ -1473,6 +1501,20 @@ void push_sink_init(void) {
 
 void push_sink_set_dict_probe(bool (*probe)(void)) { s_dict_probe = probe; }
 
+// gen22 防串台：出厂 MAC 的后两字节就是这台设备的固定代号（PicoPush-1A2B）。
+// 读不到 MAC 时退回随机数——绝不让取地址失败变成武装不了。
+// gen22 anti-crosstalk: the factory MAC's last two bytes are this unit's stable tag
+// (PicoPush-1A2B). If the MAC cannot be read, fall back to random - never let an
+// address read failure turn into "cannot arm".
+static uint16_t mac_token(void) {
+    uint8_t mac[6] = {0};
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) {
+        ESP_LOGW(TAG, "mac read failed; falling back to a random token");
+        return (uint16_t)(esp_random() & 0xFFFFu);
+    }
+    return (uint16_t)(((uint16_t)mac[4] << 8) | (uint16_t)mac[5]);
+}
+
 esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
     ensure_init();
     lock();
@@ -1502,7 +1544,17 @@ esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
                  (unsigned)PUSH_WINDOW_DEFAULT_MS);
         window_ms = PUSH_WINDOW_DEFAULT_MS;
     }
-    if (token == 0) token = (uint16_t)(esp_random() & 0xFFFFu);
+    // gen22 防串台：token 改由出厂 MAC 后两字节派生（固定且全局唯一），取代随机数。
+    // 广播名 = PicoPush-%04X(token)，所以名字自动变成 PicoPush-1A2B 这类固定代号，
+    // 咖啡馆里两台设备不会重名、手机也不会推错人。BEGIN 帧仍校验 token 与窗口期
+    // 广播名一致——Token 校验完整保留，只是值从随机变成 MAC 派生。
+    // gen22 anti-crosstalk: derive the token from the factory MAC's last two bytes
+    // (fixed and globally unique) instead of a random number. The adv name is
+    // PicoPush-%04X(token), so it becomes a stable tag like PicoPush-1A2B: two
+    // devices in a cafe can never share a name and a phone cannot push to the wrong
+    // panel. BEGIN still checks the token against the window's adv name - the token
+    // check is fully retained, only its value changed from random to MAC-derived.
+    if (token == 0) token = mac_token();
     if (token == 0) token = 1; // 0 留给「未武装」语义 / 0 means unarmed, keep it out
     s_close_why[0] = 0; // 新回合干净开局：收摊原因不留旧话 / a fresh round starts with no stale close-up reason
     try_adopt();
@@ -1573,6 +1625,22 @@ push_state_t push_sink_state(void) {
     const push_state_t st = s_sess.state;
     unlock();
     return st;
+}
+
+// gen22：取走一次手机下发的 UTC 真值（一次性）。main 层拿到后登记漂移样本并同步 PMU。
+// gen22: take one phone-supplied UTC truth (one-shot). Main records the drift sample
+// and syncs the PMU with it.
+bool push_sink_take_time_sync(uint32_t *utc) {
+    if (!utc) return false;
+    ensure_init();
+    lock();
+    bool taken = s_remote_utc_pending;
+    if (taken) {
+        *utc = s_remote_utc;
+        s_remote_utc_pending = false;
+    }
+    unlock();
+    return taken;
 }
 
 const char *push_sink_adv_name(void) {

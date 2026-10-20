@@ -58,10 +58,15 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
 
@@ -111,6 +116,18 @@ public class MainActivity extends Activity {
     private volatile String foundName = null;
     private String failReason = null;
     private volatile int scanFailedCode = -1; // 最近一次 onScanFailed 的 code，-1 = 无
+
+    /* ---- gen22 防串台：候选设备列表（不再「扫到第一个就连」） ---- */
+    // gen22 anti-crosstalk: candidate list (no longer "connect to the first hit").
+    private static final long MULTI_SCAN_GRACE_MS = 2500; // 首个设备后继续收多久 / extra window after the first hit
+    private static final class Found {
+        final String addr;
+        final String name;
+        final int token;
+        Found(String addr, String name, int token) { this.addr = addr; this.name = name; this.token = token; }
+    }
+    private final List<Found> candidates = new ArrayList<Found>();
+    private volatile long firstFoundMs = 0;
 
     /* ---- BLE 回调 ---- */
 
@@ -190,12 +207,22 @@ public class MainActivity extends Activity {
             }
             Integer token = PushProto.tokenFromAdvName(name);
             if (token != null && result.getDevice() != null) {
+                // gen22 防串台：不再「第一个命中就收工」。全部收集起来（按地址去重），
+                // 由 scanForDevice 在宽限期后统一挑选——多台并存时交给用户点选，
+                // 避免把私密长文推到别人的墨水屏上。
+                // gen22 anti-crosstalk: no longer "first hit wins". Collect every match
+                // (de-duplicated by address); scanForDevice picks after a grace window -
+                // with several panels around, the user chooses, so a private long text
+                // never lands on someone else's screen.
                 synchronized (lock) {
-                    if (foundAddr == null) {
-                        foundAddr = result.getDevice().getAddress();
-                        foundToken = token.intValue();
-                        foundName = name;
-                        scanDone = true;
+                    String addr = result.getDevice().getAddress();
+                    boolean dup = false;
+                    for (int i = 0; i < candidates.size(); i++) {
+                        if (candidates.get(i).addr.equals(addr)) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        candidates.add(new Found(addr, name, token.intValue()));
+                        if (firstFoundMs == 0) firstFoundMs = System.currentTimeMillis();
                         lock.notifyAll();
                     }
                 }
@@ -214,13 +241,13 @@ public class MainActivity extends Activity {
                 // failReason) so the retry loop in scanForDevice can stop and
                 // restart - otherwise we would idle out the full 12 seconds.
                 if (errorCode == 1) {
-                    if (foundAddr == null) {
+                    if (candidates.isEmpty()) {
                         scanDone = true;
                         lock.notifyAll();
                     }
                     return;
                 }
-                if (foundAddr == null && failReason == null) {
+                if (candidates.isEmpty() && failReason == null) {
                     failReason = "扫描启动失败（code=" + errorCode + "）";
                     scanDone = true;
                     lock.notifyAll();
@@ -431,6 +458,15 @@ public class MainActivity extends Activity {
                 return;
             }
 
+            // gen22：先把真值时间带给设备——PMU 没有外部晶振、深睡靠内部 RC 走时，
+            // 一天能快几分钟。独立操作码，设备未武装也能收；失败不阻断推送。
+            // gen22: hand the device the true time first - the PMU has no crystal and
+            // its internal RC gains minutes a day in sleep. Separate opcode, accepted
+            // even when unarmed; a failure here must not block the push.
+            byte[] setTime = PushProto.encodeSetTime(System.currentTimeMillis() / 1000L);
+            uiLog("校准设备时钟……");
+            writeChar(cCtrl, setTime);
+
             final int pushSid = nextSessionId();
             byte[] begin = PushProto.encodeBegin(body.length, PushProto.crc32(body),
                     pushSid, foundToken, ptype, title);
@@ -635,6 +671,69 @@ public class MainActivity extends Activity {
 
     /* ---- 扫描 ---- */
 
+    // gen22 防串台：只有一台才自动连；多台时必须让用户按墨水屏上显示的代号点选。
+    // 名字本身就是 MAC 后四位（PicoPush-1A2B），屏幕与列表一一对应，不会认错。
+    // gen22 anti-crosstalk: auto-connect only when there is exactly one panel; with
+    // several, the user must pick by the code shown on the e-ink screen. The name is
+    // the MAC's last four hex digits (PicoPush-1A2B), so screen and list match exactly.
+    private boolean chooseDevice(final List<Found> list) {
+        if (list.isEmpty()) return false;
+        if (list.size() == 1) {
+            Found only = list.get(0);
+            synchronized (lock) {
+                foundAddr = only.addr;
+                foundToken = only.token;
+                foundName = only.name;
+            }
+            return true;
+        }
+        final String[] labels = new String[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            Found f = list.get(i);
+            labels[i] = f.name + "   [" + f.addr + "]";
+        }
+        final int[] pickedIndex = new int[] { -1 };
+        final CountDownLatch picked = new CountDownLatch(1);
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("选择要推送的墨水屏（代号见设备屏幕）")
+                        .setItems(labels, new DialogInterface.OnClickListener() {
+                            @Override
+                            public void onClick(DialogInterface dialog, int which) {
+                                pickedIndex[0] = which;
+                                picked.countDown();
+                            }
+                        })
+                        .setOnCancelListener(new DialogInterface.OnCancelListener() {
+                            @Override
+                            public void onCancel(DialogInterface dialog) {
+                                picked.countDown();
+                            }
+                        })
+                        .show();
+            }
+        });
+        try {
+            picked.await(90, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            /* 用户不等了 / give up waiting */
+        }
+        int index = pickedIndex[0];
+        if (index < 0 || index >= list.size()) {
+            failReason = "未选择设备（发现 " + list.size() + " 台，请选一台）";
+            return false;
+        }
+        Found chosen = list.get(index);
+        synchronized (lock) {
+            foundAddr = chosen.addr;
+            foundToken = chosen.token;
+            foundName = chosen.name;
+        }
+        return true;
+    }
+
     private boolean scanForDevice() {
         BluetoothLeScanner scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
@@ -659,6 +758,8 @@ public class MainActivity extends Activity {
                 foundAddr = null;
                 failReason = null;
                 scanFailedCode = -1;
+                candidates.clear();      // gen22：每轮重新收集 / recollect each round
+                firstFoundMs = 0;
             }
             scanner.stopScan(scanCb); // 幂等：没在扫也是安全调用 / idempotent
             sleepQuiet(200);
@@ -666,7 +767,15 @@ public class MainActivity extends Activity {
             long deadline = System.currentTimeMillis() + SCAN_TIMEOUT_MS;
             synchronized (lock) {
                 while (!scanDone && failReason == null) {
-                    long rem = deadline - System.currentTimeMillis();
+                    // gen22：扫到第一台之后再多收 2.5 秒，看旁边还有没有别的墨水屏；
+                    // 只有一台时几乎立刻进入连接（保持原有手感）。
+                    // gen22: after the first hit keep listening 2.5 s for neighbours;
+                    // with a single panel we still proceed almost immediately.
+                    long effective = deadline;
+                    if (firstFoundMs > 0) {
+                        effective = Math.min(deadline, firstFoundMs + MULTI_SCAN_GRACE_MS);
+                    }
+                    long rem = effective - System.currentTimeMillis();
                     if (rem <= 0) {
                         break;
                     }
@@ -678,8 +787,12 @@ public class MainActivity extends Activity {
                 }
             }
             scanner.stopScan(scanCb);
-            if (foundAddr != null) {
-                return true;
+            List<Found> snapshot;
+            synchronized (lock) {
+                snapshot = new ArrayList<Found>(candidates);
+            }
+            if (!snapshot.isEmpty()) {
+                return chooseDevice(snapshot);
             }
             if (failReason != null) {
                 return false; // 硬失败（非 code=1），onScanFailed 已写明原因

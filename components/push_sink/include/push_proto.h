@@ -37,7 +37,12 @@ enum {
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
     PUSH_OP_RESUME_QUERY = 0x03,  ///< 重连后问断点 / ask for the resume point after reconnect
     PUSH_OP_ABORT = 0x04,         ///< 放弃本次会话 / abandon the session
+    PUSH_OP_SET_TIME = 0x05,      ///< gen22：手机下发 UTC 秒（4 字节小端）校准设备时钟 /
+                                  ///< phone pushes a UTC second count (4 bytes LE) to set the clock
 };
+
+/// CTRL 帧头字节数：magic(2) + op(1) + version(1)。/ CTRL header bytes: magic(2)+op(1)+version(1).
+#define PUSH_CTRL_HDR_LEN 4u
 
 /// STATUS 操作码（设备→手机）。/ STATUS opcodes (device to phone).
 enum {

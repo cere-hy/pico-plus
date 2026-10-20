@@ -569,7 +569,10 @@ static bool book_cover_load_list_gray_impl(const char *path, const char *title, 
 /* ---- 已处理的黑白点阵落卡 / Persistent finished monochrome raster ---- */
 // 更改封面点阵算法时递增此版本；首页与书架各保留一个快刷结果，不按相位累积文件。
 // Bump for changes to dithering; retain one Home and one shelf raster per book, not one per phase.
-#define FAST_COVER_REVISION 1u
+// gen22：push.txt 的点阵输出随专属版式改变，落卡快刷结果同步失效重建。
+// gen22: the push book's raster changed with its dedicated template; drop stale
+// fast-cover rasters too.
+#define FAST_COVER_REVISION 2u
 typedef struct {
     cover_cache_header_t source;
     uint32_t revision, width, height, stride, contrast, phase, white_edge;

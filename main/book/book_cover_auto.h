@@ -14,7 +14,11 @@
 // 缓存键的一部分：改动封面生成或封面的解码能力后必须递增，否则旧结果一直命中。
 // Part of the cover cache key: bump it whenever cover rendering or the set of decodable cover
 // formats changes, or stale entries keep winning.
-#define BOOK_AUTO_COVER_VERSION 4u
+// gen22：新增 push.txt 专属版式（第 4 版式），必须递增——否则旧缓存里 push 书的
+// 深色版式结果会一直命中，新封面永远不出来。
+// gen22: added the dedicated push.txt template (4th); the bump is required or the
+// stale dark-template entry for the push book keeps winning forever.
+#define BOOK_AUTO_COVER_VERSION 5u
 
 /// 用稳定标识、书名和作者选择模板。/ Select a template from stable identity, title and author.
 unsigned book_auto_cover_template(const char *identity, const char *title, const char *author);
