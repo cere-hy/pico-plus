@@ -162,6 +162,8 @@ static bool s_status_subscribed;        // CCCD 订阅态（BLE_GAP_EVENT_SUBSCR
                                          // CCCD subscription state (maintained by BLE_GAP_EVENT_SUBSCRIBE)
 
 static char s_adv_name[32];           // 当前广播名 / the current advertising name
+static char s_close_why[48];          // gen18：最近一次收摊原因（UI 取回展示）
+                                     // gen18: the most recent close-up reason (read back by the UI)
 
 static FILE *s_part;                  // 打开中的 .part（append 模式）/ the open partial (append mode)
 static uint32_t s_last_prog_ms;       // PROGRESS 节流时钟 / the PROGRESS throttle clock
@@ -764,7 +766,17 @@ static void ui_post_word(const char *word) {
     portEXIT_CRITICAL(&s_ui_lock);
 }
 
+// gen18：收摊原因簿记。close_why_set 由各收摊路径调用；ui_post_closed 对没有
+// 显设原因的路径补默认值——closed 事件到 UI 永远带得出一条人话。
+// gen18: the close-up reason ledger. close_why_set is called by each close-up
+// path; ui_post_closed fills a default for paths that set none - the closed
+// event always carries a human sentence to the UI.
+static void close_why_set(const char *why) {
+    snprintf(s_close_why, sizeof(s_close_why), "%s", why ? why : "");
+}
+
 static void ui_post_closed(void) {
+    if (s_close_why[0] == 0) close_why_set("接收已结束");
     portENTER_CRITICAL(&s_ui_lock);
     s_ui.closed = true;
     portEXIT_CRITICAL(&s_ui_lock);
@@ -1343,6 +1355,16 @@ void push_sink_on_stack_sync(void) {
 void push_sink_on_stack_stop(void) {
     ensure_init();
     lock();
+    // gen18：武装期栈被拆（网络租约或任何漏网入口）必须留痕——广播丢了，
+    // 主循环 sync 会按 armed 把栈找回来，但这一幕不许无声无息地过去。
+    // gen18: a stack teardown while armed (a network lease or any missed
+    // entry) must leave a trace - the advertisement is lost and the loop's
+    // sync brings the stack back per armed, but this moment must not pass
+    // silently.
+    if (s_sess.state != PUSH_STATE_IDLE) {
+        ESP_LOGW(TAG, "BLE stack stopped while armed (state=%d) - advertisement lost, sync restores it",
+                 (int)s_sess.state);
+    }
     s_stack_up = false;
     adv_stop();
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -1404,6 +1426,7 @@ esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
     }
     if (token == 0) token = (uint16_t)(esp_random() & 0xFFFFu);
     if (token == 0) token = 1; // 0 留给「未武装」语义 / 0 means unarmed, keep it out
+    s_close_why[0] = 0; // 新回合干净开局：收摊原因不留旧话 / a fresh round starts with no stale close-up reason
     try_adopt();
     if (s_stack_up) {
         push_event_t evt;
@@ -1427,8 +1450,22 @@ esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms) {
 }
 
 void push_sink_cancel(void) {
+    push_sink_cancel_why("已退出接收");
+}
+
+// gen18 排雷核心：取消必须带原因。日志行 `armed canceled by X` 是覆盖表的
+// 实证点——真机上拔充电线、开飞行模式、进 USB 存储各应出现一次。
+// The gen18 mine-sweeping core: a cancel must carry a reason. The
+// "armed canceled by X" log line is the coverage table's proof point - on
+// hardware, unplugging the charger, flight mode and USB storage each show one.
+void push_sink_cancel_why(const char *why) {
     ensure_init();
     lock();
+    close_why_set(why);
+    if (s_sess.state != PUSH_STATE_IDLE || s_pending_arm) {
+        ESP_LOGI(TAG, "armed canceled by %s (state=%d pending=%d)",
+                 why ? why : "?", (int)s_sess.state, (int)s_pending_arm);
+    }
     if (s_pending_arm) {
         s_pending_arm = false;
         s_charger_held = false;
@@ -1438,6 +1475,10 @@ void push_sink_cancel(void) {
     }
     exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
     unlock();
+}
+
+const char *push_sink_last_close_why(void) {
+    return s_close_why[0] ? s_close_why : NULL;
 }
 
 bool push_sink_armed(void) {
@@ -1510,6 +1551,11 @@ void push_sink_poll(void) {
         (void)read_pico_pmu_poll();
         if (!charging_now()) {
             s_charger_held = false;
+            // 原因在判定拔电时就设上：UNPLUG 事件与「宽限到期收官」两条路
+            // 都靠它给 UI 一句人话。/ The reason is set the moment the unplug
+            // is detected: both the UNPLUG event and the grace-expiry wrap-up
+            // rely on it for a human sentence to the UI.
+            close_why_set("充电线已拔出，接收结束");
             if (s_sess.state == PUSH_STATE_WINDOW || s_sess.state == PUSH_STATE_CONNECTED ||
                 s_sess.state == PUSH_STATE_COOLDOWN) {
                 exec_actions(push_session_event(&s_sess, PUSH_EVT_UNPLUG, NULL));

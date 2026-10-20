@@ -75,6 +75,18 @@ esp_err_t push_sink_arm(uint16_t token, uint32_t window_ms);
 /// 用户取消（UI 上的退出按钮）。/ The user cancelled (the UI's exit button).
 void push_sink_cancel(void);
 
+/// 带原因取消（gen18 排雷）：任何武装期 BLE 拆除都必须留痕——
+/// 「armed canceled by X」日志 + 原因可被 UI 取回展示，静默失败零容忍。
+/// Cancel with a reason (gen18 mine-sweeping): every armed-period BLE
+/// teardown must leave a trace - an "armed canceled by X" log plus a reason
+/// the UI can read back and show. Zero tolerance for silent failure.
+void push_sink_cancel_why(const char *why);
+
+/// 最近一次收摊的原因串（窗口到期/拔电/取消等）；无原因为 NULL。
+/// The reason string of the most recent close-up (window expiry, unplug,
+/// cancel, ...); NULL when there is none.
+const char *push_sink_last_close_why(void);
+
 /// 是否处于武装窗口的任意非 IDLE 态：栈必须保持运行、翻页器让位。
 /// Whether the machine is in any non-IDLE armed state: the stack must stay up
 /// and the page-turner yields.
