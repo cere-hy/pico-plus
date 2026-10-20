@@ -423,9 +423,9 @@ static void push_card_text(char *state_text,size_t n) {
     push_sink_progress(&received, &total);
     const char *adv = push_sink_adv_name();
     const bool has_adv = push_sink_armed() && adv && adv[0];
-    // gen21：未读徽章在场时右侧切短式（去广播名），给 104px 徽章腾位。
-    // gen21: while the unread badge is up the right side shortens (no adv name)
-    // to make room for the 104px badge.
+    // gen21：未读提醒在场时右侧切短式（去广播名），给圆点+「有新内容」旁注腾位。
+    // gen21: while the unread reminder is up the right side shortens (no adv
+    // name) to make room for the dot plus its caption.
     const bool short_form = push_sink_unread();
     switch (st) {
         case PUSH_STATE_ARMED:
@@ -447,7 +447,15 @@ static void push_card_text(char *state_text,size_t n) {
             break;
         case PUSH_STATE_PROCESSING: snprintf(state_text, n, "校验中…"); break;
         case PUSH_STATE_COOLDOWN: snprintf(state_text, n, "推送完成 · 可继续发送"); break;
-        default: snprintf(state_text, n, "未开启"); break;
+        default:
+            // gen21（用户拍板微调）：未开启态不亮反色小块——未开启时收不到数据，
+            // 且白条里黑底白字块太突兀。有历史未读时右侧文字直接说清楚。
+            // gen21 (user ruling): idle state never shows the inverted dot - no
+            // data can arrive while idle, and a black-on-white chip on the dim
+            // bar is jarring. A stale unread simply says so in the right text.
+            if (push_sink_unread()) snprintf(state_text, n, "未开启·有未读内容");
+            else snprintf(state_text, n, "未开启");
+            break;
     }
 }
 static void draw_push_card(uint8_t *fb) {
@@ -473,19 +481,23 @@ static void draw_push_card(uint8_t *fb) {
     // center 598 (real-hw screenshot). Everything now centers on 598.
     label_on(fb, 60, 598, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
     const bool unread = push_sink_unread();
-    if (unread) {
-        // gen21 未读徽章：反色胶囊「有新内容」，右缘 624、垂直中心 598。
-        // 武装态＝白底黑字（黑条上最亮元素）；未开启态＝黑底白字。
-        // gen21 unread badge: inverted capsule "有新内容", right edge 624,
-        // vertical center 598. Armed = white on black (brightest thing on the
-        // bar); idle = black on white. Static - no blinking, e-ink discipline.
-        const EpdRect badge = {520, 582, 104, 32};
-        const uint8_t bfill = live ? 0xff : 0x00;
-        const uint8_t bink = live ? 0x00 : 0xff;
-        ui_fill_round_rect(fb, badge, 16, bfill);
-        label_on(fb, 532, 598, 20, "有新内容", EPD_DRAW_ALIGN_LEFT, bink, bfill);
+    if (unread && live) {
+        // gen21 未读提醒（用户拍板定稿）：仅在武装期显示；形态 = 实心反色小圆点
+        // （12x12 圆角块 r=6 ≈ 圆）+ 旁注「有新内容」，右缘 624、垂直中心 598，
+        // 替换掉 104x32 大胶囊——墨水屏上小色块更清爽。武装卡是黑底白字，
+        // 反色圆点即白实心；静态不闪烁。未开启态不亮点（见 push_card_text）。
+        // gen21 unread reminder (user ruling, final): armed states only; form =
+        // a solid inverted 12x12 dot (r=6) plus the caption "有新内容", right
+        // edge 624, vcenter 598, replacing the 104x32 capsule - cleaner on
+        // e-ink. The armed bar is black-on-white so the inverted dot is solid
+        // white. Static, no blinking. Idle never shows the dot.
+        label_on(fb, 624, 598, 22, "有新内容", EPD_DRAW_ALIGN_RIGHT, ink, fill);
+        const EpdRect dot = {526, 592, 12, 12};
+        ui_fill_round_rect(fb, dot, 6, 0xff);
         label_on(fb, 508, 598, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
     } else {
+        // 未读且未开启：右侧文字已是「未开启·有未读内容」，无块。
+        // Unread while idle: the right text already says so, no dot.
         label_on(fb, 624, 598, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
     }
 }
