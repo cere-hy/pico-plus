@@ -471,7 +471,7 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
 // Save the current page first, then settle a clock-free static frame so shutdown never leaves a misleading frozen time.
 // 锁屏前先由页面保存进度，再持久化一次恢复上下文；不在翻页或点击时写入。
 // Flush page progress before persisting one lock checkpoint; never write it on page turns or taps.
-static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
+static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback, bool manual) {
     // 物理横屏是阅读页私有状态（全工程运行时唯一的旋转切换点在 book render()）；
     // 进入任何系统画面（锁屏/壁纸/PIN/票根/关机/重启）前必须复位，否则竖屏资产
     // 会画在横屏物理屏上——真机实证：长按电源睡眠后壁纸横置、关机画面错位。
@@ -488,6 +488,20 @@ static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedbac
     // rotation check (the PMU drops the ESP rail for a full restart).
     if (epd_get_rotation() == EPD_ROT_LANDSCAPE) epd_set_rotation(EPD_ROT_INVERTED_PORTRAIT);
     if (feedback) app_lock_feedback(ctx->hl);
+    // gen21：手动电源键（息屏/休眠）拥有最高优先级——武装期绝不拦截，改为静默
+    // 取消武装（安全关射频）后正常息屏；唤醒后状态卡回 IDLE/「未开启」，闭环成立。
+    // 自动锁屏/深睡（manual=false）保持 gen18 豁免保活（M1.5 关屏保活），不在此取消，
+    // 仍交 enter_lock_and_sleep 拒锁。cancel_why 在未 IDLE 时才打
+    // 「armed canceled by manual sleep」，重复调用幂等静默。
+    // gen21: a manual power-key lock outranks the push arm - never refuse, just
+    // silently disarm (tear the radio down) then sleep; on wake the status card
+    // returns to IDLE/"未开启", closing the loop. Auto lock (manual=false) keeps
+    // the gen18 exemption (M1.5 screen-off keepalive) and is still refused by
+    // enter_lock_and_sleep; cancel_why only logs "armed canceled by manual sleep"
+    // while not IDLE, so re-calling is idempotent and silent.
+    if (manual && push_sink_armed()) {
+        push_sink_cancel_why("manual sleep");
+    }
     if (current->on_before_lock) current->on_before_lock(ctx);
     int tab = app_index_of(current);
     pico_resume_t resume = {.tab = tab >= 0 && tab < 4 ? (uint8_t)tab : 0};
@@ -499,7 +513,7 @@ static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedbac
     (void)pico_boot_save_resume(&resume);
 }
 static void run_power_action(app_ctx_t *ctx, const app_desc_t *current, bool restart) {
-    prepare_lock(ctx, current, false);
+    prepare_lock(ctx, current, false, false);  // 关机/重启走 app_enter_host_sleep，深睡路径自带 cancel（gen18 ③），此处 manual=false
     ui_power_final_draw(ctx->fb, restart);
     guard_draw_result(ctx->hl, update_display_full(ctx->hl));
     app_lock_wait_key_idle(800);
@@ -714,11 +728,11 @@ void app_loop_run(const app_loop_config_t* config) {
                     if (!app_settings_staged_shutdown()) {
                         power_dialog_open = false;
                         ui_power_dialog_reset(&power_dialog, false);
-                        run_power_action(&ctx, current, false);
+                        run_power_action(&ctx, current, false);  // 走 app_enter_host_sleep，深睡路径自带 cancel（"关机/深睡，接收结束"），此处 manual=false
                     } else {
                         power_dialog_open = false;
                         ui_power_dialog_reset(&power_dialog, false);
-                        prepare_lock(&ctx, current, true);
+                        prepare_lock(&ctx, current, true, true);
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
@@ -898,7 +912,7 @@ void app_loop_run(const app_loop_config_t* config) {
                     bool reader_power_lock = !menu_open && current == &app_book &&
                         app_book_reader_body_visible() && app_settings_reader_power_turn();
                     if (reader_power_lock) {
-                        prepare_lock(&ctx, current, true);
+                        prepare_lock(&ctx, current, true, true);
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp, true);
                         display_request_full_refresh();
@@ -981,7 +995,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         present_page(&ctx, current, &gesture, power_redraw);
                         ctx.consumed = true;
                     } else {
-                        prepare_lock(&ctx, current, true);
+                        prepare_lock(&ctx, current, true, true);
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
@@ -1116,7 +1130,7 @@ void app_loop_run(const app_loop_config_t* config) {
             cancel_gesture(&ctx, current, &gesture);
             if (menu_pressed >= 0) menu_feedback(&ctx, current, menu_leaf, menu_pressed, false, &feedback);
             menu_pressed = UI_MENU_HIT_NONE;
-            prepare_lock(&ctx, current, false);
+            prepare_lock(&ctx, current, false, false);
             extern const app_desc_t app_book;
             main_lock_boundary();
             enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,

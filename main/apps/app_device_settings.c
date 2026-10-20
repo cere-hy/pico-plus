@@ -2312,14 +2312,15 @@ static void on_before_lock(app_ctx_t *ctx) {
     if (s_page == SETTINGS_PIN_ENTRY) { pin_setup_close(); s_page = SETTINGS_LOCK_PIN; }
     s_upgrade_job = UPGRADE_JOB_NONE;
     (void)ctx; pico_online_cancel_join(); ble_pt_scan_stop(); s_ble_learning = 0;
-    // gen18：手动息屏（电源键）不杀蓝牙——武装期豁免。此前这里无条件拆栈，
-    // 而 enter_lock_and_sleep 的拒武装发生在其后：用户按一下电源键，推流广播
-    // 就被拆了等 sync 两秒才回来（覆盖表第 5 行）。缺的守卫补上。
-    // gen18: a manual screen-off (power key) must not kill Bluetooth - the
-    // armed period is exempt. This used to tear the stack down unconditionally
-    // while enter_lock_and_sleep's armed refusal comes after it: one power-key
-    // press dropped the push advertisement until sync restored it two seconds
-    // later (coverage-table row 5). The missing guard goes in.
+    // gen21：手动电源键取消武装已上移到 prepare_lock（manual=true →
+    // push_sink_cancel_why("manual sleep")），此处到达时武装期已拆栈。本分支
+    // 仅对自动锁屏路径（manual=false，武装仍在）生效：武装期跳过 ble_pt_stop，
+    // 由 enter_lock_and_sleep 拒锁保活（M1.5 关屏保活）。
+    // gen21: manual power-key disarm moved up to prepare_lock (manual=true ->
+    // push_sink_cancel_why("manual sleep")); by the time we reach here the arm
+    // is already torn down. This branch only fires for the auto-lock path
+    // (manual=false, arm still up): skip ble_pt_stop there and let
+    // enter_lock_and_sleep refuse the lock (M1.5 screen-off keepalive).
     if (!push_sink_armed()) (void)ble_pt_stop(2000);
     else ESP_LOGI(TAG, "screen-off skipped ble stop: push sink armed");
 }
