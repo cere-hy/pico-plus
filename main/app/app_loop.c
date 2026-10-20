@@ -136,9 +136,18 @@ static void quick_toggle_wifi(void) {
     } else {
         char ssid[33] = {0}; bool configured = false;
         if (read_pico_transfer_get_saved_wifi(ssid, &configured) == ESP_OK && configured) {
-            // 先释放蓝牙占用，再用既有异步连接/重试流程；不新开上传服务器或改写凭据。
-            // Release Bluetooth resources first, then reuse connection/retry handling without starting uploads or rewriting credentials.
-            ble_pt_sync(false);
+            // gen18：武装期不释放蓝牙占用——与息屏同款豁免（覆盖表第 1 行）。
+            // ESP32 上 WiFi 与 BLE 可共存，跳过 ble_pt_sync(false) 让推送广播持续；
+            // 栈由主循环 ble_pt_sync((armed||turner)&&!wifi_busy&&!flight) 继续保活。
+            // 此前无条件 ble_pt_sync(false) 是漏网的武装期拆栈入口（覆盖表修正项）。
+            // gen18: do not release Bluetooth while armed - the same exemption as
+            // screen-off (coverage-table row 1). WiFi and BLE coexist on the ESP32,
+            // so skip ble_pt_sync(false) and keep the push advertisement up; the
+            // loop's ble_pt_sync((armed||turner)&&!wifi_busy&&!flight) keeps the
+            // stack. An unconditional ble_pt_sync(false) here was a missed armed
+            // teardown entry (coverage-table correction).
+            if (!push_sink_armed()) ble_pt_sync(false);
+            else ESP_LOGI(TAG, "wifi toggle skipped ble stop: push sink armed");
             const read_pico_transfer_cfg_t cfg = {.mode = READ_PICO_TRANSFER_MODE_STA, .network_only = true};
             (void)read_pico_transfer_start(&cfg);
         }
