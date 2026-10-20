@@ -226,6 +226,12 @@ typedef enum { TRANSFER_METHODS, TRANSFER_HOME, TRANSFER_NETWORKS, TRANSFER_PASS
 #define NETWORK_ROWS 4
 #define PASSWORD_MAX 64
 static transfer_view_t s_view;
+// gen18（18-a）：本次离页若是 OPEN_BOOK(push.txt) 的交接就不收摊——sink 转后台
+// 属主，手机在宽限期/窗口内还能直接连推。用户手动离开照旧收摊。
+// gen18 (18-a): if this exit is the OPEN_BOOK(push.txt) handoff, do not tear
+// down - the sink moves to a background owner and the phone can still push
+// within the grace/window. Manual exits close up as before.
+static bool s_push_handed_off;
 static read_pico_transfer_network_t s_networks[READ_PICO_TRANSFER_SCAN_MAX], s_selected;
 static size_t s_network_count, s_network_page;
 static bool s_scan_pending, s_network_connect_pending, s_saved_configured, s_password_visible, s_forget_confirm;
@@ -980,6 +986,13 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
     if (push_sink_take_closed()) {
         push_word_card_close();
         s_view = TRANSFER_METHODS;
+        // gen18：收摊必须带原因——窗口到期/拔电/飞行模式/USB 各说各的话，
+        // 用户看得懂下一步该干什么（错误文案要能指路）。
+        // gen18: a close-up must carry its reason - window expiry, unplug,
+        // flight mode and USB each say their own piece, so the user knows
+        // what to do next (error text must point the way).
+        const char *why = push_sink_last_close_why();
+        if (why) snprintf(s_method_message, sizeof(s_method_message), "%s", why);
         return APP_REDRAW_PAGE;
     }
     char title[PUSH_TITLE_MAX];
@@ -994,6 +1007,11 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
         (void)book_progress_forget(PUSH_TEXT_PATH);
         extern const app_desc_t app_book;
         if (app_book_request_open(PUSH_TEXT_PATH)) {
+            // gen18（18-a）：开书即交接——标记这次离页，transfer_on_exit 据此
+            // 不收摊；摊子由阅读器退出时（book_on_exit）才收。
+            // gen18 (18-a): opening the book is the handoff - flag this exit so
+            // transfer_on_exit keeps the arm; only leaving the reader closes up.
+            s_push_handed_off = true;
             ctx->request_app = &app_book;
             return APP_REDRAW_NONE;
         }
@@ -1237,6 +1255,7 @@ static void on_enter(app_ctx_t* ctx) {
     s_method_message[0] = 0;
     s_push_note[0] = 0;
     s_push_poll_ms = 0;
+    s_push_handed_off = false; // gen18：进场即清交接标记，旧标记不过夜 / gen18: clear the handoff flag on entry - no stale flags overnight
     s_view = TRANSFER_METHODS;
     s_direct_entry = s_usb_requested || s_wifi_upload_requested || s_hotspot_requested;
     s_usb_entry = s_usb_requested;
@@ -1317,6 +1336,18 @@ static void on_enter(app_ctx_t* ctx) {
         push_word_card_close();
         push_drain_stale_events();
         push_sync_live_bookkeeping();
+    } else if (push_sink_armed()) {
+        // gen18（18-a 自动切回落点）：sink 正被后台保活——用户在读 push.txt，
+        // 手机回连把用户从阅读器弹回本页。直接落武装视图接客，**不重新武装**
+        // （会话是活的，ERR(1) 意味着保活失败，验收要抓的就是它）。
+        // gen18 (18-a auto-switch-back landing): the sink is background-alive -
+        // the user reads push.txt and a returning phone bounced them back here.
+        // Land straight on the arm view to receive and **do not re-arm** (the
+        // session is live; an ERR(1) would mean the keep-alive failed, which is
+        // exactly what acceptance watches for).
+        s_view = TRANSFER_PUSH;
+        push_word_card_close();
+        push_sync_live_bookkeeping();
     } else {
         s_wifi_settings_only = false;
     }
@@ -1345,6 +1376,13 @@ static void transfer_on_media_lost(app_ctx_t* ctx) {
     (void)ctx;
     if (s_root.is_flash) return;
     if (s_view == TRANSFER_PUSH) push_word_card_close();
+    // gen18：媒体丢失照旧收摊（裁决口径）——卡没了，后续 BEGIN 只会在
+    // part_open_append 撞 ERR(5)，不如诚实地结束并留痕。
+    // gen18: media loss closes up as ruled - with the card gone every later
+    // BEGIN just hits ERR(5) in part_open_append, so end it honestly with a trace.
+    if (push_sink_armed() || push_sink_state() != PUSH_STATE_IDLE) {
+        push_sink_cancel_why("TF 卡已拔出，接收结束");
+    }
     stop_session();
     s_start_pending = s_scan_pending = false;
     s_view = s_direct_entry ? TRANSFER_HOME : TRANSFER_METHODS;
@@ -1362,8 +1400,19 @@ static void transfer_on_exit(app_ctx_t* ctx) {
     // 离页即收摊：武装中的推流随页面一起退，手机侧看到断连即知会话暂停。
     // Leaving the page closes the arm: a push in progress leaves with the page,
     // and the phone reads the disconnect as a paused session.
+    // gen18（18-a）例外：OPEN_BOOK(push.txt) 的交接离页不收摊——sink 转后台
+    // 属主继续保活，手机断开重连/宽限内再发都能直达（COOLDOWN→WINDOW/
+    // CONNECTED 既有转移，acceptance 判据「全程无 ERR(1)」）。用户手动退出
+    // 接收页照旧收摊。/ gen18 (18-a) exception: the OPEN_BOOK(push.txt)
+    // handoff exit keeps the arm under a background owner so a returning phone
+    // pushes straight through (existing COOLDOWN->WINDOW/CONNECTED moves; the
+    // acceptance criterion is "no ERR(1) throughout"). Manual exits close up.
+    const bool handed_off = s_push_handed_off;
+    s_push_handed_off = false;
     if (s_view == TRANSFER_PUSH) push_word_card_close();
-    if (push_sink_armed() || push_sink_state() != PUSH_STATE_IDLE) push_sink_cancel();
+    if (!handed_off && (push_sink_armed() || push_sink_state() != PUSH_STATE_IDLE)) {
+        push_sink_cancel();
+    }
     if (usb_storage_active()) {
         esp_err_t err = usb_storage_stop();
         if (err == ESP_OK) s_any_changed = true;

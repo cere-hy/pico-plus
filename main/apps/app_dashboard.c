@@ -36,6 +36,7 @@
 
 #include "app.h"
 #include "app_content_open.h"
+#include "app_transfer_mode.h"
 #include "boot_state.h"
 #include "app_registry.h"
 #include "book_cover.h"
@@ -45,6 +46,7 @@
 #include "book_progress.h"
 #include "book_store.h"
 #include "book_title.h"
+#include "push_sink.h"
 #include "book_ticket.h"
 #include "book_excerpt.h"
 #include "ui_home_widget.h"
@@ -132,6 +134,17 @@ static bool s_press_pending;
 static EpdRect continue_card_rect(void) { return (EpdRect){36,184,612,378}; }
 static EpdRect continue_card_hit_rect(void) { return (EpdRect){24,172,636,402}; }
 static bool continue_card_pressed(void) { return s_press_pending && s_pressed.height == 378; }
+// gen18（M1.5 案1）：首页推流状态卡。渲染源直接读 push_sink_state()——射频事实，
+// 不是武装意图；点按只跳传书页，绝不静默武装（裁决③）。卡带 = 继续阅读卡与
+// 月相钟之间的横带；原分隔线随之下移让位。/ gen18 (M1.5 case 1): the home push
+// status card. The render source reads push_sink_state() directly - the radio
+// fact, not the arming intent; a tap only jumps to the transfer page and never
+// silently arms (ruling 3). The card band sits between the continue-reading
+// card and the moon clock; the old separator moves down to make room.
+#define PUSH_CARD_RECT ((EpdRect){36,570,612,54})
+#define PUSH_CARD_HIT  ((EpdRect){24,562,636,70})
+static EpdRect push_card_rect(void) { return PUSH_CARD_RECT; }
+static bool push_card_pressed(void) { return s_press_pending && s_pressed.height == 54; }
 static EpdRect control_feedback_area(EpdRect control) {
     return control.height == 378 ? (EpdRect){56,270,184,252} : control;
 }
@@ -379,6 +392,87 @@ static void home_frame(uint8_t *fb,EpdRect box,int radius) {
 static void circle_frame(uint8_t *fb,int x,int y,int radius) {
     for(int i=0;i<3&&i<radius;++i)epd_draw_circle(x,y,radius-i,0x30,fb);
 }
+// ---- gen18 推流状态卡 / push status card ----
+// 快照对齐 push_sink_state() 的射频事实：状态、窗口剩余秒、收发字节。
+// 变化才重刷——墨水屏不陪空转。/ The snapshot mirrors push_sink_state()'s
+// radio facts: state, window seconds left, bytes moved. Repaint only on
+// change - the panel does not idle-spin.
+typedef struct {
+    int state;
+    uint32_t left_s;
+    uint32_t received, total;
+} push_card_snap_t;
+static push_card_snap_t s_push_snap;
+static bool s_push_snap_valid;
+static uint32_t s_push_poll_ms;
+
+static void push_card_text(char *state_text,size_t n,char *sub_text,size_t sub_n) {
+    const push_state_t st = push_sink_state();
+    uint32_t received = 0, total = 0;
+    push_sink_progress(&received, &total);
+    switch (st) {
+        case PUSH_STATE_ARMED:
+        case PUSH_STATE_WINDOW:
+            snprintf(state_text, n, "等待连接 · 剩 %lu 分钟",
+                     (unsigned long)((push_sink_window_left_ms() + 59999) / 60000));
+            break;
+        case PUSH_STATE_CONNECTED: snprintf(state_text, n, "手机已连接"); break;
+        case PUSH_STATE_RECEIVING:
+            snprintf(state_text, n, "接收中 %lu%%",
+                     total ? (unsigned long)(received * 100 / total) : 0UL);
+            break;
+        case PUSH_STATE_PROCESSING: snprintf(state_text, n, "校验中…"); break;
+        case PUSH_STATE_COOLDOWN: snprintf(state_text, n, "推送完成 · 可继续发送"); break;
+        default: snprintf(state_text, n, "未开启"); break;
+    }
+    // 副行：最近一推标题 + 广播名（武装期才值得看名字）。
+    // The sub line: the last pushed title plus the adv name (only worth
+    // reading while armed).
+    char title[128];
+    if (book_title_get(PUSH_TEXT_PATH, title, sizeof(title)) && title[0]) {
+        fit(title, 20, 380);
+        snprintf(sub_text, sub_n, "最近：%s", title);
+    } else {
+        snprintf(sub_text, sub_n, "尚未推送过内容");
+    }
+}
+static void draw_push_card(uint8_t *fb) {
+    const bool live = push_sink_armed();
+    const uint8_t fill = live ? 0x20 : 0xf2;
+    const uint8_t ink = live ? 0xff : 0x60;
+    const uint8_t ink_dim = live ? 0xb0 : 0x90;
+    ui_fill_round_rect(fb, PUSH_CARD_RECT, 20, fill);
+    home_frame(fb, PUSH_CARD_RECT, 20);
+    char state_text[48], sub_text[160];
+    push_card_text(state_text, sizeof(state_text), sub_text, sizeof(sub_text));
+    label_on(fb, 60, 594, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
+    label_on(fb, 624, 594, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
+    char name_line[64];
+    const char *adv = push_sink_adv_name();
+    if (live && adv && adv[0]) snprintf(name_line, sizeof(name_line), "%s", adv);
+    else snprintf(name_line, sizeof(name_line), "点按去接收");
+    fit(name_line, 20, 200);
+    label_on(fb, 60, 618, 20, sub_text, EPD_DRAW_ALIGN_LEFT, ink_dim, fill);
+    label_on(fb, 624, 618, 20, name_line, EPD_DRAW_ALIGN_RIGHT, ink_dim, fill);
+}
+static bool push_card_due(app_ctx_t *ctx) {
+    // 250ms 节流：倒计时按分钟粒度、进度按 ~2Hz，都比这个慢；墨水屏不陪空转。
+    // A 250ms throttle: the countdown is minute-granular and progress ~2Hz,
+    // both slower than this - the panel does not idle-spin.
+    if (ctx->now_ms - (int64_t)s_push_poll_ms < 250) return false;
+    s_push_poll_ms = (uint32_t)ctx->now_ms;
+    uint32_t received = 0, total = 0;
+    push_sink_progress(&received, &total);
+    const push_card_snap_t now = {
+        .state = (int)push_sink_state(),
+        .left_s = (push_sink_window_left_ms() + 999) / 1000,
+        .received = received, .total = total,
+    };
+    if (s_push_snap_valid && !memcmp(&s_push_snap, &now, sizeof(now))) return false;
+    s_push_snap = now;
+    s_push_snap_valid = true;
+    return true;
+}
 static bool date_now(struct tm *out) {
     time_t now=time(NULL);
     if(now<1704067200) { const pmu_snapshot_t *pmu=read_pico_pmu_get(); if(pmu&&pmu->time_synced)now=pmu->unix_sec; }
@@ -596,7 +690,11 @@ static void render_root(uint8_t *fb) {
         track.width=358*(b->has_progress?b->progress.pct:0)/100;if(track.width)ui_fill_round_rect(fb,track,3,0x30);
     } else label_on(fb,342,410,23,"打开一本书后，会在这里继续阅读",EPD_DRAW_ALIGN_CENTER,0x60,card_gray);
     HOME_STAGE("card_body");
-    ui_draw_separator(fb,606,36,612,0x50);
+    // gen18：推流状态卡落在继续阅读卡与月相钟之间的横带；分隔线随之下移。
+    // gen18: the push status card takes the band between the reading card and
+    // the moon clock; the separator moves down with it.
+    draw_push_card(fb);
+    ui_draw_separator(fb,634,36,612,0x50);
     if(app_settings_home_component()==APP_HOME_FOLDER) {
         ui_home_folder_draw(fb,s_folder,s_folder_fast,(EpdRect){24,604,320,350});
         label(fb,184,985,22,"最近阅读",EPD_DRAW_ALIGN_CENTER,0x50);
@@ -811,6 +909,11 @@ static void on_media_lost(app_ctx_t *ctx) {
 static void on_media_ready(app_ctx_t *ctx) {(void)ctx;s_books_cache_valid=false;s_scan_pending=true;avatar_prepare_state();}
 static app_redraw_t on_tick(app_ctx_t *ctx) {
     clock_base_prepare();
+    // gen18 状态卡轮询放在最前：状态变化是功能事实，优先于表盘 cosmetic 刷新；
+    // 250ms 节流 + 快照比对，不变不刷。/ The gen18 status-card poll comes first:
+    // a state change is a functional fact and outranks cosmetic clock refresh;
+    // 250ms throttle plus snapshot diff - no change, no repaint.
+    if(s_view==HOME_ROOT&&push_card_due(ctx)){s_area=push_card_rect();return APP_REDRAW_AREA;}
     if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
     if(s_view==HOME_COMPONENT&&s_component_pending)return APP_REDRAW_AREA;
     bool folder_preview=s_view==HOME_COMPONENT&&s_component_browse==APP_HOME_FOLDER;
@@ -885,6 +988,7 @@ static bool hit(EpdRect r,int x,int y) {return x>=r.x&&x<r.x+r.width&&y>=r.y&&y<
 static EpdRect control(int x,int y) {
     if(s_view==HOME_ROOT) {
         if(featured()->path[0] && hit(continue_card_hit_rect(),x,y))return continue_card_rect();
+        if(hit(PUSH_CARD_HIT,x,y))return PUSH_CARD_RECT;
         if(hit((EpdRect){510,88,60,60},x,y))return(EpdRect){510,88,60,60};
     }else if(hit((EpdRect){36,78,60,60},x,y))return(EpdRect){0}; // 共享圆圈反馈负责题头返回，避免再叠错位框。/ Shared circle feedback owns header backs; do not add a shifted frame.
     if(s_view==HOME_COMPONENT){
@@ -902,7 +1006,7 @@ static EpdRect control(int x,int y) {
 static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
     if(ev->type==UI_GESTURE_PRESS) {s_pressed=control(ev->x0,ev->y0);s_press_pending=s_pressed.width>0;if(s_press_pending){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}return APP_REDRAW_NONE;}
     bool restore=s_press_pending;
-    if(ev->type==UI_GESTURE_MOVE) {if(s_press_pending&&!hit(continue_card_pressed()?continue_card_hit_rect():s_pressed,ev->x,ev->y)){s_press_pending=false;s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}return APP_REDRAW_NONE;}
+    if(ev->type==UI_GESTURE_MOVE) {if(s_press_pending&&!hit(continue_card_pressed()?continue_card_hit_rect():push_card_pressed()?PUSH_CARD_HIT:s_pressed,ev->x,ev->y)){s_press_pending=false;s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}return APP_REDRAW_NONE;}
     s_press_pending=false;
     if(ev->type==UI_GESTURE_LONG_PRESS&&s_view==HOME_ROOT&&hit((EpdRect){24,640,320,365},ev->x0,ev->y0)) {
         s_component_browse=app_settings_home_component();s_view=HOME_COMPONENT;s_save_error=false;return APP_REDRAW_PAGE;
@@ -946,6 +1050,19 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
             home_book_t *b=featured();
             if(b->path[0] && app_book_request_open_from_home(b->path)){ui_nav_request(ctx,1);return APP_REDRAW_NONE;}
             if(restore){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}
+            return APP_REDRAW_NONE;
+        }
+        if(hit(PUSH_CARD_HIT,x,y)) {
+            // gen18 deep-link（裁决③）：只跳传书页，绝不静默武装——武装留给
+            // 传书页的「手机推送」入口由用户自己点。sink 若正被后台保活
+            // （18-a），传书页 on_enter 会直接落武装视图接客。
+            // gen18 deep-link (ruling 3): jump to the transfer page only, never
+            // silently arm - arming stays a deliberate tap on the transfer
+            // page's phone-push entry. If the sink is background-alive (18-a),
+            // the transfer page's on_enter lands straight on the arm view.
+            extern const app_desc_t app_transfer;
+            app_transfer_request_method_picker();
+            ctx->request_app = &app_transfer;
             return APP_REDRAW_NONE;
         }
         if(hit((EpdRect){588,88,60,60},x,y)){ui_nav_request(ctx,3);return APP_REDRAW_NONE;}

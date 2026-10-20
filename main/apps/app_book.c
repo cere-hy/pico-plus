@@ -309,6 +309,15 @@ static bool s_reader_fullscreen;
 static int64_t s_reader_clock_minute = -1, s_reader_clock_painted_minute = -1;
 static bool s_reader_clock_pending;
 static char s_message[128], s_storage[128], s_path[BOOK_STORE_PATH_MAX], s_title[128];
+// gen18（18-a）：读 push.txt 期间 sink 后台保活；手机回连时本页自动切回传书页
+// 接客。这个标记告诉 book_on_exit「此次离页是交接，不收摊」——摊子留给用户
+// 真正离开阅读器时收（裁决：收摊点挂 book_on_exit）。
+// gen18 (18-a): the sink stays background-alive while push.txt is read; a
+// returning phone bounces this page back to the transfer page to receive. The
+// flag tells book_on_exit "this exit is a handoff, do not tear down" - the
+// teardown waits for a real reader exit (the ruling: teardown hangs off
+// book_on_exit).
+static bool s_push_handoff;
 static char s_book_title[128];
 static char s_chapter_heading_title[128], s_chapter_heading_label[32];
 static size_t s_chapter_lead_skip;
@@ -6574,6 +6583,15 @@ static void book_on_exit(app_ctx_t* ctx) {
     // rather than on open: "finished reading" is only knowable at exit, and no
     // existing reader path is touched.
     if (s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0) push_sink_notify_read();
+    // gen18（18-a 收摊点）：离开手机推来的虚拟书 = 后台保活到此为止。
+    // 自动切回的交接离页除外——那时传书页正接手会话（s_push_handoff）。
+    // gen18 (18-a teardown point): leaving the phone-pushed virtual book ends
+    // the background keep-alive. The auto-switch-back handoff exit is exempt -
+    // the transfer page is taking the session over (s_push_handoff).
+    if (s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0) {
+        if (s_push_handoff) s_push_handoff = false; // 交接：摊子不收，传书页续命
+        else push_sink_cancel_why("退出阅读器，接收结束");
+    }
     // 离开阅读即退出全工程唯一的横屏语境：物理旋转若停在 LANDSCAPE，后续任何
     // 页面（Home/菜单/其他 app）都按竖屏绘制——真机实证长按退出后 Home 竖屏
     // 布局画在横屏物理屏上（半屏错位）。这里兜底复位；唯一一次刷新由 app_loop
@@ -7080,6 +7098,26 @@ static int book_remote_direction(void) {
     return direction;
 }
 static app_redraw_t on_tick(app_ctx_t* ctx) {
+    // gen18（18-a 自动切回）：读手机推来的虚拟书时，sink 在后台保活；手机回连
+    // （WINDOW→CONNECTED）或宽限内直接再发（COOLDOWN→RECEIVING）时，自动切回
+    // 传书页接客——它的泵现成，进度/状态/开书全走既有路径。用户零手动操作。
+    // gen18 (18-a auto-switch-back): while reading the phone-pushed virtual
+    // book the sink is background-alive; when the phone returns (WINDOW->
+    // CONNECTED) or pushes again inside the grace (COOLDOWN->RECEIVING), bounce
+    // back to the transfer page to receive - its pump is ready and progress,
+    // status and book-opening all follow existing paths. Zero manual steps.
+    // COOLDOWN 不触发：刚开书那两秒手机还在，别把用户弹回去。
+    // COOLDOWN does not trigger: the phone is still around for a couple of
+    // seconds right after the book opens - do not bounce the user back then.
+    if (s_view == READING && s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0 && push_sink_armed()) {
+        const push_state_t st = push_sink_state();
+        if (st == PUSH_STATE_CONNECTED || st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
+            s_push_handoff = true;
+            extern const app_desc_t app_transfer;
+            ctx->request_app = &app_transfer;
+            return APP_REDRAW_NONE;
+        }
+    }
     // 字体开关留下的重排在这里做：触摸回调的栈太深，一章排下来会把主任务栈顶穿（实测溢出过）。
     // The font switch's re-typeset happens here: the touch callback runs too deep, and laying out a
     // chapter from there overran the main task stack (measured).
