@@ -6,12 +6,15 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 
-# 本地测试沿用当前正式版号；仅正式发布或明确的 OTA 验证指定新版本。
-# Local tests keep the current release version; override only for publication or explicit OTA validation.
+# 每代必 bump（审计裁决）：TF 升级靠版本串区分代际，同版本会被判拒绝。
+# gen19 漏 bump（仍带 pico18 出厂，gen20 审计③点名）；gen20 起恢复每代一跳。
+# Per-generation bump (audit ruling): the TF upgrader tells generations apart by
+# this string and rejects a same-version package. gen19 missed its bump (shipped
+# as pico18 - called out in the gen20 audit); gen20 restores the per-gen step.
 if(DEFINED ENV{PICO_PROJECT_VER} AND NOT "$ENV{PICO_PROJECT_VER}" STREQUAL "")
     set(PROJECT_VER "$ENV{PICO_PROJECT_VER}")
 else()
-    set(PROJECT_VER "0.3.3-pico18")
+    set(PROJECT_VER "0.3.3-pico20")
 endif()
 project(Read_Pico)
 
