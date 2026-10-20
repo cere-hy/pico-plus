@@ -406,17 +406,34 @@ static push_card_snap_t s_push_snap;
 static bool s_push_snap_valid;
 static uint32_t s_push_poll_ms;
 
-static void push_card_text(char *state_text,size_t n,char *sub_text,size_t sub_n) {
+// gen20（真机打磨 2/3）：状态条单行按钮化。原第二行「最近：xxx」与大卡右上的
+// 推送摘录完全重复（用户截图实证），且长文推送的 BEGIN.title 为空时
+// book_title_set 被 valid_utf8 拒绝、这行永远停在上一条有标题的推送——信息
+// 冗余还带误导。砍掉副行，只留一行：左「接收推送」，右状态（武装期带广播名）。
+// gen20 (real-hw polish 2/3): the status bar becomes a true one-row button. The
+// old second row "last: xxx" duplicated the big card's top-right excerpt, and
+// when a long push's BEGIN.title is empty book_title_set is rejected by
+// valid_utf8 so the row froze on the last titled push - redundant AND
+// misleading. Drop the sub row: left "接收推送", right the state (plus adv name
+// while armed).
+static void push_card_text(char *state_text,size_t n) {
     const push_state_t st = push_sink_state();
     uint32_t received = 0, total = 0;
     push_sink_progress(&received, &total);
+    const char *adv = push_sink_adv_name();
+    const bool has_adv = push_sink_armed() && adv && adv[0];
     switch (st) {
         case PUSH_STATE_ARMED:
         case PUSH_STATE_WINDOW:
-            snprintf(state_text, n, "等待连接 · 剩 %lu 分钟",
-                     (unsigned long)((push_sink_window_left_ms() + 59999) / 60000));
+            if (has_adv) snprintf(state_text, n, "等待连接·剩 %lu 分钟 · %s",
+                                  (unsigned long)((push_sink_window_left_ms() + 59999) / 60000), adv);
+            else snprintf(state_text, n, "等待连接 · 剩 %lu 分钟",
+                          (unsigned long)((push_sink_window_left_ms() + 59999) / 60000));
             break;
-        case PUSH_STATE_CONNECTED: snprintf(state_text, n, "手机已连接"); break;
+        case PUSH_STATE_CONNECTED:
+            if (has_adv) snprintf(state_text, n, "手机已连接 · %s", adv);
+            else snprintf(state_text, n, "手机已连接");
+            break;
         case PUSH_STATE_RECEIVING:
             snprintf(state_text, n, "接收中 %lu%%",
                      total ? (unsigned long)(received * 100 / total) : 0UL);
@@ -425,42 +442,26 @@ static void push_card_text(char *state_text,size_t n,char *sub_text,size_t sub_n
         case PUSH_STATE_COOLDOWN: snprintf(state_text, n, "推送完成 · 可继续发送"); break;
         default: snprintf(state_text, n, "未开启"); break;
     }
-    // 副行：最近一推标题 + 广播名（武装期才值得看名字）。
-    // The sub line: the last pushed title plus the adv name (only worth
-    // reading while armed).
-    char title[128];
-    if (book_title_get(PUSH_TEXT_PATH, title, sizeof(title)) && title[0]) {
-        fit(title, 20, 380);
-        snprintf(sub_text, sub_n, "最近：%s", title);
-    } else {
-        snprintf(sub_text, sub_n, "尚未推送过内容");
-    }
 }
 static void draw_push_card(uint8_t *fb) {
     const bool live = push_sink_armed();
-    const uint8_t fill = live ? 0x20 : 0xf2;
-    const uint8_t ink = live ? 0xff : 0x60;
-    const uint8_t ink_dim = live ? 0xb0 : 0x90;
+    char state_text[96];
+    push_card_text(state_text, sizeof(state_text));
+    // gen20（真机打磨 3）：按钮视觉层级。武装期＝高亮反色（纯黑底白字）；
+    // 未开启＝白底浅灰描边、文字暗淡——两种状态一眼可分，不再是「黑糊糊一条」。
+    // gen20 (real-hw polish 3): button visual hierarchy. Armed = highlighted
+    // inverted (solid black, white text); idle = white base with a light-gray
+    // border and dim text - the two states read at a glance.
+    const uint8_t fill = live ? 0x00 : 0xff;
+    const uint8_t ink = live ? 0xff : 0x90;
     ui_fill_round_rect(fb, PUSH_CARD_RECT, 20, fill);
+    if (!live) ui_draw_round_rect(fb, PUSH_CARD_RECT, 20, 0xb0);
     home_frame(fb, PUSH_CARD_RECT, 20);
-    char state_text[48], sub_text[160];
-    push_card_text(state_text, sizeof(state_text), sub_text, sizeof(sub_text));
-    // gen19（真机 Bug1）：卡高 54→64。原第二行 y=618、20px 字到 638，超出卡底
-    // 624——下半截白字画到白底上直接「蒸发」（截图症状）。新几何 566..630：
-    // 首行 576..598、副行 602..622，上下留白 10/8。
-    // gen19 (real-hw Bug1): card height 54->64. The old sub row at y=618 with a
-    // 20px font reached 638, past the 624 card bottom - the lower half of the
-    // white glyphs landed on the white background and vanished. New geometry
-    // 566..630: row 1 at 576..598, sub row at 602..622, margins 10/8.
-    label_on(fb, 60, 576, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
-    label_on(fb, 624, 576, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
-    char name_line[64];
-    const char *adv = push_sink_adv_name();
-    if (live && adv && adv[0]) snprintf(name_line, sizeof(name_line), "%s", adv);
-    else snprintf(name_line, sizeof(name_line), "点按去接收");
-    fit(name_line, 20, 200);
-    label_on(fb, 60, 602, 20, sub_text, EPD_DRAW_ALIGN_LEFT, ink_dim, fill);
-    label_on(fb, 624, 602, 20, name_line, EPD_DRAW_ALIGN_RIGHT, ink_dim, fill);
+    // 单行垂直居中：卡体 566..630（gen19 的 64px 高保留，命中区不动），
+    // 22px 字排 y=587。/ Single row, vertically centered: card 566..630 (the
+    // gen19 64px height stays, hit region untouched), 22px text at y=587.
+    label_on(fb, 60, 587, 22, "接收推送", EPD_DRAW_ALIGN_LEFT, ink, fill);
+    label_on(fb, 624, 587, 22, state_text, EPD_DRAW_ALIGN_RIGHT, ink, fill);
 }
 static bool push_card_due(app_ctx_t *ctx) {
     // 250ms 节流：倒计时按分钟粒度、进度按 ~2Hz，都比这个慢；墨水屏不陪空转。
@@ -929,20 +930,22 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
     // window, so home-card taps failed probabilistically. Also yield while the
     // stylus is down.
     if(s_view==HOME_ROOT&&!s_press_pending&&!(ctx->touch&&ctx->touch->touched)){
-        // gen19（真机 Bug5）：每次 COMMIT 成功后，把最新推送标题写回缓存并强制
-        // 刷新首页状态卡的「最近推送」——否则连续推送时这行文字卡在首推旧值。
-        // 单词卡不写 push.txt，push_sink 不会发此事件，故「最近」不会被孤词覆盖。
-        // gen19 (real-hw Bug5): after each COMMIT, write the newest push title
-        // back into the cache and force a home status-card repaint of "last
-        // push" - otherwise a continuous push freezes that line on the first
-        // push's old value. Word cards raise no such event, so a bare word never
-        // clobbers it.
+        // gen19 Bug5→gen20：每次 COMMIT 成功后把最新推送标题写回缓存（书架/
+        // 阅读器的标题覆盖仍从这里来）。gen20 起状态条不再显示「最近」行——
+        // 长文推送 BEGIN.title 为空时 book_title_set 被 valid_utf8 拒绝、这行
+        // 会冻在上一条有标题的推送上（gen19 真机截图实证），信息冗余且有误导，
+        // 故只写缓存、不再强制重绘；卡片内容由状态快照差分驱动。
+        // gen19 Bug5->gen20: after each COMMIT the newest push title is written
+        // back to the cache (the shelf/reader title override still comes from
+        // here). Since gen20 the status bar no longer shows a "last push" row -
+        // with an empty BEGIN.title on long pushes book_title_set is rejected
+        // by valid_utf8 and the row froze on the last titled push (gen19 real-hw
+        // screenshots) - redundant and misleading. Cache write only; the card is
+        // driven by the state-snapshot diff.
         char ctitle[PUSH_TITLE_MAX];
         uint8_t ctype = 0;
         if (push_sink_take_committed(ctitle, sizeof(ctitle), &ctype)) {
             (void)book_title_set(PUSH_TEXT_PATH, ctitle);
-            s_area = push_card_rect();
-            return APP_REDRAW_AREA;
         }
         if (push_card_due(ctx)) { s_area = push_card_rect(); return APP_REDRAW_AREA; }
     }
