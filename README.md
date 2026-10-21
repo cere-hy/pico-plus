@@ -169,6 +169,10 @@ from [`apk/`](apk/) and install it:
 - **Android only**; **iOS is not supported due to system limitations**.
 - **The firmware and the APK must be updated together**: an older APK in a multi-device
   environment may connect to the wrong device (it has no device-selection capability).
+- **Android 10/11 phones note**: those systems require the location-services master switch to
+  be on plus the location permission granted, otherwise BLE scanning returns nothing at all
+  (it just keeps saying "no device found"). Since APK v1.1 a red/green banner at the top of
+  the app detects this automatically and tells you exactly what is missing.
 
 ## 3. How to use BLE Text Push (secondary display)
 
