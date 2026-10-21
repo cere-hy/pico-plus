@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico22（gen21 为 0.3.3-pico21；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico23（gen22 为 0.3.3-pico22；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico22 (gen21 was 0.3.3-pico21; reusing an older tag makes
+# Version string: 0.3.3-pico23 (gen22 was 0.3.3-pico22; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -182,6 +182,64 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
+#
+# 重锚记录（2026-10-22，gen23：第 3 项共享伽马 LUT —— 本代唯一源码增量）：
+#   版本串：0.3.3-pico23（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   范围裁定：第 1 项 AA 开关早已在既有代际内完成（本代零新增 diff）；第 2 项用户确认
+#     拒绝、不在任何发布路径；故 gen23 = 第 3 项共享 LUT 的唯一代际产物。
+#   第 3 项内容：新增 main/ui/ui_gray_lut.{h,c}（256 项幂律表，单一真源
+#     UI_GRAY_GAMMA 默认 0.5f，编译期可 -D 覆盖）。字体侧删掉私有的 s_cover 与
+#     ttf_cover_lut_init()，mix_ink() 与字形 mask 改调 ui_gray_lut_map()；图片侧
+#     ui_image_dither_gray() 在 Bayer 量化前把亮度翻成墨量、过共享伽马再翻回亮度
+#     （入参口径相反，必须翻转），中灰 128 由 119–136 变深到 68–85，端点 0/255 守恒。
+#     按范围，cover_bw / bw / acrylic_bw 三条二值点阵路径**一行未动**。
+#   断言语义（image_animation_host_test.c 同步后，待补句落此）：测的是「伽马组合后的
+#     量化行为」——输出仍是 17 的倍数（物理级）不变，但断言由「level*17 原样通过」的
+#     恒等契约改为「落在伽马提升后灰度的两个相邻物理级之一」+ 端点守恒 + 单调性；
+#     恒等契约因伽马重映射已失效，故删除。
+#   终版锚：Read_Pico.bin 4,060,480 B（相对 gen22 终版 4,060,496 **−16 B**，
+#     双操作数 4,060,480−4,060,496=−16），sha256 `b7cf63a0…`；
+#     seg1 File offs `0x00233888`（esptool 实测，与 gen22 同——本代改动落 IROM
+#     代码段 seg3，DROM 段不变，故 DRAM 段 seg1 偏移不动），
+#     paddr = 0x00233888 + 8(段头) + 0x10000(ota_0 基址) = `0x00243890`（预测，与 gen22 同）；
+#     seg1 Load addr 0x3fc9c700 世代不变锚不动，len=0x08a8c。
+#     partition-table / ota_data_initial 与 gen22 逐字节一致（9d5d890b… / 7d2c7ac4…）。
+#     bootloader sha 由 `73b9a556…` → `164ac958…`（体积同为 21,232 B；37 B 差异是
+#     编译时间戳 Oct 22 2026 07:08:34，属 IDF 产物非确定性，非源码改动，行为不变）。
+#     APK 包内为 v1.1 `7e5eea37…`（同时独立就位于 v1.0 Release 附件，可单独取用）。
+#   CI：源码经 run 39642877598（head 8b687cb）双 job 全绿验证；**gen23 bin 未过 CI**——
+#     CI 验证的是当时的源码树，本 bin 为本地 IDF v6.1.0 全量重建产物。
+#
+# Re-anchor record (2026-10-22, gen23: item 3 shared gamma LUT - this generation's
+# only source increment): version 0.3.3-pico23 (three places in step: CMakeLists.txt,
+# this record, the flashing notes). Scope: item 1 (AA switch) was already finished
+# inside an earlier generation (zero new diff here); item 2 was declined by the user
+# and is on no release path; so gen23 is exactly the item-3 shared-LUT generation.
+#   Item 3: new main/ui/ui_gray_lut.{h,c} - a 256-entry power LUT with a single source
+#     UI_GRAY_GAMMA defaulting to 0.5f and overridable with -D. The font side drops its
+#     private s_cover and ttf_cover_lut_init(); mix_ink() and glyph masks now call
+#     ui_gray_lut_map(). The image side flips brightness into ink space, applies the
+#     shared gamma and flips back before the Bayer quantiser (the argument polarity is
+#     opposite, so the flip is required): mid gray 128 moves from 119-136 down to
+#     68-85, with the 0/255 endpoints pinned. Per scope, the three binary dither paths
+#     cover_bw / bw / acrylic_bw were left untouched.
+#   Assertion semantics (after syncing image_animation_host_test.c): the test now
+#     covers post-gamma quantisation - outputs are still multiples of 17, but the
+#     "level*17 passes through unchanged" identity contract was replaced by "lands on
+#     one of the two adjacent physical levels of the gamma-lifted gray", plus endpoint
+#     pinning and monotonicity. The identity contract cannot survive gamma remapping.
+#   Anchors: Read_Pico.bin 4,060,480 B (vs gen22's 4,060,496, i.e. -16 B), sha256
+#     b7cf63a0...; seg1 File offs 0x00233888 (measured, same as gen22 - this change
+#     lands in IROM seg3 while DROM is unchanged, so DRAM seg1 does not shift),
+#     paddr = offs + 8 + 0x10000 = 0x00243890 (predicted, same as gen22); seg1 load
+#     addr 0x3fc9c700 remains the generation-invariant anchor, len 0x08a8c.
+#     partition-table / ota_data_initial byte-identical to gen22 (9d5d890b / 7d2c7ac4).
+#     bootloader sha 73b9a556 -> 164ac958 (same 21,232 B; the 37 B delta is the build
+#     timestamp - IDF output is not deterministic; no source change, no behavior change).
+#     APK is v1.1 7e5eea37 (also published standalone in the v1.0 release assets).
+#   CI: the source passed run 39642877598 (head 8b687cb) with both jobs green; the
+#     gen23 binary itself did not go through CI - CI verified the source tree, while
+#     this bin is a local full rebuild on IDF v6.1.0.
 #
 # 重锚记录（2026-10-20，gen21 真机验收全绿后的发布前打磨轮 / gen22）：
 #   版本串：0.3.3-pico22（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
@@ -524,7 +582,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="fdd48866a8cc18237f0abc06f9c492d4e67c1ce8d39ae35b2f7ef9762331248d"
+EXPECTED="b7cf63a0ee3ca73f1a266faefc55fd927b72aeddedb48eecc4aeb9bfc540e544"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
