@@ -1,122 +1,151 @@
-# ReadPico 横屏双栏 · 墨水屏阅读器固件（修改版）
+# Pico-Plus · E-Ink Geek Secondary Display Firmware (Modified)
 
-> 给 MindReset RDP-G01-W 墨水屏阅读器用的**第三方修改版固件**：在官方开源固件基础上，新增
-> **横屏界面、双栏排版、离线英汉词典、生词本**，以及**手机蓝牙推送（副屏）**等功能。
+**English | [简体中文](README.zh-CN.md)**
+
+> **Third-party modified firmware** for the MindReset RDP-G01-W e-paper reader: built on the
+> official open-source firmware, it adds a **landscape UI, dual-column layout, offline
+> dictionary and Vocabulary Book**, plus **BLE Text Push** (phone-to-device secondary display).
 >
-> 本项目与 MindReset 官方无关，也不是官方发布。固件按"原样"提供，刷机有风险，
-> 请阅读文末[免责声明](#八免责声明)。
+> This project is not affiliated with, endorsed by, or released by MindReset. The firmware is
+> provided "as is"; flashing carries risk — please read the [Disclaimer](#8-disclaimer).
 
 Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
 
-**当前版本：v1.0 正式版（内部代号 gen22，固件版本号 `0.3.3-pico22`）**
+**Current version: v1.0 (internal codename gen22, firmware version `0.3.3-pico22`)**
+
+> **Language note:** the firmware UI is currently **primarily in Chinese**; English UI support
+> is **planned for a future release**. This README is available in both English and Chinese,
+> but on-device menus, prompts and the Vocabulary Book are Chinese-only for now.
+>
+> **Dictionary note:** this firmware **does not include dictionary data** — you must supply
+> your own `dict.bin` on the TF card (see [Section 5](#5-after-flashing-put-books-on-the-device)).
 
 ---
 
-## ⚠️ 请先读这一段：本分支的独立性
+## ⚠️ Read this first: branch independence
 
-1. **已停止同步上游。** 本固件是上游 `rc95` 的**深度魔改分支**，此后不再跟随上游更新合并
-   （上游的新改动不会被并入，本分支的改动也不会推回上游）。
-2. **分区表是独立的。** 使用 `partitions_16M.csv`（app 分区 5.5MB × 2，`otadata` 在 `0xb10000`），
-   与上游/官方布局**不同**。因此：
-   - **首次刷机必须连电脑**（网页一键刷机 或 命令行线刷），不能用官方工具或设备内在线升级；
-   - 刷过一次之后，**后续升级可以用 TF 卡**（见[第四节](#四tf-卡升级不用电脑在设备上直接升级)）。
-3. **底层协议是独立的。** 蓝牙推流（手机副屏）使用本项目自有的 BLE 协议与服务 UUID，
-   与官方应用/协议**不通用**。
-4. **手机端目前仅支持安卓。** **蓝牙推流、手机副屏功能仅支持 Android，iOS 因系统限制暂不支持。**
-   请到本仓库的 [`apk/`](apk/) 目录下载配套安卓 APK——**固件与 APK 必须配套使用**。
+1. **Upstream syncing has stopped.** This firmware is a **deeply modified fork** of upstream
+   `rc95`. It no longer tracks upstream changes, and its changes are not pushed back upstream.
+2. **The partition table is independent.** It uses `partitions_16M.csv` (5.5 MB × 2 app
+   partitions, `otadata` at `0xb10000`), which is **different** from the upstream/official
+   layout. Therefore:
+   - **The first flash must be done from a computer** (web flasher or command line) — the
+     official tools and the device's built-in online upgrade cannot be used;
+   - After the first flash, **later upgrades can go through the TF card**
+     (see [Section 4](#4-tf-card-upgrade-no-computer-needed)).
+3. **The low-level protocol is independent.** BLE Text Push (phone secondary display) uses this
+   project's own BLE protocol and service UUIDs, which are **not compatible** with the official
+   app/protocol.
+4. **Android only for now.** **BLE Text Push and the phone secondary display support Android
+   only; iOS is not supported due to system limitations.** Download the companion APK from the
+   [`apk/`](apk/) directory — **the firmware and the APK must be updated together**.
 
-> 如果你只想要"官方原版体验"，请回到 [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware)。
+> If you only want the "official stock experience", please go back to
+> [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
 
 ---
 
-## 一、这个固件能干什么
+## 1. What this firmware does
 
-在原版功能（书架、EPUB/TXT 阅读、阅读进度、字体导入、锁屏、USB 存储、WiFi 传书）之上，
-本修改版主要新增：
+On top of the original features (bookshelf, EPUB/TXT reading, reading progress, font import,
+lock screen, USB storage, Wi-Fi book transfer), this modified version mainly adds:
 
-| 分类 | 功能 | 说明 |
+| Category | Feature | Notes |
 |---|---|---|
-| 📖 核心阅读 | 横屏显示 | 界面支持横屏摆放，握持阅读更接近普通书籍 |
-| 📖 核心阅读 | 双栏排版 | 一页左右两栏，翻页次数减半；可在阅读设置中开关 |
-| 📖 核心阅读 | 更快的翻页 | 纯文字翻页不闪黑、不擦白，局部刷新 |
-| 📖 核心阅读 | 水波纹翻页 | 翻页带水波纹动画效果（可选） |
-| 📚 词典生词本 | 离线词典 | 阅读中取词查义，无需联网（**词典文件需自行下载并放到 TF 卡**） |
-| 📚 词典生词本 | 生词本 | 查过的词自动记录，随时复习 |
-| 📱 极客副屏 | **手机蓝牙推流** | 安卓手机把长文/网页片段/单词卡直接推送到设备并自动打开阅读（**仅安卓**） |
-| 📱 极客副屏 | **防串台（MAC 绑定）** | 广播名取自设备出厂 MAC（如 `PicoPush-1A2B`），固定唯一；多台并存时 APK 列表点选，不会推错设备 |
-| 📱 极客副屏 | **未读提醒** | 有新推送未打开时，首页状态条出现反色小圆点 +「有新内容」，打开即清 |
-| 📱 极客副屏 | **蓝牙自动校时** | 手机推送时顺带校准设备时钟（设备无 RTC 晶振，长期会漂移） |
-| ⚙️ 底层优化 | 刷新/功耗打磨 | 武装期收口不必要局部刷新、息屏与锁屏路径梳理等 |
+| 📖 Core reading | Landscape display | UI supports landscape orientation, closer to a regular book in hand |
+| 📖 Core reading | Dual-column layout | Two columns per page, halving page turns; toggleable in reading settings |
+| 📖 Core reading | Faster page turns | Text-only turns: no black flash, no white clear, partial refresh |
+| 📖 Core reading | Water-ripple page turn | Page-turn water-ripple animation (optional) |
+| 📚 Dictionary & vocabulary | Offline dictionary | Look up words while reading, no internet needed (**you must supply your own dictionary file on the TF card**) |
+| 📚 Dictionary & vocabulary | Vocabulary book | Looked-up words are recorded automatically for later review |
+| 📱 Geek secondary display | **BLE Text Push** | Android phones push long text / web snippets / word cards to the device, which opens them for reading automatically (**Android only**) |
+| 📱 Geek secondary display | **Anti-cross-talk (MAC binding)** | The broadcast name derives from the factory MAC (e.g. `PicoPush-1A2B`), fixed and unique; with multiple devices present, pick from the APK list — no more pushing to the wrong device |
+| 📱 Geek secondary display | **Unread reminder** | When a push arrives unread, an inverted dot + "new content" appears on the home status bar; opening it clears the reminder |
+| 📱 Geek secondary display | **Bluetooth clock sync** | The phone calibrates the device clock while pushing (the device has no RTC crystal, so it drifts over time) |
+| ⚙️ Low-level polish | Refresh / power tuning | Trimming unnecessary partial refreshes during the arming window, reworked sleep & lock paths, etc. |
 
-> ## ⚠️ 重要：离线词典必须自备词典文件
+> ### ⚠️ Important: bring your own dictionary file
 >
-> **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件：
-> 需自行下载 `dict.bin`，并放入 TF 卡根目录下的 `dict` 文件夹里
-> （设备内路径记为 `/sdcard/dict/dict.bin`，其中 `/sdcard` 是 TF 卡在设备里的
-> 挂载点名，不是让你在卡上建 `sdcard` 文件夹），**否则无法使用查词功能**。
-> 下载地址与详细步骤见[第五节「刷完之后」](#五刷完之后把书放进设备)。
+> **This firmware does not include dictionary data.** The lookup feature depends on a
+> dictionary file on the TF card: download `dict.bin` yourself and place it in the `dict`
+> folder at the TF card root (recorded in the device as `/sdcard/dict/dict.bin`, where
+> `/sdcard` is the mount-point name of the TF card inside the firmware — do **not** create an
+> `sdcard` folder on the card itself), **otherwise word lookup will not work**.
+> Download links and detailed steps: [Section 5](#5-after-flashing-put-books-on-the-device).
 
-原版的传书、WiFi、USB 存储、TF 卡读写等能力全部保留（见[第五节](#五刷完之后把书放进设备)）。
+All original capabilities (book transfer, Wi-Fi, USB storage, TF card read/write, etc.) are
+preserved (see [Section 5](#5-after-flashing-put-books-on-the-device)).
 
-## 二、刷机方法（三选一）
+## 2. How to flash (three ways)
 
-> **刷机前**：确保设备电量充足（建议 50% 以上）；请使用 **USB 数据线**
-> （部分充电线只能充电、不能传数据）。
+> **Before flashing**: make sure the device is sufficiently charged (50%+ recommended); use a
+> **USB data cable** (some charge-only cables cannot transfer data).
 >
-> **首次刷机必须连电脑**（网页一键 或 命令行），因为本固件的分区布局与官方不同，
-> 需要整片写入；刷过一次之后，后续升级可走 TF 卡。
+> **The first flash must be done from a computer** (web flasher or command line), because this
+> firmware's partition layout differs from the official one and requires a full write; after
+> the first flash, later upgrades can go through the TF card.
 
-### 方法 1：网页一键刷机（推荐，最简单）
+### Method 1: Web flasher (recommended, simplest)
 
-不需要安装任何软件，用电脑浏览器就能刷。
+No software installation needed — flash from a desktop browser.
 
-1. 用 USB 数据线把设备连接到电脑；
-2. 用电脑打开网页刷机页面（需 **Chrome 或 Edge** 浏览器，暂不支持手机浏览器和 Safari）：
+1. Connect the device to your computer with a USB data cable;
+2. Open the web flasher page on your computer (**Chrome or Edge** required; mobile browsers
+   and Safari are not supported):
 
    ```
-   https://<你的用户名>.github.io/<仓库名>/
+   https://<your-username>.github.io/<repo-name>/
    ```
 
-   （本仓库开启 GitHub Pages 后，上面的地址就是刷机页——`web-flasher/` 目录会被发布为站点根目录。
-   如果你还没把仓库放到 GitHub，也可以在电脑上进入 `web-flasher` 目录后运行
-   `python -m http.server 8000`，然后用浏览器打开 `http://localhost:8000` 刷机。）
-3. 点击页面上的 **「安装固件」** 按钮；
-4. 在弹窗中选择设备对应的串口（如 `COM3`、`USB JTAG/serial debug unit`），点击连接；
-5. 等待进度条走完（约 1～2 分钟），设备自动重启，刷机完成。
+   (Once this repo has GitHub Pages enabled, the address above is the flasher page — the
+   `web-flasher/` directory is published as the site root. If you haven't put the repo on
+   GitHub, you can also enter the `web-flasher` directory locally and run
+   `python -m http.server 8000`, then open `http://localhost:8000` to flash.)
+3. Click the **"Install firmware"** button on the page;
+4. Select the device's serial port in the dialog (e.g. `COM3`, `USB JTAG/serial debug unit`)
+   and click connect;
+5. Wait for the progress bar to finish (about 1–2 minutes); the device reboots automatically
+   and flashing is complete.
 
-> 之前刷过官方固件的设备，工具会提示**擦除全部数据**，属正常现象
-> （官方固件与本固件的分区布局不同，必须整片擦除后才能写入），确认即可。
+> For devices previously flashed with official firmware, the tool will prompt **erase all
+> data** — this is normal (the official firmware and this firmware have different partition
+> layouts and a full erase is required before writing); just confirm.
 
-**遇到问题？**
+**Troubleshooting**
 
-- 按钮点了没反应 / 找不到串口 → 换一根数据线、换一个 USB 口、关掉其他可能占用串口的软件；
-- 页面一直转圈或按钮不出现 → 是刷机脚本没加载出来，换个网络环境重试；
-- 提示浏览器不支持 → 必须用电脑版 Chrome / Edge；
-- 烧到一半失败 → 重新插拔 USB 后重试。
+- No response on click / serial port not found → try a different data cable, a different USB
+  port, and close other software that may occupy the serial port;
+- Page keeps spinning or the button doesn't appear → the flashing script failed to load; retry
+  on a different network;
+- Browser unsupported → desktop Chrome / Edge required;
+- Flash failed halfway → re-plug the USB and retry.
 
-### 方法 2：一键刷机脚本（Windows 用 `flash.bat`，Linux/macOS 用 `flash.sh`）
+### Method 2: One-click flash scripts (`flash.bat` on Windows, `flash.sh` on Linux/macOS)
 
-1. 下载本仓库 Release 附件中的固件包，或取仓库 [`firmware/`](firmware/) 目录下的 4 个 `.bin`
-   与刷机脚本（**词典文件不在里面**，需另外下载，见[第五节](#五刷完之后把书放进设备)）；
-2. 安装 Python（到 [python.org](https://www.python.org/downloads/) 下载，
-   安装时**务必勾选 "Add Python to PATH"**）；
-3. 按 `Win + R`，输入 `cmd` 回车，执行：
+1. Download the firmware package from this repo's Release assets, or take the 4 `.bin` files
+   and flash scripts from the [`firmware/`](firmware/) directory (**the dictionary file is not
+   included** — download it separately, see [Section 5](#5-after-flashing-put-books-on-the-device));
+2. Install Python (download from [python.org](https://www.python.org/downloads/) and
+   **make sure to check "Add Python to PATH"** during installation);
+3. Press `Win + R`, type `cmd`, and run:
 
    ```
    pip install esptool
    ```
 
-4. 用 USB 线连接设备，**双击 `flash.bat`**（Windows）或执行 `sh flash.sh /dev/ttyUSB0`；
-5. 按提示等待，看到 `Flash done` 即完成。
+4. Connect the device via USB and **double-click `flash.bat`** (Windows) or run
+   `sh flash.sh /dev/ttyUSB0`;
+5. Wait for the prompts; done when you see `Flash done`.
 
-脚本会先校验 `Read_Pico.bin` 的 SHA-256 与锚定值一致，不一致会**拒绝烧录**并提示。
+The script first verifies that the SHA-256 of `Read_Pico.bin` matches the pinned value, and
+**refuses to flash** if they differ.
 
-### 方法 3：电脑命令行线刷（Linux / macOS / Windows 通用）
+### Method 3: Command-line flashing (Linux / macOS / Windows)
 
-适合熟悉命令行的用户：
+For users comfortable with the command line:
 
 ```sh
-pip install esptool   # 先安装 esptool
+pip install esptool   # install esptool first
 
 python -m esptool --chip esp32s3 -b 460800 \
   --before default-reset --after hard-reset write-flash \
@@ -127,121 +156,150 @@ python -m esptool --chip esp32s3 -b 460800 \
   0xb10000 ota_data_initial.bin
 ```
 
-四个偏移对应本项目的 16MB 分区布局（app 分区 `ota_0` 在 `0x10000`，故 `otadata` 落在 `0xb10000`；
-**不要写成上游/其他项目的 `0xD10000`**）。烧录中途报错，可把 `-b 460800` 改为 `-b 230400` 重试。
+The four offsets correspond to this project's 16 MB partition layout (the app partition
+`ota_0` is at `0x10000`, so `otadata` lands at `0xb10000`; **do not write the
+upstream/other-project `0xD10000`**). If flashing errors out midway, retry with
+`-b 460800` changed to `-b 230400`.
 
-### 手机端配套 APK（蓝牙推流用）
+### Companion APK (for BLE Text Push)
 
-刷完固件后，若要使用**手机蓝牙推送（副屏）**，请到 [`apk/`](apk/) 下载安卓 APK 并安装：
+After flashing, to use **BLE Text Push (phone secondary display)**, download the Android APK
+from [`apk/`](apk/) and install it:
 
-- **仅支持 Android**；**iOS 因系统限制暂不支持**。
-- **固件与 APK 必须同时更新**：旧版 APK 在有多台设备并存的环境下可能连到非目标设备
-  （它不具备设备选择能力）。
+- **Android only**; **iOS is not supported due to system limitations**.
+- **The firmware and the APK must be updated together**: an older APK in a multi-device
+  environment may connect to the wrong device (it has no device-selection capability).
 
-## 三、手机蓝牙推流怎么用（副屏）
+## 3. How to use BLE Text Push (secondary display)
 
-1. 设备上进入「手机推送」入口，开启接收（进入武装窗口，屏幕会显示广播名，如 `PicoPush-1A2B`）；
-2. 安卓手机打开配套 APK，扫描到设备后：
-   - **只有一台设备时自动连接**；
-   - **有多台时弹出列表**，请按墨水屏上显示的代号点选你想要的那台（防串台）；
-3. 在 APK 里输入/粘贴要推送的文本（也支持单词卡），发送；
-4. 设备接收完成后自动以「虚拟书」形式打开阅读；若你没打开，首页状态条会亮出
-   **反色小圆点 +「有新内容」**提醒，打开后即清除。
+1. On the device, enter the "Phone Push" entry to enable receiving (an arming window opens and
+   the screen shows the broadcast name, e.g. `PicoPush-1A2B`);
+2. Open the companion APK on your Android phone; after scanning finds the device:
+   - **With only one device, it connects automatically**;
+   - **With multiple devices, a list pops up** — pick the one matching the code shown on the
+     e-paper screen (anti-cross-talk);
+3. Type/paste the text to push in the APK (word cards are also supported) and send;
+4. After the device finishes receiving, it opens the content as a "virtual book" for reading;
+   if you don't open it, an **inverted dot + "new content"** reminder appears on the home
+   status bar, cleared once opened.
 
-> 广播名取自设备出厂 MAC，固定不变，可直接用来认设备。
+> The broadcast name derives from the factory MAC, is fixed, and can be used to identify the
+> device directly.
 
-## 四、TF 卡升级（不用电脑，在设备上直接升级）
+## 4. TF card upgrade (no computer needed)
 
-1. 把固件包里的 `Read_Pico.bin` **重命名为 `Pico-update.bin`**；
-2. 用读卡器把它拷到 TF 卡（FAT32 格式）的**根目录**；
-3. TF 卡插回设备，进入 **设置 → 升级和恢复**；
-4. 点击「安装 TF 卡升级包」，等待自动完成并重启。
+1. **Rename** the `Read_Pico.bin` from the firmware package to `Pico-update.bin`;
+2. Copy it to the **root** of the TF card (FAT32) with a card reader;
+3. Insert the TF card back into the device and enter **Settings → Upgrade & Recovery**;
+4. Tap "Install TF card upgrade package" and wait for automatic completion and reboot.
 
-> 如果设备当前已刷入**相同版本**的固件，会提示「升级包与当前版本相同」——
-> 此时想重刷，请用上面的网页刷机或线刷。
-
-> **重要：不要使用设备里的「在线升级」。** 在线升级检查的是官方固件地址，
-> 会刷回官方版本，丢失本修改版的横屏、双栏等功能。本修改版请只用本页三种方式升级。
-
-## 五、刷完之后：把书放进设备
-
-三种方式任选：
-
-- **WiFi 传书（最方便）**：设备上打开「传书」应用 → 按屏幕提示让手机/电脑连接设备热点 →
-  在浏览器里打开屏幕提示的地址，即可上传 EPUB / TXT；
-- **USB**：设备开启 USB 存储模式后，直接当 U 盘拖入书籍；
-- **TF 卡**：把书拷到 TF 卡，在设备文件管理中打开；
-- **蓝牙推流**：手机直接推送（见[第三节](#三手机蓝牙推流怎么用副屏)，**仅安卓**）。
-
-### 离线词典设置（不设置就无法查词）
-
-> **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件，
-> 必须按下面的步骤放置，否则无法使用查词功能。
-
-1. 下载词典文件（二选一，推荐第一个）：
-   - [`dict.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin)
-     ——推荐，约 8.9 MB，12.4 万词，SHA-256 `2bb228e4…9ee7`；
-   - [`dict-full.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin)
-     ——词库更全，约 23 MB，40 万词，SHA-256 `7c17cca7…f61b`；
-2. 如果下载的是 `dict-full.bin`，先把它**重命名为 `dict.bin`**；
-3. 把 `dict.bin` 复制到 **TF 卡根目录下的 `dict` 文件夹**里：在电脑上插入 TF 卡
-   （或读卡器），打开这个卡盘，在最上层建一个名为 `dict` 的文件夹，把 `dict.bin`
-   放进去——放好后卡里就是 `dict/dict.bin` 这一层结构，**不需要、也不要在卡上
-   建 `sdcard` 文件夹**（没有 `dict` 文件夹就新建一个；设备插卡启动后也会自动创建）；
-4. TF 卡插回设备并重启，之后阅读时选中单词即可查词，查过的词自动进生词本。
-
-> **命名与位置必须严格一致**：文件名叫 `dict.bin`，放在 TF 卡**根目录**的 `dict`
-> 文件夹下。文档里出现的设备内部路径 `/sdcard/dict/dict.bin` 中的 `/sdcard` 只是
-> 固件里 TF 卡的**挂载点名**（卡插到电脑上，看到的就是卡盘根目录本身），不是让你
-> 在卡上再建一层 `sdcard` 文件夹；其他名字、其他位置都不会生效。`dict` 文件夹里
-> 只放一个词典文件，放多个时打开哪一个不确定。
+> If the device already runs the **same version**, it will show "upgrade package matches the
+> current version" — to reflash in that case, use the web flasher or command-line flashing
+> above.
 >
-> 词典数据由 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）转换生成，
-> 你也可以用仓库里的 `tools/build_dict.py` 自行构建词典。
+> **Important: do not use the device's "Online Upgrade".** Online upgrade checks the official
+> firmware address and would flash back the official version, losing this fork's landscape,
+> dual-column and other features. Use only the three methods on this page for upgrades.
 
-## 六、开发者说明
+## 5. After flashing: put books on the device
 
-- 开发环境：**ESP-IDF v6.1**；
-- 编译：
+Pick any of the three ways:
+
+- **Wi-Fi book transfer (most convenient)**: open the "Transfer" app on the device → connect
+  your phone/computer to the device hotspot as prompted on screen → open the address shown on
+  screen in a browser to upload EPUB / TXT;
+- **USB**: enable USB storage mode on the device, then drag books in like a USB drive;
+- **TF card**: copy books to the TF card and open them in the device file manager;
+- **BLE Text Push**: push directly from the phone (see [Section 3](#3-how-to-use-ble-text-push-secondary-display),
+  **Android only**).
+
+### Offline dictionary setup (required for word lookup)
+
+> **This firmware does not include dictionary data.** The lookup feature depends on a
+> dictionary file on the TF card; you must set it up as follows, otherwise word lookup will
+> not work.
+
+1. Download a dictionary file (either one, the first is recommended):
+   - [`dict.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin)
+     — recommended, about 8.9 MB, 124k entries, SHA-256 `2bb228e4…9ee7`;
+   - [`dict-full.bin`](https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin)
+     — larger dictionary, about 23 MB, 400k entries, SHA-256 `7c17cca7…f61b`;
+2. If you downloaded `dict-full.bin`, **rename it to `dict.bin`** first;
+3. Copy `dict.bin` into the **`dict` folder at the TF card root**: insert the TF card into
+   your computer (or a card reader), open the card drive, create a folder named `dict` at the
+   top level and put `dict.bin` in it — the card should then contain `dict/dict.bin` at that
+   level; **do not create an `sdcard` folder on the card** (create the `dict` folder if it
+   doesn't exist; the device also creates it automatically on boot with a card inserted);
+4. Insert the TF card back into the device and reboot; afterwards, select a word while reading
+   to look it up, and looked-up words go into the Vocabulary Book automatically.
+
+> **The name and location must match exactly**: the file must be named `dict.bin` and placed
+> in the `dict` folder at the TF card **root**. The internal device path `/sdcard/dict/dict.bin`
+> mentioned in the docs: `/sdcard` is just the **mount-point name** of the TF card inside the
+> firmware (when the card is in your computer, you see the card drive root itself) — do not
+> create another `sdcard` folder on the card; other names or locations will not work. Put only
+> one dictionary file in the `dict` folder — with multiple files, which one opens is
+> undefined.
+>
+> The dictionary data is converted from [ECDICT](https://github.com/skywind3000/ECDICT) (MIT);
+> you can also build the dictionary yourself with `tools/build_dict.py` in this repo.
+
+## 6. Developer notes
+
+- Development environment: **ESP-IDF v6.1**;
+- Build:
 
   ```sh
   idf.py set-target esp32s3
   idf.py build
   ```
 
-- 分区表：`partitions_16M.csv`（app 分区 5.5MB × 2，`otadata` 在 `0xb10000`）；
-- 宿主测试：`tools/` 下有 **125 个无需硬件即可运行的测试**（C / Python / JS）
-  和 12 个一键运行脚本，CI 每次提交自动执行主要回归；
-- 目录速览：
-  - `main/` 固件主体——`book/` 文本解析与排版引擎、`dict/` 词典与生词本、`apps/` 各应用；
-  - `components/` 硬件与功能组件——`read_pico_transfer/` 为 WiFi 传书组件，
-    `push_sink/` 为蓝牙推流接收组件（含协议 `push_proto`）；
-  - `firmware/` 终版固件四件套 + 刷机脚本；`apk/` 安卓配套安装包；
-  - `web-flasher/` 网页刷机页（manifest + 固件 bin，随固件同步更新）；
-  - `tools/build_dict.py` 词典构建工具（ECDICT CSV → 设备用 RPD1 `dict.bin`）；
-  - `tools/android/` 安卓 APK 源码与构建脚本（`build-apk.sh`）、`push_pico.py` 命令行推送工具；
-- 内部机制约定（虚拟书、传书策略、波形等）见 `docs/ONBOARDING.md`、`docs/HANDOFF.md` 与 `AGENTS.md`。
+- Partition table: `partitions_16M.csv` (5.5 MB × 2 app partitions, `otadata` at `0xb10000`);
+- Host tests: `tools/` contains **125 tests that run without hardware** (C / Python / JS) and
+  12 one-click runner scripts; CI runs the main regressions on every commit;
+- Directory tour:
+  - `main/` firmware core — `book/` text parsing & layout engine, `dict/` the offline
+    dictionary & Vocabulary Book, `apps/` the various apps;
+  - `components/` hardware & feature components — `read_pico_transfer/` for Wi-Fi book
+    transfer, `push_sink/` for BLE push receiving (including the `push_proto` protocol);
+  - `firmware/` final firmware four-pack + flash scripts; `apk/` the Android companion
+    package;
+  - `web-flasher/` web flashing page (manifest + firmware bins, updated in sync with the
+    firmware);
+  - `tools/build_dict.py` dictionary build tool (ECDICT CSV → device RPD1 `dict.bin`);
+  - `tools/android/` Android APK sources & build script (`build-apk.sh`), plus the
+    `push_pico.py` command-line push tool;
+- Internal mechanism conventions (virtual books, transfer policy, waveforms, etc.) are
+  documented in `docs/ONBOARDING.md`, `docs/HANDOFF.md` and `AGENTS.md`.
 
-## 七、更新日志
+## 7. Changelog
 
-按四分类整理，**当前为 v1.0 正式版（固件版本号 `0.3.3-pico22`）**：
-详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+Organized in four categories; **currently v1.0 (firmware version `0.3.3-pico22`)**:
+see [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
-## 八、免责声明
+## 8. Disclaimer
 
-1. 本固件是第三方修改版本，**按"原样"提供，不作任何明示或默示担保**；
-   对于因刷机或使用本固件造成的设备损坏、数据丢失或其他损失，本项目不承担任何责任；
-2. 刷机存在固有风险（包括极低概率下变砖、需拆机救砖），请确认了解并愿意承担该风险后再操作；
-3. 本项目与 MindReset 官方无关；「RDP-G01-W」等硬件名称的权利归其权利人所有；
-4. 本分支**已停止同步上游**，请使用本页提供的刷机方式，不要用官方工具或设备内在线升级；
-5. 固件中的新增原创内容适用[个人学习许可](licenses/kiikoread-Personal-Study-1.0.txt)，
-   允许个人学习使用，未经单独书面授权不得商用；上游代码许可（Apache-2.0 等）不受影响，
-   完整范围见 [LICENSE](LICENSE) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+1. This firmware is a third-party modified version, **provided "as is" without warranty of
+   any kind, express or implied**; this project assumes no liability for device damage, data
+   loss or other losses caused by flashing or using this firmware;
+2. Flashing carries inherent risk (including a very low probability of bricking, potentially
+   requiring teardown recovery); make sure you understand and accept this risk before
+   proceeding;
+3. This project is not affiliated with MindReset; hardware names such as "RDP-G01-W" belong
+   to their respective rights holders;
+4. This branch **has stopped syncing upstream** — please use the flashing methods provided on
+   this page; do not use the official tools or the device's built-in online upgrade;
+5. The new original content in the firmware is licensed under the
+   [Personal Study License](licenses/kiikoread-Personal-Study-1.0.txt), which permits personal
+   study use; commercial use requires separate written authorization. Upstream code licenses
+   (Apache-2.0 etc.) are unaffected; for the full scope see [LICENSE](LICENSE) and
+   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## 九、致谢
+## 9. Acknowledgements
 
-- 基于 [MindReset 官方开源示例固件](https://github.com/MindReset/read_pico_firmware) 开发
-  （Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware)）；
-- 词典数据来自 [ECDICT](https://github.com/skywind3000/ECDICT)（MIT）；
-- 网页刷机基于 [esp-web-tools](https://github.com/espressif/esp-web-tools)（Apache-2.0）；
-- 感谢上游项目与所有第三方组件作者，完整许可清单见 `licenses/` 与 `THIRD_PARTY_NOTICES.md`。
+- Built on the [MindReset official open-source example firmware](https://github.com/MindReset/read_pico_firmware)
+  (based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware));
+- Dictionary data from [ECDICT](https://github.com/skywind3000/ECDICT) (MIT);
+- Web flashing based on [esp-web-tools](https://github.com/espressif/esp-web-tools) (Apache-2.0);
+- Thanks to the upstream project and all third-party component authors; the full license
+  list is in `licenses/` and `THIRD_PARTY_NOTICES.md`.
