@@ -5,6 +5,8 @@ cc -std=c11 -Wall -Wextra -Werror \
   -I"$root/main/ui" -I"$root/main/book" \
   "$root/tools/image_animation_host_test.c" \
   "$root/main/ui/ui_image_dither.c" \
+  "$root/main/ui/ui_gray_lut.c" \
+  -lm \
   -o /tmp/read-pico-image-animation-test
 /tmp/read-pico-image-animation-test
 python3 - "$root" <<'PY'

@@ -82,6 +82,7 @@ idf_component_register(
         "ui/ui_home_widget.c"
         "ui/ui_home_clock.c"
         "ui/ui_image_dither.c"
+        "ui/ui_gray_lut.c"
         "ui/ui_wallpaper.c"
         "ui/ui_avatar.c"
         "ui/ui_reader_background.c"

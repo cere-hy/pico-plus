@@ -4,6 +4,7 @@
  * User requests slightly darker fast covers: reduce the white lift from 1/8 to 1/16, retaining binary output without changing acrylic or refresh counts.
  */
 #include "ui_image_dither.h"
+#include "ui_gray_lut.h"
 
 uint8_t ui_image_dither_gray(uint8_t gray, int x, int y) {
     static const uint8_t bayer4[4][4] = {
@@ -12,9 +13,15 @@ uint8_t ui_image_dither_gray(uint8_t gray, int x, int y) {
         { 3, 11,  1,  9},
         {15,  7, 13,  5},
     };
-    const unsigned base = gray / 17u;
+    // 图片给的是亮度（255=白），共享伽马表吃的是墨量（越大越黑），所以先翻成墨量、
+    // 抬覆盖率，再翻回亮度，让插图与文字像素落在同一条明暗曲线上；两端仍是纯黑与纯白。
+    // Images arrive as brightness (255 is white) while the shared gamma LUT takes ink, so flip
+    // into ink space, lift coverage, then flip back, putting illustrations and glyphs on one
+    // brightness curve; both endpoints stay pure.
+    const unsigned lifted = 255u - ui_gray_lut_map((uint8_t)(255u - gray));
+    const unsigned base = lifted / 17u;
     if (base >= 15u) return 0xff;
-    const unsigned remainder = gray - base * 17u;
+    const unsigned remainder = lifted - base * 17u;
     const unsigned threshold = bayer4[(unsigned)y & 3u][(unsigned)x & 3u];
     const unsigned bump = remainder * 16u > threshold * 17u ? 1u : 0u;
     return (uint8_t)((base + bump) * 17u);

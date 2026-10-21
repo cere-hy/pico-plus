@@ -16,6 +16,7 @@
 
 #include "ttf_font.h"
 #include "ttf_stroke_filter.h"
+#include "ui_gray_lut.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -2567,29 +2568,16 @@ int ttf_text_left_bearing_px(int pixel_height, const char* text) {
     return (int)floorf(lsb * stbtt_ScaleForPixelHeight(&font_info, (float)pixel_height));
 }
 
-// 线性抗锯齿的中间灰在这块屏上偏亮。按 TTF_COVER_GAMMA 抬覆盖率，半透明边缘更深。
-static uint8_t s_cover[256];
+// 线性抗锯齿的中间灰在这块屏上偏亮。覆盖率抬升曲线见 ui_gray_lut.h，与图片共用。
+// Linear AA midtones read light on this panel; the coverage lift lives in ui_gray_lut.h and is shared with images.
 static bool s_antialias = true;
 void ttf_set_antialias(bool enabled) { s_antialias = enabled; }
 bool ttf_get_antialias(void) { return s_antialias; }
 
 /* ---- 绘制 / Draw ---- */
-static void ttf_cover_lut_init(void) {
-    static bool ready;
-    if (ready) return;
-    for (int i = 0; i < 256; i++) {
-        float t = (float)i / 255.f;
-        int v = (int)(255.f * powf(t, TTF_COVER_GAMMA) + 0.5f);
-        if (v < 0) v = 0;
-        if (v > 255) v = 255;
-        s_cover[i] = (uint8_t)v;
-    }
-    ready = true;
-}
-
 static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
     if (!s_antialias) return alpha >= 128 ? fg : bg;
-    return (uint8_t)(bg + s_cover[alpha] * ((int)fg - (int)bg) / 255);
+    return (uint8_t)(bg + ui_gray_lut_map(alpha) * ((int)fg - (int)bg) / 255);
 }
 
 void ttf_draw_text(
@@ -2604,7 +2592,6 @@ void ttf_draw_text_px(
     enum EpdFontFlags align, uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || framebuffer == NULL || text == NULL) return;
-    ttf_cover_lut_init();
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
 
@@ -2643,7 +2630,6 @@ bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
     if (!font_ready || !mask || !text || !width || !height ||
         width > 684u || height > 180u) return false;
     pixel_height = clamp_px(pixel_height);
-    ttf_cover_lut_init();
     warm_runs(pixel_height, text);
     const char *cursor = text;
     while (*cursor) {
@@ -2655,7 +2641,7 @@ bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
             for (int gx = 0; gx < glyph->width; ++gx) {
                 int xx = x + glyph->left + gx;
                 if (xx < 0 || (unsigned)xx >= width) continue;
-                uint8_t alpha = s_cover[glyph->bitmap[gy * glyph->width + gx]];
+                uint8_t alpha = ui_gray_lut_map(glyph->bitmap[gy * glyph->width + gx]);
                 uint8_t *pixel = &mask[(size_t)yy * width + (unsigned)xx];
                 if (alpha > *pixel) *pixel = alpha;
             }
@@ -2674,7 +2660,6 @@ void ttf_draw_text_px_spaced(
         return;
     }
     if (!font_ready || framebuffer == NULL || text == NULL) return;
-    ttf_cover_lut_init();
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     int cursor_x = x;
@@ -2861,7 +2846,6 @@ int ttf_draw_text_px_rotated(
     uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || framebuffer == NULL || text == NULL) return 0;
-    ttf_cover_lut_init();
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     const int baseline = ttf_ascender_px(pixel_height);
@@ -2882,7 +2866,6 @@ int ttf_draw_text_px_vertical(
     int tracking_px, uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || framebuffer == NULL || text == NULL) return 0;
-    ttf_cover_lut_init();
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     const int baseline = ttf_ascender_px(pixel_height);
@@ -2985,7 +2968,6 @@ void ttf_draw_text_px_fitted(
     int tracking_px, int target_width, uint8_t fg, uint8_t bg
 ) {
     if (!font_ready || !framebuffer || !text || !*text) return;
-    ttf_cover_lut_init();
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     int glyph_count = 0, cjk_gaps = 0;

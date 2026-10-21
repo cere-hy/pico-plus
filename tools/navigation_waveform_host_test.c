@@ -145,7 +145,9 @@ int main(void) {
         if (gray == 0) assert(white == 0 && cover_white==1);
         if (gray == 128) assert(white == 8 && cover_white==8);
     }
-    assert(previous_white == 16 && previous_cover_white==16 && ui_image_dither_gray(119, 0, 0) == 119);
-    puts("navigation waveform: calibrated GL16, unchanged grays, shelf whitespace erase, original water midgrays, vendor tables and lighter covers passed; optical behavior requires hardware");
+    // 图片灰阶经共享伽马后不再逐点守恒：119（7x17）落在更深的一级，端点仍不变。
+    // Image grays no longer round-trip exactly after the shared gamma: 119 (7x17) lands darker, endpoints unchanged.
+    assert(previous_white == 16 && previous_cover_white==16 && ui_image_dither_gray(119, 0, 0) < 119);
+    puts("navigation waveform: calibrated GL16, shared-gamma grays, shelf whitespace erase, original water midgrays, vendor tables and lighter covers passed; optical behavior requires hardware");
     return 0;
 }

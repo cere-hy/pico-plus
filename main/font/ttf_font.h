@@ -64,11 +64,8 @@ bool ttf_font_slot_has_text(int slot, const char* text);
 /// Close every slot but 0, free its bytes, and put the cursor back on the system face.
 void ttf_font_close_embedded(void);
 
-/// 灰阶字覆盖率伽马。小于 1 抬中间覆盖率，抗锯齿边缘更深；满墨仍是 0。
-/// Coverage gamma for gray glyphs. Below 1 lifts mid coverage so AA edges are darker; full ink stays 0.
-#ifndef TTF_COVER_GAMMA
-#define TTF_COVER_GAMMA 0.5f
-#endif
+/// 灰阶覆盖率伽马统一到 ui_gray_lut.h 的 UI_GRAY_GAMMA，文字与图片共用同一条曲线。
+/// Gray coverage gamma now lives in UI_GRAY_GAMMA (ui_gray_lut.h), shared by glyphs and images.
 
 esp_err_t ttf_font_init(void);
 esp_err_t ttf_font_open(const char* path);
