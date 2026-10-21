@@ -574,7 +574,7 @@ with tempfile.TemporaryDirectory() as folder:
                        ("nav-modes", navigation), ("image-bw", image_bw)):
         source, binary = Path(folder) / (name + ".c"), Path(folder) / name
         source.write_text(unit)
-        extras = [str(root / "main/ui/ui_image_dither.c")] if name == "image-bw" else []
+        extras = [str(root / "main/ui/ui_image_dither.c"), str(root / "main/ui/ui_gray_lut.c"), "-lm"] if name == "image-bw" else []
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-Wno-error=format-truncation",
                     "-fsanitize=address,undefined",
                         "-I" + str(root),

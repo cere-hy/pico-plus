@@ -53,7 +53,7 @@ static void epd_draw_pixel(int x,int y,uint8_t gray,uint8_t *fb){
  assert(px>=0&&px<device_w&&py>=0&&py<device_h);fb[(size_t)py*device_w+px]=gray;
 }
 '''
-unit+=function('ui_image_dither_gray',ROOT/'main/ui/ui_image_dither.c')+'\n'
+unit+='uint8_t ui_gray_lut_map(uint8_t value);\n'+function('ui_image_dither_gray',ROOT/'main/ui/ui_image_dither.c')+'\n'
 s=BG.read_text();start=s.index('static uint8_t *s_gray;');end=s.index('void ui_reader_background_release(')
 unit+=s[start:end]
 for n in ('ui_reader_background_release','ui_reader_background_prepare','read_pixel','ui_reader_background_paint'):unit+=function(n,BG)+'\n'
@@ -127,5 +127,5 @@ int main(void){uint8_t fb[1];char line[128];
 with tempfile.TemporaryDirectory(dir=ROOT/'build') as directory:
  for name,code in [('background',unit),('ticket',ticket)]:
   c=Path(directory)/(name+'.c');exe=Path(directory)/name;c.write_text(code)
-  subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(exe)],check=True)
+  subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),str(ROOT/'main/ui/ui_gray_lut.c'),'-lm','-o',str(exe)],check=True)
   subprocess.run([str(exe)],check=True)

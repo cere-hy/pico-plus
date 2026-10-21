@@ -186,5 +186,6 @@ with tempfile.TemporaryDirectory(dir=ROOT / 'build') as directory:
     # Pulled-in product sources trip gcc's misleading-indentation; downgrade just that check.
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-error=misleading-indentation', '-g', '-fsanitize=address,undefined',
                     '-I' + str(ROOT / 'main/ui'), str(src), str(ROOT / 'main/ui/ui_image_dither.c'),
+                    str(ROOT / 'main/ui/ui_gray_lut.c'), '-lm',
                     '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

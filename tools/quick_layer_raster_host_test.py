@@ -170,5 +170,5 @@ with tempfile.TemporaryDirectory() as tmp:
     src=Path(tmp)/'test.c';src.write_text(code)
     exe=Path(tmp)/'test'
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-g','-fsanitize=address,undefined',
-                    '-I'+str(root/'main'),str(src),str(root/'main/ui/ui_image_dither.c'),'-o',str(exe)],check=True)
+                    '-I'+str(root/'main'),str(src),str(root/'main/ui/ui_image_dither.c'),str(root/'main/ui/ui_gray_lut.c'),'-lm','-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)

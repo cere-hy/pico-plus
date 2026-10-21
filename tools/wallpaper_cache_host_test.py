@@ -113,5 +113,5 @@ int main(void){
 # Cache paths are confined to a temporary directory; source stat redirects only SD test paths.
 with tempfile.TemporaryDirectory(dir=ROOT/'build') as folder:
  d=Path(folder);c=d/'test.c';exe=d/'test';c.write_text(unit)
- subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(ROOT/'main/ui'),str(c),str(ROOT/'main/ui/ui_image_dither.c'),'-o',str(exe)],check=True)
+ subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+str(ROOT/'main/ui'),str(c),str(ROOT/'main/ui/ui_image_dither.c'),str(ROOT/'main/ui/ui_gray_lut.c'),'-lm','-o',str(exe)],check=True)
  subprocess.run([str(exe)],cwd=d,check=True)

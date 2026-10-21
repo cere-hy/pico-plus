@@ -131,5 +131,5 @@ int main(void){
     with tempfile.TemporaryDirectory(dir=ROOT/'build') as folder:
         c, exe = Path(folder)/'test.c',Path(folder)/'test'
         c.write_text(unit)
-        subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-error=misleading-indentation','-fsanitize=address,undefined','-I'+str(ROOT/'main/ui'),'-I'+str(ROOT/'main/book'),str(c),str(ROOT/'main/ui/ui_image_dither.c'),'-o',str(exe)],check=True)
+        subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-error=misleading-indentation','-fsanitize=address,undefined','-I'+str(ROOT/'main/ui'),'-I'+str(ROOT/'main/book'),str(c),str(ROOT/'main/ui/ui_image_dither.c'),str(ROOT/'main/ui/ui_gray_lut.c'),'-lm','-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)

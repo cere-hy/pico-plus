@@ -168,7 +168,7 @@ int main(int argc,char **argv){
  (p/'test.c').write_text(unit)
  flags=['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-variable','-Wno-unused-function','-Wno-missing-field-initializers','-Wno-error=format-truncation','-fsanitize=address,undefined','-ffunction-sections','-fdata-sections','-I'+str(p),'-I'+str(ROOT/'main/ui'),'-I'+str(ROOT/'main/font'),'-I'+str(ROOT/'main')]
  subprocess.run(flags+['-c',str(ROOT/'main/font/ttf_font.c'),'-o',str(p/'ttf.o')],check=True)
- subprocess.run(flags+[str(p/'test.c'),str(p/'assets.c'),str(p/'ttf.o'),str(ROOT/'main/ui/ui_gesture.c'),str(ROOT/'main/ui/ui_image_dither.c'),('-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections'),'-lm','-o',str(p/'test')],check=True)
+ subprocess.run(flags+[str(p/'test.c'),str(p/'assets.c'),str(p/'ttf.o'),str(ROOT/'main/ui/ui_gesture.c'),str(ROOT/'main/ui/ui_image_dither.c'),str(ROOT/'main/ui/ui_gray_lut.c'),('-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections'),'-lm','-o',str(p/'test')],check=True)
  if args.covers or args.output:
   from PIL import Image
  for i in range(4):

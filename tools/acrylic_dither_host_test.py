@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(dir=ROOT / 'build') as folder:
     source.write_text(unit)
     subprocess.run(['cc', '-std=gnu11', '-O1', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-I'+str(ROOT/'main/ui'),
-                    str(source), str(ROOT/'main/ui/ui_image_dither.c'), '-o', str(exe)], check=True)
+                    str(source), str(ROOT/'main/ui/ui_image_dither.c'), str(ROOT/'main/ui/ui_gray_lut.c'), '-lm', '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 # 绘制端不再注册灰区；真实present的行为在UI与display调度回归中验证。
 # Rendering no longer registers gray bands; UI and display regressions exercise the real present routes.

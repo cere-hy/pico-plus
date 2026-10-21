@@ -60,5 +60,5 @@ int main(void){
 """
 with tempfile.TemporaryDirectory() as d:
  p=Path(d)/'cache.c';p.write_text(code);out=Path(d)/'cache'
- subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-O2','-fsanitize=address,undefined','-Imain',str(p),'main/ui/ui_image_dither.c','-o',str(out)],cwd=r,check=True)
+ subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-O2','-fsanitize=address,undefined','-Imain',str(p),'main/ui/ui_image_dither.c','main/ui/ui_gray_lut.c','-lm','-o',str(out)],cwd=r,check=True)
  subprocess.run([str(out)],check=True)

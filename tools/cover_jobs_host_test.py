@@ -97,5 +97,5 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='kiiko-cover-jobs-',dir='/private/tmp') as folder:
  c=Path(folder)/'test.c';binary=Path(folder)/'test';c.write_text(unit)
- subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-g','-fsanitize=address,undefined','-I'+str(root/'main/book'),'-I'+str(root/'main/ui'),str(c),str(root/'main/ui/ui_image_dither.c'),'-o',str(binary)],check=True)
+ subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-g','-fsanitize=address,undefined','-I'+str(root/'main/book'),'-I'+str(root/'main/ui'),str(c),str(root/'main/ui/ui_image_dither.c'),str(root/'main/ui/ui_gray_lut.c'),'-lm','-o',str(binary)],check=True)
  subprocess.run([str(binary)],check=True)
