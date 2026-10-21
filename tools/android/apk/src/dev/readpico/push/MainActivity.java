@@ -47,6 +47,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.location.LocationManager;
 import android.os.Bundle;
 import android.text.method.ScrollingMovementMethod;
 import android.view.Gravity;
@@ -103,6 +104,9 @@ public class MainActivity extends Activity {
     private CheckBox wordCard;
     private TextView logView;
     private ScrollView logScroll;
+    // gen23：定位服务状态横幅（红=缺权限/GPS 未开，绿=就绪）。
+    // gen23: location-services status banner (red = missing, green = ready).
+    private TextView locBanner;
 
     private BluetoothAdapter adapter;
     private BluetoothGatt gatt;
@@ -301,6 +305,14 @@ public class MainActivity extends Activity {
         root.addView(head, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // gen23：定位服务检测横幅，紧跟标题之下。/ gen23: location banner right under the title.
+        locBanner = new TextView(this);
+        locBanner.setTextSize(13);
+        locBanner.setPadding(dp(10), dp(8), dp(10), dp(8));
+        locBanner.setVisibility(View.GONE); // onCreate 末尾按状态刷新显示
+        root.addView(locBanner, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
         input = new EditText(this);
         input.setHint("在此粘贴或输入要推送到墨水屏的文字……");
         input.setGravity(Gravity.TOP | Gravity.START);
@@ -364,6 +376,17 @@ public class MainActivity extends Activity {
 
         loadClipboard();
         uiLog("就绪。在墨水屏上开启「接收推送」后，点「发送到墨水屏」。");
+        refreshLocationBanner(); // gen23：进入 App 检测一次定位服务/权限
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // gen23：从系统设置（开 GPS / 授权限）返回时刷新一次横幅；事件触发，非轮询。
+        // gen23: refresh the banner when returning from system settings; event-driven, not polling.
+        if (!sShortcutMode) {
+            refreshLocationBanner();
+        }
     }
 
     @Override
@@ -401,6 +424,13 @@ public class MainActivity extends Activity {
         }
         if (!adapter.isEnabled()) {
             toast("请先开启手机蓝牙");
+            finish();
+            return;
+        }
+        // gen23：老系统位置服务未开 → 扫描必然空结果，提前提示（与主界面同因）。
+        // gen23: legacy systems with location services off scan into the void - warn early.
+        if (Build.VERSION.SDK_INT < 31 && !isLocationServiceOn()) {
+            toast("请先打开手机定位服务（GPS）才能扫描墨水屏");
             finish();
             return;
         }
@@ -522,6 +552,17 @@ public class MainActivity extends Activity {
             return;
         }
         if (!ensurePermissions()) {
+            return;
+        }
+        refreshLocationBanner(); // gen23：发送前再检测一次
+        // gen23：老系统（8~11）上位置服务总开关不开，BLE 扫描会静默返回空——
+        // 三星 Android 10 真机实证「一直未发现设备」。这里提前拦一下并说明原因。
+        // gen23: on legacy systems (8-11) a scan silently returns nothing while the
+        // location master switch is off (proven on Samsung Android 10: endless
+        // "no device found"). Intercept early with an explanation.
+        if (Build.VERSION.SDK_INT < 31 && !isLocationServiceOn()) {
+            uiLog("位置服务（GPS）未开启：系统会禁止蓝牙扫描返回结果");
+            toast("请先打开手机定位服务（GPS）");
             return;
         }
         new Thread(new Runnable() {
@@ -978,6 +1019,71 @@ public class MainActivity extends Activity {
     }
 
     /* ---- 权限 ---- */
+
+    // gen23：位置服务总开关。/ gen23: location services master switch.
+    // Android 8~11 的 BLE 扫描不仅需要 ACCESS_FINE_LOCATION，还需要位置服务开着，
+    // 否则 onScanResult 一个都不回调（三星 Android 10 真机实证）。12+ 起
+    // BLUETOOTH_SCAN 带 neverForLocation，不再要求位置服务。
+    // On Android 8-11 a BLE scan needs ACCESS_FINE_LOCATION AND location services
+    // enabled, otherwise onScanResult never fires (proven on Samsung Android 10).
+    // On 12+ BLUETOOTH_SCAN carries neverForLocation and location is not required.
+    private boolean isLocationServiceOn() {
+        try {
+            LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+            if (lm == null) {
+                return false;
+            }
+            if (Build.VERSION.SDK_INT >= 28) {
+                return lm.isLocationEnabled();
+            }
+            return lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                    || lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // gen23：刷新顶部横幅。红 = 蓝牙/权限/位置服务有缺失（附具体缺项）；
+    // 绿 = 定位服务已就绪。事件触发（进入 App / onResume / 发送前），不轮询。
+    // gen23: refresh the top banner. Red = something is missing (with details);
+    // green = ready. Event-driven (app entry / onResume / before send), never polled.
+    private void refreshLocationBanner() {
+        if (locBanner == null) {
+            return;
+        }
+        boolean btOk = adapter != null && adapter.isEnabled();
+        boolean permOk;
+        boolean svcOk;
+        if (Build.VERSION.SDK_INT >= 31) {
+            permOk = hasBluetoothPermissions();
+            svcOk = true; // neverForLocation：12+ 不要求位置服务
+        } else {
+            permOk = checkSelfPermission("android.permission.ACCESS_FINE_LOCATION")
+                    == PackageManager.PERMISSION_GRANTED;
+            svcOk = isLocationServiceOn();
+        }
+        if (btOk && permOk && svcOk) {
+            locBanner.setText("✅ 定位服务已就绪");
+            locBanner.setTextColor(0xFF166B3A);
+            locBanner.setBackgroundColor(0xFFE8F5EC);
+        } else {
+            StringBuilder why = new StringBuilder();
+            if (!btOk) {
+                why.append("蓝牙未开 ");
+            }
+            if (!permOk) {
+                why.append("定位权限未授予 ");
+            }
+            if (!svcOk) {
+                why.append("位置服务(GPS)未开 ");
+            }
+            locBanner.setText("⚠️ 提示：安卓系统需要开启手机定位服务（GPS）及授予定位权限，"
+                    + "才能正常扫描墨水屏。（当前：" + why.toString().trim() + "）");
+            locBanner.setTextColor(0xFF9A1B1B);
+            locBanner.setBackgroundColor(0xFFFDE8E8);
+        }
+        locBanner.setVisibility(View.VISIBLE);
+    }
 
     private boolean ensurePermissions() {
         List<String> need = new ArrayList<String>();
