@@ -202,11 +202,22 @@ void app_transfer_request_hotspot_start(void) {
 // 手机推送入口（gen24.2 块 8）：只置跳转标志——on_enter 据此落方法页，
 // 武装交给用户在传书页显式点「手机推送」行走四门（gen23 裁定：deep-link
 // 只跳转不武装；gen18~gen24.1 的自动武装绕过四门，已修正）。
+// gen24.3 问题 3：文件管理页的「手机推送」按钮已删（蓝牙不能传书，该入口
+// 多余），本函数随之失去生产调用方；首页推流状态卡走的是
+// app_transfer_request_method_picker() 独立路径，不受影响。保留定义：
+// transfer_ui 宿主测试（push_arm_regression 等）直调本函数，删除会破坏
+// gen24.2 回归；且为公共 API、非 static，无 -Wunused-function 风险。
 // The phone-push entry (gen24.2 block 8): only sets the navigate flag -
 // on_enter lands on the method page and the arm waits for the user's
 // explicit "phone push" tap, which runs the four gates (gen23 ruling: the
 // deep link navigates only; the gen18-gen24.1 auto-arm bypassed the gates
-// and is corrected).
+// and is corrected). gen24.3 problem 3: the file manager's "phone push"
+// button is gone (Bluetooth cannot transfer books, so that entry was
+// redundant) and this function has lost its production caller; the home
+// push status card takes the separate app_transfer_request_method_picker()
+// path and is unaffected. The definition stays: the transfer_ui host tests
+// (push_arm_regression etc.) call it directly, and it is a public API (not
+// static), so there is no -Wunused-function risk.
 void app_transfer_request_push(void) {
     s_push_requested = true;
 }

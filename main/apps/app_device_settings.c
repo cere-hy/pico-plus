@@ -1298,7 +1298,16 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             // the "bluetooth master switch" - it governs both the page-turner
             // and phone push, and the wording says so, no longer reading like
             // a page-turner standby switch.
-            setting_toggle(fb, l.toggle_top, "蓝牙总开关", "开启后可连接翻页器并使用手机推送；关闭后两者均停用并释放蓝牙内存",
+            // gen24.3 问题 2：文案缩短——原 30 字串单行绘制（setting_toggle 的
+            // detail 用 ui_text 不换行，起点 x=59、字号 19，≈570px）冲出屏幕右侧
+            // 并压住开关轨（x=555）。定稿 20 字 ≈380px，终点 x≈439，距开关余
+            // 116px。/ gen24.3 problem 2: the detail string is shortened - the old
+            // 30-char string was drawn on one line (setting_toggle's detail uses
+            // ui_text without wrapping, starting at x=59 at 19px, ~570px wide),
+            // running off the screen's right edge and over the switch track
+            // (x=555). The final 20 chars are ~380px, ending at x~439, leaving
+            // 116px clear of the switch.
+            setting_toggle(fb, l.toggle_top, "蓝牙总开关", "开启可使用翻页器与手机推送；关闭将释放蓝牙",
                            app_settings_ble_turner());
         }
 

@@ -9,7 +9,11 @@ ROOT=Path(__file__).resolve().parents[1]
 source=ROOT/'main/apps/app_files.c'
 s=source.read_text()
 a=s.index('    if (!long_press && sd_needs_format() && ui_rect_hit(storage_card_rect()')
-b=s.index('    for (int i = 0; !long_press && i < 4;',a)
+# gen24.3 问题 3：文件管理传输卡 4 → 3（删「手机推送」，恢复 gen10 排版），
+# 提取区间终点随之更新。/ gen24.3 problem 3: the file manager's transfer
+# cards go 4 -> 3 (the "phone push" card is removed, restoring the gen10
+# layout), so the extraction span's end marker is updated in step.
+b=s.index('    for (int i = 0; !long_press && i < 3;',a)
 unit=r'''
 #include <assert.h>
 #include <stdbool.h>

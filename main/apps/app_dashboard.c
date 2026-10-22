@@ -132,7 +132,12 @@ static char s_avatar_path[288];
 static EpdRect s_pressed;
 static bool s_press_pending;
 static EpdRect continue_card_rect(void) { return (EpdRect){36,184,612,378}; }
-static EpdRect continue_card_hit_rect(void) { return (EpdRect){24,172,636,402}; }
+// gen24.3 问题 1：命中区下沿 574 → 566，与推流卡命中区在 y=566 干净相邻。
+// 原两命中矩形在 [558,574) 重叠 16px，该带点按被当开书（误触）。
+// gen24.3 problem 1: the hit area's lower edge moves 574 -> 566 so it abuts the
+// push card's hit area exactly at y=566. The two hit rects used to overlap by
+// 16px in [558,574), where a tap was taken for "open book" (a mis-tap).
+static EpdRect continue_card_hit_rect(void) { return (EpdRect){24,172,636,394}; }
 static bool continue_card_pressed(void) { return s_press_pending && s_pressed.height == 378; }
 // gen18（M1.5 案1）：首页推流状态卡。渲染源直接读 push_sink_state()——射频事实，
 // 不是武装意图；点按只跳传书页，绝不静默武装（裁决③）。卡带 = 继续阅读卡与
@@ -142,7 +147,10 @@ static bool continue_card_pressed(void) { return s_press_pending && s_pressed.he
 // silently arms (ruling 3). The card band sits between the continue-reading
 // card and the moon clock; the old separator moves down to make room.
 #define PUSH_CARD_RECT ((EpdRect){36,566,612,64})
-#define PUSH_CARD_HIT  ((EpdRect){24,558,636,82})
+// gen24.3 问题 1：命中区上沿 558 → 566，与继续卡命中区（下沿 566）零重叠。
+// gen24.3 problem 1: the hit area's upper edge moves 558 -> 566, leaving zero
+// overlap with the continue card's hit area (lower edge 566).
+#define PUSH_CARD_HIT  ((EpdRect){24,566,636,74})
 static EpdRect push_card_rect(void) { return PUSH_CARD_RECT; }
 static bool push_card_pressed(void) { return s_press_pending && s_pressed.height == 64; }
 static EpdRect control_feedback_area(EpdRect control) {

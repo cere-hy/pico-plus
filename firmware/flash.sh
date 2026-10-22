@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico24.2（gen24.1 为 0.3.3-pico24.1；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico24.3（gen24.2 为 0.3.3-pico24.2；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico24.2 (gen24.1 was 0.3.3-pico24.1; reusing an older tag makes
+# Version string: 0.3.3-pico24.3 (gen24.2 was 0.3.3-pico24.2; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -182,6 +182,133 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
+#
+# 重锚记录（2026-10-22，gen24.3：gen24.2 真机验收（a–j 全绿）观感组三项 UI/交互
+#   修复——首页推送卡误触 + 蓝牙总开关文案溢出 + 文件管理传输按钮排版，gen24.2 的
+#   第三枚热修，仍不并 gen25）：
+#   版本串：0.3.3-pico24.3（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   问题 1（严重，首页推送卡误触）：control() 与 on_gesture 的 TAP 分支均先判继续
+#     阅读卡、后判推送卡，而两命中矩形 Y 轴重叠 16px（[558,574)），该带点按被当
+#     开书。修复：continue_card_hit_rect 下沿 574→566（{24,172,636,394}）、
+#     PUSH_CARD_HIT 上沿 558→566（{24,566,636,74}）——两区在 y=566 干净相邻、
+#     零重叠；可见卡与派发顺序均不变。
+#   问题 2（蓝牙总开关文案溢出）：setting_toggle 的 detail 单行绘制不换行（起点
+#     x=59、字号 19≈570px），原 30 字串冲出屏幕右侧并压住开关轨（x=555）。定稿
+#     20 字「开启可使用翻页器与手机推送；关闭将释放蓝牙」≈380px，终点 x≈439。
+#   问题 3（文件管理传输按钮排版，用户裁定修订）：蓝牙不能传书，二期 M1（提交
+#     ba892c3）加的第 4 张「手机推送/蓝牙发送」卡多余且卡宽收窄后右沿 676 冲出
+#     内容框 28px。删除第 4 卡，恢复 gen10 原版 3 卡排版：home_transfer_rect 恢复
+#     {36+index*208,346,196,100}（x=36/244/452，[36,648] 与内容框对称居中），
+#     methods/details 去第 4 项，渲染与命中 loop i<4→i<3。
+#   功能入口可达性（放行硬门槛）：首页推流状态卡走 app_transfer_request_method_picker()
+#     独立路径（app_dashboard.c:1129-1141），与文件管理按钮的 app_transfer_request_push()
+#     是两条路；删按钮后首页入口原样保留。app_transfer_request_push 失去生产调用方，
+#     但 transfer_ui 宿主测试（push_arm_regression 等 206/297/343 行）直调该函数，
+#     故保留定义 + 注释（公共 API、非 static，无 -Wunused-function 风险）。
+#   测试连带（诚实注记，非「零测试改动」）：
+#     (1) reading_origin_host_test.py 自 gen18 起静默腐坏（deep-link 分支进
+#         app_dashboard.c 后桩未跟进：缺 app_desc_t/app_transfer/
+#         app_transfer_request_method_picker 桩与 request_app 字段、提取列表缺
+#         push_card_pressed 与 PUSH_CARD_RECT/HIT 宏），且不在任何 run_*.sh
+#         门禁（13/13 从未覆盖它）。本代修复：补桩 + 宏从源码正则提取（单一真源）
+#         + 遍历边界 y<574→y<566 + 推流卡带 [566,640) 全网格点按不误开书且
+#         deep-link 只跳转断言 + 去 macOS-ism 的 dir='/private/tmp'；新增
+#         tools/run_reading_origin_host_test.sh 纳入门禁（13→14 runners）。
+#         变异验证：把两矩形改回重叠态，测试 SIGABRT（有牙）。
+#     (2) file_sd_format_host_test.py 以传输命中 loop 原文作提取区间终点，4→3 后
+#         定位串同步更新（机械连带，该测试不断言按钮数组）。
+#   门禁：fullclean（IDF v6.1.0）exit 0；8 警告同基线（全 -Wunused-function：
+#     app_book.c 7 + ui_pinpad.c 1，均不在改动面）；宿主测试 14/14 runner 全绿
+#     （reading_origin 新纳入；transfer_ui 全套含 push_arm/push_gate/
+#     push_pending_ui 三回归；push_sink 168/0；app_loop 55 场景；book_management
+#     PASS）。
+#   终版锚：Read_Pico.bin 4,063,296 B（相对 gen24.2 4,063,392 **−96 B**，双操作数
+#     4,063,296−4,063,392=−96），sha256
+#     `2cbac7d9e7639cbf1f03aec2f713971a1e1709cf0ecbde2fc78091cbf3284b07`；
+#     read-pico-gen24.3.zip 完整 sha256 见交付账本（记忆文件）——不在此自引，
+#     避免「zip 内含自身哈希」的循环依赖。
+#     seg1 File offs `0x00233da8`（esptool 实测，gen24.2 为 0x00233de8，−0x40=−64B
+#     顺移——文案缩短与按钮字符串删除使 DROM 段收缩），paddr = 0x00233da8 + 8(段头)
+#     + 0x10000(ota_0 基址) = `0x00243db0`（预测）；seg1 Load addr 0x3fc9c700 世代
+#     不变锚不动，len=0x08a8c 持平。partition-table / ota_data_initial 与 gen24.2
+#     逐字节一致（9d5d890b… / 7d2c7ac4…）。bootloader sha 由 `9597e307…` →
+#     `d4b82937…`（体积同为 21,232 B；差异是编译时间戳，IDF 产物非确定性，行为不变）。
+#     APK 包内为 v1.1 `7e5eea37…`（与 gen24.2 同，协议未变，无需重刷）。
+#
+# Re-anchor record (2026-10-22, gen24.3: three UI/interaction fixes from gen24.2's
+#   hardware acceptance (a-j all green) look-and-feel group - the home push card's
+#   mis-tap, the BLE master switch's overflowing detail text, and the file
+#   manager's transfer button layout; gen24.2's third hotfix, still not merging
+#   gen25):
+# version 0.3.3-pico24.3 (three places in step: CMakeLists.txt, this record, the
+# flashing notes).
+#   Problem 1 (severe, home push card mis-tap): both control() and on_gesture's
+#     TAP branch test the continue-reading card before the push card, and the two
+#     hit rects overlapped by 16px on the Y axis ([558,574)), so a tap in that
+#     band opened the book. Fix: continue_card_hit_rect's lower edge 574 -> 566
+#     ({24,172,636,394}), PUSH_CARD_HIT's upper edge 558 -> 566 ({24,566,636,74}) -
+#     the two areas now abut exactly at y=566 with zero overlap; the visible cards
+#     and dispatch order are unchanged.
+#   Problem 2 (BLE master switch text overflow): setting_toggle's detail is drawn
+#     on one line without wrapping (start x=59, 19px font, ~570px), and the old
+#     30-char string ran off the screen's right edge and over the switch track
+#     (x=555). The final 20 chars "开启可使用翻页器与手机推送；关闭将释放蓝牙" are
+#     ~380px, ending at x~439.
+#   Problem 3 (file manager transfer buttons, user-revised ruling): Bluetooth
+#     cannot transfer books, so the 4th "phone push / Bluetooth send" card added
+#     by phase-2 M1 (commit ba892c3) was redundant, and after the cards narrowed
+#     its right edge hit 676, 28px past the content box. The 4th card is removed
+#     and the gen10 3-card layout is restored: home_transfer_rect returns to
+#     {36+index*208,346,196,100} (x=36/244/452, [36,648] symmetric with the
+#     content box), methods/details lose their 4th entries, render and hit loops
+#     go i<4 -> i<3.
+#   Entry reachability (the hard gate): the home push status card takes the
+#     separate app_transfer_request_method_picker() path (app_dashboard.c:
+#     1129-1141); the file manager button's app_transfer_request_push() was a
+#     different path. With the button gone the home entry is untouched.
+#     app_transfer_request_push loses its production caller, but the transfer_ui
+#     host tests (push_arm_regression etc., lines 206/297/343) call the function
+#     directly, so the definition is kept with a comment (a public API, not
+#     static, so no -Wunused-function risk).
+#   Test follow-ons (honest note - not "zero test changes"):
+#     (1) reading_origin_host_test.py had silently rotted since gen18 (after the
+#         deep-link branch entered app_dashboard.c its stubs were never updated:
+#         missing app_desc_t/app_transfer/app_transfer_request_method_picker
+#         stubs and the request_app field, and push_card_pressed plus the
+#         PUSH_CARD_RECT/HIT macros were absent from the extraction), and it sat
+#         outside every run_*.sh gate (the 13/13 never covered it). This
+#         generation repairs it: stubs added, macros regex-extracted from the
+#         source (single source of truth), the traversal bound y<574 -> y<566,
+#         a full-grid push-card band [566,640) tap asserting no book opening and
+#         deep-link-navigates-only, and the macOS-ism dir='/private/tmp' dropped;
+#         tools/run_reading_origin_host_test.sh brings it under the gate (13 -> 14
+#         runners). Mutation check: restoring the overlapping rects makes the
+#         test SIGABRT (it has teeth).
+#     (2) file_sd_format_host_test.py used the transfer hit loop's text as its
+#         extraction span's end marker; the 4 -> 3 change updates that locator in
+#         step (a mechanical follow-on; the test asserts no button array).
+#   Gate: fullclean (IDF v6.1.0) exit 0; 8 warnings at baseline (all
+#     -Wunused-function: app_book.c 7 + ui_pinpad.c 1, neither in the changed
+#     surface); host tests 14/14 runners green (reading_origin newly under the
+#     gate; transfer_ui's full set including the push_arm/push_gate/
+#     push_pending_ui regressions; push_sink 168/0; app_loop 55 scenarios;
+#     book_management PASS).
+#   Final anchors: Read_Pico.bin 4,063,296 B (vs gen24.2 4,063,392 **-96 B**, both
+#     operands 4,063,296-4,063,392=-96), sha256
+#     `2cbac7d9e7639cbf1f03aec2f713971a1e1709cf0ecbde2fc78091cbf3284b07`;
+#     read-pico-gen24.3.zip's full sha256 lives in the delivery ledger (the
+#     memory file) - not self-referenced here, to avoid the "zip contains its own
+#     hash" circular dependency.
+#     seg1 File offs `0x00233da8` (esptool measured; gen24.2 was 0x00233de8,
+#     -0x40=-64B shift - the shortened text and removed button strings shrank the
+#     DROM segment), paddr = 0x00233da8 + 8 (segment header) + 0x10000 (ota_0
+#     base) = `0x00243db0` (predicted); seg1 Load addr 0x3fc9c700 is the
+#     generation-invariant anchor, len=0x08a8c flat. partition-table /
+#     ota_data_initial byte-identical to gen24.2 (9d5d890b… / 7d2c7ac4…).
+#     bootloader sha `9597e307…` -> `d4b82937…` (same 21,232 B; the difference is
+#     the build timestamp - IDF artifacts are non-deterministic, behavior
+#     unchanged). APK is v1.1 `7e5eea37…` (same as gen24.2, protocol unchanged,
+#     no reflash needed).
 #
 # 重锚记录（2026-10-22，gen24.2：推送按钮状态机静默死锁根治——前置四门 + B 模型
 #   开关权威化 + 行内【开启】按钮 + deep-link 澄清，gen24.1 的第二枚热修，仍不并 gen25）：
@@ -1006,7 +1133,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="41f5d596fe83a2edb0b5c16beebab03f4f2597fa578ad871b0535c0a1f386b1d"
+EXPECTED="2cbac7d9e7639cbf1f03aec2f713971a1e1709cf0ecbde2fc78091cbf3284b07"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

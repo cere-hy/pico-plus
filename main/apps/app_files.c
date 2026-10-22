@@ -96,11 +96,19 @@ static const char *folder_root(int folder) {
 }
 static int visible_rows(void) { return s_folder == 3 ? 7 : FILE_ROWS; }
 static int root_rows(void) { return 5; }
+// gen24.3 问题 3：恢复 gen10 原版 3 卡排版——二期 M1（提交 ba892c3）加第 4 张
+// 「手机推送」卡后卡宽收窄至 154、右沿 676 冲出内容框 28px，且蓝牙不能传书、
+// 该入口多余。删除第 4 卡，卡宽/步距/起始 X 完全恢复原版：3 卡 x=36/244/452，
+// 宽 196，[36,648] 与内容框左右沿各 36px 对称、屏幕水平居中。
+// gen24.3 problem 3: restore the gen10 3-card layout - phase-2 M1 (commit
+// ba892c3) added a 4th "phone push" card, narrowing the cards to 154 and pushing
+// the right edge to 676, 28px past the content box; Bluetooth cannot transfer
+// books, so that entry was redundant. The 4th card is removed and the card
+// width / stride / start X return to the original: 3 cards at x=36/244/452,
+// width 196, [36,648] symmetric with the content box's edges (36px each side),
+// horizontally centered on screen.
 static EpdRect home_transfer_rect(int index) {
-    // 二期 M1 起四张传输卡（WiFi/热点/USB/手机推送）横排，卡宽随之收窄。
-    // Since phase 2 M1 four transfer cards (WiFi/hotspot/USB/phone push) share
-    // the row, so each card narrows.
-    return (EpdRect){36 + index * 162, 346, 154, 100};
+    return (EpdRect){36 + index * 208, 346, 196, 100};
 }
 
 // 存储卡卡片的位置，绘制与命中测试共用一份，免得两处各写一个坐标。
@@ -609,9 +617,16 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             if (capacity.width > 0) ui_fill_round_rect(fb, capacity, 3, 0x68);
         }
         ui_text(fb, 42, 308, 21, "传输文件", EPD_DRAW_ALIGN_LEFT, false);
-        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输", "手机推送"};
-        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑", "蓝牙发送"};
-        for (int i = 0; i < 4; ++i) {
+        // gen24.3 问题 3：恢复 gen10 原版 3 卡（WiFi/热点/USB）。第 4 项
+        // 「手机推送 / 蓝牙发送」随 ba892c3 进入，但蓝牙不能传书，已删除；
+        // 该功能入口在首页推流状态卡（gen18 deep-link，见 app_dashboard.c）。
+        // gen24.3 problem 3: restore the gen10 3 cards (WiFi/hotspot/USB). The
+        // 4th entry "phone push / Bluetooth send" arrived with ba892c3, but
+        // Bluetooth cannot transfer books, so it is removed; that feature's
+        // entry is the home push status card (gen18 deep-link, app_dashboard.c).
+        static const char *const methods[] = {"WiFi传输", "热点传输", "USB传输"};
+        static const char *const details[] = {"同一网络", "连接设备热点", "连接电脑"};
+        for (int i = 0; i < 3; ++i) {
             EpdRect card = home_transfer_rect(i);
             ui_fill_round_rect(fb, card, 20, UI_GRAY_WHITE);
             ui_draw_control_frame(fb, card, 20, UI_GRAY_BLACK);
@@ -980,12 +995,18 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         s_sd_format_confirm = false;
         s_sd_notice[0] = 0;
     }
-    for (int i = 0; !long_press && i < 4; ++i) if (ui_rect_hit(home_transfer_rect(i), ev->x0, ev->y0)) {
+    // gen24.3 问题 3：命中 loop 恢复 3 卡；第 4 分支 app_transfer_request_push()
+    // （文件管理「手机推送」入口）随按钮一并移除——该函数保留作 API 并被
+    // transfer_ui 宿主测试直调（见 app_transfer.c 注释）。
+    // gen24.3 problem 3: the hit loop returns to 3 cards; the 4th branch
+    // app_transfer_request_push() (the file manager's "phone push" entry) is
+    // removed together with the button - the function is kept as an API and is
+    // called directly by the transfer_ui host tests (see app_transfer.c).
+    for (int i = 0; !long_press && i < 3; ++i) if (ui_rect_hit(home_transfer_rect(i), ev->x0, ev->y0)) {
         extern const app_desc_t app_transfer;
         if (i == 0) app_transfer_request_wifi_upload();
         else if (i == 1) app_transfer_request_hotspot_start();
-        else if (i == 2) app_transfer_request_usb_start();
-        else app_transfer_request_push();
+        else app_transfer_request_usb_start();
         ctx->request_app = &app_transfer;
         return APP_REDRAW_NONE;
     }
