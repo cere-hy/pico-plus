@@ -11,6 +11,8 @@
 #include <stddef.h>
 
 bool app_book_request_open(const char *path);
+/// gen24.4：带一次整屏 GC16 的开书（推送收官专用，第一页无残影）。/ With one full-screen GC16 underneath (push finale only, ghost-free first page).
+bool app_book_request_open_clean(const char *path);
 bool app_book_request_open_from_home(const char *path);
 /// 一次性深睡恢复；保持保存的正文位置与全屏状态。/ One-shot deep-sleep resume with saved position and fullscreen state.
 bool app_book_request_resume(const char *path, bool fullscreen);

@@ -394,6 +394,17 @@ static EpdRect s_area;
 static enum EpdDrawMode s_mode = MODE_GL16;
 static bool s_input_settle;
 static bool s_reader_cleanup;
+// gen24.4：推送收官的开书要一次整屏 GC16 打底。BLE 推流从武装页切进阅读页，
+// 两页墨迹差异大（武装页满是灰底卡片与边框），GL16 差分第一页会把旧墨留着——
+// 真机 gen24.3 验收报「推送完成后打开第一页也有残影」。只由
+// app_book_request_open_clean 置位、present 消费一次；书架/首页开书沿用既有
+// 节拍，不抢这次全刷。/ Gen24.4: the push-completed open wants one full-screen
+// GC16 underneath. The BLE push finale switches from the arm page (full of gray
+// cards and borders) into the reader, and a GL16 differential first page keeps
+// the old ink - gen24.3 hardware acceptance reported "the first page after a
+// completed push also has ghosting". Set only by app_book_request_open_clean
+// and consumed once by present; shelf and home opens keep their cadence.
+static bool s_open_full_once;
 static bool s_reader_footer_pending;
 static bool s_water_turn_pending;
 static e0470_turn_dir_t s_water_turn_dir;
@@ -437,6 +448,17 @@ bool app_book_request_open(const char* path) {
     copy_text(s_requested_open, sizeof(s_requested_open), path);
     s_requested_open_home = false;
     s_requested_fullscreen = true;
+    return true;
+}
+// gen24.4（渲染发灰根治）：带一次整屏 GC16 的开书。供推送收官使用——武装页
+// 切阅读页时旧底必须整屏擦净，第一页才不会有残影；消费点在 present 的
+// update_display_full 分支，一次即止。/ Gen24.4 (the gray-render root fix): an
+// open carrying one full-screen GC16. For the push finale - switching from the
+// arm page to the reader must wipe the old base screen-wide, or the first page
+// keeps the ghosting; consumed in present's update_display_full branch, once.
+bool app_book_request_open_clean(const char* path) {
+    if (!app_book_request_open(path)) return false;
+    s_open_full_once = true;
     return true;
 }
 bool app_book_request_open_from_home(const char* path) {
@@ -3813,7 +3835,14 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         redraw != APP_REDRAW_FULL && !s_reader_cleanup
         ? update_display_mode_diff(ctx->hl, MODE_GL16)
         : update_display_with(ctx->hl, &E0470_FULL_WAVEFORM, MODE_GC16);
-    else if (redraw == APP_REDRAW_FULL || s_reader_cleanup) err = update_display_full(ctx->hl);
+    // gen24.4：推送收官（s_open_full_once）与常规全刷/清屏同一出口——整屏
+    // GC16 擦旧底，第一页纯黑纯白无残影。/ Gen24.4: the push finale
+    // (s_open_full_once) shares the regular full/cleanup exit - one screen-wide
+    // GC16 wipes the old base, so the first page is pure black on pure white.
+    else if (redraw == APP_REDRAW_FULL || s_reader_cleanup || s_open_full_once) {
+        s_open_full_once = false;
+        err = update_display_full(ctx->hl);
+    }
     else if (redraw == APP_REDRAW_AREA && s_view == SHELF && s_shelf_feedback_pending) {
         // 抽出与复位只驱动发生变化的像素，避免整张封面被反复压黑。
         // Lift and restore only changed pixels, avoiding a dark pulse over the whole cover.

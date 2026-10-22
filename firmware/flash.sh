@@ -183,6 +183,69 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
 #
+# 重锚记录（2026-10-22，gen24.4：推送/传书界面渲染发灰根治——跨页进入武装页与
+#   推送收官开书强制一次整屏 GC16 擦旧底，gen24.3 真机验收全绿后报的观感缺陷，
+#   gen24.3 的第四枚热修，仍不并 gen25）：
+#   版本串：0.3.3-pico24.4（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   背景（gen24.3 真机 5 项验收全绿后）：「接收推送」页【切换充电时常开】按钮文字
+#     模糊发灰、背景隐约有旧图案残影（时钟轮廓）；推送完成后打开第一页也有残影。
+#     用户裁定（现象判断+修改要求）：从首页进入「接收推送」页时没有触发全刷，上一页
+#     的时钟轮廓叠在现在的按钮上。修改：跨页面进入此视图时强制触发一次全屏刷新
+#     （GC16）擦除旧底，保证文字纯黑、底色纯白，绝不允许用低质量局部快刷；整个
+#     传书/推送界面清晰度第一，不追求极致快刷。
+#   根因（查实）：跨 app 切页唯一出口 app_loop.c:336
+#     `app_present(ctx, next, next->enter_full ? APP_REDRAW_FULL : APP_REDRAW_PAGE)`，
+#     app_transfer 与 app_book 的 .enter_full 均为 false → 拿 APP_REDRAW_PAGE；
+#     app_transfer 的 present() 改前首行 `if (redraw != APP_REDRAW_AREA) return
+#     false;` → 落回 app_loop.c:226-230 的 `render + update_display_fast_page()`
+#     （GL16 差分快刷，display.c:501-532，每 12 次切页才附带一次 GC16）。首页月相
+#     钟的深墨被 GL16 差分留着，透出叠在按钮上。开书侧：app_book present 对
+#     APP_REDRAW_PAGE+READING 的落点是 update_display_mode_diff(MODE_GL16)
+#     （app_book.c:3853 改前），武装页灰底卡片墨迹同样留着——app_transfer.c:1137
+#     原注释「全刷落在 app_book 的开书路径」对跨 app 进入不成立（全刷分支只认
+#     APP_REDRAW_FULL/s_reader_cleanup），本次修正该路径。
+#     用户方向 1（清屏不彻底）与方向 3（图层重叠）经查证不成立：draw_push 首行
+#     ui_clear_page(fb) 全帧清底，武装页无叠加图层；残影是面板物理残留，根因是
+#     刷新波形（方向 2）。
+#   修改一（app_transfer.c，武装页落地强制 GC16，循 app_dashboard.c:920
+#     s_home_force_full_once 范式）：新增 s_push_entry_full_once；置位点 =
+#     push_arm_now()（页内点按武装，方法页同样带旧墨）与 on_enter 的
+#     push_sink_armed() 保活分支（18-a 手机回连弹回）；on_enter 入口清零防陈旧
+#     标记；present() 消费——非 APP_REDRAW_AREA 且标记在 → render +
+#     update_display_full（display.c:572-581：E0470_WAVEFORM+MODE_GC16+full，
+#     整屏 GC16 非差分），一次即止；标记不在 → 原样 return false 落 app_loop
+#     快刷。只打武装页落地：其余视图/页面呈现路径逐字节不变。倒计时活区更新仍走
+#     既定 AREA 通道（墨没动就不刷、动只重绘活区，gen19 防闪烁裁定不动摇）；
+#     静态按钮文字像素在差分中不被重驱，全刷后纯黑文字保持纯净。
+#   修改二（app_book.c，推送收官开书第一页 GC16）：新增
+#     app_book_request_open_clean()（内部走 app_book_request_open + 置位
+#     s_open_full_once，头文件 app_content_open.h 同步声明）；present 全刷分支扩
+#     条件 `redraw == APP_REDRAW_FULL || s_reader_cleanup || s_open_full_once`
+#     → update_display_full，一次即止；app_transfer.c push_tick 开书交接改调
+#     clean 变体。只服务推送收官：书架/首页开书（_open/_from_home/_resume）不
+#     置位，翻页节拍零变化。
+#   测试：transfer_ui_host_test.c 补 app_book_request_open_clean 桩 +
+#     push_arm_regression 断言 test_book_open_clean（收官必须走 clean 变体）；
+#     ui_refresh_feedback_host_test.py 补 s_open_full_once 声明 + present 路由
+#     断言（APP_REDRAW_PAGE 默认 READER 差分、标记置位 → FULL/MODE_GC16 且一次
+#     即止）。变异验证两处均有牙：换回普通开书变体 → transfer_ui SIGABRT；删
+#     present 分支的 || s_open_full_once → ui_refresh_feedback 断言失败。
+#     宿主 14/14 runner 全绿。
+#   门禁：fullclean（IDF v6.1.0）exit 0；8 警告同基线（全 -Wunused-function：
+#     app_book.c 7 + ui_pinpad.c 1，均不在改动面）；宿主测试 14/14 runner 全绿。
+#   终版锚：Read_Pico.bin 4,063,488 B（相对 gen24.3 4,063,296 **+192 B**，双操作数
+#     4,063,488−4,063,296=192——两处 present 分支与两个静态标志/API 的代码增量），
+#     sha256 `ab2a7a51d7f9f5679edc16a16b7efad138f114168b010075d9b7098e78b78a52`；
+#     read-pico-gen24.4.zip 完整 sha256 见交付账本（记忆文件）——不在此自引，
+#     避免「zip 内含自身哈希」的循环依赖。
+#     seg1 File offs `0x00233da8`（esptool 实测，与 gen24.3 持平——DROM 段未动），
+#     paddr = 0x00233da8 + 8(段头) + 0x10000(ota_0 基址) = `0x00243db0`（预测，
+#     与 gen24.3 同值）；seg1 Load addr 0x3fc9c700 世代不变锚不动，len=0x08a8c
+#     持平。partition-table / ota_data_initial 与 gen24.3 逐字节一致（9d5d890b… /
+#     7d2c7ac4…）。bootloader sha 由 `d4b82937…` → `8e7f7866…`（体积同为 21,232 B；
+#     差异是编译时间戳，IDF 产物非确定性，行为不变）。APK 包内为 v1.1
+#     `7e5eea37…`（与 gen24.3 同，协议未变，无需重刷）。
+#
 # 重锚记录（2026-10-22，gen24.3：gen24.2 真机验收（a–j 全绿）观感组三项 UI/交互
 #   修复——首页推送卡误触 + 蓝牙总开关文案溢出 + 文件管理传输按钮排版，gen24.2 的
 #   第三枚热修，仍不并 gen25）：
@@ -1133,7 +1196,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="2cbac7d9e7639cbf1f03aec2f713971a1e1709cf0ecbde2fc78091cbf3284b07"
+EXPECTED="ab2a7a51d7f9f5679edc16a16b7efad138f114168b010075d9b7098e78b78a52"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

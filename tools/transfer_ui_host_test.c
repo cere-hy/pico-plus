@@ -25,9 +25,21 @@
 const app_desc_t app_book = {0};
 static char test_book_open_path[160];
 static bool test_book_open_ok = true;
+// gen24.4：记录最后一次开书是否走 _clean 变体（推送收官必须走，第一页才有
+// 整屏 GC16 擦旧底）。/ Gen24.4: remembers whether the last open took the
+// _clean variant (the push finale must, so its first page gets the full GC16).
+static bool test_book_open_clean;
 bool app_book_request_open(const char *path) {
     if (!path || !test_book_open_ok) return false;
+    test_book_open_clean = false;
     snprintf(test_book_open_path, sizeof(test_book_open_path), "%s", path);
+    return true;
+}
+// gen24.4：带一次整屏 GC16 的开书（app_book.c 真身语义的宿主替身）。
+// Gen24.4: the host double of app_book.c's real _clean open (one full GC16).
+bool app_book_request_open_clean(const char *path) {
+    if (!app_book_request_open(path)) return false;
+    test_book_open_clean = true;
     return true;
 }
 static char test_dict_word[64];
@@ -228,15 +240,21 @@ static void push_arm_regression(app_ctx_t *ctx) {
     // A push succeeds: open the virtual book - override the display title with
     // the pushed one, drop stale progress, switch to the reader, and do not
     // steal the single full refresh.
+    // gen24.4：全刷改走 _clean 变体真正落在阅读页第一页（GL16 差分留残影，
+    // 真机 gen24.3 验收实证）。/ Gen24.4: the full refresh now takes the _clean
+    // variant so it truly lands on the reader's first page (a GL16 differential
+    // kept the ghosting - gen24.3 hardware evidence).
     test_push_open = true;
     snprintf(test_push_title, sizeof(test_push_title), "被推送的书");
     test_push_type = 0;
     test_book_open_path[0] = 0;
+    test_book_open_clean = false;
     test_book_title_path[0] = test_book_title[0] = test_progress_forget_path[0] = 0;
     ctx->request_app = NULL;
     assert(on_tick(ctx) == APP_REDRAW_NONE);
     assert(ctx->request_app == &app_book);
     assert(!strcmp(test_book_open_path, "/sdcard/.readpico/push.txt"));
+    assert(test_book_open_clean);
     assert(!strcmp(test_book_title_path, "/sdcard/.readpico/push.txt"));
     assert(!strcmp(test_book_title, "被推送的书"));
     assert(!strcmp(test_progress_forget_path, "/sdcard/.readpico/push.txt"));

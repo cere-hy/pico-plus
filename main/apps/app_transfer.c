@@ -85,6 +85,20 @@ static bool s_wifi_upload_requested, s_hotspot_requested, s_direct_entry, s_usb_
 static bool s_push_requested;
 static int64_t s_push_poll_ms;
 static char s_push_note[96];
+// gen24.4（渲染发灰根治）：进入武装页的第一次呈现必须整屏 GC16。跨页切入
+// （首页/阅读器弹回）时上一页的深墨——首页月相钟轮廓——会被 GL16 差分留着，
+// 叠在按钮上就是「文字发糊、发灰、背景有旧图案残影」。清晰度第一：武装页
+// 落地只用全刷擦旧底，绝不用低质量局部快刷打底。置位点：push_arm_now
+// （页内点按武装）与 on_enter 的 armed 保活分支；消费点：present，一次即止。
+// Gen24.4 (the gray-render root fix): the arm view's first presentation must
+// be a screen-wide GC16. On a cross-page entry (home / a bounce back from the
+// reader) the previous page's dark ink - the home moon-phase clock outline -
+// survives a GL16 differential and stacks onto the buttons: "blurred, gray
+// text with an old pattern's ghost in the background". Clarity first: the arm
+// page lands on a full refresh that wipes the old base, never on a low-quality
+// partial refresh. Set by push_arm_now (in-page arm tap) and on_enter's armed
+// keep-alive branch; consumed once by present.
+static bool s_push_entry_full_once;
 // Step 4：单词卡开关与活区比对簿记。/ Step 4: the word-card switch and the
 // live-region comparison bookkeeping.
 static bool s_push_word_card;
@@ -1125,10 +1139,21 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
         // Virtual book: override the display title with the pushed one, drop
         // stale progress, then switch to the reader - the single full refresh
         // belongs to app_book's open path, so the arm page does not steal it.
+        // gen24.4（渲染发灰根治）：改走 _clean 变体——全刷必须真正落在阅读
+        // 页第一页上。gen24.3 真机报「推送完成后打开第一页也有残影」：跨 app
+        // 切页走 APP_REDRAW_PAGE，阅读页第一页原是 GL16 差分，武装页的灰底
+        // 卡片墨迹留着。_clean 让 app_book 的 present 对第一页强制整屏 GC16。
+        // Gen24.4 (the gray-render root fix): take the _clean variant - the
+        // full refresh must truly land on the reader's first page. gen24.3
+        // hardware reported "the first page after a completed push also has
+        // ghosting": the cross-app switch presents APP_REDRAW_PAGE, and the
+        // reader's first page was a GL16 differential that kept the arm page's
+        // gray-card ink. _clean makes app_book's present force a screen-wide
+        // GC16 for that first page.
         (void)book_title_set(PUSH_TEXT_PATH, title);
         (void)book_progress_forget(PUSH_TEXT_PATH);
         extern const app_desc_t app_book;
-        if (app_book_request_open(PUSH_TEXT_PATH)) {
+        if (app_book_request_open_clean(PUSH_TEXT_PATH)) {
             // gen18（18-a）：开书即交接——标记这次离页，transfer_on_exit 据此
             // 不收摊；摊子由阅读器退出时（book_on_exit）才收。
             // gen18 (18-a): opening the book is the handoff - flag this exit so
@@ -1424,6 +1449,11 @@ static void push_arm_now(void) {
         return;
     }
     s_view = TRANSFER_PUSH;
+    // gen24.4：本视图第一次呈现强制整屏 GC16——方法页切过来同样带着旧墨，
+    // 差分打底会留残影。/ Gen24.4: this view's first presentation forces a
+    // screen-wide GC16 - switching over from the method page carries old ink
+    // too, and a differential landing keeps the ghosting.
+    s_push_entry_full_once = true;
     // 新回合干净开局：单词卡收掉、陈事件清扫（离页补的 closed、上一回合
     // 待武装失败补的 start_failed 等）、活区簿记对齐当前值。
     // A clean slate for the new round: drop the word card, sweep stale events
@@ -1662,6 +1692,12 @@ static void on_enter(app_ctx_t* ctx) {
     s_session_started = false;
     s_pressed = -1;
     s_settle = s_any_changed = false;
+    // gen24.4：进场先清零强制全刷标记，防上一回合的陈旧标记在本回合某次
+    // 普通整页刷新上误放全刷；本回合真落武装页时由下面两个入口重新置位。
+    // Gen24.4: clear the force-full flag on entry so a stale flag from the
+    // last round cannot fire a spurious full refresh; this round's real arm
+    // landings re-set it at the two entries below.
+    s_push_entry_full_once = false;
     s_status.mode = s_mode;
     read_pico_transfer_get_saved_wifi(s_status.wifi_ssid, &s_status.wifi_configured);
     s_poll_ms = 0;
@@ -1739,6 +1775,10 @@ static void on_enter(app_ctx_t* ctx) {
         // session is live; an ERR(1) would mean the keep-alive failed, which is
         // exactly what acceptance watches for).
         s_view = TRANSFER_PUSH;
+        // gen24.4：跨页弹回同样强制一次整屏 GC16——阅读页的墨迹叠不到本页
+        // 按钮上。/ Gen24.4: a cross-page bounce-back forces the same single
+        // full GC16 - the reader's ink must not stack onto this page's buttons.
+        s_push_entry_full_once = true;
         push_word_card_close();
         push_sync_live_bookkeeping();
     } else {
@@ -2113,7 +2153,26 @@ static app_redraw_t on_key(app_ctx_t *ctx, int key) {
 }
 
 static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
-    if (redraw != APP_REDRAW_AREA) return false;
+    // gen24.4（渲染发灰根治）：进入武装页的第一次呈现强制整屏 GC16。此前
+    // 非 AREA 刷新直接落回 app_loop 的 fast_page（GL16 差分快刷），跨页带入
+    // 的旧墨——首页月相钟轮廓——留着叠在按钮上，文字发糊、底色发灰。清晰度
+    // 第一：落地只用全刷擦旧底，绝不用低质量局部快刷；倒计时等活区更新仍走
+    // 既定 AREA 通道（墨没动就不刷，动也只重绘活区）。
+    // Gen24.4 (the gray-render root fix): the arm view's first presentation
+    // forces a screen-wide GC16. Non-AREA refreshes used to fall straight back
+    // to app_loop's fast_page (a GL16 differential), so ink carried over from
+    // the previous page - the home clock outline - stacked onto the buttons,
+    // blurring text and graying the base. Clarity first: the landing wipes the
+    // old base with a full refresh only, never a low-quality partial one; the
+    // countdown's live updates keep using the established AREA path (nothing
+    // moved, nothing painted; a move repaints the live region only).
+    if (redraw != APP_REDRAW_AREA) {
+        if (!s_push_entry_full_once) return false;
+        s_push_entry_full_once = false;
+        render(ctx, ctx->fb);
+        guard_draw_result(ctx->hl, update_display_full(ctx->hl));
+        return true;
+    }
     if (s_view == TRANSFER_PASSWORD) {
         if (s_input_settle) {
             guard_draw_result(ctx->hl, update_display_area_full_with(ctx->hl, &E0470_WAVEFORM, MODE_GL16, s_area));

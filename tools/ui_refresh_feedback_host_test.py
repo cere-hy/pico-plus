@@ -60,6 +60,9 @@ static const int* display_reader_text_waveform(void){return &E0470_SOFT_TEXTTURN
 static const char *TAG="test";
 static int s_view,s_presented_view,s_reader_panel,s_pressed_control,s_reader_slider;
 static bool s_shelf_page_pending,s_shelf_feedback_pending,s_reader_cleanup,s_reader_image_refresh_pending,s_toolbar,s_clear_confirm;
+// gen24.4：推送收官开书的一次性全刷标记（app_book.c present 消费）。
+// Gen24.4: the push finale's one-shot full-refresh flag (consumed by app_book.c's present).
+static bool s_open_full_once;
 static bool s_reader_fullscreen,s_water_turn_pending,s_reader_footer_pending,s_reader_turn_pending,s_reader_text_frame;
 static enum EpdDrawMode s_mode;
 static EpdRect s_area,s_du_area;
@@ -259,6 +262,16 @@ int main(void){
    s_reader_turn_pending=true;trace_count=0;
    assert(present(&ctx,APP_REDRAW_FULL)&&trace_count==1&&route==FULL);
  }
+ // gen24.4：推送收官开书第一页。APP_REDRAW_PAGE 默认走 READER 差分（残影
+ // 根源）；s_open_full_once 置位时强制整屏 GC16 且一次即止。
+ // Gen24.4: the push finale's reader first page. APP_REDRAW_PAGE defaults to
+ // the READER differential (the ghosting's root); with s_open_full_once set it
+ // forces a screen-wide GC16, once.
+ s_reader_cleanup=false;s_open_full_once=false;trace_count=0;
+ assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==READER);
+ s_open_full_once=true;trace_count=0;
+ assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==FULL&&pushed_mode==MODE_GC16&&!s_open_full_once);
+ s_open_full_once=false;
  s_reader_fullscreen=false;s_reader_turn_pending=true;s_reader_image_refresh_pending=true;
  trace_count=0;assert(present(&ctx,APP_REDRAW_AREA));
  assert(trace_count==1&&route==AREA&&pushed_mode==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
