@@ -233,7 +233,12 @@ static void push_arm_regression(app_ctx_t *ctx) {
     test_push_left_ms -= 500;
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_AREA);
-    assert(s_area.x == 36 && s_area.y == 168 && s_area.width == 612 && s_area.height == 496);
+    // gen24.5：常开按钮去除，活区只剩广播名卡与状态卡（168~532）——每秒
+    // DU 快刷不再压到任何静态控件上（糊死根因随按钮消失）。
+    // Gen24.5: with the hold button removed the live region is just the adv-name
+    // card and the status card (168-532) - the per-second DU refresh no longer
+    // lands on any static control (the smear root cause left with the button).
+    assert(s_area.x == 36 && s_area.y == 168 && s_area.width == 612 && s_area.height == 364);
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_NONE);
     // 推送成功：开虚拟书——标题覆盖成推送标题、清旧进度、切阅读页，且不抢全刷。
@@ -321,18 +326,31 @@ static void push_arm_regression(app_ctx_t *ctx) {
     test_pmu_snapshot.charging = true;
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_AREA);
+    // gen24.5（用户裁定：按钮去除）：原常开按钮所在区域（control_rect(0) 的
+    // 旧位）点下去既不武装也不取消——「切换充电时常开 / 常开需充电」这套三态
+    // 入口连同框体与文案一并退场（禁用态那句会让人误读成蓝牙开着就要没电），
+    // 页面守住不动。
+    // Gen24.5 (the user's ruling: remove the button): tapping where the hold
+    // button used to sit (control_rect(0)'s old slot) neither arms nor cancels
+    // - the tri-state entry ("switch charger-held" / "hold needs charger") left
+    // with its frame and label (the disabled line read as if Bluetooth on meant
+    // the battery was about to die), and the page simply holds.
     int arms = test_push_arm_calls;
+    int cancels = test_push_cancel_calls;
     tap(ctx, control_rect(0));
-    assert(test_push_arm_calls == arms + 1 && test_push_arm_window == 0);
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
     assert(test_push_armed && !test_push_closed && s_view == TRANSFER_PUSH);
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_NONE);
     assert(s_view == TRANSFER_PUSH);
-    // 未充电时常开按钮不可切。/ The hold button does nothing off the charger.
+    // 未充电时同样无入口可切（入口已整体不存在）。
+    // Off the charger there is still nothing to switch (the entry is gone).
     test_pmu_snapshot.charging = false;
     arms = test_push_arm_calls;
+    cancels = test_push_cancel_calls;
     tap(ctx, control_rect(0));
-    assert(test_push_arm_calls == arms && s_view == TRANSFER_PUSH);
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
+    assert(s_view == TRANSFER_PUSH);
     // 退出接收：cancel 之后 closed 把页面带回方法页。/ Exit receive: after the
     // cancel the closed event walks the page back to the method page.
     tap(ctx, control_rect(2));

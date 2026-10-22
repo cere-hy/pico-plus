@@ -77,6 +77,10 @@ static inline void ui_fill_round_rect(uint8_t* f,...) {(void)f;}
 static inline void ui_draw_menu_handle(uint8_t* f,...) {(void)f;}
 static inline void ui_hairline(uint8_t* f,...) {(void)f;}
 static inline void ui_text(uint8_t* f,...) {(void)f;}
+// gen24.5：常开按钮改纯黑白 1-bit 文字（ui_text_bw），桩同形补齐。
+// Gen24.5: the hold button switched to 1-bit black-and-white text
+// (ui_text_bw); the stub follows in the same shape.
+static inline void ui_text_bw(uint8_t* f,...) {(void)f;}
 static inline int ui_text_effective_px(int px) {return px + 2;}
 static inline void ui_text_vc(uint8_t* f,...) {(void)f;}
 static inline void ui_text_fixed_vc(uint8_t* f,...) {(void)f;}

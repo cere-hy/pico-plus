@@ -911,6 +911,10 @@ static EpdRect control_rect(int id) {
     return (EpdRect){0};
 }
 
+// gen24.5：常开按钮已整块删除（用户裁定），其独立几何随之取消。
+// Gen24.5: the hold button is gone outright (the user's ruling), and so is its
+// own geometry.
+
 /* ---- 手机推送武装页 / The phone-push arm page ---- */
 
 // 武装入口的默认窗口：30 分钟。充电时常开（window 0）由页内按钮切换。
@@ -929,10 +933,13 @@ static const char *push_state_text(push_state_t st) {    switch (st) {
     }
 }
 
-static bool push_charging_now(void) {
-    const pmu_snapshot_t *p = read_pico_pmu_get();
-    return p && p->present && pmu_battery_charging(p);
-}
+// gen24.5：push_charging_now() 随常开按钮一并移除——它唯一的用处是判断按钮
+// 该不该亮，按钮没了就成了死代码（还会多一条 -Wunused-function，破 8 警告
+// 基线）。日后若恢复常开入口，把这段和按钮一起请回来。
+// Gen24.5: push_charging_now() leaves with the hold button - its only job was
+// deciding whether that button should light up, and with the button gone it is
+// dead code (plus one stray -Wunused-function, breaking the 8-warning
+// baseline). Bring this pair back if the hold entry ever returns.
 
 static void draw_push(uint8_t *fb) {
     ui_clear_page(fb);
@@ -1004,18 +1011,20 @@ static void draw_push(uint8_t *fb) {
     ui_text(fb, 42, 556, 18, "开启后将暂停翻页器连接，退出接收后自动恢复。", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 42, 586, 18, "接收期间屏幕不会自动锁屏，推送到会自动亮屏。", EPD_DRAW_ALIGN_LEFT, false);
 
-    // 常开开关（仅插电时可切；传输中不切，避免 cancel 丢会话簿记）。
-    // The hold switch (charger only; never mid-transfer, a cancel would drop the
-    // session bookkeeping).
-    EpdRect hold = control_rect(0);
-    const bool held = push_sink_window_left_ms() == 0 && push_charging_now();
-    const bool can_hold = push_charging_now() &&
-        (st == PUSH_STATE_WINDOW || st == PUSH_STATE_CONNECTED);
-    ui_fill_round_rect(fb, hold, 18, s_pressed == 0 ? 0x60 : (can_hold ? UI_GRAY_WHITE : 0xe8));
-    ui_draw_round_rect(fb, hold, 18, can_hold ? 0x92 : 0xc0);
-    ui_text_vc(fb, hold.x + hold.width / 2, hold.y + hold.height / 2, 20,
-               held ? "常开已开启" : can_hold ? "切换充电时常开" : "常开需充电",
-               EPD_DRAW_ALIGN_CENTER, can_hold);
+    // gen24.5（用户裁定：按钮去除）：此处原是「切换充电时常开 / 常开已开启 /
+    // 常开需充电」三态开关，整块删除。理由有二：一、真机 gen24.4 上它糊成一团
+    // 且压住上方提示文字——灰框 + 抗锯齿文字被每秒 DU 活区重驱，反复错误驱动
+    // 出糊团与重影；二、禁用态文案「常开需充电」有歧义，让人以为蓝牙开着马上
+    // 就要没电。删除后武装页不再提供进入常开（window 0）的入口，底层
+    // push_sink_arm(0, 0) 能力保留，日后要恢复入口另立裁定。
+    // Gen24.5 (the user's ruling: remove the button): the tri-state hold switch
+    // used to live here; the whole block is gone. Two reasons: on gen24.4
+    // hardware it smeared into a blob over the notice line above - a gray frame
+    // plus antialiased text re-driven by the per-second DU live region; and the
+    // disabled label "hold needs charger" read as if Bluetooth being on were
+    // about to drain the battery. With it gone the arm page no longer offers a
+    // way into charger-held (window 0); push_sink_arm(0, 0) stays in the
+    // component, and bringing the entry back is a separate ruling.
 
     EpdRect back = control_rect(2);
     if (s_pressed == 2) ui_draw_pressed_round_rect(fb, back, UI_BTN_RADIUS);
@@ -1064,13 +1073,25 @@ static void push_drain_stale_events(void) {
     (void)push_sink_take_err(NULL);
 }
 
-// 武装页的活区：广播名卡、状态卡与常开按钮——倒计时/进度/状态只在这三块变。
-// The arm page's live regions: the adv-name card, the status card and the hold
-// button - the countdown, progress and state only ever change in these three.
+// 武装页的活区：广播名卡与状态卡——倒计时/进度/状态只在这两块变。
+// gen24.5（按钮糊死根治）：常开按钮**逐出活区**。gen19 起它被并进活区，
+// 倒计时每秒的 DU 区域快刷把按钮区域一并反复重驱——抗锯齿灰阶像素被低质量
+// 波形一次次错误驱动，糊成一团还出重影（真机 gen24.4 实锤）。按钮自己的
+// 更新只走三处：进页整屏 GC16（gen24.4）、手势切开关的全页 GL16、hold 可用
+// 态变化时 tick 附加的高质量 GL16 区域刷（见 push_tick）。
+// The arm page's live regions: the adv-name card and the status card - the
+// countdown, progress and state only ever change in these two.
+// Gen24.5 (the smeared-button root fix): the hold button is evicted from the
+// live region. Since gen19 it was unioned in, so the per-second DU area
+// refresh re-drove the button region over and over - the antialiased gray
+// pixels got mis-driven again and again into a smeared, ghosted blob
+// (confirmed on gen24.4 hardware). The button now refreshes only in three
+// places: the entry full GC16 (gen24.4), the full GL16 page after a tap
+// toggles it, and the high-quality GL16 area refresh the tick appends when
+// hold availability changes (see push_tick).
 static EpdRect push_dynamic_rect(void) {
-    return ui_rect_union(ui_rect_union((EpdRect){36, 168, 612, 116},
-                                       (EpdRect){36, 308, 612, 224}),
-                         control_rect(0));
+    return ui_rect_union((EpdRect){36, 168, 612, 116},
+                         (EpdRect){36, 308, 612, 224});
 }
 
 // 把活区簿记对齐当前推流状态：调用方刚整页画过或刚武装时用，避免下一拍做
@@ -1223,8 +1244,12 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
     s_push_last_total = total;
     snprintf(s_push_last_adv, sizeof(s_push_last_adv), "%s", adv);
     draw_push(ctx->fb);
+    // gen24.5：活区只剩广播名卡与状态卡——常开按钮已删除，倒计时每秒的 DU
+    // 快刷不会再压到任何静态控件上（糊死根因随按钮一并消失）。
+    // Gen24.5: the live region is the adv-name card and the status card only -
+    // with the hold button gone, the per-second DU refresh no longer lands on
+    // any static control (the smear root cause left with the button).
     s_area = push_dynamic_rect();
-    s_settle = false;
     return APP_REDRAW_AREA;
 }
 
@@ -1289,47 +1314,17 @@ static app_redraw_t push_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
     }
     int old = s_pressed;
     int origin = -1;
-    if (ui_rect_hit(control_rect(0), ev->x0, ev->y0)) origin = 0;
-    else if (ui_rect_hit(control_rect(2), ev->x0, ev->y0)) origin = 2;
+    // gen24.5：常开按钮去除后武装页只剩「退出接收」一个可点控件。
+    // Gen24.5: with the hold button gone the arm page has exactly one tappable
+    // control left - "exit receive".
+    if (ui_rect_hit(control_rect(2), ev->x0, ev->y0)) origin = 2;
     s_pressed = ev->type == UI_GESTURE_PRESS ? origin : -1;
     if (ev->type != UI_GESTURE_TAP || old < 0 || old != origin) {
         if (old == s_pressed) return APP_REDRAW_NONE;
         render(ctx, ctx->fb);
         s_settle = false;
-        s_area = control_rect(old >= 0 ? old : s_pressed);
+        s_area = control_rect(2);
         return APP_REDRAW_AREA;
-    }
-    if (origin == 0) {
-        // 充电时常开：cancel 当前窗口再以 window 0 重新武装。仅 WINDOW/CONNECTED
-        // 可切（draw_push 已置灰，这里再挡一次）；传输中切会丢会话簿记。
-        // Charger-held: cancel the window and re-arm with window 0. Only from
-        // WINDOW/CONNECTED (draw_push greys the button; checked again here) -
-        // switching mid-transfer would drop the session bookkeeping.
-        if (!push_charging_now()) return APP_REDRAW_NONE;
-        const push_state_t st = push_sink_state();
-        if (st != PUSH_STATE_WINDOW && st != PUSH_STATE_CONNECTED) return APP_REDRAW_NONE;
-        push_sink_cancel();
-        if (push_sink_arm(0, 0) != ESP_OK) {
-            // cancel 之后 closed 会把页面带回方法页，原因写到方法页的消息位上，
-            // 别只留在武装页的便签里。/ After the cancel the closed event walks
-            // the page back to the method page, so the reason goes to the
-            // method page's message slot, not just the arm page's note.
-            snprintf(s_method_message, sizeof(s_method_message), "切换常开失败");
-            snprintf(s_push_note, sizeof(s_push_note), "切换常开失败");
-            return APP_REDRAW_PAGE;
-        }
-        // cancel 补的 closed 是旧会话的收尾信号，重武装是有意为之：吃掉它，
-        // 否则下一拍就把用户扔回方法页。/ The closed posted by the cancel ends
-        // the old session; the re-arm is deliberate: swallow the event, or the
-        // next tick would throw the user back to the method page.
-        push_drain_stale_events();
-        s_push_note[0] = 0;
-        // 全页重画已经画上新 token，簿记对齐当前值，别让 500ms 后再补一次
-        // 内容相同的 DU 区域刷新。/ The full repaint already shows the new
-        // token: align the bookkeeping so the 500 ms tick does not repeat an
-        // identical DU area refresh.
-        push_sync_live_bookkeeping();
-        return APP_REDRAW_PAGE;
     }
     // 退出接收：cancel 之后 closed 事件会把页面带回方法页。
     // Exit: after the cancel the closed event walks the page back.

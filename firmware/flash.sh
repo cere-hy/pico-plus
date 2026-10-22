@@ -1194,9 +1194,60 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   into a permanent resume after one failure (APK now issues a distinct sid per
 #   push); the NVS checkpoint now calls part_sync() so the "visible length never
 #   runs ahead of the counters" comment finally holds.
+# gen24.5（武装页常开按钮去除）：gen24.4 跨页进入整屏 GC16 已让底色纯白、
+#   时钟残影消失，但【切换充电时常开】按钮本身仍糊成一团、严重重影、字与
+#   边框黑成一团，还压住上方提示文字。根因三条叠加：① 按钮被并进
+#   push_dynamic_rect() 活区，倒计时每秒的 DU 区域快刷反复重驱它，抗锯齿
+#   灰阶像素误差累积；② 样式不是纯黑白——灰框 0x92/0xc0、禁用灰底 0xe8、
+#   且 can_hold 被当 inverted 传入 ui_text_vc，可用态竟是反白渲染；
+#   ③ control_rect(0) 的 y=608 与第二行提示文字（y=586 起，字底约 610）
+#   相叠。用户裁定：按钮整块删除——禁用态文案「常开需充电」有歧义，会让人
+#   以为开着蓝牙马上就要没电。删除 draw_push 的按钮段与 push_hold_rect()、
+#   push_gesture 的 origin==0 常开切换分支、hold 簿记与 push_charging_now()
+#   （随按钮成死代码，留着会多一条 -Wunused-function 破 8 警告基线）；
+#   活区维持两卡形态（168~532），每秒 DU 快刷不再压到任何静态控件。
+#   底层 push_sink_arm(0, 0) 能力保留，只是没有 UI 入口。
+#   门禁：宿主 runner 14/14 全绿（活区断言 496→364，原「插电常开切换」回归
+#   改为「入口已去除」断言）；变异验证有牙（把 control_rect(0) 命中加回 →
+#   transfer_ui 断言 arm/cancel 计数失败）；fullclean exit 0，8 警告同基线
+#   （app_book.c 7 + ui_pinpad.c 1）。锚：Read_Pico.bin 4,062,960 B（相对
+#   gen24.4 4,063,488 为 -528 B，双操作数 4,062,960-4,063,488=-528），
+#   sha256 `5c3bab05…`，seg1 File offs `0x00233d58`（paddr 0x00243d58）、
+#   Load `0x3fc9c700`、len `0x08a8c`；partition-table `9d5d890b…`、
+#   ota_data_initial `7d2c7ac4…` 与 gen24.4 逐字节一致；bootloader
+#   `8e7f7866…`→`cbe2b12a…`（同 21,232 B，编译时间戳差异）。
+# Gen24.5 (the arm page's hold button removed): gen24.4's screen-wide GC16 on
+#   entry already made the base pure white and killed the clock ghosting, but
+#   the "switch charger-held" button itself was still a smeared, ghosted blob
+#   of run-together text and frame, and it covered the notice line above. Three
+#   causes stacked: (1) the button was unioned into push_dynamic_rect(), so the
+#   per-second DU area refresh kept re-driving it and the antialiased gray
+#   pixels accumulated error; (2) the styling was never pure black and white -
+#   gray frames 0x92/0xc0, a gray disabled fill 0xe8, and can_hold passed as
+#   inverted to ui_text_vc, which made the enabled state an inverted render;
+#   (3) control_rect(0)'s y=608 overlapped the second notice line (y=586,
+#   bottom around 610). The user ruled the button out entirely: the disabled
+#   label "hold needs charger" reads as if Bluetooth being on were about to
+#   drain the battery. Removed draw_push's button block and push_hold_rect(),
+#   push_gesture's origin==0 hold-switch branch, the hold bookkeeping and
+#   push_charging_now() (dead with the button, and one stray -Wunused-function
+#   would break the 8-warning baseline); the live region stays at its two-card
+#   shape (168-532) so the per-second DU never lands on a static control again.
+#   push_sink_arm(0, 0) keeps the ability in the component - it just has no UI
+#   entry now. Gate: 14/14 host runners green (the live-region assertion moves
+#   496 to 364; the old "charger-held switch" regression becomes an
+#   "entry removed" assertion); the mutation test bites (restoring the
+#   control_rect(0) hit fails transfer_ui's arm/cancel counters); fullclean
+#   exit 0 with the 8-warning baseline intact (app_book.c 7 + ui_pinpad.c 1).
+#   Anchors: Read_Pico.bin 4,062,960 B (-528 vs gen24.4's 4,063,488;
+#   4,062,960-4,063,488=-528), sha256 `5c3bab05…`, seg1 File offs
+#   `0x00233d58` (paddr 0x00243d58), Load `0x3fc9c700`, len `0x08a8c`;
+#   partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…` are
+#   byte-identical to gen24.4; bootloader `8e7f7866…` -> `cbe2b12a…` (same
+#   21,232 B, build-timestamp difference).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="ab2a7a51d7f9f5679edc16a16b7efad138f114168b010075d9b7098e78b78a52"
+EXPECTED="5c3bab059fa5cf519dd995c75b43e77b457caeff0f6d385ddea94d02dc368d84"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
