@@ -170,10 +170,13 @@ void app_settings_set_reader_two_column(bool on);
 /// 书架排序偏好重启后保持。/ Persist the shelf's recent-reading sort across restarts.
 bool app_settings_shelf_recent_sort(void);
 void app_settings_set_shelf_recent_sort(bool on);
-/// 蓝牙翻页器：启用 BLE HID 主机，好让蓝牙翻页器连上并翻页；默认关闭。
-/// 关掉会把整个 BLE 栈拆掉，把 NimBLE 占的内存还回去。
-/// Bluetooth page-turner: bring up the BLE HID host so a remote can pair and turn pages; off
-/// by default. Turning it off tears the whole stack down and returns NimBLE's memory.
+/// 蓝牙总开关（gen24.2 起由「蓝牙翻页器开关」升格）：同时管 BLE HID 主机
+/// （翻页器）与手机推送——开启后可连接翻页器、也可在传书页接收推送；关闭
+/// 后两者均停用并释放蓝牙内存（拆栈）。默认关闭。
+/// The Bluetooth master switch (promoted from the page-turner switch in
+/// gen24.2): it governs both the BLE HID host (page-turner) and phone push -
+/// on, a remote can pair and the transfer page can receive; off, both stop
+/// and the memory is returned (stack torn down). Off by default.
 bool app_settings_ble_turner(void);
 void app_settings_set_ble_turner(bool on);
 /// 飞行模式：只关射频（WiFi 与蓝牙），保留 NVS 里已存的 WiFi 凭据；关闭后原网络照旧可用。

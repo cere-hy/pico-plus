@@ -212,6 +212,10 @@ static push_state_t test_push_state = PUSH_STATE_IDLE;
 static char test_push_adv[64];
 static uint32_t test_push_left_ms, test_push_recv, test_push_total;
 static bool test_push_closed, test_push_start_failed, test_push_open, test_push_word_card, test_push_err;
+// gen24.2 R2：待武装旋钮——push_tick 的回退判定与「正在启动蓝牙…」渲染的
+// 驱动源。/ Gen24.2 R2: the pending-arm knob - drives push_tick's fallback
+// verdict and the "starting bluetooth..." rendering.
+static bool test_push_pending;
 static char test_push_title[64], test_push_word[64];
 static char test_push_close_why[48];
 static uint8_t test_push_type;
@@ -233,14 +237,32 @@ static inline void push_sink_cancel_why(const char *why) {
     // 对齐真实组件：cancel 从武装态出发，状态机走 ADV_OFF，补一个 closed。
     // Mirror the real glue: a cancel from an armed state walks the machine
     // through ADV_OFF and posts one closed event.
+    // gen24.2：pending 态取消同走 closed（对齐真实组件 push_sink.c 的
+    // pending 分支）——「pending 中关开关 → cancel → closed」的闭环可测。
+    // Gen24.2: a pending cancel also posts one closed (mirroring the real
+    // component's pending branch) - the "switch off during pending -> cancel
+    // -> closed" loop becomes testable.
+    if (test_push_pending) {
+        test_push_pending = false;
+        test_push_armed = false;
+        test_push_closed = true;
+        return;
+    }
     if (test_push_armed) test_push_closed = true;
     test_push_armed = false;
+    // 对齐真实组件：CANCEL 事件走 ADV_OFF，状态机回 IDLE——否则 WINDOW 态
+    // 取消后再点按钮会撞上「非 IDLE → 取消」分支，与真机语义相反。
+    // Mirror the real component: the CANCEL event walks ADV_OFF and the
+    // machine returns to IDLE - otherwise a post-cancel tap in WINDOW would
+    // hit the "non-IDLE -> cancel" branch, opposite to the hardware.
+    test_push_state = PUSH_STATE_IDLE;
 }
 static inline void push_sink_cancel(void) {
     push_sink_cancel_why("已退出接收");
 }
 static inline const char *push_sink_last_close_why(void) { return test_push_close_why[0] ? test_push_close_why : NULL; }
 static inline bool push_sink_armed(void) { return test_push_armed; }
+static inline bool push_sink_pending(void) { return test_push_pending; } // gen24.2 R2 查询
 static inline push_state_t push_sink_state(void) { return test_push_state; }
 static inline const char *push_sink_adv_name(void) { return test_push_adv; }
 static inline uint32_t push_sink_window_left_ms(void) { return test_push_left_ms; }
@@ -304,3 +326,18 @@ static inline void ble_pt_reset_failure(void) {
     ++test_ble_reset_calls;
     test_ble_locked = false; // 对齐真实组件：清锁 / mirror: the lock clears
 }
+
+/* gen24.2 四门旋钮：蓝牙总开关（默认开——保住 gen24.1 及更早已有断言语义，
+   门 2 用例显式置 false）、飞行模式（默认关）、USB 存储（旋钮在宿主测试
+   文件里，usb_storage_active 同形制）。settings 读写同一旋钮，行内【开启】
+   按钮点按的写入由此可断言。
+   Gen24.2 four-gate knobs: the BLE master switch (on by default - the gen24.1
+   and older assertions keep their meaning; gate-2 cases set it false
+   explicitly), flight mode (off by default) and USB storage (its knob lives
+   in the host test file, same shape as usb_storage_active). Reads and writes
+   share one knob, so the inline [enable] button's write is assertable. */
+static bool test_settings_ble_turner = true;
+static bool test_settings_flight_mode;
+static inline bool app_settings_ble_turner(void) { return test_settings_ble_turner; }
+static inline void app_settings_set_ble_turner(bool on) { test_settings_ble_turner = on; }
+static inline bool app_settings_flight_mode(void) { return test_settings_flight_mode; }

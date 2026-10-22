@@ -92,6 +92,18 @@ const char *push_sink_last_close_why(void);
 /// and the page-turner yields.
 bool push_sink_armed(void);
 
+/// gen24.2：是否处于「待武装」——点了接收但 BLE 栈还没起来（app_loop 的
+/// sync 正把它拉起，on_stack_sync 会续上）。这是合法的在途状态，不是
+/// 会话结束：UI 必须留在推送页显示「正在启动蓝牙…」，闪回方法页就是
+/// gen24.2 前的静默死锁（点了没反应 + 超时失败无人消费）。
+/// Gen24.2: whether an arm is pending - receive was pressed but the BLE stack
+/// is still coming up (app_loop's sync is pulling it; on_stack_sync completes
+/// it). This is a legitimate in-flight state, NOT a finished session: the UI
+/// must stay on the push page showing "starting bluetooth..." - bouncing back
+/// to the method page was gen24.2's silent deadlock (a dead tap plus an
+/// unconsumed timeout failure).
+bool push_sink_pending(void);
+
 /// 当前状态（UI 轮询刷新用）。/ Current state, for the UI to poll.
 push_state_t push_sink_state(void);
 

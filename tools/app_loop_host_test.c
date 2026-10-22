@@ -532,6 +532,13 @@ int main(void) {
     reset();add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);
     add(256,156,1,0);add(0,0,0,0);add(256,156,1,0);add(0,0,0,0);run();
     assert(!ble_enabled&&ble_resets==1&&!touch_calls);
+    // gen24.2 块 2：快捷层关蓝牙 = 设置页关蓝牙的同一语义——cancel_why
+    // 「蓝牙已关闭」必须随行（armed/pending 收摊），否则快捷层成为 B 模型
+    // 的静默后门。/ Block 2: the quick layer's switch-off is the settings
+    // page's switch-off - cancel_why "bluetooth off" must ride along (the
+    // armed/pending close-up), or the quick layer is model B's silent back
+    // door.
+    assert(push_cancel_calls==1&&!strcmp(push_cancel_why,"蓝牙已关闭"));
     reset();first.on_before_lock=before_lock;
     add(300,20,1,0);add(300,110,1,0);add(0,0,0,0);
     add(427,156,1,0);add(0,0,0,0);add(598,156,1,0);add(0,0,0,0);run();

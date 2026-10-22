@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico24.1（gen24 为 0.3.3-pico24；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico24.2（gen24.1 为 0.3.3-pico24.1；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico24.1 (gen24 was 0.3.3-pico24; reusing an older tag makes
+# Version string: 0.3.3-pico24.2 (gen24.1 was 0.3.3-pico24.1; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -182,6 +182,187 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
+#
+# 重锚记录（2026-10-22，gen24.2：推送按钮状态机静默死锁根治——前置四门 + B 模型
+#   开关权威化 + 行内【开启】按钮 + deep-link 澄清，gen24.1 的第二枚热修，仍不并 gen25）：
+#   版本串：0.3.3-pico24.2（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   背景（gen24.1 真机两轮 + 531 行 boot 日志，日志首行 paddr=00243af0 与 gen24.1
+#     预测锚逐字吻合，确认测的就是 gen24.1）：问题 1——设置里关「蓝牙总开关」后进
+#     传书页点「接收推送」，首次能收；点「退出接收」再点「手机推送」直接死锁无反应。
+#     问题 2——开机不开蓝牙点「接收推送」毫无反应、无文字提示。问题 3——关设置里的
+#     蓝牙开关后回首页，「接收推送」仍在工作且能正常收，但点「退出接收」再点手机
+#     推送即失效（无提示）。代码级闭环：三题同根——待武装（pending）路径自 gen12
+#     起没有 UI 存在感，app_loop 拉栈条件漏算它，10s 超时事件又烂死在无人消费的
+#     方法页，全程零提示（日志实证：死锁瞬间 largest=31744 内存健康，卡死在权限与
+#     状态路径，不是内存；gen24.1 的卸书自愈未动）。
+#   根因三环：R1 app_loop.c:1093 sync 条件 `(ble_turner || push_sink_armed())`
+#     漏算 pending（pending 时 state 恰是 IDLE）；R2 push_tick 把 pending 当会话
+#     结束，500ms 内闪回方法页；R3 方法页 tick 直接 APP_REDRAW_NONE，start_failed/
+#     closed 永无人消费。对用户「某处检查 app_settings_ble() 后默默 return」的假设
+#     予以修正：push_button_action 全链根本不读设置开关，开关是经 R1 的 sync 条件
+#     silently 掐死二次武装的。
+#   权限模型裁定 B（用户拍板）：设置开关 = 蓝牙总开关（权威），同时管翻页器与手机
+#     推送；gen18 的「武装入口可能就是翻页器关着时点的」注释随 deep-link 自动武装
+#     一并修订。用户另拍板两项：行内快捷开关做（门 2 提示条内嵌【开启】，原地写设置
+#     项并继续推送，不跳设置页）；deep-link 只跳转不武装（gen23 裁定兑现）。
+#   实现八块：
+#     1. B 模型落地：设置项更名「蓝牙总开关」，文案定稿「开启后可连接翻页器并使用
+#        手机推送；关闭后两者均停用并释放蓝牙内存」；无线组行标签「蓝牙翻页器」→
+#        「蓝牙」；settings.h 注释同步；app_loop.c gen18 注释按 B 模型修订。
+#     2. 中途关开关即断：设置页 toggle off handler 与 app_loop 快捷层
+#        UI_QUICK_BLUETOOTH off handler 两处追加 push_sink_cancel_why("蓝牙已关闭")
+#        （覆盖 armed 与 pending 两态，首页状态卡自然回「未开启」）。
+#     3. 前置四门（push_button_action）：内存 gate（既有两段式，gen24.1 D1/D2/D3
+#        原样）→ 蓝牙总开关（行内提示 + 【开启】按钮）→ 飞行模式（「飞行模式开启中，
+#        请先关闭」）→ USB 存储（「USB 传书已接管，接收推送暂停」）；R1 sync 条件
+#        不改——pending 只在开关开启时发生，sync 条件恒真，缺口自然消解。
+#     4. R2 pending 语义：push_sink 新增 push_sink_pending() 查询；push_tick 回退
+#        条件改为「非 armed 且非 pending」；pending 期间推送页显示「正在启动蓝牙…」
+#        （draw_push starting 分支，状态卡/副行/窗口行三处文案）。
+#     5. R3 结构性根修：方法页 tick 消费一次性事件（methods_tick：start_failed/
+#        closed 落 s_method_message + 重绘）；pending 超时补 ESP_LOGW 仪表行；
+#        极端闭环 pending 中关开关 → cancel_why → closed → 方法页显示「蓝牙已关闭」。
+#     6. 分支 10 收摊原因：on_enter 取 push_sink_last_close_why() 快照入
+#        s_last_cancel_why（内存态，不做 NVS），提示条挂「上次接收已结束：X」，
+#        下一次武装清除（push_arm_now 新回合干净开局）。
+#     7. 分支 1 禁用提示：CONNECTED/RECEIVING/PROCESSING 点按钮 →
+#        「手机正在推送，完成后自动结束」，不再静默 return。
+#     8. deep-link 澄清修正：on_enter 的 s_push_requested 从 else-if 链解耦——
+#        只清 flag 不武装；armed 保活中落武装页由 push_sink_armed 分支接住
+#        （不重新武装、不重置窗口）。
+#   行内【开启】按钮要点（用户钉死）：单一真源（与设置页读写同一 settings 值）；
+#     点按写设置项 → 重走四门（门 2 已过，内存/飞行/USB 复查）→ 过则既有武装路径
+#     （pending 拉栈，不引入第二套启动路径）；提示条瞬态（点按后「正在启动蓝牙…」，
+#     失败回对应门提示）；仅门 2 出现；竞态由同源 + 复查自然收敛。
+#   测试：transfer_ui 新增 push_gate_regression（门 2 提示 + 行内点按写设置重走
+#     四门 + 飞行/USB 拦截 + pending 中关开关闭环 + 块 6 底账）与
+#     push_pending_ui_regression（pending 不闪回 + 方法页消费 start_failed/closed
+#     + 查序）；桩新增 test_settings_ble_turner/app_settings_set_ble_turner/
+#     app_settings_flight_mode/push_sink_pending/test_push_pending；cancel_why 桩
+#     补 pending 分支与 CANCEL 回 IDLE（对齐真实组件）；push_arm_regression 五处
+#     deep-link 依赖同步改显式点按（宿主断言即实现契约，教训同 gen19/gen21）。
+#     app_loop 补快捷层关蓝牙 cancel 联动断言（既有 BLE toggle 样本上加断言）。
+#   门禁：fullclean（IDF v6.1.0）exit 0；8 警告同基线（全 -Wunused-function：
+#     app_book.c 7 + ui_pinpad.c 1，不在改动面）；transfer_ui PASS（含 gen24.2 两
+#     新回归）；push_sink 168/0；app_loop 55 场景 PASS；book_management PASS；
+#     run_*.sh 全量枚举 13/13 绿。
+#   终版锚：Read_Pico.bin 4,063,392 B（相对 gen24.1 4,061,584 **+1,808 B**，
+#     双操作数 4,063,392−4,061,584=1808），sha256 `41f5d596…`；
+#     seg1 File offs `0x00233de8`（esptool 实测，gen24.1 为 0x00233ae8，+0x300=768B
+#     顺移——DROM 段与文案增长所致），paddr = 0x00233de8 + 8(段头) + 0x10000(ota_0
+#     基址) = `0x00243df0`（预测）；seg1 Load addr 0x3fc9c700 世代不变锚不动，
+#     len=0x08a8c 持平。partition-table / ota_data_initial 与 gen24.1 逐字节一致
+#     （9d5d890b… / 7d2c7ac4…）。bootloader sha 由 `0dcba57a…` → `9597e307…`
+#     （体积同为 21,232 B；差异是编译时间戳，IDF 产物非确定性，行为不变）。
+#     APK 包内为 v1.1 `7e5eea37…`（与 gen24.1 同，协议未变，无需重刷）。
+#
+# Re-anchor record (2026-10-22, gen24.2: the push-button state machine's silent
+#   deadlock rooted out - front four gates + model-B switch authority + the
+#   inline [enable] button + deep-link clarification; gen24.1's second hotfix,
+#   still not merging gen25):
+# version 0.3.3-pico24.2 (three places in step: CMakeLists.txt, this record, the
+# flashing notes).
+#   Background (gen24.1 hardware, two rounds + 531-line boot log; the log's first
+#   line paddr=00243af0 matches gen24.1's predicted anchor character for
+#   character, confirming the gen24.1 build under test): problem 1 - with the
+#   BLE master switch off in Settings, the first "receive push" tap works, but
+#   after "exit receive" the next "phone push" tap deadlocks with zero response.
+#   Problem 2 - booting without enabling Bluetooth, the tap does nothing and
+#   shows no text. Problem 3 - after switching Bluetooth off in Settings, the
+#   home "receive push" keeps working and can still receive, but "exit receive"
+#   then a phone push fails silently. Code-level closure: all three share one
+#   root - the pending-arm path has had no UI presence since gen12, app_loop's
+#   stack-pull condition never counted it, and the 10 s timeout event rotted in
+#   a method page nobody consumed: zero hints throughout (log proof: at the
+#   deadlock largest=31744, memory healthy - it jammed on the permission and
+#   state paths, not memory; gen24.1's leave-the-book self-heal untouched).
+#   Three-link root cause: R1 app_loop.c:1093's sync condition
+#   `(ble_turner || push_sink_armed())` never counts pending (a pending arm's
+#   state is exactly IDLE); R2 push_tick treats pending as a finished session
+#   and bounces back within 500 ms; R3 the method page's tick returns
+#   APP_REDRAW_NONE outright, so start_failed/closed are never consumed. The
+#   user's hypothesis ("some path checks app_settings_ble() and returns
+#   silently") is corrected: push_button_action never reads the setting at all;
+#   the switch kills the second arm silently THROUGH R1's sync condition.
+#   Model ruling B (user-decided): the settings switch is the BLE master switch
+#   (authoritative), governing both the page-turner and phone push; gen18's
+#   "the arm entry may have been tapped with the page-turner setting off" note
+#   is revised along with the deep-link auto-arm it described. Two further user
+#   rulings: build the inline quick switch (gate-2 hint embeds [enable], writes
+#   the setting in place and continues, no settings-page detour); the deep link
+#   navigates only, never arms (gen23's ruling paid off).
+#   Eight implementation blocks:
+#     1. Model B lands: the setting is renamed "bluetooth master switch" with
+#        the final wording "on: connect the turner and use phone push; off:
+#        both stop and the memory is returned"; the wireless-group row label
+#        becomes "bluetooth"; settings.h's comment follows; app_loop.c's gen18
+#        note is revised under model B.
+#     2. Mid-flight switch-off cuts: both the settings-page toggle-off handler
+#        and app_loop's quick-layer UI_QUICK_BLUETOOTH off handler append
+#        push_sink_cancel_why("bluetooth off") (covering armed and pending;
+#        the home status card naturally returns to "off").
+#     3. Front four gates (push_button_action): memory gate (the existing
+#        two-part wording, gen24.1 D1/D2/D3 verbatim) -> BLE master switch
+#        (inline hint + [enable] button) -> flight mode ("flight mode is on,
+#        turn it off first") -> USB storage ("USB transfer owns the card,
+#        receive paused"); R1's sync condition unchanged - a pending arm only
+#        exists with the switch on, so the condition holds and the gap closes
+#        naturally.
+#     4. R2 pending semantics: push_sink gains push_sink_pending(); push_tick's
+#        fallback tightens to "neither armed nor pending"; while pending the
+#        push page shows "starting bluetooth..." (draw_push's starting branch,
+#        three文案 spots: status card, sub-line, window line).
+#     5. R3 structural root fix: the method page's tick consumes the one-shot
+#        events (methods_tick: start_failed/closed land in s_method_message
+#        with a repaint); the pending timeout gains an ESP_LOGW instrumentation
+#        line; the extreme loop "switch off during pending -> cancel_why ->
+#        closed -> the method page shows bluetooth off" closes.
+#     6. Branch 10 close-up reason: on_enter snapshots
+#        push_sink_last_close_why() into s_last_cancel_why (in-memory, no NVS),
+#        the hint bar shows "last receive ended: X", and the next arm clears it
+#        (push_arm_now's fresh-round slate).
+#     7. Branch 1 disabled hint: CONNECTED/RECEIVING/PROCESSING taps say "the
+#        phone is pushing; it ends automatically" instead of returning silently.
+#     8. Deep-link clarification: on_enter's s_push_requested decouples from
+#        the else-if chain - it only clears the flag and never arms; a
+#        keep-alive arm still lands on the arm page via the push_sink_armed
+#        branch (no re-arm, no window reset).
+#   Inline [enable] button points (user-pinned): single source of truth (the
+#   same settings value as the settings page); tap writes the setting, re-runs
+#   the four gates (gate 2 passed, memory/flight/USB rechecked), and a full
+#   pass takes the existing arm path (pending pulls the stack; no second start
+#   path); the hint is transient ("starting bluetooth..." after the tap, back
+#   to the refusing gate on failure); it appears only at gate 2; races converge
+#   naturally through the shared source plus the recheck.
+#   Tests: transfer_ui gains push_gate_regression (gate-2 hint + inline tap
+#   writing the setting and re-running the gates + flight/USB refusals + the
+#   switch-off-during-pending loop + the block-6 ledger) and
+#   push_pending_ui_regression (pending holds + the method page consumes
+#   start_failed/closed + the check order); the stubs gain
+#   test_settings_ble_turner/app_settings_set_ble_turner/
+#   app_settings_flight_mode/push_sink_pending/test_push_pending; the
+#   cancel_why stub gains the pending branch and CANCEL-to-IDLE (mirroring the
+#   real component); push_arm_regression's five deep-link dependencies switch
+#   to explicit taps (a host assertion is an implementation contract - the
+#   same lesson as gen19/gen21); app_loop asserts the quick-layer switch-off
+#   cancel linkage (on the existing BLE-toggle sample).
+#   Gate: fullclean (IDF v6.1.0) exit 0; 8 warnings at baseline (all
+#   -Wunused-function: app_book.c 7 + ui_pinpad.c 1, outside the change set);
+#   transfer_ui PASS (with gen24.2's two new regressions); push_sink 168/0;
+#   app_loop 55 scenarios PASS; book_management PASS; run_*.sh full enumeration
+#   13/13 green.
+#   Final anchor: Read_Pico.bin 4,063,392 B (**+1,808 B** vs gen24.1's
+#   4,061,584 - both operands: 4,063,392 − 4,061,584 = 1808), sha256
+#   `41f5d596…`; seg1 File offs `0x00233de8` (esptool-measured; gen24.1 was
+#   0x00233ae8, +0x300 = 768B shift from DROM growth and longer strings),
+#   paddr = 0x00233de8 + 8 (segment header) + 0x10000 (ota_0 base) =
+#   `0x00243df0` (predicted); seg1 Load addr 0x3fc9c700 generation-invariant,
+#   len = 0x08a8c flat. partition-table / ota_data_initial byte-identical to
+#   gen24.1 (9d5d890b… / 7d2c7ac4…). bootloader sha `0dcba57a…` → `9597e307…`
+#   (same 21,232 B; the difference is the build timestamp - IDF artifact
+#   non-determinism, behavior unchanged).
+#   The package's APK remains v1.1 `7e5eea37…` (same as gen24.1; protocol
+#   unchanged, no reflash needed).
 #
 # 重锚记录（2026-10-22，gen24.1：gen24 真机两项缺陷热修——D2 冤拒 + D1 文案，独立代）：
 #   版本串：0.3.3-pico24.1（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
@@ -317,7 +498,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #     unchanged, no reflash needed).
 #
 # 重锚记录（2026-10-22，gen24：真机 BLE 碎片化失败急救 + 多态按钮四态与一键自愈）：
-#   版本串：0.3.3-pico24.1（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   版本串：0.3.3-pico24（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
 #   背景（gen23 真机）：用户 31 分钟后首次点「接收推送」，NimBLE 启动失败并自锁
 #     （tries≥3），屏幕「启动失败 3 次：内存不足（内部 75K，最大块 19K）」。
 #     根因：start_locked() 预检 free≥56K 过、最大块 19K < 20K 闸门差 1KB——
@@ -361,7 +542,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #
 # Re-anchor record (2026-10-22, gen24: hardware BLE-fragmentation emergency fix
 # plus the multistate button with one-key self-healing):
-# version 0.3.3-pico24.1 (three places in step: CMakeLists.txt, this record, the
+# version 0.3.3-pico24 (three places in step: CMakeLists.txt, this record, the
 # flashing notes).
 #   Background (gen23 hardware): the user's first "receive push" tap came 31
 #     minutes in; NimBLE failed to start and self-locked (tries>=3), screen
@@ -814,7 +995,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="eb07a4a76b3416bdf60998ab648a7d848cc1778f9b008a1881ec5b0188245751"
+EXPECTED="41f5d596fe83a2edb0b5c16beebab03f4f2597fa578ad871b0535c0a1f386b1d"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

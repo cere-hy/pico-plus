@@ -199,11 +199,14 @@ void app_transfer_request_hotspot_start(void) {
     s_wifi_settings_only = false;
 }
 
-// 手机推送入口（二期 M1）：进页即武装。其它入口只置标志，武装动作在 on_enter，
-// 与 WiFi/热点入口同款——页面没真正显示之前不碰射频。
-// The phone-push entry (phase 2 M1): entering the page arms it. Like the WiFi and
-// hotspot entries it only sets a flag; the arming happens in on_enter, so nothing
-// touches the radio before the page is actually on screen.
+// 手机推送入口（gen24.2 块 8）：只置跳转标志——on_enter 据此落方法页，
+// 武装交给用户在传书页显式点「手机推送」行走四门（gen23 裁定：deep-link
+// 只跳转不武装；gen18~gen24.1 的自动武装绕过四门，已修正）。
+// The phone-push entry (gen24.2 block 8): only sets the navigate flag -
+// on_enter lands on the method page and the arm waits for the user's
+// explicit "phone push" tap, which runs the four gates (gen23 ruling: the
+// deep link navigates only; the gen18-gen24.1 auto-arm bypassed the gates
+// and is corrected).
 void app_transfer_request_push(void) {
     s_push_requested = true;
 }
@@ -237,6 +240,22 @@ static read_pico_transfer_network_t s_networks[READ_PICO_TRANSFER_SCAN_MAX], s_s
 static size_t s_network_count, s_network_page;
 static bool s_scan_pending, s_network_connect_pending, s_saved_configured, s_password_visible, s_forget_confirm;
 static char s_saved_ssid[33], s_password[PASSWORD_MAX + 1], s_network_message[96], s_method_message[160];
+// gen24.2 块 6：最近一次收摊原因的内存态副本（不做 NVS——重启后旧原因
+// 没有指路价值，push_sink 的 s_close_why 也会被下一次武装清掉，故 on_enter
+// 时取一次快照在此）。/ Gen24.2 block 6: an in-memory copy of the most recent
+// close-up reason (no NVS - a stale reason points nowhere after a reboot, and
+// push_sink's own s_close_why is cleared by the next arm, so we snapshot it at
+// on_enter).
+static char s_last_cancel_why[64];
+// gen24.2 块 3：门 2（蓝牙总开关）提示条的行内【开启】按钮可见性——提示条
+// 是瞬态 UI，按钮只在开关门拦截时出现。/ Gen24.2 block 3: visibility of the
+// inline [enable] button on the gate-2 (BLE master switch) hint bar - a
+// transient UI that appears only when the switch gate refuses.
+static bool s_method_inline_enable;
+// 行内【开启】按钮的命中区：钉在提示条横幅（36,584,612,76）右侧，文字让位
+// 左半区。/ The inline [enable] button's hit rect: pinned to the right of the
+// hint banner, with the text yielding the left half.
+static EpdRect inline_enable_rect(void) { return (EpdRect){496, 596, 128, 52}; }
 static ui_text_edit_t s_password_input;
 
 static esp_err_t s_scan_error;
@@ -244,6 +263,7 @@ static esp_err_t s_scan_error;
 static void render(app_ctx_t* ctx, uint8_t* fb);
 static void stop_session(void);
 static bool stop_upload_if_idle(void);
+static void fit_label(char* text, int px, int width);
 
 static void transfer_header(uint8_t *fb, const char *title, const char *subtitle) {
     ui_nav_status(fb);
@@ -259,8 +279,7 @@ static EpdRect method_control_rect(int id) {
 
 // S05：入口只负责选择传输方式，具体服务信息留给下一页。
 // S05 keeps method selection separate from the service details shown on the next page.
-static void draw_methods(uint8_t *fb) {
-    ui_clear_page(fb);
+static void draw_methods(uint8_t *fb) {    ui_clear_page(fb);
     ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
     transfer_header(fb, "Wifi/热点传书", NULL);
     ui_text(fb, 42, 180, 21, "选择方式", EPD_DRAW_ALIGN_LEFT, false);
@@ -308,27 +327,55 @@ static void draw_methods(uint8_t *fb) {
         ui_text(fb, 112, row.y + 64, 19, details[i], EPD_DRAW_ALIGN_LEFT, false);
         ui_text_vc(fb, 617, cy, 29, "›", EPD_DRAW_ALIGN_CENTER, false);
     }
+    // 提示条：优先瞬态消息（s_method_message），无消息时挂 gen24.2 块 6 的
+    // 收摊原因底账（上次取消/超时的一句话，武装后清除）。
+    // The hint bar: the transient message first; with none, gen24.2 block 6's
+    // close-up reason ledger (last cancel/timeout one-liner, cleared on arm).
     if (s_method_message[0]) {
         ui_fill_round_rect(fb, (EpdRect){36, 584, 612, 76}, 20, 0xd8);
-        // gen24.1：两段式文案以「——」分界拆两行画——单行约 780px（20px 字号），
-        // 超出 612px 横幅。无分隔符的单行文案（如「蓝牙启动失败，请重试」）仍走
-        // 居中单行，行为不变。
-        // gen24.1: the two-part hint renders as two lines split at the em-dash
-        // separator - one line runs ~780px at a 20px font, past the 612px banner.
-        // Single-line hints without the separator (e.g. "bluetooth start failed,
-        // retry") stay centered one-liners, unchanged.
-        const char *dash = strstr(s_method_message, "——");
-        if (dash) {
-            char head[160];
-            size_t n = (size_t)(dash - s_method_message);
-            if (n >= sizeof(head)) n = sizeof(head) - 1;
-            memcpy(head, s_method_message, n);
-            head[n] = '\0';
-            ui_text_vc(fb, 342, 608, 20, head, EPD_DRAW_ALIGN_CENTER, false);
-            ui_text_vc(fb, 342, 638, 20, dash + strlen("——"), EPD_DRAW_ALIGN_CENTER, false);
+        if (s_method_inline_enable) {
+            // gen24.2 块 3：门 2 提示 + 行内【开启】按钮——文字让位左半区
+            // （cx=258），按钮钉横幅右侧。/ Gate-2 hint plus the inline
+            // [enable] button - the text yields the left half (cx=258) and
+            // the button pins to the banner's right.
+            ui_text_vc(fb, 258, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+            const EpdRect btn = inline_enable_rect();
+            ui_fill_round_rect(fb, btn, 16, UI_GRAY_WHITE);
+            ui_draw_round_rect(fb, btn, 16, 0x60);
+            ui_text_vc(fb, btn.x + btn.width / 2, btn.y + btn.height / 2, 24, "开启",
+                       EPD_DRAW_ALIGN_CENTER, false);
         } else {
-            ui_text_vc(fb, 342, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+            // gen24.1：两段式文案以「——」分界拆两行画——单行约 780px（20px 字号），
+            // 超出 612px 横幅。无分隔符的单行文案（如「蓝牙启动失败，请重试」）仍走
+            // 居中单行，行为不变。
+            // gen24.1: the two-part hint renders as two lines split at the em-dash
+            // separator - one line runs ~780px at a 20px font, past the 612px banner.
+            // Single-line hints without the separator (e.g. "bluetooth start failed,
+            // retry") stay centered one-liners, unchanged.
+            const char *dash = strstr(s_method_message, "——");
+            if (dash) {
+                char head[160];
+                size_t n = (size_t)(dash - s_method_message);
+                if (n >= sizeof(head)) n = sizeof(head) - 1;
+                memcpy(head, s_method_message, n);
+                head[n] = '\0';
+                ui_text_vc(fb, 342, 608, 20, head, EPD_DRAW_ALIGN_CENTER, false);
+                ui_text_vc(fb, 342, 638, 20, dash + strlen("——"), EPD_DRAW_ALIGN_CENTER, false);
+            } else {
+                ui_text_vc(fb, 342, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+            }
         }
+    } else if (s_last_cancel_why[0]) {
+        // gen24.2 块 6：非主动收摊（窗口到期/拔电/关开关）后进传书页，先把
+        // 最近一次原因挂在提示条位——用户不必猜上一次为什么结束。
+        // Block 6: after a non-voluntary close-up (window expiry, unplug,
+        // switch-off), entering the page shows the latest reason in the hint
+        // slot - the user should not have to guess why it ended.
+        ui_fill_round_rect(fb, (EpdRect){36, 584, 612, 76}, 20, 0xd8);
+        char why_line[96];
+        snprintf(why_line, sizeof(why_line), "上次接收已结束：%s", s_last_cancel_why);
+        fit_label(why_line, 20, 560);
+        ui_text_vc(fb, 342, 622, 20, why_line, EPD_DRAW_ALIGN_CENTER, false);
     }
     ui_text(fb, 42, 694, 19, "浏览器传书支持 EPUB、TXT、字体和图片文件。", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 42, 734, 18, "传输完成后，新内容会自动出现在书架或字体列表。", EPD_DRAW_ALIGN_LEFT, false);
@@ -885,11 +932,21 @@ static void draw_push(uint8_t *fb) {
     ui_fill_round_rect(fb, status, 24, UI_GRAY_WHITE);
     ui_draw_round_rect(fb, status, 24, 0x98);
     const push_state_t st = push_sink_state();
-    ui_text(fb, 64, 336, 27, push_state_text(st), EPD_DRAW_ALIGN_LEFT, false);
+    // gen24.2 R2：pending 期间 push_sink 状态机仍是 IDLE（栈还没起来，会话
+    // 未开），但页面留在推送页说「正在启动蓝牙…」——状态机没词的地方 UI
+    // 必须自己说，闪回方法页就是死锁。/ Gen24.2 R2: while pending the state
+    // machine is still IDLE (the stack is not up, the session has not opened),
+    // but the page stays on the push view saying "starting bluetooth..." -
+    // where the machine has no word the UI must speak its own; bouncing back
+    // to the method page was the deadlock.
+    const bool starting = !push_sink_armed() && push_sink_pending();
+    ui_text(fb, 64, 336, 27, starting ? "正在启动蓝牙…" : push_state_text(st), EPD_DRAW_ALIGN_LEFT, false);
     char sub[128];
     uint32_t received = 0, total = 0;
     push_sink_progress(&received, &total);
-    if (st == PUSH_STATE_RECEIVING && total) {
+    if (starting) {
+        snprintf(sub, sizeof(sub), "蓝牙正在启动，请稍候…");
+    } else if (st == PUSH_STATE_RECEIVING && total) {
         snprintf(sub, sizeof(sub), "已接收 %.1f / %.1f KB", received / 1024.0, total / 1024.0);
     } else if (st == PUSH_STATE_COOLDOWN) {
         snprintf(sub, sizeof(sub), "共 %u 字节，可继续等待下一条", (unsigned)total);
@@ -911,7 +968,8 @@ static void draw_push(uint8_t *fb) {
     }
     char window[96];
     const uint32_t left_ms = push_sink_window_left_ms();
-    if (left_ms) snprintf(window, sizeof(window), "接收窗口剩余 %u 分 %02u 秒，超时自动退出",
+    if (starting) snprintf(window, sizeof(window), "启动完成后自动进入接收窗口");
+    else if (left_ms) snprintf(window, sizeof(window), "接收窗口剩余 %u 分 %02u 秒，超时自动退出",
                           (unsigned)(left_ms / 60000u), (unsigned)((left_ms / 1000u) % 60u));
     else snprintf(window, sizeof(window), "充电时常开：没有超时，拔下充电器即退出");
     ui_text(fb, 64, 486, 18, window, EPD_DRAW_ALIGN_LEFT, false);
@@ -1004,6 +1062,16 @@ static void push_sync_live_bookkeeping(void) {
     snprintf(s_push_last_adv, sizeof(s_push_last_adv), "%s", push_sink_adv_name());
 }
 
+// 把一次 closed 的原因落到提示条与块 6 底账：推送页与方法页两处消费同源。
+// Absorb one closed event's reason into the hint and the block-6 ledger - the
+// push page and the method page consume it from this one place.
+static void absorb_close_why(void) {
+    const char *why = push_sink_last_close_why();
+    if (!why) return;
+    snprintf(s_last_cancel_why, sizeof(s_last_cancel_why), "%s", why);
+    snprintf(s_method_message, sizeof(s_method_message), "%s", why);
+}
+
 // 武装页轮询：消费 push_sink 的一次性 UI 事件，500ms 节流刷新倒计时与进度。
 // The arm page's pump: consume the push sink's one-shot UI events and refresh the
 // countdown and progress at a 500 ms cadence.
@@ -1032,8 +1100,10 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
         // gen18: a close-up must carry its reason - window expiry, unplug,
         // flight mode and USB each say their own piece, so the user knows
         // what to do next (error text must point the way).
-        const char *why = push_sink_last_close_why();
-        if (why) snprintf(s_method_message, sizeof(s_method_message), "%s", why);
+        // gen24.2 块 5/6：原因同时进底账——用户随后进传书页也看得到。
+        // Gen24.2 blocks 5/6: the reason also lands in the ledger, so the
+        // user still sees it after entering the transfer page later.
+        absorb_close_why();
         return APP_REDRAW_PAGE;
     }
     char title[PUSH_TITLE_MAX];
@@ -1080,10 +1150,19 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
     }
     if (ctx->now_ms - s_push_poll_ms < 500) return APP_REDRAW_NONE;
     s_push_poll_ms = ctx->now_ms;
-    // 双保险：closed 事件万一漏接（极端时序），节流刷新也会把页面放回去。
-    // A safety net: if the closed event were ever missed (extreme timing), the
-    // throttled refresh still walks the page back.
-    if (!push_sink_armed()) {
+    // gen24.2 R2：回退条件收紧为「非 armed 且非 pending」。pending 是点了
+    // 接收、栈正在拉起的合法在途态（app_loop 的 sync 会拉栈，on_stack_sync
+    // 续上）——此时闪回方法页，用户看到的就是「点了没反应」，随后 10s 超时
+    // 的 start_failed 又烂死在无人消费的方法页（gen24.2 问题 1/2 死锁链的
+    // 第二、三环）。 armed 丢失（事件漏接的极端时序）仍照旧放回。
+    // Gen24.2 R2: the fallback tightens to "neither armed nor pending". A
+    // pending arm is a legitimate in-flight state (receive pressed, the stack
+    // is coming up; app_loop's sync pulls it and on_stack_sync completes it) -
+    // bouncing back here showed the user a dead tap, and the 10 s timeout's
+    // start_failed then rotted in a method page nobody consumed (the second
+    // and third links of the gen24.2 problem 1/2 deadlock chain). A genuinely
+    // lost armed flag (missed-event extreme timing) still walks back as before.
+    if (!push_sink_armed() && !push_sink_pending()) {
         push_word_card_close();
         s_view = TRANSFER_METHODS;
         return APP_REDRAW_PAGE;
@@ -1111,6 +1190,43 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
     s_area = push_dynamic_rect();
     s_settle = false;
     return APP_REDRAW_AREA;
+}
+
+// gen24.2 块 5（R3 结构性根修）：方法页轮询也消费一次性事件。
+// gen24.2 前方法页 tick 直接 APP_REDRAW_NONE——一切 start_failed/closed
+// 到了方法页就烂死：pending 超时失败（问题 1）与关开关收摊（问题 2）的
+// 原因永远到不了屏幕，用户看到的就是「点了没反应」。事件在此落
+// s_method_message 并整页重绘；极端闭环（pending 中关开关 → cancel →
+// closed）由本函数与 push_tick 共同覆盖。
+// Gen24.2 block 5 (R3 structural root fix): the method page's pump also
+// consumes the one-shot events. Pre-gen24.2 the method tick returned
+// APP_REDRAW_NONE outright, so every start_failed/closed that arrived here
+// rotted: the pending-arm timeout (problem 1) and the switch-off close-up
+// (problem 2) never reached the screen - the user just saw a dead tap. The
+// events land in s_method_message with a full repaint; the extreme loop
+// (switch off during pending -> cancel -> closed) is covered here and in
+// push_tick together.
+static app_redraw_t methods_tick(app_ctx_t *ctx) {
+    (void)ctx; // 本页轮询只消费事件，不用节流时钟 / this pump only consumes events, no clock needed
+    // start_failed 先于 closed 查：pending 超时路径两个标志都会置位
+    // （与 push_tick 同序，理由同其注释）。/ start_failed before closed,
+    // same order and rationale as push_tick's.
+    if (push_sink_take_start_failed()) {
+        (void)push_sink_take_closed();
+        snprintf(s_method_message, sizeof(s_method_message), "蓝牙启动失败，请重试");
+        s_method_inline_enable = false;
+        ESP_LOGW(TAG, "methods page: pending arm failed, stack never came up");
+        return APP_REDRAW_PAGE;
+    }
+    if (push_sink_take_closed()) {
+        // gen24.2 块 6：原因同时进底账——用户随后进传书页也看得到。
+        // Block 6: the reason also lands in the ledger, so the user still
+        // sees it after entering the transfer page later.
+        absorb_close_why();
+        s_method_inline_enable = false;
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
 }
 
 // 武装页手势：常开开关、退出接收、按下反馈。/ The arm page's gestures: the hold
@@ -1301,6 +1417,10 @@ static void push_arm_now(void) {
     // 待武装失败补的 start_failed 等）、活区簿记对齐当前值。
     // A clean slate for the new round: drop the word card, sweep stale events
     // and align the live-region bookkeeping.
+    // gen24.2 块 6：收摊原因底账只挂到下一次武装为止——新回合开局不再拿
+    // 旧原因指路。/ Gen24.2 block 6: the close-up reason ledger hangs only
+    // until the next arm - a fresh round stops quoting the stale reason.
+    s_last_cancel_why[0] = 0;
     push_word_card_close();
     push_drain_stale_events();
     push_sync_live_bookkeeping();
@@ -1308,21 +1428,44 @@ static void push_arm_now(void) {
 
 // gen24 多态按钮：「手机推送」行按 push_sink 状态一台戏唱四种姿态，点按动作
 // 状态驱动，渲染与判定同源（push_sink_state + ble_pt_locked + ble_pt_mem_gate）。
-//   IDLE（干净）              → 直接武装；BLE 栈未起由 pending 机制静默拉起
+//   IDLE（干净）              → 过四门后直接武装；BLE 栈未起由 pending 机制静默拉起
 //   IDLE（上次失败/自锁）      → 一键自愈：预检过 → 清锁 + 重试，一次到位
 //                               预检不过 → 行内提示碎片数字，零等待（不吞 30s 退避）
 //   ARMED/WINDOW/COOLDOWN     → 取消，回 IDLE
-//   CONNECTED/RECEIVING/PROCESSING → 禁用，传输中不打断
+//   CONNECTED/RECEIVING/PROCESSING → 禁用，传输中不打断（给一句话，不静默）
+// gen24.2 前置四门（块 3）：武装前依次查 内存 → 蓝牙总开关 → 飞行模式 →
+// USB 存储；任何一门不过都行内给话 + 零武装。gen24.2 前的代码没有开关门——
+// 开关关着时按钮进 pending，而 app_loop 的拉栈条件不算 pending，栈永远不起
+// 来，10s 超时事件又烂死在无人消费的方法页——「点了没反应」的静默死锁。
 // 不假死底线：任何分支结束后方法页其余按钮照常可用、状态可再变更。
 // gen24 multi-state button: the phone-push row plays four poses off push_sink state;
 // the tap action is state-driven, with rendering and verdict sharing one source
-// (push_sink_state + ble_pt_locked + ble_pt_mem_gate). The no-freeze bottom line:
-// after any branch the other method rows keep working and the state stays mutable.
+// (push_sink_state + ble_pt_locked + ble_pt_mem_gate).
+//   clean IDLE -> pass the four gates, then arm; a down stack is pulled up by
+//   the pending mechanism.
+//   failed/self-locked IDLE -> one-tap self-heal (clear lock + retry on pass;
+//   inline fragment numbers on fail, zero wait).
+//   ARMED/WINDOW/COOLDOWN -> cancel back to IDLE.
+//   CONNECTED/RECEIVING/PROCESSING -> disabled mid-transfer (with a sentence,
+//   never silent).
+// gen24.2 front four gates (block 3): before arming, check memory -> BLE
+// master switch -> flight mode -> USB storage in order; any refusal speaks
+// inline and arms nothing. Pre-gen24.2 code had no switch gate - with the
+// switch off the button pended the arm, but app_loop's stack-pull condition
+// never counted pending, so the stack never came up and the 10 s timeout
+// event rotted in a method page nobody consumed: the silent deadlock of a
+// dead tap. The no-freeze bottom line: after any branch the other method
+// rows keep working and the state stays mutable.
 static void push_button_action(void) {
     const push_state_t st = push_sink_state();
-    // 传输中：禁用。一次活推送比任何按钮都重要。/ Mid-transfer: disabled. A live
-    // push outranks any button.
+    // 传输中：禁用——但必须给一句话。gen24.2 前这里静默 return，而按压反馈
+    // 照旧，看起来能按、按了没反应（铁律违规第 1 号）。
+    // Mid-transfer: disabled - but it must speak. Pre-gen24.2 this returned
+    // silently while press feedback still played, so the row looked pressable
+    // and did nothing (iron-rule violation #1).
     if (st == PUSH_STATE_CONNECTED || st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
+        snprintf(s_method_message, sizeof(s_method_message), "手机正在推送，完成后自动结束");
+        s_method_inline_enable = false;
         return;
     }
     // 已武装/窗口/宽限期：再点即取消（gen18 取消必须带原因）。
@@ -1330,11 +1473,13 @@ static void push_button_action(void) {
     // carry a reason).
     if (st != PUSH_STATE_IDLE) {
         push_sink_cancel_why("已取消接收");
+        s_method_message[0] = 0;
+        s_method_inline_enable = false;
         return;
     }
-    // IDLE：栈已在运行 → 跳过预检直接武装；栈 down → 预检先行。
-    // IDLE: stack already running -> skip the precheck and arm directly; stack
-    // down -> precheck first.
+    // IDLE：四门。栈已在运行 → 跳过内存预检直接武装；栈 down → 预检先行。
+    // IDLE: the four gates. Stack already running -> skip the memory precheck
+    // and arm directly; stack down -> precheck first.
     // gen24.1（D2 冤拒修复）：闸门的语义是预测「NimBLE 能否启动」（控制器与协议栈
     // 任务必须落内部 RAM，跑硬件路径读不到 PSRAM）。栈已经起来时这个问题不存在、
     // 武装也不需要任何新的控制器分配——此处拦截就是冤枉。boot1 实证：BLE 自开机起
@@ -1380,8 +1525,39 @@ static void push_button_action(void) {
                      "内存碎片不足（最大块 %uK，需 %uK）——退出当前书籍后重试；若仍失败，请重启设备",
                      (unsigned)(largest_internal / 1024),
                      (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024));
+            s_method_inline_enable = false;
             return;
         }
+    }
+    // gen24.2 门 2（块 3，B 模型）：蓝牙总开关。开关关着时不武装、不进
+    // pending——给行内提示 + 【开启】按钮，用户原地写设置项继续，不必跳
+    // 设置页。置于内存门之后（执行令定稿顺序），但早于飞行/USB：开关没开
+    // 是最高频的拦截，值得第一个给按钮。
+    // gen24.2 gate 2 (block 3, model B): the BLE master switch. With it off,
+    // nothing arms and nothing pends - an inline hint plus an [enable] button
+    // writes the setting in place and continues, with no trip to the settings
+    // page. It sits after the memory gate (the finalised order) but before
+    // flight/USB: the switch is the most frequent refusal and earns the button.
+    if (!app_settings_ble_turner()) {
+        ESP_LOGW(TAG, "push gate refused: ble master switch off (settings)");
+        snprintf(s_method_message, sizeof(s_method_message), "蓝牙已关闭，点按右侧「开启」后继续");
+        s_method_inline_enable = true;
+        return;
+    }
+    // gen24.2 门 3（块 3）：飞行模式。/ Gen24.2 gate 3: flight mode.
+    if (app_settings_flight_mode()) {
+        ESP_LOGW(TAG, "push gate refused: flight mode on");
+        snprintf(s_method_message, sizeof(s_method_message), "飞行模式开启中，请先关闭");
+        s_method_inline_enable = false;
+        return;
+    }
+    // gen24.2 门 4（块 3）：USB 存储接管中。/ Gen24.2 gate 4: USB storage owns
+    // the card right now.
+    if (usb_storage_active()) {
+        ESP_LOGW(TAG, "push gate refused: usb storage active");
+        snprintf(s_method_message, sizeof(s_method_message), "USB 传书已接管，接收推送暂停");
+        s_method_inline_enable = false;
+        return;
     }
     // 预检过：一键自愈——上次失败/自锁先清掉（幂等；没锁时调用无害），再走既有
     // 武装路径（push_sink_arm → pending 静默拉栈，gen12 的启动链原样复用）。
@@ -1390,6 +1566,29 @@ static void push_button_action(void) {
     // pending silently brings the stack up; gen12's start chain is reused verbatim).
     ble_pt_reset_failure();
     push_arm_now();
+}
+
+// gen24.2 行内【开启】按钮（块 3 + §二 设计要点）：原地写设置项（关→开），
+// 再重走四门——门 2 此时已过，内存/飞行/USB 复查，全过则走既有武装路径
+// （push_sink_arm → pending 拉栈），不引入第二套启动路径。写入与复查之间
+// 无第二份状态：设置项就是单一真源，与设置页手动开启天然收敛。
+// Gen24.2's inline [enable] button (block 3 + section 2's design points):
+// write the setting in place (off->on), then re-run the four gates - gate 2
+// has passed by now, memory/flight/USB are rechecked, and a full pass takes
+// the existing arm path (push_sink_arm -> pending pulls the stack). No second
+// start path and no second state: the setting itself is the single source of
+// truth, converging naturally with a manual flip on the settings page.
+static void inline_enable_push(void) {
+    s_method_inline_enable = false;
+    app_settings_set_ble_turner(true);
+    ESP_LOGI(TAG, "inline enable: ble master switch written on, re-running the four gates");
+    // 提示条先行更新为「正在启动蓝牙…」——若四门复查失败，下面的
+    // push_button_action 会用对应门的提示覆盖它（§二-3 状态迁移）。
+    // The hint bar moves to "starting bluetooth..." first - if a gate refuses
+    // on recheck, push_button_action below overwrites it with that gate's
+    // hint (section 2-3's state migration).
+    snprintf(s_method_message, sizeof(s_method_message), "正在启动蓝牙…");
+    push_button_action();
 }
 
 static void on_enter(app_ctx_t* ctx) {
@@ -1424,6 +1623,21 @@ static void on_enter(app_ctx_t* ctx) {
     s_usb_host_connected = false;
     s_usb_capacity_bytes = 0;
     s_method_message[0] = 0;
+    // gen24.2 块 6：取一次收摊原因快照进底账并挂上提示条——push_sink 的
+    // s_close_why 会被下一次武装清掉，而「上次为什么结束」在用户下次进
+    // 页面时仍有指路价值（窗口到期/拔电/关开关都算）。armed 保活回连
+    // （1494 分支）时原因通常是空的，不挂。/ Block 6: snapshot the close-up
+    // reason into the ledger and hang it on the hint bar - push_sink's own
+    // s_close_why is cleared by the next arm, yet "why it ended last time"
+    // still points the way on the next entry (window expiry, unplug and
+    // switch-off all count). The keep-alive re-landing (the push_sink_armed
+    // branch) usually carries no reason and hangs nothing.
+    {
+        const char *last_why = push_sink_last_close_why();
+        snprintf(s_last_cancel_why, sizeof(s_last_cancel_why), "%s", last_why ? last_why : "");
+        if (s_last_cancel_why[0])
+            snprintf(s_method_message, sizeof(s_method_message), "上次接收已结束：%s", s_last_cancel_why);
+    }
     s_push_note[0] = 0;
     s_push_poll_ms = 0;
     s_push_handed_off = false; // gen18：进场即清交接标记，旧标记不过夜 / gen18: clear the handoff flag on entry - no stale flags overnight
@@ -1441,6 +1655,27 @@ static void on_enter(app_ctx_t* ctx) {
     read_pico_transfer_get_saved_wifi(s_status.wifi_ssid, &s_status.wifi_configured);
     s_poll_ms = 0;
     s_free = 0;
+    // gen24.2 块 8（gen23 裁定兑现）：deep-link 只跳转、不武装。首页卡片
+    // 点击仅把用户带到方法页——四门检查（内存/蓝牙总开关/飞行/USB）只在
+    // 传书页「手机推送」按钮显式触发。gen18~gen24.1 此处直接 push_arm_now()
+    // ——绕过全部四门，是 gen24.2 问题 1「首次能收、二次死锁」的史前版本
+    // （开关关着也照收）；gen23 已裁定只跳转，本版落地。
+    // 与 else-if 链解耦（而非占链内一支）：armed 保活中（gen18 18-a：后台
+    // 会话活着、手机在宽限期内）点卡片，仍由下面的 push_sink_armed 分支
+    // 落武装页接客——同一语义，区别仅在不重新武装、不重置窗口。
+    // gen24.2 block 8 (the gen23 ruling paid off): the deep link only
+    // navigates, never arms. A home-card tap brings the user to the method
+    // page; the four gates (memory / BLE master switch / flight / USB) run
+    // only on the explicit "phone push" tap. gen18-gen24.1 called
+    // push_arm_now() right here - bypassing every gate, the prehistoric form
+    // of gen24.2 problem 1's "first tap works, second deadlocks" (it
+    // received even with the switch off). gen23 ruled navigate-only; this
+    // generation lands it. Decoupled from the else-if chain (not a chain
+    // link): with a keep-alive arm live (gen18 18-a - the session lives in
+    // the background, the phone inside the grace window) a card tap still
+    // lands on the arm page via the push_sink_armed branch below - same
+    // semantics, only without re-arming or resetting the window.
+    if (s_push_requested) s_push_requested = false;
     if (s_usb_requested) {
         read_pico_sd_info_t usb_sd = {0};
         if (read_pico_sd_get_info(&usb_sd) == ESP_OK) s_usb_capacity_bytes = usb_sd.capacity_bytes;
@@ -1483,14 +1718,6 @@ static void on_enter(app_ctx_t* ctx) {
         } else {
             (void)enter_networks();
         }
-    } else if (s_push_requested) {
-        // 手机推送入口：直接武装（push_arm_now）。电量不足（组件层门槛）或被
-        // 别的会话占住时退回方法页并说明原因。
-        // The phone-push entry: arm outright via push_arm_now. A low battery
-        // (the glue-side gate) or a busy session falls back to the method page
-        // with the reason shown.
-        s_push_requested = false;
-        push_arm_now();
     } else if (push_sink_armed()) {
         // gen18（18-a 自动切回落点）：sink 正被后台保活——用户在读 push.txt，
         // 手机回连把用户从阅读器弹回本页。直接落武装视图接客，**不重新武装**
@@ -1624,7 +1851,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     }
     if (usb_storage_active()) return APP_REDRAW_NONE;
     if (s_view == TRANSFER_PUSH) return push_tick(ctx);
-    if (s_view == TRANSFER_METHODS) return APP_REDRAW_NONE;
+    if (s_view == TRANSFER_METHODS) return methods_tick(ctx);
     if (s_view != TRANSFER_HOME) return network_ui_tick(ctx);
     if (s_start_pending) {
         s_start_pending = false;
@@ -1723,6 +1950,17 @@ static app_redraw_t stop_usb_for_navigation(app_ctx_t *ctx, bool home) {
 
 static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
     int old = s_pressed;
+    // gen24.2 块 3：行内【开启】按钮——门 2 提示条挂着时才出现，命中即原地
+    // 写设置项 + 重走四门，不跳设置页（§二-4 边界：其他门无此控件）。
+    // Block 3's inline [enable] button: visible only while the gate-2 hint is
+    // up; a hit writes the setting in place and re-runs the four gates with
+    // no trip to the settings page (section 2-4's boundary: no other gate
+    // carries this control).
+    if (s_method_inline_enable && ev->type == UI_GESTURE_TAP &&
+        ui_rect_hit(inline_enable_rect(), ev->x, ev->y)) {
+        inline_enable_push();
+        return APP_REDRAW_PAGE;
+    }
     int origin = hit_method(ev->x0, ev->y0);
     s_pressed = ev->type == UI_GESTURE_PRESS ? origin : -1;
     if (ev->type == UI_GESTURE_TAP && old >= 0 && old == origin && hit_method(ev->x, ev->y) == origin) {

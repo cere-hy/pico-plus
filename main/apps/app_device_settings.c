@@ -1292,7 +1292,13 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             if (!s_ble_learning)
                 ui_text_vc(fb, 342, 305 - s_ble_scroll, 19, "轻点此处返回蓝牙开关", EPD_DRAW_ALIGN_CENTER, false);
         } else {
-            setting_toggle(fb, l.toggle_top, "启用蓝牙", "开启后可配对蓝牙翻页器；关闭会释放蓝牙内存",
+            // gen24.2 块 1（B 模型落地）：「启用蓝牙」更名「蓝牙总开关」——
+            // 它同时管翻页器与手机推送，文案说清两者，不再让用户以为只是个
+            // 翻页器待机开关。/ Block 1 (model B): "enable bluetooth" becomes
+            // the "bluetooth master switch" - it governs both the page-turner
+            // and phone push, and the wording says so, no longer reading like
+            // a page-turner standby switch.
+            setting_toggle(fb, l.toggle_top, "蓝牙总开关", "开启后可连接翻页器并使用手机推送；关闭后两者均停用并释放蓝牙内存",
                            app_settings_ble_turner());
         }
 
@@ -1374,7 +1380,12 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     // 两者并存。行序必须与下方派发（row 分支）逐行一致。
     // Four rows in 连接与时间; flight mode is ours while upstream r91 puts
     // 日期与时间 third. Both stay, and the order must match the row dispatch.
-    const char *connection_labels[]={"WiFi","蓝牙翻页器","飞行模式","日期与时间"};
+    // gen24.2 块 1：行标签随设置项一起更名——「蓝牙翻页器」→「蓝牙」，
+    // 与子页 toggle「蓝牙总开关」同源（B 模型：一个开关两种用途）。
+    // Block 1: the row label follows the setting - "bluetooth" alongside the
+    // sub-page's "bluetooth master switch" toggle (model B: one switch, two
+    // uses).
+    const char *connection_labels[]={"WiFi","蓝牙","飞行模式","日期与时间"};
     const char *connection_values[]={wifi,app_settings_ble_turner()?"已开启":"已关闭",
         app_settings_flight_mode()?"开启":"关闭","设置"};
     const int connection_icons[]={0,1,SETTINGS_ICON_SLOT_FLIGHT_MODE,6};
@@ -2132,14 +2143,29 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             // 明确关掉时把失败计数和原因一起清掉：否则自锁之后用户没有重试的途径。
             // Switching it off explicitly clears the failure count and reason; without this a
             // self-locked stack leaves the user no way to try again.
-            if (!app_settings_ble_turner()) ble_pt_reset_failure();
+            if (!app_settings_ble_turner()) {
+                // gen24.2 块 2（B 模型）：开关即权威——关开关必须同时收摊，
+                // 覆盖 armed 与 pending 两态。gen24 真机 109.27s 实证：只改
+                // 设置项不收摊，推送照跑（sync 条件里 push_sink_armed() 仍
+                // 真），用户看到「关了还在推」。cancel_why 带原因，首页状态
+                // 卡与传书页随后都能说清为什么结束。
+                // Block 2 (model B): the switch is the authority - flipping it
+                // off must also close up, covering both armed and pending.
+                // gen24 hardware at 109.27s proved that writing the setting
+                // alone leaves the push running (sync still sees
+                // push_sink_armed() true): "off but still pushing". The
+                // cancel_why carries the reason so the home card and the
+                // transfer page can both say why it ended.
+                push_sink_cancel_why("蓝牙已关闭");
+                ble_pt_reset_failure();
+            }
             snprintf(s_ble_notice, sizeof(s_ble_notice), "%s",
                      app_settings_ble_turner() ? "已开启，正在等待设备" : "已关闭，蓝牙内存已释放");
             return APP_REDRAW_PAGE;
         }
         if (ty >= l.scan_entry_top && ty < l.scan_entry_top + BLE_ROW_H) {
             if (!app_settings_ble_turner() || !ble_pt_running()) {
-                snprintf(s_ble_notice, sizeof(s_ble_notice), "请先开启蓝牙翻页器"); return APP_REDRAW_PAGE;
+                snprintf(s_ble_notice, sizeof(s_ble_notice), "请先开启蓝牙总开关"); return APP_REDRAW_PAGE;
             }
             // 进扫描页就开持续扫描，离页时停掉。/ Scan continuously while the page is open.
             ble_pt_scan_start(BLE_PT_SCAN_FOREVER);

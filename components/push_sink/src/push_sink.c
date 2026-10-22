@@ -1619,6 +1619,17 @@ bool push_sink_armed(void) {
     return armed;
 }
 
+// gen24.2：待武装查询——UI 的 R2 回退判定与「正在启动蓝牙…」渲染同源。
+// Gen24.2: the pending-arm query - the UI's R2 fallback verdict and the
+// "starting bluetooth..." rendering share this one source.
+bool push_sink_pending(void) {
+    ensure_init();
+    lock();
+    const bool pending = s_pending_arm;
+    unlock();
+    return pending;
+}
+
 push_state_t push_sink_state(void) {
     ensure_init();
     lock();
@@ -1680,6 +1691,15 @@ void push_sink_poll(void) {
     if (s_pending_arm && now - s_pending_at_ms >= PUSH_PENDING_ARM_TIMEOUT_MS) {
         s_pending_arm = false;
         s_charger_held = false;
+        // gen24.2（D3 同源）：pending 超时必须留日志行——真机据此分辨「点了
+        // 没反应」是 pending 超时还是别的原因；此前该路径静默入队，事件又
+        // 烂死在无人消费的方法页，屏幕零变化（gen24.2 问题 1/2 现场）。
+        // Gen24.2 (same source as D3): a pending-arm timeout must log - on
+        // hardware this line tells "dead tap" apart from other causes; the
+        // path used to enqueue silently into a method page nobody consumed,
+        // leaving the screen frozen (the gen24.2 problem 1/2 field).
+        ESP_LOGW(TAG, "pending arm timed out after %u ms, stack never came up",
+                 (unsigned)PUSH_PENDING_ARM_TIMEOUT_MS);
         ui_post_start_failed();
     }
     if (s_sess.state != PUSH_STATE_IDLE) {

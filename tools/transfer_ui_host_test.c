@@ -196,8 +196,21 @@ static void push_arm_regression(app_ctx_t *ctx) {
     test_push_state = PUSH_STATE_WINDOW;
     snprintf(test_push_adv, sizeof(test_push_adv), "PicoPush-1a2b");
     test_push_left_ms = 30u * 60u * 1000u;
+    // gen24.2 块 8：deep-link 只跳转不武装（gen23 裁定兑现）——on_enter 落
+    // 方法页，武装由用户显式点「手机推送」行走四门。gen18~gen24.1 此处
+    // 自动 push_arm_now() 绕过四门，是问题 1 死锁的史前版本。
+    // Block 8: the deep link navigates only (gen23's ruling paid off) -
+    // on_enter lands on the method page and the arm waits for the explicit
+    // "phone push" tap, which runs the four gates. gen18-gen24.1 auto-armed
+    // here, bypassing every gate: problem 1's prehistoric deadlock.
     app_transfer_request_push();
     on_enter(ctx);
+    assert(s_view == TRANSFER_METHODS && !test_push_armed);
+    // 显式点按钮走四门：先回 IDLE（本节现场是 WINDOW，非 IDLE 时点按是取消）。
+    // The explicit tap runs the four gates: back to IDLE first (this case's
+    // field is WINDOW, where a tap cancels instead).
+    test_push_state = PUSH_STATE_IDLE;
+    tap(ctx, method_control_rect(2));
     assert(s_view == TRANSFER_PUSH && test_push_armed);
     assert(test_push_arm_calls == 1 && test_push_arm_window == 30 * 60 * 1000);
     ctx->now_ms = 1000;
@@ -317,7 +330,11 @@ static void push_arm_regression(app_ctx_t *ctx) {
     // This assertion missed its gen19 sync (the test file stopped at df09529);
     // gen24 catches it up - same lesson as the CI fix: a host assertion is an
     // implementation contract and a strategy change must update it.
-    app_transfer_request_push();
+    // gen24.2 块 8：上一步已主动取消（armed=false），deep-link 不再自动武装，
+    // 显式点按钮重新上台。/ Block 8: the previous step cancelled outright
+    // (armed=false); the deep link no longer auto-arms, so the explicit tap
+    // takes the stage again.
+    tap(ctx, method_control_rect(2));
     on_enter(ctx);
     assert(s_view == TRANSFER_PUSH && test_push_armed && !test_push_closed);
     ui_gesture_event_t nav = {.type = UI_GESTURE_TAP, .x0 = 20, .y0 = 1150, .x = 20, .y = 1150};
@@ -336,7 +353,10 @@ static void push_arm_regression(app_ctx_t *ctx) {
     // 双保险：武装标志丢了（事件漏接的极端时序）也能把页面放回去。
     // The safety net: a lost armed flag (the extreme timing of a missed event)
     // still walks the page back.
-    app_transfer_request_push();
+    // gen24.2 块 8：armed=false 时 deep-link 不再自动武装，显式点按钮上台。
+    // Block 8: with nothing armed the deep link no longer auto-arms; the
+    // explicit tap takes the stage.
+    tap(ctx, method_control_rect(2));
     on_enter(ctx);
     assert(s_view == TRANSFER_PUSH);
     test_push_armed = false;
@@ -390,6 +410,11 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     tap(ctx, method_control_rect(2));
     assert(test_push_cancel_calls == cancels + 1 && test_push_arm_calls == arms);
     assert(!test_push_armed && !strcmp(test_push_close_why, "已取消接收"));
+    // gen24.2 R3：取消补的 closed 由方法页消费——原因上屏（「已取消接收」），
+    // 不再烂死在队列里。/ R3: the cancel's closed is consumed by the method
+    // page - the reason lands on screen instead of rotting in the queue.
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE && !strcmp(s_method_message, "已取消接收"));
 
     // ---- 姿态 3a：锁死 + 预检不过（gen23 现场：最大块 19K）----
     // 提示带数字、不武装、不清锁、零等待（不进 pending、不吞 30s 退避）。
@@ -490,7 +515,188 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     // 复位，把现场还给后续用例。/ Reset and hand the field back to later cases.
     test_push_state = PUSH_STATE_IDLE;
     test_push_armed = false;
+    // gen24.2 旋钮归还：四门默认态（开关开/飞行关/USB 停）+ pending 清零，
+    // 后续用例回到 gen24.1 及更早的语义。/ Hand back the gen24.2 knobs: the
+    // four gates' defaults (switch on, flight off, USB stopped) and pending
+    // cleared, so later cases keep their meaning.
+    test_settings_ble_turner = true;
+    test_settings_flight_mode = false;
+    test_usb_active = false;
+    test_push_pending = false;
+    s_method_inline_enable = false;
     transfer_on_exit(ctx);
+}
+
+// gen24.2 前置四门 + 行内【开启】按钮回归：门 2 开关门提示与原地写设置、
+// 内存/飞行/USB 三门拦截各态、以及「pending 中关开关 → cancel_why →
+// closed → 方法页显示原因」的极端闭环与块 6 底账。
+// The gen24.2 four-gate + inline [enable] regression: the gate-2 switch hint
+// and its in-place settings write, each refusal state of the memory/flight/
+// USB gates, plus the extreme loop "switch off during pending -> cancel_why
+// -> closed -> the method page shows the reason" and the block-6 ledger.
+static void push_gate_regression(app_ctx_t *ctx) {
+    // 干净开局：富余堆、无锁、栈 down、开关开、无飞行、无 USB、无 pending。
+    // A clean slate: ample heap, no lock, stack down, switch on, no flight,
+    // no USB, nothing pending.
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
+    test_push_pending = false;
+    test_ble_locked = false;
+    test_ble_running = false;
+    test_ble_free_internal = 90 * 1024;
+    test_ble_largest_internal = 32 * 1024;
+    test_ble_free_psram = 4 * 1024 * 1024;
+    test_ble_reset_calls = 0;
+    test_push_arm_calls = 0;
+    test_push_cancel_calls = 0;
+    test_push_closed = test_push_start_failed = false;
+    test_settings_ble_turner = true;
+    test_settings_flight_mode = false;
+    test_usb_active = false;
+    s_method_message[0] = 0;
+    s_method_inline_enable = false;
+    on_enter(ctx);
+    assert(s_view == TRANSFER_METHODS);
+
+    // ---- 门 2：开关关 → 行内提示 + 【开启】按钮、零武装零 pending ----
+    // Gate 2: switch off - the inline hint + [enable] button, nothing armed
+    // and nothing pended.
+    test_settings_ble_turner = false;
+    s_method_message[0] = 0;
+    int arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && !test_push_armed && !test_push_pending);
+    assert(strstr(s_method_message, "蓝牙已关闭"));
+    assert(s_method_inline_enable); // 按钮只在门 2 出现 / the button shows only at gate 2
+    // ---- 行内【开启】点按：原地写设置 + 重走四门 + 既有武装路径 ----
+    // The inline [enable] tap: write the setting in place, re-run the four
+    // gates, take the existing arm path.
+    int resets = test_ble_reset_calls;
+    tap(ctx, inline_enable_rect());
+    assert(test_settings_ble_turner);        // 单一真源已写入 / the single source was written
+    assert(test_push_arm_calls == arms + 1); // 重走四门后走既有武装路径 / the arm path ran
+    assert(s_view == TRANSFER_PUSH);         // 成功 → 武装视图 / success lands on the arm view
+    assert(!s_method_inline_enable);         // 按钮随提示条消失 / the button goes with the hint
+    assert(test_ble_reset_calls == resets + 1); // 自愈 reset 顺带一次 / the idempotent heal reset rides along
+
+    // ---- 行内按钮点按但复查不过（飞行门）：提示回退到对应门（§二-3）----
+    // The inline tap with a failing recheck (flight gate): the hint falls
+    // back to that gate (section 2-3).
+    s_view = TRANSFER_METHODS;
+    test_settings_ble_turner = false;
+    test_settings_flight_mode = true; // 写设置后仍被飞行门拦 / flight still refuses after the write
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));        // 门 2 提示 / gate 2 refuses first
+    assert(s_method_inline_enable && strstr(s_method_message, "蓝牙已关闭"));
+    tap(ctx, inline_enable_rect());          // 写设置 + 重走四门 → 飞行门不过 / the flight gate now refuses
+    assert(test_settings_ble_turner);        // 写入仍然发生 / the write still happened
+    assert(test_push_arm_calls == arms && test_ble_reset_calls == resets);
+    assert(!s_method_inline_enable);
+    assert(strstr(s_method_message, "飞行模式开启中")); // 回对应门提示 / back to that gate's hint
+    test_settings_flight_mode = false;
+
+    // ---- 门 3：飞行模式（无行内按钮——§二-4 边界）----
+    // Gate 3: flight mode (no inline button - section 2-4's boundary).
+    test_settings_ble_turner = true;
+    test_settings_flight_mode = true;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && !s_method_inline_enable);
+    assert(strstr(s_method_message, "飞行模式开启中"));
+    test_settings_flight_mode = false;
+
+    // ---- 门 4：USB 存储接管 ----
+    // Gate 4: USB storage owns the card.
+    test_usb_active = true;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && !s_method_inline_enable);
+    assert(strstr(s_method_message, "USB 传书已接管"));
+    test_usb_active = false;
+
+    // ---- 极端闭环：pending 中关开关 → cancel_why → closed → 方法页显示 ----
+    // The extreme loop: switch off during pending -> cancel_why -> closed ->
+    // the method page shows the reason.
+    s_view = TRANSFER_METHODS;
+    s_method_message[0] = 0;
+    test_push_armed = false;
+    test_push_pending = true;            // 模拟 on_stack_sync 未到的窗口 / the pre-sync window
+    test_push_cancel_calls = 0;
+    push_sink_cancel_why("蓝牙已关闭");  // 设置页/快捷层关开关的同一动作 / the switch-off action
+    assert(test_push_cancel_calls == 1 && !test_push_pending && !test_push_armed);
+    assert(test_push_closed);            // cancel 从 pending 补 closed / the pending cancel posts closed
+    assert(on_tick(ctx) == APP_REDRAW_PAGE); // 方法页消费 closed（R3 根修）/ the method page consumes it
+    assert(!strcmp(s_method_message, "蓝牙已关闭"));
+    assert(!strcmp(s_last_cancel_why, "蓝牙已关闭")); // 块 6 底账入账 / the ledger takes it
+    // 块 6：再进传书页，底账挂上提示条 / Block 6: re-entering hangs the ledger.
+    on_enter(ctx);
+    assert(!strcmp(s_method_message, "上次接收已结束：蓝牙已关闭"));
+    // 武装后底账清除（新回合干净开局）/ The arm clears the ledger (a fresh round).
+    test_push_pending = false;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms + 1 && s_view == TRANSFER_PUSH && !s_last_cancel_why[0]);
+    s_view = TRANSFER_METHODS;
+    // 归还现场 / hand the field back.
+    test_push_armed = false;
+    test_push_pending = false;
+    transfer_on_exit(ctx);
+}
+
+// gen24.2 R2/R3 回归：pending 期间推送页不闪回、方法页消费 start_failed 与
+// closed、以及 start_failed 先于 closed 的查序（pending 超时两标志同置）。
+// The gen24.2 R2/R3 regression: the push page holds through pending, the
+// method page consumes start_failed and closed, and the start_failed-before-
+// closed order (a pending timeout sets both).
+static void push_pending_ui_regression(app_ctx_t *ctx) {
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
+    test_push_pending = true; // 点了接收、栈还没起来 / receive pressed, stack still down
+    test_push_left_ms = 0;
+    test_push_adv[0] = 0;
+    s_push_note[0] = 0;
+    s_view = TRANSFER_PUSH;
+    ctx->now_ms = 5000;
+    // 对齐活区簿记（真实路径由 push_arm_now 调）/ align the live bookkeeping
+    // (the real path calls it from push_arm_now).
+    push_sync_live_bookkeeping();
+    // R2：pending 中 tick 不闪回方法页（gen24.2 前此处 500ms 内把用户踢走）
+    // R2: a pending tick does not bounce back (pre-gen24.2 the user was
+    // kicked out within 500 ms).
+    assert(on_tick(ctx) == APP_REDRAW_NONE && s_view == TRANSFER_PUSH);
+    // 双保险仍有效：armed 与 pending 双丢才回退 / The safety net still holds:
+    // only a double loss (neither armed nor pending) walks back.
+    test_push_pending = false;
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
+    // R3：方法页消费 start_failed（pending 超时路径）/ R3: the method page
+    // consumes start_failed (the pending-timeout path).
+    test_push_start_failed = true;
+    test_push_closed = true; // 超时路径两标志同置（CANEL 的 ADV_OFF 顺带 closed）
+    s_method_message[0] = 0;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!strcmp(s_method_message, "蓝牙启动失败，请重试")); // 先于 closed 查 / checked before closed
+    assert(!test_push_closed && !test_push_start_failed);
+    // R3：方法页消费 closed（窗口到期/关开关等非主动收摊）/ R3: the method
+    // page consumes closed (window expiry, switch-off, ...).
+    test_push_closed = true;
+    snprintf(test_push_close_why, sizeof(test_push_close_why), "蓝牙已关闭");
+    s_method_message[0] = 0;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!strcmp(s_method_message, "蓝牙已关闭") && !strcmp(s_last_cancel_why, "蓝牙已关闭"));
+    // 无事件时方法页安静待命 / With no events the method page waits quietly.
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    // 归还现场 / hand the field back.
+    test_push_pending = false;
+    test_push_armed = false;
+    test_push_start_failed = test_push_closed = false;
+    s_last_cancel_why[0] = 0;
 }
 
 int main(void) {
@@ -692,5 +898,7 @@ int main(void) {
     wifi_recovery_regression(&ctx);
     push_arm_regression(&ctx);
     push_multistate_regression(&ctx);
+    push_gate_regression(&ctx);
+    push_pending_ui_regression(&ctx);
     puts("transfer_ui_host_test: PASS");
 }

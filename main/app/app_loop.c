@@ -697,7 +697,19 @@ void app_loop_run(const app_loop_config_t* config) {
                     quick_present(&ctx, current, false);
                 } else if (action == UI_QUICK_BLUETOOTH) {
                     app_settings_set_ble_turner(!app_settings_ble_turner());
-                    if (!app_settings_ble_turner()) ble_pt_reset_failure();
+                    if (!app_settings_ble_turner()) {
+                        // gen24.2 块 2：快捷层与设置页是同一设置项的两个写入口，
+                        // B 模型下关开关的行为必须一致——不收摊就是「关了还在
+                        // 推」的静默后门（gen24 真机 109.27s 同款现场）。
+                        // Block 2: the quick layer and the settings page are two
+                        // writers of the same setting; under model B the
+                        // switch-off behaviour must match - skipping the
+                        // close-up here is the silent back door of "off but
+                        // still pushing" (the same gen24 hardware scene at
+                        // 109.27s).
+                        push_sink_cancel_why("蓝牙已关闭");
+                        ble_pt_reset_failure();
+                    }
                     quick_present(&ctx, current, false);
                 } else if (action == UI_QUICK_FULL) quick_present(&ctx, current, true);
                 else if (action == UI_QUICK_LOCK) quick_lock_requested = true;
@@ -1084,12 +1096,29 @@ void app_loop_run(const app_loop_config_t* config) {
             pico_online_busy();
         // 飞行模式下蓝牙同样停摆；解除后按原设置自动恢复。
         // Flight mode halts Bluetooth too; clearing it restores whatever the setting asks for.
-        // 推流武装期同理要栈：手机在等一条推送，武装入口本身可能就是翻页器
-        // 设置关着时点的——BLE 栈必须为推流保持运行（on_sync 会注册 GATT 服务）。
+        // 推流武装期同理要栈：手机在等一条推送（on_sync 会注册 GATT 服务）。
         // An open push arm needs the stack for the same reason: the phone is
-        // waiting for a push, and the arm entry may have been tapped with the
-        // page-turner setting off - the BLE stack must stay up for the push
-        // (on_sync registers the GATT services).
+        // waiting for a push (on_sync registers the GATT services).
+        // gen24.2（块 1，B 模型下 gen18 注释的修订）：gen18 原文说「武装入口
+        // 可能就是翻页器设置关着时点的，栈必须为推流保持运行」——那个入口
+        // （deep-link 自动武装）已按 gen23 裁定删除，武装只可能发生在四门
+        // 全过之后，而门 2 就是蓝牙总开关：开关关着根本进不到武装。关开关
+        // 即收摊（cancel_why「蓝牙已关闭」），故 app_settings_ble_turner()
+        // 与 push_sink_armed() 在实践中同真；|| 保留是防御——pending 拉栈
+        // 窗口与极端时序下的双保险。R1 的「pending 不算 armed」缺口在 B
+        // 模型下自然消解：pending 只在开关开启时发生，sync 条件恒真。
+        // gen24.2 (block 1, the gen18 note revised under model B): gen18's
+        // original wording - "the arm entry may have been tapped with the
+        // page-turner setting off, so the stack must stay up for the push" -
+        // described an entry (the deep-link auto-arm) that gen23's ruling has
+        // since removed; an arm is now possible only after all four gates,
+        // and gate 2 IS the master switch: with it off nothing arms. Flipping
+        // it off closes up (cancel_why "bluetooth off"), so
+        // app_settings_ble_turner() and push_sink_armed() are true together
+        // in practice; the || remains defensive - a double safety net for the
+        // pending stack-pull window and extreme timings. R1's "pending does
+        // not count as armed" gap closes naturally under model B: a pending
+        // arm only exists with the switch on, so the sync condition holds.
         ble_pt_sync((app_settings_ble_turner() || push_sink_armed()) && !wifi_busy && !app_settings_flight_mode());
         ble_pt_poll();
         // 推流轮询：驱动窗口/宽限到期、拔电看守、待武装超时。放在 poll 之后，
