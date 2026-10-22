@@ -286,11 +286,15 @@ static inline bool push_sink_take_err(int *code) {
    defaults to ample values (gate passes); cases dial in the fragmented field
    (largest 19K) to prove "precheck fails -> inline prompt, zero wait". */
 static bool test_ble_locked;
+static bool test_ble_running; // gen24.1：BLE 栈运行态——预检只该拦启动路径（D2）
+                             // gen24.1: BLE stack state - the precheck must only gate
+                             // the start path, never an already-running stack (D2).
 static size_t test_ble_free_internal = 90 * 1024;
 static size_t test_ble_largest_internal = 32 * 1024;
 static size_t test_ble_free_psram = 4 * 1024 * 1024;
 static int test_ble_reset_calls;
 static inline bool ble_pt_locked(void) { return test_ble_locked; }
+static inline bool ble_pt_running(void) { return test_ble_running; }
 static inline void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram) {
     if (free_internal) *free_internal = test_ble_free_internal;
     if (largest_internal) *largest_internal = test_ble_largest_internal;

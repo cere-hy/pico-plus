@@ -424,6 +424,46 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     on_enter(ctx);
     assert(s_view == TRANSFER_METHODS);
 
+    // ---- 姿态 3a'：未锁 + 栈 down + 预检不过（gen24.1 D1：两段式文案）----
+    // 与 3a 同一条拒绝路径但未锁：提示带数字，且两段话都落到消息串里——
+    // 先让用户卸书（大概率自愈），再兜底重启。不武装、不清锁、零退避。
+    // Pose 3a': unlocked + stack down + precheck fails - the gen24.1 D1
+    // two-segment prompt. Same refusal path as 3a but unlocked: numbers ride
+    // along and BOTH segments land in the string - first ask the user to leave
+    // the book (likely self-heals), then fall back to a restart. No arm, no
+    // lock clearing, zero back-off.
+    test_ble_locked = false;
+    test_ble_largest_internal = 19 * 1024;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    cancels = test_push_cancel_calls;
+    resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
+    assert(test_ble_reset_calls == resets);
+    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "19K") &&
+           strstr(s_method_message, "20K"));
+    assert(strstr(s_method_message, "退出当前书籍后重试") && strstr(s_method_message, "请重启设备"));
+    assert(strstr(s_method_message, "——")); // 两段式分界落进消息串 / the split lands in the string
+
+    // ---- 姿态 3a''：栈 up + 预检不过 → 跳过闸门直接武装（gen24.1 D2）----
+    // 栈已在跑时点按钮被 gen24 冤拒（boot1 实证：BLE 自开机 up、碎片窗口内
+    // 拦截）。gen24.1 起闸门只拦启动路径：栈 up 跳过预检，恢复 gen23 语义。
+    // Pose 3a'': stack up + precheck would fail - skip the gate and arm anyway
+    // (gen24.1 D2). gen24 falsely refused the button while the stack was
+    // already up (boot1 field data). From gen24.1 the gate guards only the
+    // start path: an up stack bypasses the precheck, restoring gen23 semantics.
+    test_ble_running = true;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms + 1 && s_view == TRANSFER_PUSH);
+    assert(test_ble_reset_calls == resets + 1); // 武装即清锁（自愈顺带）/ arming clears the lock
+    assert(!s_method_message[0]);               // 无提示、无冤拒 / no prompt, no false refusal
+    test_ble_running = false;                   // 归还：后续用例回到栈 down 语义 / hand back to stack-down semantics
+    s_view = TRANSFER_METHODS;
+
     // ---- 姿态 3b：锁死 + 预检过 → 一键自愈（清锁 + 重试一次到位）----
     // Pose 3b: locked + precheck passes - one-tap self-heal (clear lock + retry).
     test_ble_locked = true;

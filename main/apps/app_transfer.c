@@ -236,7 +236,7 @@ static bool s_push_handed_off;
 static read_pico_transfer_network_t s_networks[READ_PICO_TRANSFER_SCAN_MAX], s_selected;
 static size_t s_network_count, s_network_page;
 static bool s_scan_pending, s_network_connect_pending, s_saved_configured, s_password_visible, s_forget_confirm;
-static char s_saved_ssid[33], s_password[PASSWORD_MAX + 1], s_network_message[96], s_method_message[96];
+static char s_saved_ssid[33], s_password[PASSWORD_MAX + 1], s_network_message[96], s_method_message[160];
 static ui_text_edit_t s_password_input;
 
 static esp_err_t s_scan_error;
@@ -310,7 +310,25 @@ static void draw_methods(uint8_t *fb) {
     }
     if (s_method_message[0]) {
         ui_fill_round_rect(fb, (EpdRect){36, 584, 612, 76}, 20, 0xd8);
-        ui_text_vc(fb, 342, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+        // gen24.1：两段式文案以「——」分界拆两行画——单行约 780px（20px 字号），
+        // 超出 612px 横幅。无分隔符的单行文案（如「蓝牙启动失败，请重试」）仍走
+        // 居中单行，行为不变。
+        // gen24.1: the two-part hint renders as two lines split at the em-dash
+        // separator - one line runs ~780px at a 20px font, past the 612px banner.
+        // Single-line hints without the separator (e.g. "bluetooth start failed,
+        // retry") stay centered one-liners, unchanged.
+        const char *dash = strstr(s_method_message, "——");
+        if (dash) {
+            char head[160];
+            size_t n = (size_t)(dash - s_method_message);
+            if (n >= sizeof(head)) n = sizeof(head) - 1;
+            memcpy(head, s_method_message, n);
+            head[n] = '\0';
+            ui_text_vc(fb, 342, 608, 20, head, EPD_DRAW_ALIGN_CENTER, false);
+            ui_text_vc(fb, 342, 638, 20, dash + strlen("——"), EPD_DRAW_ALIGN_CENTER, false);
+        } else {
+            ui_text_vc(fb, 342, 622, 20, s_method_message, EPD_DRAW_ALIGN_CENTER, false);
+        }
     }
     ui_text(fb, 42, 694, 19, "浏览器传书支持 EPUB、TXT、字体和图片文件。", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 42, 734, 18, "传输完成后，新内容会自动出现在书架或字体列表。", EPD_DRAW_ALIGN_LEFT, false);
@@ -1314,21 +1332,56 @@ static void push_button_action(void) {
         push_sink_cancel_why("已取消接收");
         return;
     }
-    // IDLE：预检先行。闸门与 start_locked 共用单一真源 ble_pt_mem_gate；不过就当场
-    // 把数字摆出来（最大块 vs 20K），不进 pending、不让用户干等 10s 超时再听一句
-    // 笼统的「启动失败」。/ IDLE: precheck first. The gate shares start_locked's
-    // single source of truth; on failure show the numbers right here instead of
-    // entering pending and making the user sit through a 10 s timeout for a vague
-    // "start failed".
+    // IDLE：栈已在运行 → 跳过预检直接武装；栈 down → 预检先行。
+    // IDLE: stack already running -> skip the precheck and arm directly; stack
+    // down -> precheck first.
+    // gen24.1（D2 冤拒修复）：闸门的语义是预测「NimBLE 能否启动」（控制器与协议栈
+    // 任务必须落内部 RAM，跑硬件路径读不到 PSRAM）。栈已经起来时这个问题不存在、
+    // 武装也不需要任何新的控制器分配——此处拦截就是冤枉。boot1 实证：BLE 自开机起
+    // up，两本大书的碎片窗口（largest 19K）内点按钮被拒，而当时推流根本无需启动
+    // 栈。恢复 gen23 语义：栈 up 直接走既有武装路径，栈 down 才预检先行。
+    // gen24.1 (D2 unjust-refusal fix): the gate predicts "can NimBLE start" (the
+    // controller and stack task must live in internal RAM - they sit on the
+    // hardware path and cannot read PSRAM). With the stack already up that
+    // question does not exist and the arm needs no new controller allocation, so
+    // refusing here is unjust. Boot1 evidence: BLE up since boot, an in-book tap
+    // refused inside the two-book fragmentation window (largest 19K) although
+    // the push needed no stack start at all. Restores the gen23 semantics:
+    // stack up -> take the existing arm path; stack down -> precheck first.
     s_push_requested = false;
-    size_t free_internal, largest_internal, free_psram;
-    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
-    if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
-        snprintf(s_method_message, sizeof(s_method_message),
-                 "内存碎片不足（最大块 %uK，需 %uK），重启设备后可用",
-                 (unsigned)(largest_internal / 1024),
-                 (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024));
-        return;
+    if (!ble_pt_running()) {
+        size_t free_internal, largest_internal, free_psram;
+        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+        if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
+            // gen24.1（D3 仪表）：与 UI 提示同源记日志——真机日志由此可分辨「按钮
+            // 预检拒绝」与 start_locked 的「启动拒绝」（后者也打日志），gen24 真机
+            // 轮就因缺这一行分不清两种拒绝。
+            // gen24.1 (D3 instrumentation): log with the same figures as the UI
+            // hint - hardware logs can now tell a button precheck refusal from a
+            // start_locked refusal (which also logs); the gen24 hardware round
+            // could not tell the two apart for want of this line.
+            ESP_LOGW(TAG, "push precheck refused: internal %u B free / %u B largest (gate %u K), psram %u B free",
+                     (unsigned)free_internal, (unsigned)largest_internal,
+                     (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024), (unsigned)free_psram);
+            // gen24.1（D1 文案说真话）：gen24 原文案「重启设备后可用」被真机证伪——
+            // NVS 自锁（tries+why）跨重启存活，重启 alone 并不解锁；且重启后开大书
+            // 几秒内 largest 再破闸（boot2：70.4s 开书 → 76.2s 跌到 19K）。boot1
+            // 实证离开书籍后 largest 自行恢复（19456 → 31744），故主路径是「退出
+            // 当前书籍后重试」，重启降为兜底。
+            // gen24.1 (D1 the hint tells the truth): gen24's wording "restart the
+            // device to use it" was falsified on hardware - the NVS self-lock
+            // (tries+why) survives a restart, so a restart alone does not unlock;
+            // and after a restart a big book shreds the largest block below the
+            // gate within seconds (boot2: book open at 70.4s -> 19K at 76.2s).
+            // Boot1 proved leaving the book recovers the largest block on its own
+            // (19456 -> 31744), so the primary path is "exit the current book and
+            // retry", with restart as the fallback.
+            snprintf(s_method_message, sizeof(s_method_message),
+                     "内存碎片不足（最大块 %uK，需 %uK）——退出当前书籍后重试；若仍失败，请重启设备",
+                     (unsigned)(largest_internal / 1024),
+                     (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024));
+            return;
+        }
     }
     // 预检过：一键自愈——上次失败/自锁先清掉（幂等；没锁时调用无害），再走既有
     // 武装路径（push_sink_arm → pending 静默拉栈，gen12 的启动链原样复用）。

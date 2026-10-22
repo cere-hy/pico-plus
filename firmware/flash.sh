@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico24（gen23 为 0.3.3-pico23；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico24.1（gen24 为 0.3.3-pico24；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico24 (gen23 was 0.3.3-pico23; reusing an older tag makes
+# Version string: 0.3.3-pico24.1 (gen24 was 0.3.3-pico24; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -183,8 +183,141 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
 #
+# 重锚记录（2026-10-22，gen24.1：gen24 真机两项缺陷热修——D2 冤拒 + D1 文案，独立代）：
+#   版本串：0.3.3-pico24.1（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   背景（gen24 真机两轮，用户实证 + 688 行 boot 日志）：开两本大书后点首页
+#     「接收推送」出「内存碎片不足，需重新启动」，但恢复链全落空——① 不重启、
+#     设置内关开蓝牙无效；② 重启后仍无法开启，须进设置关蓝牙再开才生效；补测：
+#     单独关蓝牙或单独重启电源均无效，必须「关闭蓝牙再重启」。代码级闭环定性
+#     gen24 自身两笔缺陷 + 一笔仪表缺口：
+#   - D2 冤拒（gen24 引入）：push_button_action() 预检无条件执行。boot1 实证
+#     BLE 栈自开机即 up，碎片窗口内点按钮仍被闸门拦下——但闸门 ble_pt_mem_gate
+#     的语义是预测「NimBLE 能否**启动**」（控制器+栈任务必须落内部 RAM），栈已
+#     up 时武装无需新控制器分配。gen24.1 起恢复 gen23 语义：!ble_pt_running()
+#     才预检先行；栈 up 跳过预检直接 reset+arm。
+#   - D1 虚假承诺（gen24 引入）：文案「重启设备后可用」被真机证伪——失败锁
+#     （tries+why）落 NVS flash（rp_blestate namespace），ble_pt_reset_failure()
+#     是唯一清点（设置页/快捷层关蓝牙触发：app_device_settings.c:2135 +
+#     app_loop.c:700），重启本身不清锁；且重启后开书几秒内 largest 再破闸
+#     （boot2：70.4s 开书 → 76.2s 跌至 19456）。用户定稿两段式：「内存碎片不足
+#     （最大块 19K，需 20K）——退出当前书籍后重试；若仍失败，请重启设备」——
+#     先卸书（boot1 实证：离开书籍回首页 largest 自行恢复 19456→31744，预检
+#     自愈无需重启），再兜底重启；「重启不清锁」不再提（自愈按钮自动清锁）。
+#   - D3 仪表缺口（gen24 漏）：按钮预检失败不打日志，真机分不清「按钮冤拒」
+#     与「启动被拒」。补 ESP_LOGW 带数字（free/largest/闸门/psram），与 UI 同源。
+#   实现（外科式四项，main/apps/app_transfer.c + tools/transfer_ui_*）：
+#   1. D2：push_button_action() 预检加 !ble_pt_running() 条件（栈 down 才检）。
+#   2. D1：s_method_message 缓冲 96→160（两段式约 114B，96 装不下）；draw_methods
+#      横幅按「——」拆两行（cy=608/638）；无分隔符的单行文案仍居中单行（cy=622）
+#      行为不变。
+#   3. D3：预检失败分支补
+#      `transfer_page: push precheck refused: internal %u B free / %u B largest
+#       (gate %u K), psram %u B free`。
+#   4. 测试：transfer_ui 桩加 test_ble_running/ble_pt_running（默认 false=栈
+#      down，保住既有三姿态断言）；push_multistate_regression 增姿态 3a'
+#      （未锁+栈 down+19K → 两段式文案四断言：退出当前书籍/请重启设备/19K/20K，
+#      无 arm 无 reset）与 3a''（栈 up+19K → 跳过闸门直接武装：arm+1、reset+1、
+#      无消息）。
+#   门禁：fullclean（IDF v6.1.0）exit 0；8 警告同基线（全 -Wunused-function：
+#     app_book.c 7 + ui_pinpad.c 1，均不在本代改动面）；transfer_ui host test
+#     PASS（含 gen24.1 新分支）；push_sink 168/0；app_loop 55 场景 PASS；
+#     book_management PASS；tools/run_*.sh 全量枚举 13/13 绿。
+#     构建确定性实证：首构（修一处 ui_text_vc 实参笔误后增量完成）与净构
+#     fullclean+build 两产物仅差 68 字节、分三簇——0x74（app 描述符编译时间串
+#     06:26:07 vs 06:22:55）、0xb0-0xcf（app_elf_sha256，ELF 含时间串故变）、
+#     0x3df96f-0x3df98f（镜像尾部 SHA-256 摘要，实测=镜像主体 sha256，随内容变）。
+#     体积与全部段锚逐字节一致，零行为差异。
+#   终版锚：Read_Pico.bin 4,061,584 B（相对 gen24 4,061,360 **+224 B**，
+#     双操作数 4,061,584−4,061,360=224），sha256 `eb07a4a7…`；
+#     seg1 File offs `0x00233ae8`（esptool 实测，gen24 为 0x00233a48，+0xa0=160B
+#     顺移——DROM 段增长所致），paddr = 0x00233ae8 + 8(段头) + 0x10000(ota_0 基址)
+#     = `0x00243af0`（预测）；seg1 Load addr 0x3fc9c700 世代不变锚不动，len=0x08a8c。
+#     partition-table / ota_data_initial 与 gen24 逐字节一致（9d5d890b… / 7d2c7ac4…）。
+#     bootloader sha 由 `ae8c4718…` → `0dcba57a…`（体积同为 21,232 B；差异是
+#     编译时间戳，属 IDF 产物非确定性，非源码改动，行为不变）。
+#     APK 包内为 v1.1 `7e5eea37…`（与 gen24 同，协议未变，无需重刷）。
+#
+# Re-anchor record (2026-10-22, gen24.1: gen24 hardware two-defect hotfix -
+# D2 false refusal + D1 wording, standalone generation):
+# version 0.3.3-pico24.1 (three places in step: CMakeLists.txt, this record, the
+# flashing notes).
+#   Background (gen24 hardware, two rounds, user-proven + 688-line boot log):
+#     after opening two large books, tapping "receive push" on the home page
+#     showed "insufficient memory fragmentation, restart required", but every
+#     recovery path fell flat - (1) no restart, toggling Bluetooth in Settings
+#     did nothing; (2) after a restart it still would not enable, requiring
+#     Settings>Bluetooth off/on; supplement: power-cycling or Bluetooth-off
+#     alone both fail, only "Bluetooth off THEN restart" works. Code-level
+#     closure pins two gen24-introduced defects plus one instrumentation gap:
+#   - D2 false refusal (introduced by gen24): push_button_action() ran its
+#     precheck unconditionally. boot1 proves the BLE stack was up since boot,
+#     yet a tap inside the fragmentation window was still refused by the gate -
+#     but the gate ble_pt_mem_gate predicts whether NimBLE can START (controller
+#     + stack task must land in internal RAM); with the stack already up, arming
+#     needs no new controller allocation. From gen24.1 gen23 semantics return:
+#     precheck first only when !ble_pt_running(); stack up skips it and goes
+#     straight to reset+arm.
+#   - D1 false promise (introduced by gen24): "restart the device to use it"
+#     was disproven on hardware - the failure lock (tries+why) persists in NVS
+#     flash (rp_blestate namespace) and ble_pt_reset_failure() is the only
+#     clearing point (Settings/quick-layer Bluetooth off: app_device_settings.c
+#     :2135 + app_loop.c:700); a bare restart clears nothing. Worse, opening a
+#     book a few seconds after restart breaks the gate again (boot2: book open
+#     at 70.4s -> largest falls to 19456 by 76.2s). The user's final two-part
+#     wording: "insufficient memory fragmentation (largest block 19K, needs
+#     20K) - leave the current book and retry; if it still fails, restart the
+#     device" - first leave the book (boot1 proves largest self-recovers
+#     19456->31744 on returning home, no restart needed), then restart as
+#     fallback; "restart does not clear the lock" is no longer mentioned (the
+#     self-heal button clears the lock automatically).
+#   - D3 instrumentation gap (missed by gen24): a button precheck failure
+#     logged nothing, so hardware logs could not tell "button false refusal"
+#     from "start refused". Added ESP_LOGW with numbers (free/largest/gate/
+#     psram), same source as the UI hint.
+#   Implementation (four surgical items, main/apps/app_transfer.c + tools/
+#   transfer_ui_*):
+#   1. D2: push_button_action() wraps the precheck in !ble_pt_running().
+#   2. D1: s_method_message buffer 96->160 (two-part text ~114B, 96 too small);
+#      draw_methods splits the banner at the em-dash into two lines (cy=608/
+#      638); single-line hints without the separator stay centered one-liners
+#      (cy=622), unchanged.
+#   3. D3: precheck-failure branch logs
+#      `transfer_page: push precheck refused: internal %u B free / %u B largest
+#       (gate %u K), psram %u B free`.
+#   4. Tests: transfer_ui stub gains test_ble_running/ble_pt_running (default
+#      false = stack down, preserving the existing three-pose assertions);
+#      push_multistate_regression adds pose 3a' (unlocked + stack down + 19K ->
+#      two-part prompt four assertions: leave the book / restart the device /
+#      19K / 20K; no arm, no reset) and 3a'' (stack up + 19K -> skip the gate
+#      and arm directly: arm+1, reset+1, no message).
+#   Gate: fullclean (IDF v6.1.0) exit 0; 8 warnings same baseline (all
+#     -Wunused-function: app_book.c 7 + ui_pinpad.c 1, none in this change's
+#     surface); transfer_ui host test PASS (incl. gen24.1 new branches);
+#     push_sink 168/0; app_loop 55 scenarios PASS; book_management PASS;
+#     tools/run_*.sh full enumeration 13/13 green.
+#     Build-determinism evidence: the first build (incrementally finished after
+#     fixing one ui_text_vc argument typo) and the pristine fullclean+build
+#     differ in only 68 bytes, three clusters - 0x74 (app descriptor build-time
+#     string 06:26:07 vs 06:22:55), 0xb0-0xcf (app_elf_sha256, changed because
+#     the ELF embeds the time string), 0x3df96f-0x3df98f (image-tail SHA-256
+#     digest, verified = sha256 of the image body, content-dependent). Size and
+#     every segment anchor byte-identical; zero behavioral difference.
+#   Final anchors: Read_Pico.bin 4,061,584 B (**+224 B** vs gen24 4,061,360;
+#     both operands: 4,061,584 - 4,061,360 = 224), sha256 `eb07a4a7…`;
+#     seg1 File offs `0x00233ae8` (esptool measured; gen24 was 0x00233a48,
+#     +0xa0=160B shift from DROM segment growth), paddr = 0x00233ae8 + 8
+#     (segment header) + 0x10000 (ota_0 base) = `0x00243af0` (predicted);
+#     seg1 Load addr 0x3fc9c700 generation-invariant, unmoved; len=0x08a8c.
+#     partition-table / ota_data_initial byte-identical to gen24
+#     (9d5d890b… / 7d2c7ac4…).
+#     bootloader sha `ae8c4718…` -> `0dcba57a…` (same 21,232 B; difference is
+#     the build timestamp - IDF artifact non-determinism, not a source change;
+#     behavior unchanged).
+#     APK inside the package remains v1.1 `7e5eea37…` (same as gen24; protocol
+#     unchanged, no reflash needed).
+#
 # 重锚记录（2026-10-22，gen24：真机 BLE 碎片化失败急救 + 多态按钮四态与一键自愈）：
-#   版本串：0.3.3-pico24（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   版本串：0.3.3-pico24.1（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
 #   背景（gen23 真机）：用户 31 分钟后首次点「接收推送」，NimBLE 启动失败并自锁
 #     （tries≥3），屏幕「启动失败 3 次：内存不足（内部 75K，最大块 19K）」。
 #     根因：start_locked() 预检 free≥56K 过、最大块 19K < 20K 闸门差 1KB——
@@ -228,7 +361,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #
 # Re-anchor record (2026-10-22, gen24: hardware BLE-fragmentation emergency fix
 # plus the multistate button with one-key self-healing):
-# version 0.3.3-pico24 (three places in step: CMakeLists.txt, this record, the
+# version 0.3.3-pico24.1 (three places in step: CMakeLists.txt, this record, the
 # flashing notes).
 #   Background (gen23 hardware): the user's first "receive push" tap came 31
 #     minutes in; NimBLE failed to start and self-locked (tries>=3), screen
@@ -681,7 +814,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="b1a46ff28d2a9b18f1f932c47ddb74e9ada141dbfb60b22134d410a6cbfc36ed"
+EXPECTED="eb07a4a76b3416bdf60998ab648a7d848cc1778f9b008a1881ec5b0188245751"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
