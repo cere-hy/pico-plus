@@ -12,12 +12,16 @@
 # The single relaxed warning: upstream's transfer_ui_host_test.c has its own
 # -Wmisleading-indentation at line 220 (a for and a following assert on one line), which fails
 # under -Werror. That is upstream's, not this patch's; only that one warning is downgraded here.
+# gen24：-Icomponents/ble_page_turner/include 让 app_transfer.c 的 ble_page_turner.h 与
+# 测试直include的 ble_pt_mem.c（预检闸门真身）找到头。/ gen24: the extra include path lets
+# app_transfer.c's ble_page_turner.h and the directly-included ble_pt_mem.c (the real
+# precheck gate) find their header.
 # 在仓库根目录运行；产物仅在build。/ Run from the repository root; artifacts stay in build.
 set -euo pipefail
 mkdir -p build/book-tests
 flags=(-std=gnu11 -Wall -Wextra -Werror -Wno-deprecated-declarations -Wno-error=misleading-indentation -g -fsanitize=address,undefined)
 gcc "${flags[@]}" -Itools/transfer_ui_stubs -Icomponents/read_pico_transfer/include \
-    -Icomponents/read_pico_search/include -Imain/ui \
+    -Icomponents/read_pico_search/include -Imain/ui -Icomponents/ble_page_turner/include \
     tools/transfer_ui_host_test.c main/ui/ui_text_edit.c main/ui/ui_text_input.c \
     main/ui/ui_keyboard.c main/ui/ui_ime.c components/read_pico_search/read_pico_search.c \
     -o build/book-tests/transfer-ui

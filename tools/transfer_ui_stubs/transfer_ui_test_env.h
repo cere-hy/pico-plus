@@ -277,3 +277,26 @@ static inline bool push_sink_take_err(int *code) {
     if (code) *code = test_push_err_code;
     return true;
 }
+
+/* gen24：ble_page_turner 的锁态查询、堆快照与失败重置桩——多态按钮一键自愈
+   路径的旋钮。快照默认给富余值（闸门全过），用例按需调成碎片现场
+   （largest 19K）验证「预检不过 → 行内提示、零等待」。
+   Gen24: doubles for ble_page_turner's lock query, heap snapshot and failure
+   reset - the knobs of the multi-state button's self-heal path. The snapshot
+   defaults to ample values (gate passes); cases dial in the fragmented field
+   (largest 19K) to prove "precheck fails -> inline prompt, zero wait". */
+static bool test_ble_locked;
+static size_t test_ble_free_internal = 90 * 1024;
+static size_t test_ble_largest_internal = 32 * 1024;
+static size_t test_ble_free_psram = 4 * 1024 * 1024;
+static int test_ble_reset_calls;
+static inline bool ble_pt_locked(void) { return test_ble_locked; }
+static inline void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram) {
+    if (free_internal) *free_internal = test_ble_free_internal;
+    if (largest_internal) *largest_internal = test_ble_largest_internal;
+    if (free_psram) *free_psram = test_ble_free_psram;
+}
+static inline void ble_pt_reset_failure(void) {
+    ++test_ble_reset_calls;
+    test_ble_locked = false; // 对齐真实组件：清锁 / mirror: the lock clears
+}

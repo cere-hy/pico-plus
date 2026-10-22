@@ -47,6 +47,7 @@
 #include "esp_log.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
+#include "ble_page_turner.h"
 #include "push_sink.h"
 #include "read_pico_pmu.h"
 #include "settings.h"
@@ -267,12 +268,34 @@ static void draw_methods(uint8_t *fb) {
     ui_fill_round_rect(fb, card, 24, UI_GRAY_WHITE);
     ui_draw_round_rect(fb, card, 24, 0x60);
     ui_draw_round_rect(fb, (EpdRect){37, 225, 610, 334}, 23, 0x60);
-    static const char *titles[] = {"WiFi传书", "热点传书", "手机推送"};
-    static const char *details[] = {
+    // 注意不能用 static：第 3 行的词要随状态每次重算，static 会把上一次的
+    // 状态词永久留在数组里。/ Not static on purpose: row 3's wording is recomputed
+    // per state each call; a static array would keep the last state's words forever.
+    const char *titles[] = {"WiFi传书", "热点传书", "手机推送"};
+    const char *details[] = {
         "与手机或电脑连接同一个无线网络",
         "由墨水屏创建临时网络，离线也能传书",
         "安卓复制文字，通过蓝牙发送到墨水屏"
     };
+    // gen24 多态按钮：第 3 行标题随 push_sink 状态改词，按钮本身就是状态指示。
+    // 判定与点按动作同源：干净 IDLE=手机推送；上次失败/自锁=重试接收（一键自愈
+    // 入口）；武装/窗口/宽限=取消接收；传输中=正在接收（禁用）。
+    // gen24 multi-state button: row 3 retitles itself off push_sink state - the
+    // button is the status. The verdict shares the tap action's source: a clean
+    // IDLE says "phone push"; a failed/self-locked IDLE says "retry" (the heal
+    // entry); armed/window/grace says "cancel"; mid-transfer says "receiving"
+    // (disabled).
+    const push_state_t pst = push_sink_state();
+    if (pst == PUSH_STATE_CONNECTED || pst == PUSH_STATE_RECEIVING || pst == PUSH_STATE_PROCESSING) {
+        titles[2] = "正在接收";
+        details[2] = "手机正在推送，请勿离开本页";
+    } else if (pst != PUSH_STATE_IDLE) {
+        titles[2] = "取消接收";
+        details[2] = "正在等待手机连接，再点一次取消";
+    } else if (ble_pt_locked()) {
+        titles[2] = "重试接收";
+        details[2] = "上次启动未成功，再点一次自动重试";
+    }
     for (int i = 0; i < 3; ++i) {
         EpdRect row = method_control_rect(i);
         if (s_pressed == i) ui_draw_pressed_round_rect(fb, row, 0);
@@ -1265,6 +1288,57 @@ static void push_arm_now(void) {
     push_sync_live_bookkeeping();
 }
 
+// gen24 多态按钮：「手机推送」行按 push_sink 状态一台戏唱四种姿态，点按动作
+// 状态驱动，渲染与判定同源（push_sink_state + ble_pt_locked + ble_pt_mem_gate）。
+//   IDLE（干净）              → 直接武装；BLE 栈未起由 pending 机制静默拉起
+//   IDLE（上次失败/自锁）      → 一键自愈：预检过 → 清锁 + 重试，一次到位
+//                               预检不过 → 行内提示碎片数字，零等待（不吞 30s 退避）
+//   ARMED/WINDOW/COOLDOWN     → 取消，回 IDLE
+//   CONNECTED/RECEIVING/PROCESSING → 禁用，传输中不打断
+// 不假死底线：任何分支结束后方法页其余按钮照常可用、状态可再变更。
+// gen24 multi-state button: the phone-push row plays four poses off push_sink state;
+// the tap action is state-driven, with rendering and verdict sharing one source
+// (push_sink_state + ble_pt_locked + ble_pt_mem_gate). The no-freeze bottom line:
+// after any branch the other method rows keep working and the state stays mutable.
+static void push_button_action(void) {
+    const push_state_t st = push_sink_state();
+    // 传输中：禁用。一次活推送比任何按钮都重要。/ Mid-transfer: disabled. A live
+    // push outranks any button.
+    if (st == PUSH_STATE_CONNECTED || st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
+        return;
+    }
+    // 已武装/窗口/宽限期：再点即取消（gen18 取消必须带原因）。
+    // Already armed / in window / in grace: tap again cancels (gen18: a cancel must
+    // carry a reason).
+    if (st != PUSH_STATE_IDLE) {
+        push_sink_cancel_why("已取消接收");
+        return;
+    }
+    // IDLE：预检先行。闸门与 start_locked 共用单一真源 ble_pt_mem_gate；不过就当场
+    // 把数字摆出来（最大块 vs 20K），不进 pending、不让用户干等 10s 超时再听一句
+    // 笼统的「启动失败」。/ IDLE: precheck first. The gate shares start_locked's
+    // single source of truth; on failure show the numbers right here instead of
+    // entering pending and making the user sit through a 10 s timeout for a vague
+    // "start failed".
+    s_push_requested = false;
+    size_t free_internal, largest_internal, free_psram;
+    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+    if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
+        snprintf(s_method_message, sizeof(s_method_message),
+                 "内存碎片不足（最大块 %uK，需 %uK），重启设备后可用",
+                 (unsigned)(largest_internal / 1024),
+                 (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024));
+        return;
+    }
+    // 预检过：一键自愈——上次失败/自锁先清掉（幂等；没锁时调用无害），再走既有
+    // 武装路径（push_sink_arm → pending 静默拉栈，gen12 的启动链原样复用）。
+    // Precheck passed: one-tap self-heal - clear any failure/lock first (idempotent,
+    // harmless when not locked), then take the existing arm path (push_sink_arm ->
+    // pending silently brings the stack up; gen12's start chain is reused verbatim).
+    ble_pt_reset_failure();
+    push_arm_now();
+}
+
 static void on_enter(app_ctx_t* ctx) {
     (void)ctx;
     display_set_bulk_io(true);
@@ -1275,6 +1349,21 @@ static void on_enter(app_ctx_t* ctx) {
     memset(&s_root, 0, sizeof(s_root));
     s_heap_before = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     s_internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // gen24 诊断：进传书页记一笔堆快照，口径与 BLE 自愈预检/start_locked 完全一致
+    // （内部 free/最大块 + PSRAM free/最大块），真机日志可直接与 `book: open start`
+    // 风格的行对表——gen25 定位「长使用周期内部堆布局退化」的直接数据。
+    // gen24 diagnostics: snapshot the heap on entry in exactly the units the BLE
+    // self-heal precheck and start_locked use (internal free/largest + PSRAM
+    // free/largest), so real-hardware logs line up with the `book: open start`
+    // style directly - the data gen25 needs to pin down the long-run internal-heap
+    // layout degradation.
+    {
+        size_t free_internal, largest_internal, free_psram;
+        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+        ESP_LOGI(TAG, "on_enter internal free=%u largest=%u psram free=%u largest=%u",
+                 (unsigned)free_internal, (unsigned)largest_internal, (unsigned)free_psram,
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     s_start_pending = false;
     s_usb_message[0] = 0;
     s_usb_start_pending = false;
@@ -1597,13 +1686,15 @@ static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
             if (start_hotspot_service()) return APP_REDRAW_PAGE;
             snprintf(s_method_message, sizeof(s_method_message), "传输正在结束，请稍后再试");
         } else if (origin == 2) {
-            // 手机推送：gen19（真机 Bug2）改为当场武装（push_arm_now）。
-            // gen18 只置 flag 等 on_enter 消费——用户已在页内，on_enter 不会
-            // 重跑，flag 挂死按钮无反应。/ Phone push: gen19 (real-hw Bug2)
-            // arms right now via push_arm_now; gen18's flag-for-on_enter hung
-            // forever because on_enter never re-runs while the page is open.
+            // 手机推送：gen24 多态按钮统一入口（状态驱动：武装/取消/自愈/禁用）。
+            // gen19（真机 Bug2）起改为当场动作——gen18 只置 flag 等 on_enter 消费，
+            // 用户已在页内时 on_enter 不会重跑，flag 挂死按钮无反应。
+            // Phone push: gen24's one state-driven entry (arm / cancel / heal /
+            // disable). gen19 (real-hw Bug2) made it act right now - gen18's
+            // flag-for-on_enter hung forever because on_enter never re-runs while
+            // the page is open.
             s_push_requested = false;
-            push_arm_now();
+            push_button_action();
         }
         return APP_REDRAW_PAGE;
     }

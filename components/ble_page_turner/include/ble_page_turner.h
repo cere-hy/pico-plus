@@ -28,6 +28,20 @@
 // 一个外设最多学多少个按键。/ Learned buttons per peripheral.
 #define BLE_PT_MAX_BINDINGS 4
 // 一帧报告的最大字节数。报告一般 8-9 字节，16 足够覆盖带报告号的复合设备。
+
+// 启动前的内存下限（gen24 起公开：UI 自愈提示要引用「最大块 20K」这同一个数字）。
+// 内部 RAM 才是瓶颈：控制器与协议栈任务只能放这里（硬件路径读不到 PSRAM）。阈值取
+// CrossMux 在同一块板子上验证过的值；本仓库把文件列表、图片列表、壁纸列表、字形缓存
+// 和字体目录搬进 PSRAM 之后，DIRAM 空闲约 148KB，这里过得绰绰有余。定得太低会半途
+// 失败，失败由退避和自锁兜住。/ Memory floors checked before starting (public since
+// gen24 so the UI heal prompt can quote the same "20K largest" figure). Internal RAM is
+// the constraint: the controller and stack task can only live there. The values are the
+// ones CrossMux verified on this same board; after the lists and caches moved to PSRAM,
+// DIRAM has about 148 KB free, so this passes with room to spare. Too low and the start
+// fails halfway, which the back-off and self-lock contain.
+#define BLE_PT_MIN_FREE_INTERNAL (56 * 1024)
+#define BLE_PT_MIN_LARGEST_INTERNAL (20 * 1024)
+#define BLE_PT_MIN_FREE_PSRAM (256 * 1024)
 // Maximum report frame size. Reports are typically 8-9 bytes; 16 covers composite devices that
 // prefix a report id.
 #define BLE_PT_FRAME_MAX 16
@@ -109,6 +123,20 @@ typedef enum {
 
 /* ---- 生命周期 / Lifecycle ---- */
 
+/// gen24：BLE 启动内存闸门的单一真源（纯函数，无 IO）。start_locked() 的预检与
+/// 传书页「一键自愈」按钮共用本判定，两边数字永远一致；宿主测试直接覆盖。
+/// gen24: the single source of truth for the BLE start memory gate (pure, no IO).
+/// start_locked()'s precheck and the transfer page's one-tap self-heal button share
+/// this verdict so the numbers can never disagree; host tests cover it directly.
+bool ble_pt_mem_gate(size_t free_internal, size_t largest_internal, size_t free_psram);
+
+/// gen24：读当前堆快照（内部 free / 内部最大连续块 / PSRAM free），配合上面的
+/// gate 使用。UI 自愈路径与 start_locked 各自快照、同一判定。
+/// gen24: snapshot the heap (internal free / internal largest block / PSRAM free)
+/// for use with the gate above. The UI self-heal path and start_locked each take
+/// their own snapshot and apply the same verdict.
+void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram);
+
 /// 起 BLE 栈、载入 bond 表。可重复调用。内存不够时返回 ESP_ERR_NO_MEM 且不做任何初始化。
 /// Bring the stack up and load bonds. Idempotent. Returns ESP_ERR_NO_MEM without initialising
 /// anything when there is not enough memory.
@@ -125,6 +153,14 @@ void ble_pt_sync(bool wanted);
 /// 启动失败时的原因（取走即清空），供给界面显示。
 /// Reason for a failed start, cleared once taken, for the UI to show.
 bool ble_pt_take_start_failure(char *out, size_t cap);
+
+/// gen24：上一次启动失败或已自锁（tries>=3）。UI 的「手机推送」按钮据此显示
+/// 「重试接收」并走一键自愈（预检→清锁→重试），不再傻等退避。只读 RAM。
+/// gen24: the last start failed or the stack is self-locked (tries>=3). The UI's
+/// push button retitles itself to "retry" and takes the one-tap self-heal path
+/// (precheck -> clear lock -> retry) instead of dumbly waiting out the back-off.
+/// RAM-only, safe from the render path.
+bool ble_pt_locked(void);
 
 /// 用户明确把蓝牙关掉时调用：清掉失败计数与原因，下次开启重新给机会。
 /// 与 sync(false) 不同——sync(false) 也会被「WiFi 抢占射频」触发，那种情况下不能清，

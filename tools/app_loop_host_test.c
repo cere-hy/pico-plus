@@ -61,6 +61,12 @@ static bool online_busy;
 static bool ble_enabled, saved_wifi, upload_busy, click_enabled, click_active;
 static read_pico_transfer_status_t transfer_status;
 static int quick_draws, quick_gl, quick_du, wifi_starts, wifi_stops, ble_resets, click_presses, click_restores;
+// push_sink 调度面可编程替身状态：默认未武装；cancel_why 记录见桩定义处注释。
+// Programmable push_sink scheduling-shim state: unarmed by default; the
+// cancel_why recorder is documented at its stub definition.
+static bool push_armed;
+static int push_cancel_calls;
+static char push_cancel_why[64];
 
 static app_redraw_t long_key(app_ctx_t* c, int k) { assert(k==UI_KEY_2); ++long_keys; c->request_menu=true; return APP_REDRAW_NONE; }
 static app_redraw_t response;
@@ -221,6 +227,7 @@ static void reset(void) {
     ble_enabled=saved_wifi=upload_busy=click_enabled=click_active=false;
     transfer_status=(read_pico_transfer_status_t){0};
     quick_draws=quick_gl=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
+    push_armed=false;push_cancel_calls=0;push_cancel_why[0]='\0';
     main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
@@ -447,7 +454,7 @@ int main(void) {
     assert(media_lost==2&&builtin_opens==2&&!probes&&font_opens==1);
     reset();idle_minutes=1;time_step=60000000;first.on_before_lock=before_lock;
     add(0,0,0,0);add(0,0,0,0);run();
-    assert(idle_locks==1&&before_locks==1); // Real scheduler flushes before automatic lock.
+    assert(idle_locks==1&&before_locks==1&&!push_cancel_calls); // Real scheduler flushes before automatic lock. 自动锁屏（manual=false）从不取消武装（gen18 豁免）；武装期自动锁屏另被 idle_blocked 整体阻断，见下方 gen21 守门。
     // 横屏下自动锁：prepare_lock 先把物理旋转复位竖屏，锁屏/壁纸资产才不画在
     // 横屏物理屏上（真机 bug：长按电源睡眠后壁纸横置）；本就竖屏时保持不动。
     // Auto lock under landscape: prepare_lock resets the panel to portrait first,
@@ -561,6 +568,26 @@ int main(void) {
     reset();power_trigger_step=1;time_step=3000000;staged_shutdown=true;
     add(0,0,0,0);add(0,0,0,0);add(128,374,1,0);add(556,374,1,0);add(0,0,0,0);add(0,0,0,0);run();
     assert(idle_locks==1&&wake_clean_requests==1&&!shutdowns&&!restarts&&!power_final_draws);
+    // gen21 守门（手动电源键推翻 gen18 豁免）：武装期手动息屏不拦截——静默取消
+    // 武装（cancel_why 恰一次且 why=="manual sleep"）后正常走锁+息屏闭环， resumed
+    // 卡回 IDLE；自动锁屏则被武装整体阻断（M1.5 关屏保活），一次都不取消。此桩自
+    // gen21（2ea51cb）引入调用起漏同步定义，宿主链接失败躺三代（gen21-23），
+    // 与 gen19 transfer_ui 断言脱节同型：宿主桩是实现契约，策略变更必须同步。
+    // gen21 gatekeeper (manual power key outranks the gen18 exemption): while
+    // armed, manual sleep never refuses - it silently disarms (exactly one
+    // cancel_why, why=="manual sleep") then completes the lock-and-sleep loop;
+    // auto lock stays blocked wholesale by the arm (M1.5 screen-off keepalive)
+    // and never cancels. This stub missed its definition since gen21 (2ea51cb)
+    // and the host link failed for three generations (gen21-23), the same
+    // shape as gen19's transfer_ui assertion drift: host stubs are the
+    // implementation contract - policy changes must be mirrored in.
+    reset();power_trigger_step=1;time_step=3000000;staged_shutdown=true;push_armed=true;
+    add(0,0,0,0);add(0,0,0,0);add(128,374,1,0);add(556,374,1,0);add(0,0,0,0);add(0,0,0,0);run();
+    assert(idle_locks==1&&wake_clean_requests==1&&!shutdowns&&!restarts&&!power_final_draws);
+    assert(push_cancel_calls==1&&strcmp(push_cancel_why,"manual sleep")==0);
+    reset();idle_minutes=1;time_step=60000000;push_armed=true;first.on_before_lock=before_lock;
+    add(0,0,0,0);add(0,0,0,0);run();
+    assert(!idle_locks&&!before_locks&&!push_cancel_calls); // 武装阻断自动锁屏（保活），且不取消武装
     reset();power_trigger_step=1;time_step=3000000;
     add(0,0,0,0);add(0,0,0,0);add(238,960,1,0);add(0,0,0,0);run();
     assert(restarts==1&&!shutdowns&&power_final_draws==1);
@@ -601,7 +628,8 @@ int main(void) {
     assert(power_open_draws==1&&landscape_renders==2&&host_rotation==EPD_ROT_LANDSCAPE&&!shutdowns&&!restarts);
     puts("PASS: real loop and power recognizer: DU-only contact, release commits off/staged sleep/restart once, cancel restores full navigation, touch/multitouch errors and entry-held suppression");
     puts("PASS: shutdown dialog gatekeepers: landscape long-press resets the dialog branch to portrait, and cancel repaints through render() to restore landscape");
-    puts("app_loop: 53 scheduler scenarios passed, including automatic lock, save callback, input reset, busy guards and the shutdown dialog rotation gatekeepers");
+    puts("PASS: gen21 manual-sleep gatekeeper: armed manual sleep silently disarms (one cancel_why \"manual sleep\") then sleeps; armed auto lock stays blocked with no cancel");
+    puts("app_loop: 55 scheduler scenarios passed, including automatic lock, save callback, input reset, busy guards, the shutdown dialog rotation gatekeepers and the gen21 manual-sleep push-arm gatekeeper");
     return 0;
 }
 
@@ -615,8 +643,22 @@ bool pico_online_busy(void) { return online_busy; }
    English: scheduling shims for push_sink. The host defaults to unarmed, so the
    page-turner link, sleep scheduling and dialog logic stay unaffected; the arm
    page's rendering paths are covered by the transfer_ui regression alone. */
-bool push_sink_armed(void) { return false; }
+bool push_sink_armed(void) { return push_armed; }
 void push_sink_poll(void) {}
+// gen21：手动息屏经 prepare_lock(manual=true) 调 cancel_why("manual sleep")。
+// 记录调用次数与 why 文本，供守门用例断言「武装期手动息屏静默取消武装」。
+// 此桩自 gen21（2ea51cb）起漏同步补定义，宿主链接失败躺了三代——教训同
+// gen19：实现契约变更必须同步进宿主桩，否则红灯静默躺代。
+// gen21: manual sleep reaches cancel_why("manual sleep") through
+// prepare_lock(manual=true). Record the call count and why text so the
+// gatekeeper can assert "manual sleep while armed silently disarms". This
+// stub missed its definition since gen21 (2ea51cb) and the host link failed
+// for three generations - same lesson as gen19: implementation-contract
+// changes must be mirrored into the host stubs, or red lights lie dormant.
+void push_sink_cancel_why(const char *why) {
+    ++push_cancel_calls;
+    snprintf(push_cancel_why, sizeof(push_cancel_why), "%s", why);
+}
 
 uint8_t app_settings_auto_lock_minutes(void){return idle_minutes;}
 uint32_t ble_pt_input_serial(void){return 0;}

@@ -7,6 +7,10 @@
  */
 #include "transfer_ui_test_env.h"
 #include "../main/apps/app_transfer.c"
+// gen24：预检闸门的真身直接进测试（单一真源，边界逐项覆盖）。它零 IDF 依赖。
+// Gen24: the precheck gate's real body comes straight into the test (single
+// source of truth, bounds covered one by one). It carries no IDF dependency.
+#include "../components/ble_page_turner/src/ble_pt_mem.c"
 #include <assert.h>
 #include "../components/read_pico_transfer/transfer_signature.h"
 /* 中文：武装页 Step 4 依赖的宿主替身。app_content_open.h 与 dict_popup.h 的真身
@@ -303,16 +307,22 @@ static void push_arm_regression(app_ctx_t *ctx) {
     tap(ctx, control_rect(2));
     assert(!test_push_armed);
     assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
-    // 离页再进：nav 切走时 cancel 补的 closed 是陈事件，on_enter 清扫后页面
-    // 不再被立刻扔回方法页。/ Leaving and returning: the closed posted by the
-    // nav-away cancel is stale; after on_enter's sweep the page is no longer
-    // thrown straight back to the method page.
+    // 离页再进：nav 切走不再收摊（gen19 Bug3 起保活语义统一， armed 保持、
+    // closed 不置）；on_enter 的清扫对陈事件兜底，页面不被立刻扔回方法页。
+    // Leaving and returning: a nav-away no longer tears down (gen19 Bug3 unified
+    // the keep-alive semantics: armed stays, no closed); on_enter's sweep covers
+    // stale events so the page is not thrown straight back to the method page.
+    // 本断言在 gen19 改语义时漏同步（测试文件停在 df09529），gen24 补上——
+    // 教训同 CI 那条：宿主断言是「实现契约」，策略变更必须同步。
+    // This assertion missed its gen19 sync (the test file stopped at df09529);
+    // gen24 catches it up - same lesson as the CI fix: a host assertion is an
+    // implementation contract and a strategy change must update it.
     app_transfer_request_push();
     on_enter(ctx);
     assert(s_view == TRANSFER_PUSH && test_push_armed && !test_push_closed);
     ui_gesture_event_t nav = {.type = UI_GESTURE_TAP, .x0 = 20, .y0 = 1150, .x = 20, .y = 1150};
     assert(on_gesture(ctx, &nav) == APP_REDRAW_NONE);
-    assert(!test_push_armed && test_push_closed);
+    assert(test_push_armed && !test_push_closed);
     app_transfer_request_push();
     on_enter(ctx);
     assert(s_view == TRANSFER_PUSH && test_push_armed && !test_push_closed);
@@ -332,6 +342,114 @@ static void push_arm_regression(app_ctx_t *ctx) {
     test_push_armed = false;
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_PAGE && s_view == TRANSFER_METHODS);
+    transfer_on_exit(ctx);
+}
+
+// gen24 多态按钮 + 预检单一真源回归：四种姿态的点按行为、自愈路径、以及
+// 「任何失败路径结束后其他按钮仍可用」的不假死底线。
+// Gen24 multi-state button + precheck single-source regression: each pose's tap
+// behaviour, the self-heal path, and the no-freeze bottom line (after any failure
+// path the other rows keep working).
+static void push_multistate_regression(app_ctx_t *ctx) {
+    // ---- gate 真身：边界逐项（start_locked 用的就是这一个函数）----
+    // The real gate, bounds one by one (the very function start_locked calls).
+    assert(ble_pt_mem_gate(90 * 1024, 32 * 1024, 4 * 1024 * 1024));
+    assert(!ble_pt_mem_gate(90 * 1024, 19 * 1024, 4 * 1024 * 1024)); // gen23 真机现场 / the gen23 field case
+    assert(!ble_pt_mem_gate(90 * 1024, 32 * 1024, 128 * 1024));      // PSRAM 不够 / PSRAM short
+    assert(ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL - 1, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL - 1, BLE_PT_MIN_FREE_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM - 1));
+
+    // 干净开局：富余堆、无锁、方法页。/ A clean slate: ample heap, no lock, method page.
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
+    test_ble_locked = false;
+    test_ble_free_internal = 90 * 1024;
+    test_ble_largest_internal = 32 * 1024;
+    test_ble_free_psram = 4 * 1024 * 1024;
+    test_ble_reset_calls = 0;
+    s_method_message[0] = 0;
+    on_enter(ctx);
+    assert(s_view == TRANSFER_METHODS);
+
+    // ---- 姿态 1：干净 IDLE → 武装（预检过；reset 幂等顺带清一次）----
+    // Pose 1: a clean IDLE arms (precheck passes; the idempotent reset rides along).
+    int arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms + 1 && s_view == TRANSFER_PUSH);
+    assert(test_ble_reset_calls == 1);
+    s_view = TRANSFER_METHODS; // 回方法页（不収摊）/ back to the method page (no teardown)
+
+    // ---- 姿态 2：ARMED/WINDOW → 取消回 IDLE（带原因）----
+    // Pose 2: ARMED/WINDOW cancels back to IDLE (with a reason).
+    test_push_state = PUSH_STATE_WINDOW;
+    test_push_armed = true;
+    int cancels = test_push_cancel_calls;
+    arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_cancel_calls == cancels + 1 && test_push_arm_calls == arms);
+    assert(!test_push_armed && !strcmp(test_push_close_why, "已取消接收"));
+
+    // ---- 姿态 3a：锁死 + 预检不过（gen23 现场：最大块 19K）----
+    // 提示带数字、不武装、不清锁、零等待（不进 pending、不吞 30s 退避）。
+    // Pose 3a: locked + precheck fails (the gen23 field case: 19K largest) - the
+    // prompt carries the numbers, nothing arms, no lock clearing, zero wait (no
+    // pending, no 30 s back-off to sit through).
+    test_push_state = PUSH_STATE_IDLE;
+    test_ble_locked = true;
+    test_ble_largest_internal = 19 * 1024;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    cancels = test_push_cancel_calls;
+    int resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
+    assert(test_ble_reset_calls == resets); // 预检不过不清锁 / a failed precheck clears nothing
+    assert(s_view == TRANSFER_METHODS);
+    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "19K") &&
+           strstr(s_method_message, "20K"));
+    // 不假死：再点一次同样只出提示；on_tick 不挂。/ No freeze: tapping again only
+    // re-prompts, and on_tick never hangs.
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && s_view == TRANSFER_METHODS);
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    // 不假死：其他按钮仍可用——WiFi 行走配网入口，页面切得动、状态变得了。
+    // No freeze: the other rows still work - the WiFi row walks the provisioning
+    // entry, the page moves and the state stays mutable.
+    s_method_message[0] = 0;
+    tap(ctx, method_control_rect(0));
+    assert(s_view != TRANSFER_METHODS || s_method_message[0]); // 有反应：切页或留话 / it reacts: moves or speaks
+    on_enter(ctx);
+    assert(s_view == TRANSFER_METHODS);
+
+    // ---- 姿态 3b：锁死 + 预检过 → 一键自愈（清锁 + 重试一次到位）----
+    // Pose 3b: locked + precheck passes - one-tap self-heal (clear lock + retry).
+    test_ble_locked = true;
+    test_ble_largest_internal = 32 * 1024;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_ble_reset_calls == resets + 1 && !test_ble_locked);
+    assert(test_push_arm_calls == arms + 1 && s_view == TRANSFER_PUSH);
+    s_view = TRANSFER_METHODS;
+
+    // ---- 姿态 4：CONNECTED/RECEIVING → 禁用（不 arm 不 cancel）----
+    // Pose 4: CONNECTED/RECEIVING - disabled (neither arms nor cancels).
+    test_push_state = PUSH_STATE_CONNECTED;
+    test_push_armed = true;
+    arms = test_push_arm_calls;
+    cancels = test_push_cancel_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
+    test_push_state = PUSH_STATE_RECEIVING;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
+    // 复位，把现场还给后续用例。/ Reset and hand the field back to later cases.
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
     transfer_on_exit(ctx);
 }
 
@@ -533,5 +651,6 @@ int main(void) {
     network_ui_tick(&ctx);
     wifi_recovery_regression(&ctx);
     push_arm_regression(&ctx);
+    push_multistate_regression(&ctx);
     puts("transfer_ui_host_test: PASS");
 }

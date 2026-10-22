@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico23（gen22 为 0.3.3-pico22；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico24（gen23 为 0.3.3-pico23；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico23 (gen22 was 0.3.3-pico22; reusing an older tag makes
+# Version string: 0.3.3-pico24 (gen23 was 0.3.3-pico23; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -182,6 +182,105 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
 # gen16.
+#
+# 重锚记录（2026-10-22，gen24：真机 BLE 碎片化失败急救 + 多态按钮四态与一键自愈）：
+#   版本串：0.3.3-pico24（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
+#   背景（gen23 真机）：用户 31 分钟后首次点「接收推送」，NimBLE 启动失败并自锁
+#     （tries≥3），屏幕「启动失败 3 次：内存不足（内部 75K，最大块 19K）」。
+#     根因：start_locked() 预检 free≥56K 过、最大块 19K < 20K 闸门差 1KB——
+#     内部堆**碎片化**（非净泄漏：internal_before==internal_after 零流失；
+#     长时间使用积累的常驻块把大块咬碎）。gen23 固件只把既存碎片化暴露成
+#     首次可见故障，定性为高置信既存问题（非实锤新增）。
+#   第 1 件（多态按钮四态 + 一键自愈）：app_transfer.c push_button_action() 按
+#     push_sink_state() + ble_pt_locked() 分四态——CONNECTED/RECEIVING/PROCESSING
+#     禁用；非 IDLE 取消（cancel_why）；IDLE 先过内存预检**再**武装（预检不过
+#     零等待出带数字提示「最大块 %uK，需 %uK，重启设备后可用」，不傻等 3 次退避）；
+#     锁死态预检过则 ble_pt_reset_failure() 一键自愈后武装（reset 幂等）。
+#     draw_methods 第 3 行按状态动态改词；titles/details 去掉 static（修跨调用
+#     持久化 bug）。method_gesture origin==2 改调同一入口（on_enter deep-link
+#     分支按裁定不动）。
+#   第 2 件（预检单一真源）：ble_pt_mem_gate(free,largest,psram) 纯函数落独立 TU
+#     components/ble_page_turner/src/ble_pt_mem.c（零 IDF 依赖，宿主测试直接
+#     include）；阈值宏 BLE_PT_MIN_* 搬进 ble_page_turner.h 公开（UI 提示与
+#     预检引用同一数字）。新增 ble_pt_locked() RAM 锁态查询（比「锁死」宽：
+#     预检失败也置位）。
+#   第 3 件（诊断日志）：app_transfer.c on_enter 打
+#     `transfer_page: on_enter internal free=%u largest=%u psram free=%u largest=%u`；
+#     app_book.c free_book() 出入口各一行 before/after——给 gen25 根治三层路线
+#     （数据层/分配卫生层/书模块池化层）攒真机数据。
+#   第 4 件（不假死底线）：预检失败再点只提示不挂死；on_tick 与其他按钮不受影响。
+#   门禁：fullclean exit 0，8 警告同基线（全 -Wunused-function：app_book.c 7 +
+#     ui_pinpad.c 1，均不在本代改动面）；push_sink 168/0；transfer_ui host test
+#     含 gen24 新回归（gate 边界 7 项 + 四姿态 + 不假死）；顺手修复两个**既存**
+#     红灯——transfer_ui gen19 断言脱节（nav 不收摊语义漏同步，躺了 gen20-23
+#     四代）与 app_loop 宿主链接失败（gen21 起 push_sink_cancel_why 桩漏定义，
+#     躺三代；已补桩并加 gen21 守门用例：武装期手动息屏静默取消武装一次，
+#     自动锁屏被武装阻断且不取消）。
+#   终版锚：Read_Pico.bin 4,061,360 B（相对 gen23 4,060,480 **+880 B**，
+#     双操作数 4,061,360−4,060,480=880），sha256 `b1a46ff2…`；
+#     seg1 File offs `0x00233a48`（esptool 实测，gen23 为 0x00233888，+0x1c0=448B
+#     顺移——DROM 段增长所致），paddr = 0x00233a48 + 8(段头) + 0x10000(ota_0 基址)
+#     = `0x00243a50`（预测）；seg1 Load addr 0x3fc9c700 世代不变锚不动，len=0x08a8c。
+#     partition-table / ota_data_initial 与 gen23 逐字节一致（9d5d890b… / 7d2c7ac4…）。
+#     bootloader sha 由 `164ac958…` → `ae8c4718…`（体积同为 21,232 B；差异是
+#     编译时间戳，属 IDF 产物非确定性，非源码改动，行为不变）。
+#     APK 包内为 v1.1 `7e5eea37…`（与 gen23 同，协议未变，无需重刷）。
+#
+# Re-anchor record (2026-10-22, gen24: hardware BLE-fragmentation emergency fix
+# plus the multistate button with one-key self-healing):
+# version 0.3.3-pico24 (three places in step: CMakeLists.txt, this record, the
+# flashing notes).
+#   Background (gen23 hardware): the user's first "receive push" tap came 31
+#     minutes in; NimBLE failed to start and self-locked (tries>=3), screen
+#     showing "start failed 3 times: out of memory (internal 75K, largest 19K)".
+#     Root cause: start_locked()'s precheck passes free>=56K but the largest
+#     block 19K misses the 20K gate by 1KB - internal heap FRAGMENTATION (not a
+#     net leak: internal_before==internal_after, zero loss; long-session
+#     resident blocks shred the large block). gen23 merely exposed a pre-existing
+#     fragmentation as a first-visible failure: high-confidence pre-existing
+#     issue, not a proven new regression.
+#   Item 1 (multistate button, four states + one-key self-heal): app_transfer.c
+#     push_button_action() branches on push_sink_state() + ble_pt_locked() -
+#     CONNECTED/RECEIVING/PROCESSING disabled; non-IDLE cancels (cancel_why);
+#     IDLE runs the memory precheck BEFORE arming (on failure, zero-wait message
+#     with the numbers "largest %uK, need %uK, reboot to use" instead of waiting
+#     out three backoffs); locked state that passes the precheck self-heals via
+#     ble_pt_reset_failure() then arms (reset is idempotent). draw_methods row 3
+#     rewords per state; titles/details drop static (fixing cross-call
+#     persistence). method_gesture origin==2 routes through the same entry (the
+#     on_enter deep-link branch stays as ruled).
+#   Item 2 (single source of the precheck): ble_pt_mem_gate(free,largest,psram)
+#     as a pure function in its own TU components/ble_page_turner/src/ble_pt_mem.c
+#     (zero IDF dependency, host tests include it directly); the BLE_PT_MIN_*
+#     thresholds moved into ble_page_turner.h (UI hints and the precheck quote
+#     the same numbers). New ble_pt_locked() RAM lock-state query (wider than
+#     "locked": a failed precheck also sets it).
+#   Item 3 (diagnostics): app_transfer.c on_enter logs
+#     `transfer_page: on_enter internal free=%u largest=%u psram free=%u largest=%u`;
+#     app_book.c free_book() logs one line before and after - data for gen25's
+#     three-layer root-cause route (data layer / allocation hygiene / book-module
+#     pooling).
+#   Item 4 (never-hang floor): a failed precheck re-tap only messages; on_tick
+#     and other buttons stay live.
+#   Gate: fullclean exit 0, 8 warnings same as baseline (all -Wunused-function:
+#     app_book.c 7 + ui_pinpad.c 1, none inside this generation's change
+#     surface); push_sink 168/0; transfer_ui host test with the new gen24
+#     regression (7 gate-boundary cases + four postures + never-hang). Two
+#     PRE-EXISTING red lights fixed in passing: transfer_ui's gen19 assertion
+#     drift (the nav no-teardown semantics missed the test sync, dormant
+#     gen20-23) and the app_loop host link failure (push_sink_cancel_why stub
+#     undefined since gen21, dormant three generations; stub added plus a gen21
+#     gatekeeper: armed manual sleep disarms silently exactly once, armed auto
+#     lock stays blocked and never cancels).
+#   Anchors: Read_Pico.bin 4,061,360 B (vs gen23's 4,060,480, i.e. +880 B),
+#     sha256 b1a46ff2...; seg1 File offs 0x00233a48 (measured; gen23 was
+#     0x00233888, +0x1c0 = 448 B shift from DROM growth), paddr = offs + 8 +
+#     0x10000 = 0x00243a50 (predicted); seg1 load addr 0x3fc9c700 remains the
+#     generation-invariant anchor, len 0x08a8c. partition-table / ota_data_initial
+#     byte-identical to gen23 (9d5d890b / 7d2c7ac4). bootloader sha 164ac958 ->
+#     ae8c4718 (same 21,232 B; the delta is the build timestamp - IDF output is
+#     not deterministic; no source change, no behavior change). APK is v1.1
+#     7e5eea37 (same as gen23; protocol unchanged, no reflash needed).
 #
 # 重锚记录（2026-10-22，gen23：第 3 项共享伽马 LUT —— 本代唯一源码增量）：
 #   版本串：0.3.3-pico23（CMakeLists.txt 一处 + 本记录 + 烧录说明，三处同步）。
@@ -582,7 +681,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   runs ahead of the counters" comment finally holds.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="b7cf63a0ee3ca73f1a266faefc55fd927b72aeddedb48eecc4aeb9bfc540e544"
+EXPECTED="b1a46ff28d2a9b18f1f932c47ddb74e9ada141dbfb60b22134d410a6cbfc36ed"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

@@ -77,19 +77,9 @@ static void lifecycle_give(void) { atomic_flag_clear(&s_lifecycle); }
 // arrives.
 #define HID_CHR_CCCD 0x2902
 
-// 启动前的内存下限。内部 RAM 才是瓶颈：控制器与协议栈任务只能放这里（硬件路径读不到
-// PSRAM）。阈值取 CrossMux 在同一块板子上验证过的值；本仓库把文件列表、图片列表、壁纸
-// 列表、字形缓存和字体目录搬进 PSRAM 之后，DIRAM 空闲约 148KB，这里过得绰绰有余。
-// 定得太低会半途失败，失败由退避和自锁兜住。
-// Memory floors checked before starting. Internal RAM is the constraint, since the controller and
-// the stack task can only live there (the hardware path cannot read PSRAM). The values are the
-// ones CrossMux verified on this same board; after this tree moved its file, image, wallpaper,
-// glyph-cache and font-catalogue arrays into PSRAM, DIRAM has about 148 KB free, so this passes
-// with room to spare. Too low and the start fails halfway, which the back-off and self-lock
-// contain.
-#define BLE_PT_MIN_FREE_INTERNAL (56 * 1024)
-#define BLE_PT_MIN_LARGEST_INTERNAL (20 * 1024)
-#define BLE_PT_MIN_FREE_PSRAM (256 * 1024)
+// 启动前的内存下限：内部 RAM 才是瓶颈（阈值与理由见 ble_page_turner.h 的公开定义）。
+// Memory floors checked before starting: internal RAM is the constraint (see the
+// public definitions in ble_page_turner.h for the values and rationale).
 
 // 启动失败后的退避。/ Back-off after a failed start.
 #define BLE_PT_RETRY_BACKOFF_MS 30000
@@ -168,6 +158,16 @@ static char s_failure[128];
 static uint32_t s_retry_after_ms;
 static uint32_t s_stable_since;
 static char s_start_failure[160];
+// gen24：上一次启动失败或已自锁（tries>=3）。UI 据此把「手机推送」按钮显示成
+// 「重试接收」并走一键自愈（预检→清锁→重试）；启动成功或用户明确重置时清除。
+// 注意它比「锁死」宽：start_locked 预检失败（tries 还没到 3）同样置位——那种
+// 情况下按钮也该是自愈入口而不是傻等下一次退避。/ gen24: the last start failed or
+// the stack is self-locked (tries>=3). The UI retitles the push button to "retry" and
+// runs the one-tap self-heal (precheck -> clear lock -> retry); cleared on a successful
+// start or an explicit reset. It is broader than "locked": a precheck failure in
+// start_locked (tries below 3) sets it too - there the button should also be the heal
+// entry, not a dumb wait for the next back-off.
+static bool s_locked;
 // 自动重连：链路曾经建立过才记这里；用户主动断开时清空，免得"关掉"之后又被自己连回来。
 // Auto-reconnect: recorded once a link has been up. Cleared on an explicit disconnect, so
 // switching it off is not immediately undone by the retry.
@@ -1474,6 +1474,17 @@ bool ble_pt_take_passkey(uint32_t *out) {
 
 /* ---- 生命周期 / Lifecycle ---- */
 
+// gen24：内存闸门的判定真身在 ble_pt_mem.c（纯函数、宿主测试直接覆盖）；这里只留
+// 读堆的快照 helper。/ gen24: the gate's verdict lives in ble_pt_mem.c (a pure
+// function host tests cover directly); only the heap-reading snapshot stays here.
+void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram) {
+    if (free_internal) *free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (largest_internal) {
+        *largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (free_psram) *free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+}
+
 static void on_sync(void) {
     if (ble_hs_util_ensure_addr(0) != 0) {
         ESP_LOGE(TAG, "no usable address");
@@ -1504,12 +1515,13 @@ static esp_err_t start_locked(void) {
     // (CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL), but the controller and the stack task must live
     // in internal RAM - they sit on the hardware path and cannot read PSRAM. So the binding
     // constraint is internal RAM, not PSRAM. Refuse outright rather than half-initialise.
-    const size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t largest_internal =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (free_internal < BLE_PT_MIN_FREE_INTERNAL ||
-        largest_internal < BLE_PT_MIN_LARGEST_INTERNAL || free_psram < BLE_PT_MIN_FREE_PSRAM) {
+    // gen24：快照与判定走 ble_pt_mem_snapshot/ble_pt_mem_gate 单一真源，传书页自愈
+    // 按钮用同一对函数，两边数字永远一致。/ gen24: snapshot and verdict go through the
+    // shared ble_pt_mem_snapshot/ble_pt_mem_gate pair; the transfer page's self-heal button
+    // uses the same pair so the two sides can never disagree.
+    size_t free_internal, largest_internal, free_psram;
+    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+    if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
         ESP_LOGW(TAG, "not enough memory: internal %u B free / %u B largest, psram %u B free",
                  (unsigned)free_internal, (unsigned)largest_internal, (unsigned)free_psram);
         snprintf(s_failure, sizeof(s_failure), "内存不足（内部 %uK，最大块 %uK）",
@@ -1748,6 +1760,7 @@ void ble_pt_sync(bool wanted) {
     if (tries >= BLE_PT_MAX_BOOT_TRIES && have_why) {
         snprintf(s_start_failure, sizeof(s_start_failure),
                  "启动失败 %u 次：%s（关掉再开启可重试）", (unsigned)tries, why);
+        s_locked = true; // gen24：自锁态对 UI 可见（按钮自愈入口）/ gen24: make the lock visible to the UI (the button's heal entry)
         return;
     }
 
@@ -1774,11 +1787,13 @@ void ble_pt_sync(bool wanted) {
             snprintf(s_start_failure, sizeof(s_start_failure), "启动失败：%s", esp_err_to_name(err));
         }
         why_store(s_start_failure);
+        s_locked = true; // gen24：失败态对 UI 可见（含未到 3 次的预检失败）/ gen24: make the failure visible to the UI (including precheck failures below 3 tries)
         ESP_LOGW(TAG, "start failed (%s), backing off %u ms", esp_err_to_name(err),
                  (unsigned)BLE_PT_RETRY_BACKOFF_MS);
     } else {
         s_retry_after_ms = 0;
         s_start_failure[0] = 0;
+        s_locked = false; // gen24：起来了，清除失败/锁态 / gen24: up now, clear the failure/lock state
         why_store(NULL);
     }
 }
@@ -1790,12 +1805,20 @@ bool ble_pt_take_start_failure(char *out, size_t cap) {
     return true;
 }
 
+// gen24：上一次启动失败或已自锁。UI 的「手机推送」按钮据此显示「重试接收」并走
+// 一键自愈路径；它只读 RAM，不做 NVS IO，渲染路径可安全调用。
+// gen24: the last start failed or the stack is self-locked. The UI's push button
+// retitles itself to "retry" and takes the one-tap self-heal path accordingly.
+// RAM-only, no NVS IO, safe to call from the render path.
+bool ble_pt_locked(void) { return s_locked; }
+
 void ble_pt_reset_failure(void) {
     boot_tries_store(0);
     why_store(NULL);
     s_retry_after_ms = 0;
     s_start_failure[0] = 0;
     s_failure[0] = 0;
+    s_locked = false;
 }
 
 // 自动重复：按住 500ms 后开始，之后每 120ms 一次。

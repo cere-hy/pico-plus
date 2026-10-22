@@ -12,6 +12,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 BLE = ROOT / 'components/ble_page_turner/src/ble_page_turner.c'
+MEM = ROOT / 'components/ble_page_turner/src/ble_pt_mem.c'
 SETTINGS = ROOT / 'main/apps/app_device_settings.c'
 
 def function(path, name):
@@ -67,9 +68,9 @@ unit = r'''
 #define MALLOC_CAP_INTERNAL 1
 #define MALLOC_CAP_8BIT 2
 #define MALLOC_CAP_SPIRAM 4
-#define BLE_PT_MIN_FREE_INTERNAL (56*1024)
-#define BLE_PT_MIN_LARGEST_INTERNAL (20*1024)
-#define BLE_PT_MIN_FREE_PSRAM (256*1024)
+// gen24：BLE_PT_MIN_* 改由 ble_page_turner.h 提供（单一真源），本测试不再私有定义。
+// Gen24: BLE_PT_MIN_* now come from ble_page_turner.h (single source of truth);
+// this test no longer keeps private copies.
 static ble_pt_device_t s_devices[BLE_PT_MAX_DEVICES];
 static uint8_t s_device_count;
 struct fake_uuid {uint16_t u;};
@@ -152,9 +153,11 @@ for name in ('lifecycle_take','lifecycle_give','ble_pt_input_serial','key_push',
              'frame_idle','raw_release','raw_frame','extract_primary_code',
              'usage_to_special','emit_usage','ingest_report','ble_pt_pop_key','ble_pt_pop_raw',
              'ble_pt_learn_begin','ble_pt_bind','ble_pt_binding','start_locked','stop_locked','ble_pt_start','ble_pt_stop',
+             'ble_pt_mem_snapshot','ble_pt_mem_gate',
              'ble_pt_network_acquire','ble_pt_network_release','scan_cb','ble_pt_device_count',
              'ble_pt_device','ble_pt_action_for_frame','ble_pt_action_for_usage'):
-    unit += '\n' + function(BLE, name)
+    path = MEM if name == 'ble_pt_mem_gate' else BLE
+    unit += '\n' + function(path, name)
 unit += '\n' + function(SETTINGS, 'ble_receive_feedback')
 unit += '\n' + function(SETTINGS, 'format_bound_key')
 for name in ('ble_scan_visible','ble_scan_visible_count','ble_scan_visible_at'):

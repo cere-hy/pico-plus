@@ -3959,6 +3959,16 @@ static void track_ticket_stats(app_ctx_t* ctx) {
     if (s_stats_pending_ms >= 30000) flush_ticket_stats();
 }
 static void free_book(void) {
+    // gen24 诊断：关书前后各记一笔内部堆快照（free/最大块）。与 `book: open start`
+    // 那行同口径，开大书的瞬时峰值与关书残留直接对表——gen25 定位「长使用周期
+    // 内部堆布局退化」的数据点。/ gen24 diagnostics: snapshot the internal heap
+    // before and after closing a book (free/largest), same units as the
+    // `book: open start` line, so a big open's transient peak and the post-close
+    // residue line up directly - a data point for gen25's long-run internal-heap
+    // layout investigation.
+    ESP_LOGI(TAG, "close before internal free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     flush_ticket_stats();
     e0470_page_turn_release();
     s_water_turn_pending = false;
@@ -3996,6 +4006,9 @@ static void free_book(void) {
     s_reader_favorite = false;
     s_book_title[0] = 0;
     app_font_activate_system();
+    ESP_LOGI(TAG, "close after internal free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 // 通栏之后一页位图更大：装不下就按最大空闲块等比缩一档——图小一圈也胜过整页消失。
 // A full-bleed page bitmap is larger: when it does not fit, step the aspect-preserving size down
