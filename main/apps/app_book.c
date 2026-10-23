@@ -429,28 +429,34 @@ static book_layout_draw_cursor_t s_prep_cursor;
 static uint32_t s_next_generation;
 static uint8_t* s_next_fb;
 static int s_next_page = -1, s_prep_page = -1;
-// gen25（高水位采样，用户裁定「要」）：book_prep 任务栈的 min-so-far 剩余量
-// （FreeRTOS 以 word 为单位，S3 上 1 word = 4 B）。12K 栈是开书后内部最大块从
-// 31744 掉到 19456 的属主（差正好 12288），若实测高水位只剩 3-4K，把栈降到
-// 6-8K 还能再省 4-6K 内部堆——比任何搬移都直接。任务在**自删前**打这一行，
-// 覆盖整个生命周期；只在外部删时打会漏掉中途低谷。
+// gen25（高水位采样，用户裁定「要」）：book_prep 任务栈的 min-so-far 剩余量。
+// 本 port 的 portSTACK_TYPE=uint8_t，故 FreeRTOS 的 HWM 计数单位=1 字节
+// （不是 4 B——gen25 曾误读为「4 B/word」并据此错下「9.2K 已占用→不降栈」；
+// gen26 纠错：9444 是**最低剩余字节**，峰值=12288-9444≈2.8K，故 12K→6K 降栈，
+// 省 6K 内部堆，峰值仍留 ~3.3K 余量）。任务在**自删前**打这一行，覆盖整个
+// 生命周期；只在外部删时打会漏掉中途低谷。
 // Gen25 (high-water sampling, the user ruled "yes"): book_prep's stack
-// min-so-far (FreeRTOS counts words; 4 B each on the S3). The 12K stack owns
-// the 31744 -> 19456 drop (a difference of exactly 12288); if the measured high
-// water mark is only 3-4K, shrinking the stack to 6-8K saves another 4-6K of
-// internal RAM - more directly than any relocation. The task logs the line
-// **before self-deleting** so the whole lifetime is covered; logging only from
-// the outside would miss mid-life troughs.
+// min-so-far free. This port defines portSTACK_TYPE=uint8_t, so FreeRTOS's HWM
+// count unit is 1 byte (NOT 4 B - gen25 misread it as "4 B/word" and wrongly
+// concluded "9.2K used -> keep 12K"; gen26 corrects: 9444 is the *minimum free
+// bytes*, peak = 12288-9444 ~= 2.8K, so stack 12K->6K, saving 6K internal heap
+// with ~3.3K peak headroom). The task logs the line **before self-deleting** so
+// the whole lifetime is covered; logging only from the outside misses troughs.
 static UBaseType_t s_prep_hwm_words;
+// book_prep 任务栈深（FreeRTOS 以 StackType_t 为单位，本 port=1 字节）：6*1024=6 KiB。
+// 峰值实测 ~2.8K，留 ~3.3K 余量（gen26 由 12K 降下）。
+// book_prep stack depth (FreeRTOS unit = StackType_t = 1 byte here): 6*1024 = 6 KiB.
+// Measured peak ~2.8K leaves ~3.3K headroom (gen26 cut from 12K).
+#define BOOK_PREP_STACK_SZ (6 * 1024)
 // 停机等待上限：一次 prep 的工作单元是「预绘一页」的行循环（每行都查一次
 // s_prep_stop），真机一页预绘在百毫秒量级，这里给 1s——约 3-10 倍余量，足以
 // 覆盖最大书最长 prep。关键是**超时不强删**（见 prep_task_request_stop），
-// 所以这个值只影响「本次能否立刻归还 12K」，不影响安全。
+// 所以这个值只影响「本次能否立刻归还 6K」，不影响安全。
 // Stop-wait ceiling: one prep unit is the row loop that pre-renders a page
 // (every row re-checks s_prep_stop); a page pre-render runs in the hundreds of
 // milliseconds on hardware, so 1 s leaves roughly 3-10x headroom. What matters
 // is that a timeout never force-deletes (see prep_task_request_stop), so this
-// only decides whether the 12K comes back right now, never safety.
+// only decides whether the 6K comes back right now, never safety.
 #define BOOK_PREP_STOP_WAIT_MS 1000
 
 #define s_toolbar (s_reader_panel != READER_PANEL_NONE)
@@ -538,10 +544,10 @@ bool app_book_request_resume(const char *path, bool fullscreen) {
 }
 
 /* ---- gen25 让路链（yield / restore）---- */
-// 预检不过时把当前这本「临时卸下」，把它的 12K prep 栈与整批解析缓冲还给内部
+// 预检不过时把当前这本「临时卸下」，把它的 6K prep 栈与整批解析缓冲还给内部
 // 堆，让 BLE 闸门过得去；推送收官后再自动重开、回到原位置（位置走既有
 // book_progress 单一真源，不引入第二套机制）。
-// Yield the current book away when the precheck fails, handing its 12K prep stack
+// Yield the current book away when the precheck fails, handing its 6K prep stack
 // and the whole parse buffer set back to the internal heap so the BLE gate
 // passes; the push finale then reopens it at the saved position (position uses
 // the existing book_progress single source - no second mechanism).
@@ -569,7 +575,7 @@ bool app_book_has_open_book(void) { return s_text && s_path[0]; }
 bool app_book_request_yield_for_push(void) {
     if (s_book_yielded) return true;             // 幂等：已卸过就不再卸 / idempotent
     if (!s_text || !s_path[0]) return true;      // 无书可卸 = 无需让路，直接就绪 / nothing open: nothing to yield, already ready
-    // ① prep 停机（12K 栈归还）。/ Stop prep first (returns the 12K stack).
+    // ① prep 停机（6K 栈归还）。/ Stop prep first (returns the 6K stack).
     prep_task_request_stop("yield");
     if (s_prep_task) return false;               // 超时未停 → 按失败处理，不原地空等 / still busy: report failure, never wait it out here
     // ② 无活跃渲染：拿得到绘制锁才算空闲。/ No rendering in flight: idle means we can take the draw lock.
@@ -3734,8 +3740,10 @@ static void prep_task(void *arg) {
 
 // 任务自删的唯一出口。/ The single exit the task takes when it stops itself.
 static void prep_task_self_stop(void) {
-    ESP_LOGI(TAG, "prep stack HWM: %u words (%u B) of 12288 B stack",
-             (unsigned)s_prep_hwm_words, (unsigned)(s_prep_hwm_words * sizeof(StackType_t)));
+    ESP_LOGI(TAG, "prep stack HWM: %u B free (peak used %u B) of %u B stack",
+             (unsigned)(s_prep_hwm_words * sizeof(StackType_t)),
+             (unsigned)((BOOK_PREP_STACK_SZ - s_prep_hwm_words) * sizeof(StackType_t)),
+             (unsigned)(BOOK_PREP_STACK_SZ * sizeof(StackType_t)));
     // 先置空句柄（外部据此判定已停，天然幂等），再 give 让等待者继续，最后自删。
     // Clear the handle first (the outside reads it to see "stopped", which makes
     // this idempotent by construction), then give so the waiter proceeds, then
@@ -3746,9 +3754,9 @@ static void prep_task_self_stop(void) {
 }
 
 // 外部停机请求：置位 → 唤醒 → 等任务自删；**超时从不强删**，只记日志保留任务
-// （12K 这次不还，下次让路链/开书再收）。/ The outside's stop request: set the
+// （6K 这次不还，下次让路链/开书再收）。/ The outside's stop request: set the
 // flag, wake the task, wait for it to delete itself; a timeout never force-deletes,
-// it only logs and leaves the task in place (the 12K waits for the next pass).
+// it only logs and leaves the task in place (the 6K waits for the next pass).
 static void prep_task_request_stop(const char *why) {
     if (!s_prep_task) return;
     atomic_store_explicit(&s_prep_stop, true, memory_order_release);
@@ -3759,14 +3767,14 @@ static void prep_task_request_stop(const char *why) {
         stopped = xSemaphoreTake(s_prep_done, pdMS_TO_TICKS(BOOK_PREP_STOP_WAIT_MS)) == pdTRUE;
     }
     if (stopped) {
-        ESP_LOGI(TAG, "prep task stopped (%s): 12K stack returned", why ? why : "close");
+        ESP_LOGI(TAG, "prep task stopped (%s): 6K stack returned", why ? why : "close");
     } else {
         // 不强删：任务仍持有内部缓冲/可能持锁，强删会漏内存。保留它，等它自己
         // 走到安全点退出；期间 kick_prep 会复用同一个任务，不会重复创建。
         // Never force-delete: the task may still hold internal buffers or a lock,
         // and deleting it would leak. Leave it; it exits at its own safe point,
         // and kick_prep reuses that same task meanwhile instead of creating a second.
-        ESP_LOGW(TAG, "prep task still busy after %d ms (%s): kept alive, 12K stack stays for now",
+        ESP_LOGW(TAG, "prep task still busy after %d ms (%s): kept alive, 6K stack stays for now",
                  BOOK_PREP_STOP_WAIT_MS, why ? why : "close");
     }
 }
@@ -3798,7 +3806,7 @@ static bool kick_prep(void) {
     if(!s_draw_lock)s_draw_lock=xSemaphoreCreateMutex();
     if(!s_prep_done)s_prep_done=xSemaphoreCreateBinary();
     if(!s_prep_task&&s_draw_lock&&s_prep_done&&
-       xTaskCreatePinnedToCore(prep_task,"book_prep",12*1024,NULL,3,&s_prep_task,1)!=pdPASS)s_prep_task=NULL;
+       xTaskCreatePinnedToCore(prep_task,"book_prep",BOOK_PREP_STACK_SZ,NULL,3,&s_prep_task,1)!=pdPASS)s_prep_task=NULL;
     if(!s_prep_task)return false;
     xSemaphoreTake(s_prep_done,0);
     atomic_store_explicit(&s_prep_stop,false,memory_order_release);
@@ -4226,27 +4234,27 @@ static void free_book(void) {
     s_text_len = 0;
     s_selected_toc = SIZE_MAX;
     s_jump_offset = SIZE_MAX;
-    // gen25（池化 · 生命周期收口）：book_prep 的 12K 任务栈随书归还。
-    // 数据层硬事实：内部最大块健康常驻 31744，开书后跌到 19456——差正好
-    // 12288 = 12×1024，即 kick_prep() 里 `xTaskCreatePinnedToCore(prep_task,
-    // "book_prep", 12*1024, ...)` 建在内部 DRAM 的任务栈。任务栈是每帧热路径，
-    // 按冷热纪律**不可搬 PSRAM**，所以解法是把它变成边界清晰的租户：关书即停
-    // 即删，下次开书 kick_prep 会按 `if (!s_prep_task && ...)` 重建。
-    // 原先只有 book_on_exit（离页）才 vTaskDelete，于是「关掉一本书」后这笔 12K
-    // 仍常驻内部堆，推送预检因此卡在 19456 < 闸门 20K 被拒——这正是真机
-    // 「开大书后点推送被拒」的直接属主。
-    // Gen25 (pooling, lifetime closure): book_prep's 12K task stack is returned
-    // with the book. Data-layer fact: the internal largest block sits at 31744
-    // when healthy and drops to 19456 once a book is open - the difference is
-    // exactly 12288 = 12*1024, the stack kick_prep() creates in internal DRAM
-    // with xTaskCreatePinnedToCore(prep_task, "book_prep", 12*1024, ...). A task
-    // stack is per-frame hot, so the冷热 discipline forbids moving it to PSRAM;
-    // the fix is to make it a well-bounded tenant: stop and delete it on close,
-    // and let the next open rebuild it (kick_prep()'s `if (!s_prep_task && ...)`
-    // already does). Until now only book_on_exit (leaving the app) deleted it, so
-    // closing a book left the 12K resident and the push precheck sat at
-    // 19456 < the 20K gate - the direct owner of the hardware "push refused
-    // after opening a big book" report.
+    // gen25（池化 · 生命周期收口）+ gen26（降栈 12K→6K）：book_prep 的 6K 任务栈随书归还。
+    // 数据层硬事实：内部最大块健康常驻 31744，开书后跌到 25600（gen25 在 12K 栈时
+    // 跌到 19456）——差正好 6144 = 6×1024，即 kick_prep() 里 `xTaskCreatePinnedToCore
+    // (prep_task, "book_prep", 6*1024, ...)` 建在内部 DRAM 的任务栈。任务栈是每帧热路径，
+    // 按冷热纪律**不可搬 PSRAM**，所以解法是把它变成边界清晰的租户：关书即停即删，
+    // 下次开书 kick_prep 会按 `if (!s_prep_task && ...)` 重建。gen25 时 19456 < 闸门 20K
+    // 致推送预检被拒（「开大书后点推送被拒」）；gen26 降栈后开书 largest≈25600 > 20K
+    // 闸门，预检直接过、让路鲜少触发（让路机制保留为保险，不删）。
+    // Gen25 (pooling, lifetime closure) + gen26 (stack 12K->6K): book_prep's 6K
+    // task stack is returned with the book. Data-layer fact: the internal largest
+    // block sits at 31744 when healthy and drops to 25600 once a book is open
+    // (at gen25's 12K stack it dropped to 19456) - the difference is exactly
+    // 6144 = 6*1024, the stack kick_prep() creates in internal DRAM with
+    // xTaskCreatePinnedToCore(prep_task, "book_prep", 6*1024, ...). A task stack
+    // is per-frame hot, so the冷热 discipline forbids moving it to PSRAM; the fix
+    // is to make it a well-bounded tenant: stop and delete it on close, and let
+    // the next open rebuild it (kick_prep()'s `if (!s_prep_task && ...)` already
+    // does). At gen25's 12K the 19456 < 20K gate blocked the push precheck (the
+    // "push refused after opening a big book" report); after gen26's cut the
+    // book-open largest is ~25600 > 20K, so the precheck passes and yield rarely
+    // fires (the yield path stays as insurance, not removed).
     // 停机协议见 prep_task_request_stop()：**只请求，不强删**——任务自己在
     // 安全点（无锁、无临时缓冲）退出并回收栈，task self-delete 天然幂等，
     // 两条路径（关书 / 离页）先后调用也不会重复删。

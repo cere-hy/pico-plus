@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico25.2（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico26（gen25.2 为 0.3.3-pico25.2；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico25.2 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
+# Version string: 0.3.3-pico26 (gen25.2 was 0.3.3-pico25.2; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1480,9 +1480,52 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   gen25/gen25.1 field by field; partition-table `9d5d890b…` and
 #   ota_data_initial `7d2c7ac4…` byte-identical to gen25; bootloader
 #   `95ae371c…` -> `a399f196…` (same 21,232 B, build-timestamp difference).
+# gen26（块0 · 降栈 12K→6K + HWM 打印纠错 + 版本串 bump）：
+#   版本串：0.3.3-pico26（三处同步；必须换串——同串会被 TF 卡升级判「版本相同」拒绝）。
+#   范围（本代只落块0，块1–5 待续）：① prep 任务栈 12*1024→6*1024（实测峰值
+#   ~2.8K，留 ~3.3K 余量，省 6K 内部堆；开书 largest 由 ~19456 抬到 ~25600，>20K
+#   闸门故让路鲜少触发、降为保险）；② 修复 HWM 打印——本 port 的
+#   portSTACK_TYPE=uint8_t 致 HWM 计数单位=1 字节，旧 `words` 标签误导（gen25
+#   曾误读为「4 B/word→9.2K 已占用→不降栈」）；改为显式 `B free / peak used /
+#   total`；③ 三处版本串 0.3.3-pico25.2→pico26。调用方图谱：栈/日志均为 prep
+#   内部，无外部 API 改动，无调用方影响。
+#   门禁：fullclean exit 0，8 警告同基线逐条对表（app_book.c 7 + ui_pinpad.c 1，
+#   零新增）；宿主 runner 14/14 全绿（book_management 56 PASS + 2 KNOWN-FAIL 同
+#   口径；ui_kit 的 r93 KNOWN-FAIL 容忍为非回归）；无变异回归。
+#   锚：Read_Pico.bin 4,066,400 B（相对 gen25.2 的 4,066,384 为 **+16 B**，双操作数
+#   4,066,400-4,066,384=+16——HWM 打印串变长 + 版本串缩短净增，rodata 增长；
+#   代码段 seg1 未动）；sha256 `39309cd1…`；seg1 File offs `0x002341d8`（paddr =
+#   offs + 0x10008 = 0x002441e0）、Load `0x3fc9c700`、len `0x08a8c`，与 gen25.2
+#   逐字段一致；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…` 与
+#   gen25.2 逐字节一致；bootloader `c720f1bc…`（同 21,232 B，时间戳差异 vs gen25.2
+#   的 `a399f196…`）。
+# Gen26 (block 0 - stack 12K->6K + HWM print fix + version bump):
+#   Version string: 0.3.3-pico26 (three places in sync; the tag must change - the
+#   same tag would make the TF-card upgrade reject the package as "same version").
+#   Scope (this gen ships block 0 only; blocks 1-5 pending): ① prep task stack
+#   12*1024 -> 6*1024 (measured peak ~2.8K, ~3.3K headroom, saves 6K internal
+#   heap; book-open largest rises ~19456 -> ~25600, above the 20K gate so yield
+#   rarely fires and becomes insurance); ② HWM print fix - this port's
+#   portSTACK_TYPE=uint8_t makes the HWM count unit 1 byte, so the old `words`
+#   label misled (gen25 misread it as "4 B/word -> 9.2K used -> keep 12K"); now
+#   prints explicit `B free / peak used / total`; ③ 0.3.3-pico25.2 -> pico26.
+#   Caller graph: stack + log are prep-internal, no external API change, no
+#   caller impact.
+#   Gate: fullclean exit 0, 8-warning baseline intact (app_book.c 7 + ui_pinpad.c
+#   1, zero new); 14/14 host runners green (book_management 56 PASS + 2 KNOWN-FAIL
+#   same caliber; ui_kit's r93 KNOWN-FAIL tolerated as non-regression); no
+#   mutation regression.
+#   Anchors: Read_Pico.bin 4,066,400 B (**+16 B** vs gen25.2's 4,066,384; both
+#   operands 4,066,400-4,066,384=+16 - the longer HWM print string net of the
+#   shorter version string, rodata growth; the code segment seg1 is untouched);
+#   sha256 `39309cd1…`; seg1 File offs `0x002341d8` (paddr = offs + 0x10008 =
+#   0x002441e0), Load `0x3fc9c700`, len `0x08a8c` - identical to gen25.2 field by
+#   field; partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…`
+#   byte-identical to gen25.2; bootloader `c720f1bc…` (same 21,232 B, timestamp
+#   difference vs gen25.2's `a399f196…`).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="8818e1934c3bd2bbea6f7c9a1a547fe4f563a3c90e0ba5555f320a959ed07b9b"
+EXPECTED="39309cd12e61af87c5fa0f6da235ce32c4760c62a53b4497866d43e3f0077b3e"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
