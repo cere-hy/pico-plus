@@ -1130,7 +1130,26 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
         }
         if(hit(continue_card_hit_rect(),x,y)) {
             home_book_t *b=featured();
-            if(b->path[0] && app_book_request_open_from_home(b->path)){ui_nav_request(ctx,1);return APP_REDRAW_NONE;}
+            // gen25.2（补 gen25.1 的漏）：continue 卡是「从首页恢复最近阅读」——
+            // 语义就是 resume。gen25.1 只在 app_book_request_resume 真身置位
+            // s_open_full_once（首屏 GC16 打底），而本卡当时走
+            // app_book_request_open_from_home（该函数不置位），导致真机验收
+            // 「首页最近阅读进去还有残影」——修改落空。改调 resume 后本卡与
+            // 开机恢复/让路 restore 统一拿首屏打底。fullscreen 显式 true 与
+            // 原 from_home 路径的 s_requested_fullscreen=true 等价（request_open
+            // 内置），行为零损失。
+            // Gen25.2 (plugging gen25.1's miss): the continue card is "resume
+            // recent reading from home" - resume semantics. gen25.1 set
+            // s_open_full_once (first-screen GC16 base) only in the resume
+            // body, while this card went through
+            // app_book_request_open_from_home (which does not set it), so the
+            // hardware check "recent reading from home still ghosts" failed -
+            // the fix never reached here. Calling resume unifies this card
+            // with boot recovery / yield restore for the first-screen base.
+            // The explicit fullscreen=true equals the old from_home path's
+            // s_requested_fullscreen=true (set inside request_open) - zero
+            // behavior loss.
+            if(b->path[0] && app_book_request_resume(b->path, true)){ui_nav_request(ctx,1);return APP_REDRAW_NONE;}
             if(restore){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}
             return APP_REDRAW_NONE;
         }

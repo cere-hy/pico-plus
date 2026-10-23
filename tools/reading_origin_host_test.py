@@ -45,7 +45,7 @@ static EpdRect s_pressed,s_area;
 typedef struct {char path[32];} home_book_t;
 static home_book_t book={"/sdcard/books/Novel/a.epub"};
 static home_book_t *featured(void){return &book;}
-static int open_calls,nav=-1;static bool fail_open;
+static int open_calls,nav=-1;static bool fail_open,resume_fullscreen;
 static int app_settings_home_component(void){return 0;}
 static int app_settings_set_home_component(int i){(void)i;return 0;}
 static int app_settings_home_goal_minutes(void){return 30;}
@@ -54,7 +54,15 @@ static unsigned component_index(int c){(void)c;return 0;}
 static void refresh_days(void){}
 static int ui_nav_hit(int x,int y){(void)x;return y>=1096?2:-1;}
 static void ui_nav_request(app_ctx_t *ctx,int tab){(void)ctx;nav=tab;}
-static bool app_book_request_open_from_home(const char *path){assert(!strcmp(path,book.path));++open_calls;return !fail_open;}
+// gen25.2：continue 卡改调 resume（「从首页恢复最近阅读」= resume 语义）——
+// gen25.1 只改 resume 真身置位首屏 GC16，而本卡当时走 from_home（不置位），
+// 修改落空、真机验收报残影。替身记录 fullscreen 实参并对调用方断言。
+// Gen25.2: the continue card now calls resume ("resume recent reading from
+// home" = resume semantics) - gen25.1 set the first-screen GC16 only in the
+// resume body while this card went through from_home (no set), so the fix
+// never reached here and hardware reported ghosting. The double records the
+// fullscreen argument and asserts on the caller.
+static bool app_book_request_resume(const char *path,bool fullscreen){assert(!strcmp(path,book.path));resume_fullscreen=fullscreen;++open_calls;return !fail_open;}
 static int picker_calls;
 const app_desc_t app_transfer={0};
 void app_transfer_request_method_picker(void){++picker_calls;}
@@ -90,12 +98,17 @@ int main(void){app_ctx_t ctx={0};
  // gen24.3 problem 1: the continue card's hit area's lower edge moves
  // 574 -> 566 (zero overlap with the push card's hit area).
  for(int y=172;y<566;y+=17)for(int x=24;x<660;x+=17){
-  s_view=HOME_ROOT;nav=-1;int old=open_calls;
+  s_view=HOME_ROOT;nav=-1;resume_fullscreen=false;int old=open_calls;
   ui_gesture_event_t ev={UI_GESTURE_PRESS,x,y,x,y};
   assert(on_gesture(&ctx,&ev)==APP_REDRAW_AREA&&continue_card_pressed());
   assert(s_area.x==56&&s_area.y==270&&s_area.width==184&&s_area.height==252); // no added card frame
   ev.type=UI_GESTURE_TAP;assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE);
-  assert(open_calls==old+1&&nav==1&&!s_press_pending);++points;
+  // gen25.2：continue 卡必须走 resume 且 fullscreen=true（首屏 GC16 打底随
+  // resume 真身置位生效；改回 from_home 则 resume_fullscreen 不置、断言红）。
+  // Gen25.2: the continue card must call resume with fullscreen=true (the
+  // first-screen GC16 base rides the resume body's set; reverting to from_home
+  // leaves resume_fullscreen false and fails the assert).
+  assert(open_calls==old+1&&nav==1&&resume_fullscreen&&!s_press_pending);++points;
  }
  // gen24.3 问题 1 加固：推流卡带 [566,640) 全网格点按——只跳传书页
  // （picker 被调 + request_app 落 app_transfer），绝不开书；修复前

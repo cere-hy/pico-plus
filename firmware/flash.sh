@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico25.1（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico25.2（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico25.1 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
+# Version string: 0.3.3-pico25.2 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1425,9 +1425,64 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   field; partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…`
 #   byte-identical to gen25; bootloader `834ec762…` -> `95ae371c…` (same
 #   21,232 B, build-timestamp difference).
+# gen25.2（补 gen25.1 的漏：首页 continue 卡未走 resume，修改落空）：
+#   版本串：0.3.3-pico25.2（三处同步；必须换串——同串会被 TF 卡升级判「版本相同」拒绝）。
+#   根因（gen25.1 真机验收失败后诊断）：gen25.1 只在 app_book_request_resume 真身
+#   置位 s_open_full_once（首屏 GC16 打底），而首页「最近阅读」continue 卡
+#   （app_dashboard.c continue_card_hit_rect 分支）走的是
+#   app_book_request_open_from_home——该函数不置位。from_home 的唯一固件调用方
+#   正是这张卡，故 gen25.1 的修改对首页场景完全落空；开机恢复（app_main.c）与
+#   让路 restore（app_book.c）本就走 resume，不受影响。
+#   修法：continue 卡改调 app_book_request_resume(b->path, true)——「从首页恢复
+#   最近阅读」本就是 resume 语义；fullscreen 显式 true 与原 from_home 路径的
+#   s_requested_fullscreen=true 等价（request_open 内置），行为零损失。三条
+#   resume 来路（首页 continue 卡 / 开机恢复 / 让路 restore）自此统一拿首屏打底。
+#   门禁：宿主 runner 14/14 全绿；reading_origin_host_test 替身改 resume 并断言
+#   fullscreen 实参（变异有牙：continue 卡改回 from_home → 断言红，还原复绿；
+#   1102 全网格点击点全部覆盖）；reader_fullscreen 的 resume/from_home 断言保持
+#   （from_home 真身未动）；book_management 56 PASS + 2 KNOWN-FAIL 同口径维持；
+#   fullclean exit 0，8 警告同基线逐条对表（app_book.c 7 + ui_pinpad.c 1）。
+#   锚：Read_Pico.bin 4,066,384 B（相对 gen25/gen25.1 的 4,066,576 为 **-192 B**，
+#   双操作数 4,066,384-4,066,576=-192——调用点收敛后代码略减），sha256
+#   `8818e193…`；seg1 File offs `0x002341d8`（paddr = offs + 0x10008 =
+#   0x002441e0）、Load `0x3fc9c700`、len `0x08a8c`，与 gen25/gen25.1 逐字段一致；
+#   partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…` 与 gen25 逐字节一致；
+#   bootloader `95ae371c…`→`a399f196…`（同 21,232 B，编译时间戳差异）。
+# Gen25.2 (plugging gen25.1's miss: the home continue card never took resume):
+#   Version string: 0.3.3-pico25.2 (three places in sync; the tag must change -
+#   the same tag would make the TF-card upgrade path reject the package as
+#   "same version").
+#   Root cause (diagnosed after gen25.1's failed hardware check): gen25.1 set
+#   s_open_full_once (first-screen GC16 base) only in the
+#   app_book_request_resume body, while the home "recent reading" continue card
+#   (app_dashboard.c's continue_card_hit_rect branch) went through
+#   app_book_request_open_from_home - which does not set it. That card is the
+#   only firmware caller of from_home, so gen25.1's fix never reached the home
+#   scenario; boot recovery (app_main.c) and the yield restore (app_book.c)
+#   already took resume and were unaffected.
+#   Fix: the continue card now calls app_book_request_resume(b->path, true) -
+#   "resume recent reading from home" is resume semantics; the explicit
+#   fullscreen=true equals the old from_home path's s_requested_fullscreen=true
+#   (set inside request_open), zero behavior loss. All three resume sources
+#   (home continue card / boot recovery / yield restore) now share the
+#   first-screen base.
+#   Gate: 14/14 host runners green; reading_origin_host_test's double becomes
+#   resume and asserts the fullscreen argument (mutation bites: reverting the
+#   card to from_home fails the assert, restore returns green; all 1,102
+#   full-card hit grid points covered); reader_fullscreen's resume/from_home
+#   assertions stand (the from_home body is untouched); book_management 56 PASS
+#   + 2 KNOWN-FAIL same caliber; fullclean exit 0 with the 8-warning baseline
+#   intact (app_book.c 7 + ui_pinpad.c 1). Anchors: Read_Pico.bin 4,066,384 B
+#   (**-192 B** vs gen25/gen25.1's 4,066,576; both operands
+#   4,066,384-4,066,576=-192 - the call-site convergence slightly shrank the
+#   code), sha256 `8818e193…`; seg1 File offs `0x002341d8` (paddr = offs +
+#   0x10008 = 0x002441e0), Load `0x3fc9c700`, len `0x08a8c` - identical to
+#   gen25/gen25.1 field by field; partition-table `9d5d890b…` and
+#   ota_data_initial `7d2c7ac4…` byte-identical to gen25; bootloader
+#   `95ae371c…` -> `a399f196…` (same 21,232 B, build-timestamp difference).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="11bcf6435c43d1f6a22e379e2e723603b0844dab7daf2b1ed49ec910a68a34e8"
+EXPECTED="8818e1934c3bd2bbea6f7c9a1a547fe4f563a3c90e0ba5555f320a959ed07b9b"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
