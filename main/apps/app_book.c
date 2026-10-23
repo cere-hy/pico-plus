@@ -516,6 +516,24 @@ bool app_book_request_open_from_home(const char* path) {
 bool app_book_request_resume(const char *path, bool fullscreen) {
     if (!app_book_request_open_from_home(path)) return false;
     s_requested_fullscreen = fullscreen;
+    // gen25.1（resume 首屏 GC16 打底）：resume 的三种来路——首页「继续阅读」卡、
+    // 开机恢复（boot recovery）、让路 restore 恢复原书——全部从旧屏差分进阅读页，
+    // 首屏走 APP_PAGE_REFRESH_MODE(GL16) 差分，旧墨（首页大卡/底栏/传书页卡片）
+    // 会留在第一页上；真机报「最近阅读点开有残影」。与 gen24.4 open_clean 同族
+    // 同一标志：present 的 update_display_full 分支消费一次即止，后续翻页节拍
+    // 零变化（gen24.4 红线不破）。开书失败时标志残留的最坏后果是下次开书多一次
+    // 整屏 GC16，与 open_clean 同款语义，不单独造轮子。
+    // Gen25.1 (resume first screen GC16 base): all three resume sources - the
+    // home "continue reading" card, boot recovery, and the yield restore of the
+    // original book - enter the reader differentially, and the first screen's
+    // APP_PAGE_REFRESH_MODE (GL16) differential keeps the old ink (home card /
+    // nav bar / transfer cards); hardware reported ghosting when opening recent.
+    // Same flag family as gen24.4's open_clean: consumed once by present's
+    // update_display_full branch; later turns keep their cadence (the gen24.4
+    // red line holds). If the open fails the flag's worst case is one extra
+    // screen-wide GC16 on the next open - same semantics as open_clean, no new
+    // mechanism.
+    s_open_full_once = true;
     return true;
 }
 
@@ -580,6 +598,11 @@ bool app_book_restore_after_push(void) {
     // The user opened something else during the yield: give up rather than
     // override them.
     if (s_text && s_path[0]) { s_yield_path[0] = 0; return false; }
+    // gen25.1：restore 复用 request_resume，因此恢复原书的首屏顺带获得一次
+    // 整屏 GC16 打底（resume 真身置位 s_open_full_once），无需单独处理。
+    // Gen25.1: restore reuses request_resume, so the restored book's first
+    // screen gets the one-time GC16 base for free (the resume body sets
+    // s_open_full_once) - no separate handling needed.
     bool ok = app_book_request_resume(s_yield_path, true);
     ESP_LOGI(TAG, "restore after push: %s (%s)", ok ? "requested" : "FAILED", s_yield_path);
     s_yield_path[0] = 0;

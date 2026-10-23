@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico25（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico25.1（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico25 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
+# Version string: 0.3.3-pico25.1 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1359,9 +1359,75 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #     len `0x08a8c`; partition-table `9d5d890b…` and ota_data_initial
 #     `7d2c7ac4…` are byte-identical to gen24.5; bootloader `cbe2b12a…` ->
 #     `834ec762…` (same 21,232 B, build-timestamp difference).
+# gen25.1（resume 首屏 GC16 打底热修，一行级、独立热修不并入 gen26）：
+#   版本串：0.3.3-pico25.1（三处同步：CMakeLists.txt + 本记录 + 顶部版本串注释）。
+#   三项核查（落码前）：① resume 首屏当前档位 = GL16 差分
+#   （present 末分支 update_display_mode_diff(APP_PAGE_REFRESH_MODE)，balanced
+#   档 APP_PAGE_REFRESH_MODE=MODE_GL16），与书架普通开书同档——push.txt 的干净
+#   不来自 request_open 本身，而来自 gen24.4 open_clean / gen25 push_first_open
+#   置位 s_open_full_once 后 present 的 update_display_full 分支（GC16）；
+#   ② gen24.5→gen25 diff 显示 app_book_request_resume 函数体零改动——既存缺口，
+#   非 gen25 回归；③ 让路 restore 复用 app_book_request_resume
+#   （app_book_restore_after_push → request_resume），修复后 restore 首屏顺带干净。
+#   修法：app_book_request_resume 置位 s_open_full_once（与 open_clean 同族同一
+#   标志，present 既有 update_display_full 消费点，一次即止），只动 resume 一条
+#   路径——书架/push.txt/自动开书不碰，后续翻页节拍零变化（gen24.4 红线不破）。
+#   resume 三种来路全覆盖：首页「继续阅读」卡、开机恢复（boot recovery）、
+#   让路 restore 恢复原书。
+#   门禁：宿主 runner 14/14 全绿；book_management 同口径双操作数——检出 gen25
+#   提交 54f2ddf 同 runner 复跑（补 managed_components 未跟踪依赖）：基线 56 PASS
+#   + 2 KNOWN-FAIL = gen25.1 56 PASS + 2 KNOWN-FAIL，PASS 集合逐条 identical
+#   （gen25 轮「73 PASS」为旧计数口径，本轮以同 runner 同口径复核为准）；
+#   reader_fullscreen 新增 resume 置位断言（变异有牙：撤除置位 → 断言精确红，
+#   还原复绿）；ui_refresh_feedback 增 resume 序列回归（首屏一次 GC16 后翻页仍走
+#   READER 差分 = 节拍不变）；transfer_ui 不变（绿）；fullclean exit 0，8 警告同
+#   基线逐条对表（app_book.c 7 + ui_pinpad.c 1，零新增）。
+#   锚：Read_Pico.bin 4,066,576 B（与 gen25 等长，双操作数
+#   4,066,576-4,066,576=+0——一行 store 与版本串增长被段对齐吸收），sha256
+#   `11bcf643…`；seg1 File offs `0x002341d8`（paddr = offs + 0x10008 =
+#   0x002441e0）、Load `0x3fc9c700`、len `0x08a8c`，与 gen25 逐字段一致；
+#   partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…` 与 gen25 逐字节
+#   一致；bootloader `834ec762…`→`95ae371c…`（同 21,232 B，编译时间戳差异）。
+# Gen25.1 (resume first-screen GC16 base hotfix - one line, standalone, NOT
+#   folded into gen26):
+#   Version string: 0.3.3-pico25.1 (three places in sync).
+#   Three checks (before coding): (1) resume's first screen currently takes the
+#   GL16 differential (present's final branch update_display_mode_diff(
+#   APP_PAGE_REFRESH_MODE), balanced profile MODE_GL16) - the same tier as an
+#   ordinary shelf open; push.txt's cleanliness does not come from request_open
+#   itself but from gen24.4's open_clean / gen25's push_first_open setting
+#   s_open_full_once, which routes present through update_display_full (GC16);
+#   (2) the gen24.5->gen25 diff shows app_book_request_resume's body untouched -
+#   a pre-existing gap, not a gen25 regression; (3) the yield restore reuses
+#   app_book_request_resume (app_book_restore_after_push -> request_resume), so
+#   the restored book's first screen is clean too.
+#   Fix: app_book_request_resume sets s_open_full_once (same flag family as
+#   open_clean; present's existing update_display_full branch consumes it once),
+#   touching the resume path only - shelf / push.txt / auto-open untouched, later
+#   turns keep their cadence (the gen24.4 red line holds). All three resume
+#   sources covered: the home "continue reading" card, boot recovery, and the
+#   yield restore of the original book.
+#   Gate: 14/14 host runners green; book_management same-caliber double operand -
+#   gen25 commit 54f2ddf checked out and re-run on the same runner (with the
+#   untracked managed_components restored): baseline 56 PASS + 2 KNOWN-FAIL =
+#   gen25.1 56 PASS + 2 KNOWN-FAIL, PASS sets identical line by line (gen25's
+#   "73 PASS" was the old counting caliber - this round re-verifies on the same
+#   runner); reader_fullscreen gains the resume-set assertion (mutation bites:
+#   removing the set fails the assert exactly, restore returns green);
+#   ui_refresh_feedback gains the resume sequence (one first-screen GC16, then
+#   turns still take the READER differential = cadence unchanged); transfer_ui
+#   unchanged (green); fullclean exit 0 with the 8-warning baseline intact
+#   (app_book.c 7 + ui_pinpad.c 1, zero new). Anchors: Read_Pico.bin 4,066,576 B
+#   (equal length to gen25; both operands 4,066,576-4,066,576=+0 - the one store
+#   plus the version-string growth absorbed by section alignment), sha256
+#   `11bcf643…`; seg1 File offs `0x002341d8` (paddr = offs + 0x10008 =
+#   0x002441e0), Load `0x3fc9c700`, len `0x08a8c` - identical to gen25 field by
+#   field; partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…`
+#   byte-identical to gen25; bootloader `834ec762…` -> `95ae371c…` (same
+#   21,232 B, build-timestamp difference).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="de93e5e403e9ff4ca504217ef6325b8be29fb1dae9a34b3d49564cd85493df61"
+EXPECTED="11bcf6435c43d1f6a22e379e2e723603b0844dab7daf2b1ed49ec910a68a34e8"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

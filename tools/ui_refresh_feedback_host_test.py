@@ -264,14 +264,24 @@ int main(void){
  }
  // gen24.4：推送收官开书第一页。APP_REDRAW_PAGE 默认走 READER 差分（残影
  // 根源）；s_open_full_once 置位时强制整屏 GC16 且一次即止。
+ // gen25.1：resume（首页继续阅读/开机恢复/让路 restore）复用同一标志，故
+ // 同一组断言同时覆盖 resume 首屏打底与「恢复后翻页节拍不变」。
  // Gen24.4: the push finale's reader first page. APP_REDRAW_PAGE defaults to
  // the READER differential (the ghosting's root); with s_open_full_once set it
  // forces a screen-wide GC16, once.
+ // Gen25.1: resume (home continue-reading / boot recovery / yield restore)
+ // reuses the same flag, so this block also covers resume's first-screen base
+ // and "turns after restore keep their cadence".
  s_reader_cleanup=false;s_open_full_once=false;trace_count=0;
  assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==READER);
  s_open_full_once=true;trace_count=0;
  assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==FULL&&pushed_mode==MODE_GC16&&!s_open_full_once);
- s_open_full_once=false;
+ // gen25.1：resume 序列——首屏一次 GC16 后，下一帧翻页仍走 READER 差分
+ // （节拍零变化，gen24.4 红线）。/ Gen25.1: resume sequence - after the
+ // one-time first-screen GC16, the next turn still takes the READER
+ // differential (zero cadence change, the gen24.4 red line).
+ s_open_full_once=false;s_reader_turn_pending=true;trace_count=0;
+ assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==READER);
  s_reader_fullscreen=false;s_reader_turn_pending=true;s_reader_image_refresh_pending=true;
  trace_count=0;assert(present(&ctx,APP_REDRAW_AREA));
  assert(trace_count==1&&route==AREA&&pushed_mode==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
