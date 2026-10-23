@@ -145,9 +145,10 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico26.1（块0 为 0.3.3-pico26；沿用旧串会让 TF 卡升级
-# 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico26.1 (block 0 was 0.3.3-pico26; reusing an older tag makes
+# 版本串 / Version string: 0.3.3-pico26.2（gen26.1 为 AI 查词包；本代修回流时序
+# defect。沿用旧串会让 TF 卡升级判「版本相同」而拒绝，故每代 fork 专属可区分串）。
+# Version string: 0.3.3-pico26.2 (gen26.1 was the AI-lookup package; this
+# generation fixes the ride-along flush timing defect. Reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1604,9 +1605,92 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   sha256 `d45c7096…`; partition-table `9d5d890b…` and ota_data_initial
 #   `7d2c7ac4…` byte-identical to block 0; bootloader `15f97791…` (same 21,232 B,
 #   timestamp difference).
+# gen26.2（回流时序 defect 热修 · AI 链首验暴露、当日裁定即修的小包）：
+#   根因（真机首验判读，gen26ai-log 实证）：ai_on_connect()（CAPS 0x18 +
+#   ai_flush_queue() 逐词 0x17）在 BLE CONNECT 事件内调用，而手机 CCCD 订阅
+#   迟到 ~470ms；notify_status() 对未订阅 peer 直接丢帧（if (!s_status_
+#   subscribed) { ESP_LOGD dropped; return; }——LOGD 在 release 构建不可见，
+#   丢帧静默）；ai_flush_queue() 不论投递成败逐个 dequeue——帧丢词也被吃，
+#   离线队列每次重连被静默清空；订阅处理器只置旗 + 日志，不重发 s_last_status。
+#   三重叠加后果：连接后订阅窗口内到达的点词全部流失。宿主测试不可见（不模拟
+#   GAP 回调），仅设备级时序暴露——真机首验「功能全绿但无任何 AI 界面」即此
+#   defect 的正确表现（APK 无应答方时无 AI 界面本是半链预期，但回流路径本身
+#   已断，半链也验不到回流）。
+#   修复（push_sink.c 三处，最小改动）：① ai_on_connect() 更名 ai_on_subscribed()
+#   并补双语根因注释；② CONNECT 处理器移除调用、留注释说明改在 SUBSCRIBE 交付；
+#   ③ SUBSCRIBE 处理器在 cur_notify != 0（peer 已订阅，可收帧的首个时刻）时
+#   持锁调用 ai_on_subscribed()——订阅前 ~470ms 窗口内入队的点词在此一并交付。
+#   协议上下文扩展（词+书+位置，微信读书式架构）不现在动，并入 APK 应用侧
+#   立项，C/Java/Python 三端同步登记即冻结。
+#   门禁：宿主 runner 248 checks, 0 red（gen26 基线不松动）；fullclean exit 0，
+#   真 fullclean 编 1,244 个编译单元，8 警告 = §33 原始全量基线（app_book.c 7 +
+#   ui_pinpad.c 1）逐条一致、零新增——§38 挂账的「8→7 漂移」至此结案：旧
+#   「fullclean」日志只编 13 个文件，实为增量构建覆盖伪影，ui_pinpad.c 未被
+#   重编故少一警告；本次真全量复现 8 警告坐实此判。
+#   锚：Read_Pico.bin 4,070,048 B（相对 gen26.1 的 4,070,032 为 **+16 B**，双
+#   操作数 4,070,048-4,070,032=+16）；段级净和 seg3(IROM)+20（0x18c588→
+#   0x18c59c，修复代码在 seg3）+ 尾注差 **-4**（40→36，16B 对齐余数挪动）
+#   ——**分项净和 + 尾注差 = 总差，逐分闭合**（新门禁固定项再战）；seg1
+#   File offs `0x00234308`（paddr = offs + 8 + 0x10000 = `0x00244310`）、
+#   Load `0x3fc9c700`、len `0x08a8c`——与 gen26.1 **零偏移**，双锚再守。
+#   sha256 `5a97ef4a…`；partition-table `9d5d890b…`、ota_data_initial
+#   `7d2c7ac4…` 与 gen26.1 逐字节一致；bootloader `36c0a5e3…`（同 21,232 B，
+#   时间戳差异 vs gen26.1 的 `15f97791…`）。
+#   真机复测面（待验）：半链回归全绿（同 gen26.1 面）；有 PC 蓝牙适配器则用
+#   android-tools/push_pico.py 做全链回流复测——断开态点词入队→重连→订阅
+#   事件后 CAPS+逐词 0x17 交付→PC 回 0x07→释义卡弹出。
+# Gen26.2 (reflux-timing defect hotfix - exposed by the first live AI-chain
+#   verification, ruled "fix" and shipped same-day as a small package):
+#   Root cause (first-live-verdict reading, gen26ai-log evidence):
+#   ai_on_connect() (CAPS 0x18 + ai_flush_queue() word-by-word 0x17) ran inside
+#   the BLE CONNECT event, while the phone's CCCD subscription lands ~470 ms
+#   late; notify_status() drops frames for unsubscribed peers outright
+#   (if (!s_status_subscribed) { ESP_LOGD dropped; return; } - LOGD invisible
+#   in release builds, so the drop is silent); ai_flush_queue() dequeues every
+#   word regardless of delivery outcome - dropped frames eat the words, and the
+#   offline queue is silently cleared on every reconnect; the subscribe handler
+#   only sets the flag + logs, never resending s_last_status. Triple-stacked
+#   consequence: every word tapped inside the post-connect pre-subscribe window
+#   is lost. Invisible to host tests (GAP callbacks are not simulated), only
+#   device-level timing exposes it - the first live run's "all functions green
+#   but no AI UI at all" is exactly this defect's correct behavior (no AI UI
+#   without a PC responder is expected for the half-chain, but the reflux path
+#   itself was already broken, so even the half-chain could not see reflux).
+#   Fix (push_sink.c, three edits, minimal): ① ai_on_connect() renamed
+#   ai_on_subscribed() with a bilingual root-cause comment; ② the CONNECT
+#   handler drops the call, leaving a comment that delivery moved to SUBSCRIBE;
+#   ③ the SUBSCRIBE handler calls ai_on_subscribed() under the lock when
+#   cur_notify != 0 (peer subscribed - the first moment frames can be
+#   received) - words enqueued during the ~470 ms pre-subscribe window are
+#   delivered here too. The protocol context extension (word + book + position,
+#   the WeChat-Reading-style architecture) is NOT moved now; it folds into the
+#   APK app-side project, registered as frozen across C/Java/Python.
+#   Gate: host runner 248 checks, 0 red (the gen26 baseline unshaken); fullclean
+#   exit 0, a true fullclean of 1,244 compilation units, 8 warnings = the §33
+#   original full baseline (app_book.c 7 + ui_pinpad.c 1) line by line, zero
+#   new - the "8->7 drift" booked in §38 closes here: the old "fullclean" log
+#   compiled only 13 files, actually an incremental-build coverage artifact -
+#   ui_pinpad.c was not recompiled hence one warning fewer; this true full run
+#   reproduces the 8 and settles the call.
+#   Anchors: Read_Pico.bin 4,070,048 B (**+16 B** vs gen26.1's 4,070,032; both
+#   operands 4,070,048-4,070,032=+16); segment-level sum seg3(IROM)+20
+#   (0x18c588->0x18c59c, the fix lives in seg3) + footer delta **-4** (40->36,
+#   the 16B-alignment residue shifted) - **sum of parts + footer delta = total,
+#   closed to the byte** (the new fixed gate item's second live run); seg1 File
+#   offs `0x00234308` (paddr = offs + 8 + 0x10000 = `0x00244310`), Load
+#   `0x3fc9c700`, len `0x08a8c` - **zero-offset vs gen26.1, the double anchor
+#   holds again**.
+#   sha256 `5a97ef4a…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to gen26.1; bootloader `36c0a5e3…` (same 21,232 B,
+#   timestamp difference vs gen26.1's `15f97791…`).
+#   Live re-test surface (pending): half-chain regression all green (same
+#   surface as gen26.1); with a PC Bluetooth adapter, run the full-chain reflux
+#   re-test with android-tools/push_pico.py - words tapped while disconnected
+#   enqueue -> reconnect -> CAPS + word-by-word 0x17 delivered at the SUBSCRIBE
+#   event -> PC replies 0x07 -> the definition card opens.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="d45c70965292c03c4c42f162196559ec17106329609354cf14a4a177e36456f6"
+EXPECTED="5a97ef4ac28ddc66b8463c721acefb1d3f32a1e24e8a8111b1ca03e2ea287984"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

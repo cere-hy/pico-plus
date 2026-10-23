@@ -1208,10 +1208,27 @@ static void ai_flush_queue(void) {
     }
 }
 
-// 连接建立：上报能力 + 回流离线队列。在 CONNECT 锁区内调用（notify 需持锁）。
-// On connect: report capability and flush the offline queue. Called inside the
-// CONNECT lock region (notify needs the lock held).
-static void ai_on_connect(void) {
+// 订阅建立：上报能力 + 回流离线队列。持锁调用（notify 需持锁）。
+// On subscription: report capability and flush the offline queue. Called with
+// the lock held (notify needs the lock held).
+//
+// gen26.2 根因修复：这两件事**不能**在 BLE CONNECT 事件里做。手机的 CCCD 订阅
+// 比连接建立晚 ~470ms（日志两会话实证），而 notify_status() 对未订阅的 peer
+// 直接丢帧（LOGD，release 不可见）；本函数若在 connect 时跑，CAPS 与全部
+// 回流帧都会被丢，且 ai_flush_queue() 不论投递成败逐个 dequeue——帧丢词也被
+// 吃，离线搭车队列每次重连被静默清空。订阅事件是 peer 可收帧的首个时刻，
+// 故 CAPS/回流/订阅窗口内积压的点词全部在此交付。
+// gen26.2 root-cause fix: these two things must NOT run in the BLE CONNECT
+// event. The phone's CCCD subscription lands ~470 ms after the connection is
+// established (measured in two sessions on hardware), and notify_status()
+// drops frames for a peer that has not subscribed (LOGD, invisible in
+// release); if this ran at connect time, CAPS and every flushed frame would
+// be dropped, and ai_flush_queue() dequeues each word regardless of delivery
+// - frames dropped AND words eaten, silently emptying the offline queue on
+// every reconnect. The subscribe event is the first moment the peer can
+// receive, so CAPS, the flush, and any taps queued inside the pre-subscribe
+// window are all delivered here.
+static void ai_on_subscribed(void) {
     if (!s_ai_enabled) return;
     ai_send_caps();
     ai_flush_queue();
@@ -1513,7 +1530,11 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         s_notify_retry_left = 3; // gen14：每个连接周期 3 次重投配额 / 3 retries per cycle
         ESP_LOGI(TAG, "phone connected");
         exec_actions(push_session_event(&s_sess, PUSH_EVT_CONNECT, NULL));
-        ai_on_connect(); // gen26：上报能力 + 回流离线待查词（持锁内调用）
+        // gen26.2：CAPS + 回流**不在此处**做——此刻 peer 尚未订阅，notify 全丢
+        // （详见 ai_on_subscribed 注释）。改在 SUBSCRIBE 事件交付。
+        // gen26.2: CAPS + flush are NOT done here - the peer has not subscribed
+        // yet and every notify would be dropped (see ai_on_subscribed). They are
+        // delivered in the SUBSCRIBE event instead.
         unlock();
         return 0;
 
@@ -1542,6 +1563,17 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
             s_status_subscribed = event->subscribe.cur_notify != 0;
             ESP_LOGI(TAG, "status notify %s (reason %u)",
                      s_status_subscribed ? "on" : "off", (unsigned)event->subscribe.reason);
+            if (s_status_subscribed) {
+                // gen26.2：订阅是 peer 可收帧的首个时刻——CAPS + 回流离线队列改在
+                // 此交付（connect 时做会被全丢 + 吃词，根因见 ai_on_subscribed）。
+                // gen26.2: subscription is the first moment the peer can receive -
+                // CAPS + the offline-queue flush are delivered here (doing it at
+                // connect dropped every frame and ate the words; root cause in
+                // ai_on_subscribed).
+                lock();
+                ai_on_subscribed();
+                unlock();
+            }
         }
         return 0;
 
