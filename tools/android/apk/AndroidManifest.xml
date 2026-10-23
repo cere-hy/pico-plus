@@ -11,8 +11,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.readpico.push"
-    android:versionCode="2"
-    android:versionName="1.1">
+    android:versionCode="3"
+    android:versionName="1.2">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
@@ -27,6 +27,11 @@
         android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
+    <!-- gen26 M1：AI 释义要调 LLM 出网（DeepSeek 等），必须显式声明；
+         蓝牙链路本身不上网，这条只服务查词。 -->
+    <!-- gen26 M1: AI definitions call an LLM over the network (DeepSeek etc.),
+         so INTERNET must be declared. BLE itself never touches the network. -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 

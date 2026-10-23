@@ -111,6 +111,27 @@ public class MainActivity extends Activity {
     private BluetoothAdapter adapter;
     private BluetoothGatt gatt;
 
+    /* ---- gen26 M1：AI 查词应答链 ----
+     * 设备点词 -> STATUS 0x17 -> APK 调 LLM -> CTRL 0x07 回传 -> 设备出释义卡。
+     * 要收到 0x17 就必须**保持连接**（现有推送流程是推完即断），所以监听是
+     * 一条独立的显式路径：不改 doPush 一行，老行为零退化。
+     * To receive 0x17 the link must stay up (the existing push flow disconnects
+     * when done), so listening is an explicit, separate path: doPush is
+     * untouched and the old behavior cannot regress.
+     */
+    private TextView aiStatus;
+    private Button btnListen;
+    private volatile boolean listenMode = false;
+    private volatile long devCaps = -1L;              // 设备能力位图（0x18 上报）
+    private volatile BluetoothGattCharacteristic cCtrlAi = null; // 回 0x07 用的 CTRL 特征
+    /** BLE 写串行锁：GATT 同时只容一个操作，AI 回帧与推送不得并发。 */
+    private final Object writeLock = new Object();
+
+    private static final String PREF = "ai";
+    private static final String PREF_KEY = "api_key";
+    private static final String PREF_BASE = "base_url";
+    private static final String PREF_MODEL = "model";
+
     /* ---- 同步门：worker 线程等待 BLE 回调 ---- */
     private final Object lock = new Object();
     private int connState = -1;
@@ -196,9 +217,19 @@ public class MainActivity extends Activity {
             if (!PushProto.STATUS_UUID.equalsIgnoreCase(c.getUuid().toString())) {
                 return;
             }
+            byte[] v = c.getValue();
+            byte[] copy = (v == null) ? null : v.clone();
+            // gen26 M1：AI 帧在推送流程之外单独分发（0x18 记能力位 / 0x17 触发查词）。
+            // 必须先分发再入 lastStatus——waitStatus 只认推送 opcode，不会吃掉 AI 帧，
+            // 所以这里也无需担心抢走推送流程要等的帧。
+            // The AI frames are dispatched outside the push flow; waitStatus only
+            // accepts push opcodes, so this can never steal a frame the push is
+            // waiting for.
+            if (copy != null) {
+                dispatchAiStatus(copy);
+            }
             synchronized (lock) {
-                byte[] v = c.getValue();
-                lastStatus = (v == null) ? null : v.clone();
+                lastStatus = copy;
                 lock.notifyAll();
             }
         }
@@ -356,6 +387,46 @@ public class MainActivity extends Activity {
         root.addView(row, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // ---- gen26 M1：AI 查词应答（设置入口 + 常驻监听开关）----
+        // 监听是显式开启的独立路径：不开就与老版本行为完全一致。
+        // Listening is an explicit, separate path: off means byte-identical old behavior.
+        aiStatus = new TextView(this);
+        aiStatus.setTextSize(12);
+        aiStatus.setPadding(0, dp(6), 0, dp(2));
+        root.addView(aiStatus, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout rowAi = new LinearLayout(this);
+        rowAi.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button btnAi = new Button(this);
+        btnAi.setText("AI 设置");
+        btnAi.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showAiSettings();
+            }
+        });
+        rowAi.addView(btnAi, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        btnListen = new Button(this);
+        btnListen.setText("连接并监听点词");
+        btnListen.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (listenMode) {
+                    stopListen();
+                } else {
+                    startListen();
+                }
+            }
+        });
+        rowAi.addView(btnListen, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(rowAi, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
         logScroll = new ScrollView(this);
         logView = new TextView(this);
         logView.setTextSize(12);
@@ -377,6 +448,7 @@ public class MainActivity extends Activity {
         loadClipboard();
         uiLog("就绪。在墨水屏上开启「接收推送」后，点「发送到墨水屏」。");
         refreshLocationBanner(); // gen23：进入 App 检测一次定位服务/权限
+        refreshAiStatus();       // gen26 M1：AI 状态行（key 是否配置 / 是否在监听）
     }
 
     @Override
@@ -391,6 +463,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        listenMode = false; // gen26 M1：退出即停监听，不留悬挂连接
         closeQuietly();
         super.onDestroy();
     }
@@ -1163,6 +1236,258 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {
             }
         }
+    }
+
+    /* ================= gen26 M1：AI 查词应答链 =================
+     * 设备点词 -> STATUS 0x17 -> 本 APK 调 LLM -> CTRL 0x07 回传 -> 设备出释义卡。
+     * 与推送流程完全并列：doPush 一行未改，不开监听即与老版本行为一致。
+     * key/prompt/模型全在 APK 侧（可热改），设备零改动。
+     */
+
+    /** 读本机保存的 AI 配置（key 只存 SharedPreferences，绝不进仓库）。 */
+    private AiClient.Config aiConfig() {
+        AiClient.Config cfg = new AiClient.Config();
+        android.content.SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
+        cfg.apiKey = sp.getString(PREF_KEY, "");
+        String base = sp.getString(PREF_BASE, "");
+        cfg.baseUrl = base.isEmpty() ? AiClient.DEFAULT_BASE_URL : base;
+        String model = sp.getString(PREF_MODEL, "");
+        cfg.model = model.isEmpty() ? AiClient.DEFAULT_MODEL : model;
+        return cfg;
+    }
+
+    private void saveAiConfig(String key, String base, String model) {
+        getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                .putString(PREF_KEY, key)
+                .putString(PREF_BASE, base)
+                .putString(PREF_MODEL, model)
+                .apply();
+    }
+
+    /** 刷新 AI 状态行与监听按钮文案（可在任意线程调用）。 */
+    private void refreshAiStatus() {
+        if (aiStatus == null) {
+            return;
+        }
+        AiClient.Config cfg = aiConfig();
+        StringBuilder sb = new StringBuilder("AI 释义：");
+        sb.append(cfg.apiKey.isEmpty() ? "未配置 key" : "key 已配置");
+        sb.append(" · ").append(cfg.model);
+        if (listenMode) {
+            sb.append(" · 监听中");
+            if (devCaps >= 0) {
+                sb.append(((devCaps & PushProto.CAP_AI_QUERY) != 0) ? " · 设备支持" : " · 设备不支持");
+            }
+        } else {
+            sb.append(" · 未监听");
+        }
+        final String text = sb.toString();
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                aiStatus.setText(text);
+                if (btnListen != null) {
+                    btnListen.setText(listenMode ? "停止监听" : "连接并监听点词");
+                }
+            }
+        });
+    }
+
+    /** AI 设置对话框：key / base_url / model 三项，服务商可换（不锁死）。 */
+    private void showAiSettings() {
+        AiClient.Config cfg = aiConfig();
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(16);
+        box.setPadding(p, p, p, p);
+
+        final EditText edKey = new EditText(this);
+        edKey.setHint("API key（只存本机，不进代码仓库）");
+        edKey.setText(cfg.apiKey);
+        edKey.setSingleLine(true);
+        box.addView(edKey);
+
+        final EditText edBase = new EditText(this);
+        edBase.setHint("base_url（默认 " + AiClient.DEFAULT_BASE_URL + "）");
+        edBase.setText(cfg.baseUrl);
+        edBase.setSingleLine(true);
+        box.addView(edBase);
+
+        final EditText edModel = new EditText(this);
+        edModel.setHint("model（默认 " + AiClient.DEFAULT_MODEL + "）");
+        edModel.setText(cfg.model);
+        edModel.setSingleLine(true);
+        box.addView(edModel);
+
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("AI 释义设置（默认 DeepSeek）")
+                .setView(box)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        saveAiConfig(edKey.getText().toString().trim(),
+                                edBase.getText().toString().trim(),
+                                edModel.getText().toString().trim());
+                        uiLog("AI 设置已保存到本机（key 不进仓库）");
+                        refreshAiStatus();
+                    }
+                })
+                .show();
+    }
+
+    /** 扫描 + 连接 + 订阅，然后**保持连接**等设备的点词通知。 */
+    private void startListen() {
+        if (aiConfig().apiKey.trim().isEmpty()) {
+            uiLog("请先点「AI 设置」填写 API key");
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                resetState();
+                uiLog("扫描设备……");
+                if (!scanForDevice()) {
+                    uiLog(failReason == null ? "未发现设备" : failReason);
+                    return;
+                }
+                uiLog("发现 " + foundName + "，连接中……");
+                BluetoothDevice dev = adapter.getRemoteDevice(foundAddr);
+                gatt = dev.connectGatt(MainActivity.this, false, gattCb,
+                        BluetoothDevice.TRANSPORT_LE);
+                if (gatt == null) {
+                    uiLog("connectGatt 返回 null");
+                    return;
+                }
+                if (!waitFlag(STATE_CONNECTED_WAIT, CONNECT_TIMEOUT_MS)) {
+                    return;
+                }
+                gatt.requestMtu(247);
+                waitFlag(MTU_WAIT, 8000); // 失败不致命 / non-fatal
+                gatt.discoverServices();
+                if (!waitFlag(SVC_WAIT, 10000)) {
+                    return;
+                }
+                if (svcStatus != BluetoothGatt.GATT_SUCCESS) {
+                    uiLog("服务发现失败（status=" + svcStatus + "）");
+                    return;
+                }
+                BluetoothGattService svc = gatt.getService(UUID.fromString(PushProto.SERVICE_UUID));
+                if (svc == null) {
+                    uiLog("设备上没有推送服务");
+                    return;
+                }
+                BluetoothGattCharacteristic cStatus =
+                        svc.getCharacteristic(UUID.fromString(PushProto.STATUS_UUID));
+                BluetoothGattCharacteristic cCtrl =
+                        svc.getCharacteristic(UUID.fromString(PushProto.CTRL_UUID));
+                if (cStatus == null || cCtrl == null) {
+                    uiLog("推送特征缺失（5f12/5f13）");
+                    return;
+                }
+                cCtrlAi = cCtrl;
+                gatt.setCharacteristicNotification(cStatus, true);
+                BluetoothGattDescriptor cccd =
+                        cStatus.getDescriptor(UUID.fromString(PushProto.CCCD_UUID));
+                if (cccd == null) {
+                    uiLog("找不到 CCCD 描述符");
+                    return;
+                }
+                cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                if (!gatt.writeDescriptor(cccd) || !waitFlag(DSC_WAIT, 10000)) {
+                    uiLog("订阅失败");
+                    return;
+                }
+                listenMode = true;
+                uiLog("已连接并保持监听——在墨水屏上点英文词，释义会自动回传（约 2-5 秒出卡）。");
+                refreshAiStatus();
+            }
+        }).start();
+    }
+
+    private void stopListen() {
+        listenMode = false;
+        cCtrlAi = null;
+        devCaps = -1L;
+        closeQuietly();
+        uiLog("已停止监听并断开");
+        refreshAiStatus();
+    }
+
+    /** 分发设备来的 AI 状态帧：0x18 记能力位，0x17 触发查词。 */
+    private void dispatchAiStatus(byte[] frame) {
+        int op = frame.length > 0 ? (frame[0] & 0xFF) : 0;
+        if (op == PushProto.ST_CAPS) {
+            long bits = PushProto.capsBits(frame);
+            if (bits >= 0) {
+                devCaps = bits;
+                boolean ai = (bits & PushProto.CAP_AI_QUERY) != 0;
+                uiLog("设备能力上报：AI 查词" + (ai ? "已支持" : "不支持")
+                        + "（bits=0x" + Long.toHexString(bits) + "）");
+                refreshAiStatus();
+            }
+            return;
+        }
+        if (op == PushProto.ST_AI_QUERY) {
+            if (!listenMode) {
+                return; // 没开监听就不应答（老行为：推送流程不处理 AI 帧）
+            }
+            String word = PushProto.aiQueryWord(frame);
+            if (word == null || word.isEmpty()) {
+                return;
+            }
+            onAiQuery(word);
+        }
+    }
+
+    /** 收到点词：后台调 LLM，拿到释义后回 0x07。 */
+    private void onAiQuery(final String word) {
+        uiLog("墨水屏点词「" + word + "」，查询中……");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final AiClient.Result r = AiClient.define(aiConfig(), word);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!r.ok) {
+                            // 失败不回帧：设备不会弹出空卡（诚实优于假成功）。
+                            uiLog("释义失败：" + r.error + "（不回帧）");
+                            refreshAiStatus();
+                            return;
+                        }
+                        uiLog("释义：" + r.text);
+                        sendAiResult(word, r.text);
+                        refreshAiStatus();
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 写 CTRL 0x07 回传释义（BLE 写串行化，且必须离主线程）。 */
+    private void sendAiResult(String word, String def) {
+        final BluetoothGattCharacteristic c = cCtrlAi;
+        final byte[] frame = PushProto.encodeAiResult(word, def);
+        if (c == null) {
+            uiLog("未持有 CTRL 特征，无法回传释义");
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (writeLock) {
+                    final boolean ok = writeChar(c, frame);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            uiLog(ok ? "释义已回传设备（0x07，" + frame.length + " B）"
+                                    : "释义回传失败（设备未接受写入）");
+                        }
+                    });
+                }
+            }
+        }).start();
     }
 
     private void loadClipboard() {

@@ -72,6 +72,33 @@ public final class PushProtoTest {
         return sb.toString();
     }
 
+    /** hex -> bytes（把 vectors.txt 里的帧还原出来喂给解码器）。 */
+    private static byte[] unhex(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    /** 70 字节 ASCII 词：触发 63 字节截断。/ 70 ASCII bytes: triggers the 63-byte cut. */
+    private static String longWord() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 70; i++) {
+            sb.append('a');
+        }
+        return sb.toString();
+    }
+
+    /** 200 字节释义：触发 169 字节截断。/ 200-byte definition: triggers the 169-byte cut. */
+    private static String longDef() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 200; i++) {
+            sb.append('x');
+        }
+        return sb.toString();
+    }
+
     private static byte[] bigBody() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 100; i++) {
@@ -159,6 +186,51 @@ public final class PushProtoTest {
         // 9) 错误码文案
         check(PushProto.errText(PushProto.ERR_CHECKSUM).contains("CRC32"), "errText CHECKSUM");
         check(PushProto.errText(PushProto.ERR_NOT_ARMED).contains("接收窗口"), "errText NOT_ARMED");
+
+        // 10) gen26 AI 查词帧：CTRL 0x06 / 0x07 + STATUS 0x17 / 0x18
+        //     编码侧与 Python 参考逐字节一致；解码侧做往返与非目标帧拒绝。
+        check(PushProto.AI_QUERY_MAX == 69, "AI_QUERY(0x06) 帧长 69");
+        check(PushProto.AI_RESULT_MAX == 241, "AI_RESULT(0x07) 帧长 241（<= MTU 247-3 = 244）");
+        check(PushProto.AI_STATUS_QUERY_MAX == 66, "STATUS 0x17 帧长 66");
+
+        check(hex(PushProto.encodeAiQuery("serendipity")).equals(v.get("ai_query_serendipity")),
+                "AI_QUERY(0x06) serendipity 逐字节一致");
+        check(hex(PushProto.encodeAiQuery("")).equals(v.get("ai_query_empty")),
+                "AI_QUERY(0x06) 空词逐字节一致（槽位零填充）");
+        check(hex(PushProto.encodeAiQuery(longWord())).equals(v.get("ai_query_long")),
+                "AI_QUERY(0x06) 超长词按 63 字节截断");
+
+        check(hex(PushProto.encodeAiResult("ephemeral", "adj. 短暂的"))
+                .equals(v.get("ai_result_basic")), "AI_RESULT(0x07) 中文释义逐字节一致");
+        check(hex(PushProto.encodeAiResult("ephemeral", "adj. 短暂的；朝生暮死的"))
+                .equals(v.get("ai_result_cjk")), "AI_RESULT(0x07) 长中文释义逐字节一致");
+        check(hex(PushProto.encodeAiResult("ephemeral", longDef()))
+                .equals(v.get("ai_result_long")), "AI_RESULT(0x07) 释义 200B 截断到 169");
+        check(hex(PushProto.encodeAiResult("ephemeral", ""))
+                .equals(v.get("ai_result_empty_def")), "AI_RESULT(0x07) 空释义逐字节一致");
+
+        check(hex(PushProto.encodeStatusAiQuery("serendipity"))
+                .equals(v.get("status_ai_serendipity")), "STATUS 0x17 serendipity 逐字节一致");
+        check(hex(PushProto.encodeStatusAiQuery("你好"))
+                .equals(v.get("status_ai_cjk")), "STATUS 0x17 中文词逐字节一致");
+        check(hex(PushProto.encodeStatusAiQuery(longWord()))
+                .equals(v.get("status_ai_long")), "STATUS 0x17 超长词按 63 字节截断");
+        check(hex(PushProto.encodeCaps(PushProto.CAP_AI_QUERY)).equals(v.get("caps_ai")),
+                "STATUS 0x18 CAPS 能力位图逐字节一致");
+
+        // 解码往返 / decode round-trips
+        check("serendipity".equals(PushProto.aiQueryWord(unhex(v.get("status_ai_serendipity")))),
+                "解 STATUS 0x17 -> serendipity");
+        check("你好".equals(PushProto.aiQueryWord(unhex(v.get("status_ai_cjk")))),
+                "解 STATUS 0x17 -> 你好（中文往返）");
+        check(v.get("ai_word_long").equals(PushProto.aiQueryWord(unhex(v.get("status_ai_long")))),
+                "解 STATUS 0x17 -> 超长词截断结果与参考一致");
+        check(PushProto.capsBits(unhex(v.get("caps_ai"))) == vecInt(v, "caps_ai_bits"),
+                "解 STATUS 0x18 -> 能力位图 == 1");
+        check(PushProto.aiQueryWord(new byte[] { (byte) PushProto.ST_PROGRESS, 1, 'a' }) == null,
+                "非 0x17 帧解词返回 null（不误判）");
+        check(PushProto.capsBits(new byte[] { (byte) PushProto.ST_CAPS, 1 }) == -1L,
+                "CAPS 帧过短返回 -1（不误判）");
 
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));

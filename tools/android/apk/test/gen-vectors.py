@@ -61,6 +61,34 @@ def main() -> int:
     v["chunk_247"] = min(pp.PUSH_DATA_PAYLOAD_MAX, 247 - 6)
     v["chunk_23"] = min(pp.PUSH_DATA_PAYLOAD_MAX, 23 - 6)
 
+    # ---- gen26 AI 查词：CTRL 0x06/0x07 + STATUS 0x17/0x18 ----
+    # 编码向量：Java 侧编出的帧必须与 Python 参考逐字节一致（零手抄）。
+    # Encoding vectors: the Java codec must match the Python reference byte for byte.
+    long_word = "a" * 70  # 70 字节 ASCII：触发 63 字节截断 / triggers the 63-byte cut
+    v["ai_query_serendipity"] = pp.encode_ai_query("serendipity").hex()
+    v["ai_query_empty"] = pp.encode_ai_query("").hex()
+    v["ai_query_long"] = pp.encode_ai_query(long_word).hex()
+
+    # 能力位图（设备上报 AI 查词能力）/ capability bitmap reported by the device
+    caps = pp.encode_caps(pp.PUSH_CAP_AI_QUERY)
+    v["caps_ai"] = caps.hex()
+    v["caps_ai_bits"] = pp.decode_caps(caps)
+
+    # STATUS 0x17：设备请手机算释义 / device asks the phone to define this word
+    v["status_ai_serendipity"] = pp.encode_status_ai_query("serendipity").hex()
+    v["status_ai_cjk"] = pp.encode_status_ai_query("你好").hex()
+    v["status_ai_long"] = pp.encode_status_ai_query(long_word).hex()
+    # 解码标量：Java 解上列 STATUS 帧应得到同样的词 / decode scalars the Java side must reproduce
+    v["ai_word_serendipity"] = pp.decode_ai_query_status(pp.encode_status_ai_query("serendipity"))
+    v["ai_word_cjk"] = pp.decode_ai_query_status(pp.encode_status_ai_query("你好"))
+    v["ai_word_long"] = pp.decode_ai_query_status(pp.encode_status_ai_query(long_word))
+
+    # CTRL 0x07 释义回传（241 B）/ definition reply
+    v["ai_result_basic"] = pp.encode_ai_result("ephemeral", "adj. 短暂的").hex()
+    v["ai_result_cjk"] = pp.encode_ai_result("ephemeral", "adj. 短暂的；朝生暮死的").hex()
+    v["ai_result_long"] = pp.encode_ai_result("ephemeral", "x" * 200).hex()
+    v["ai_result_empty_def"] = pp.encode_ai_result("ephemeral", "").hex()
+
     with open(OUT, "w", encoding="utf-8") as f:
         for k in sorted(v):
             f.write(f"{k}={v[k]}\n")

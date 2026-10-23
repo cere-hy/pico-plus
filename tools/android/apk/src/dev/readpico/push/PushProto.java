@@ -40,6 +40,14 @@ public final class PushProto {
     // gen22: the phone pushes a UTC second count to set the device clock (not
     // gated on an armed window - any connection can carry it).
     public static final int OP_SET_TIME = 0x05;
+    // gen26：AI 查词（蓝牙代理 + 搭车协议首个插件）。与 push_proto.h 的
+    // PUSH_OP_AI_QUERY / PUSH_OP_AI_RESULT 同值同义；Java 侧此前未登记（APK
+    // 只做推送），本代随 M1 应答链补齐——登记即冻结，改值会破坏已发货固件。
+    // gen26: AI word lookup. Same values and meaning as push_proto.h; the Java
+    // side never registered them (the APK only pushed). Added with the M1
+    // responder chain - registration freezes, changing breaks shipped firmware.
+    public static final int OP_AI_QUERY = 0x06;  // 手机→设备：触发回流 / 即时查询
+    public static final int OP_AI_RESULT = 0x07; // 手机→设备：单词 + 释义回传
 
     public static final int ST_READY = 0x10;
     public static final int ST_RESUME = 0x11;
@@ -48,6 +56,20 @@ public final class PushProto {
     public static final int ST_EVT_READ = 0x14;
     public static final int ST_BATT = 0x15;
     public static final int ST_PROGRESS = 0x16;
+    // gen26：设备→手机的两条 AI 状态。0x17 请手机算释义，0x18 上报能力位图。
+    // gen26: two device-to-phone AI statuses - 0x17 asks the phone to define a
+    // word, 0x18 reports the capability bitmap.
+    public static final int ST_AI_QUERY = 0x17;
+    public static final int ST_CAPS = 0x18;
+
+    /* ---- gen26 AI 帧长与上限（与 push_proto.h 逐字一致）---- */
+    public static final int AI_WORD_MAX = 64;   // 单词 UTF-8 槽（含结尾 0）
+    public static final int AI_DEF_MAX = 170;   // 单帧释义槽（含结尾 0）
+    public static final int AI_QUERY_MAX = 4 + 1 + AI_WORD_MAX;              // 0x06 = 69
+    public static final int AI_RESULT_MAX = 4 + 1 + AI_WORD_MAX + 2 + AI_DEF_MAX; // 0x07 = 241
+    public static final int AI_STATUS_QUERY_MAX = 1 + 1 + AI_WORD_MAX;       // 0x17 = 66
+    /** 设备支持 AI 查词（0x06/0x07 + 0x17）的能力位。/ Device supports AI lookup. */
+    public static final int CAP_AI_QUERY = 1 << 0;
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MARKDOWN = 1;
@@ -117,6 +139,100 @@ public final class PushProto {
         out[3] = (byte) VERSION;
         putU32(out, 4, unixSeconds);
         return out;
+    }
+
+    /* ---- gen26 AI 帧（0x06 / 0x07 / STATUS 0x17 / 0x18）----
+     * 布局与 push_proto.c 的 push_ai_*_encode、push_pico.py 的 encode_ai_*
+     * 逐字节一致；截断一律按「UTF-8 字节上限」切（与参考实现同款：word 63 字节、
+     * def 169 字节），槽位零填充。宿主对表由 test/PushProtoTest.java 用 Python
+     * 生成的向量断言。
+     * Byte-identical to push_proto.c and push_pico.py; truncation is always by
+     * UTF-8 byte cap (63 for word, 169 for def) with zero padding, matching the
+     * references. Asserted against Python-generated vectors in the host test.
+     */
+
+    /** 按 UTF-8 字节上限截断（不做字符边界回退——与 C/Python 参考同款行为）。 */
+    private static byte[] fitUtf8(String s, int maxBytes) {
+        byte[] raw = (s == null) ? new byte[0] : s.getBytes(UTF8);
+        if (raw.length > maxBytes) {
+            raw = copyOf(raw, maxBytes);
+        }
+        return raw;
+    }
+
+    /** CTRL 0x06 AI_QUERY（69 B）：帧头 + wlen(1) + word[64]。 */
+    public static byte[] encodeAiQuery(String word) {
+        byte[] raw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] out = new byte[AI_QUERY_MAX];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_AI_QUERY;
+        out[3] = (byte) VERSION;
+        out[4] = (byte) raw.length;
+        System.arraycopy(raw, 0, out, 5, raw.length);
+        return out;
+    }
+
+    /**
+     * CTRL 0x07 AI_RESULT（241 B）：帧头 + wlen(1) + word[64] + dlen(u16 LE) +
+     * def[170]。释义超 169 字节按字节截断（APK 侧应先自行裁到 UTF-8 安全边界，
+     * 这里只是兜底，防半个汉字进帧）。
+     */
+    public static byte[] encodeAiResult(String word, String definition) {
+        byte[] wraw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] draw = fitUtf8(definition, AI_DEF_MAX - 1);
+        byte[] out = new byte[AI_RESULT_MAX];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_AI_RESULT;
+        out[3] = (byte) VERSION;
+        out[4] = (byte) wraw.length;
+        System.arraycopy(wraw, 0, out, 5, wraw.length);
+        int off = 5 + AI_WORD_MAX;
+        putU16(out, off, draw.length);
+        System.arraycopy(draw, 0, out, off + 2, draw.length);
+        return out;
+    }
+
+    /** STATUS 0x17（66 B，设备→手机请算释义）：op + wlen(1) + word[64]。 */
+    public static byte[] encodeStatusAiQuery(String word) {
+        byte[] raw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] out = new byte[AI_STATUS_QUERY_MAX];
+        out[0] = (byte) ST_AI_QUERY;
+        out[1] = (byte) raw.length;
+        System.arraycopy(raw, 0, out, 2, raw.length);
+        return out;
+    }
+
+    /** 解 STATUS 0x17 → 单词；帧不是 0x17 或过短返回 null。 */
+    public static String aiQueryWord(byte[] frame) {
+        if (frame == null || frame.length < 2 || (frame[0] & 0xFF) != ST_AI_QUERY) {
+            return null;
+        }
+        int n = frame[1] & 0xFF;
+        if (n > AI_WORD_MAX - 1) {
+            n = AI_WORD_MAX - 1;
+        }
+        if (frame.length < 2 + n) {
+            n = frame.length - 2;
+        }
+        return new String(frame, 2, n, UTF8);
+    }
+
+    /** STATUS 0x18 CAPS（5 B）：op + 能力位图 u32 LE。 */
+    public static byte[] encodeCaps(int bits) {
+        byte[] out = new byte[5];
+        out[0] = (byte) ST_CAPS;
+        putU32(out, 1, bits & 0xFFFFFFFFL);
+        return out;
+    }
+
+    /** 解 STATUS 0x18 → 能力位图；帧不是 0x18 或不足 5 字节返回 -1。 */
+    public static long capsBits(byte[] frame) {
+        if (frame == null || frame.length < 5 || (frame[0] & 0xFF) != ST_CAPS) {
+            return -1L;
+        }
+        return getU32(frame, 1) & 0xFFFFFFFFL;
     }
 
     public static byte[] encodeBegin(long totalLen, long crc, long sessionId,
