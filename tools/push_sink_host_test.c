@@ -15,6 +15,7 @@
 
 #include "push_proto.h"
 #include "push_session.h"
+#include "ai_ridealong.h"
 
 static int s_checks;
 static int s_red;
@@ -138,7 +139,7 @@ static void test_ctrl_header(void) {
     // gen25 预留区登记（0x06..0x0F，见 push_proto.h 变更记录）：帧头解码器必须
     // 原样放行 op（gen26 启用时不必改解码层），且预留段与 STATUS 段（0x10 起）
     // 零重叠——重叠了 gen26 第一天就会撞号。
-    // Gen25 reservation registry (0x06-0x0F, see push_proto.h's change log): the
+    // Gen26 reservation registry (0x08-0x0F now; 0x06/0x07 taken by gen26, see push_proto.h): the
     // header decoder must pass the op through untouched (gen26 enables one
     // without touching the decode layer), and the reserved block must not
     // overlap the STATUS block (0x10 up) - an overlap would collide on day one.
@@ -148,8 +149,9 @@ static void test_ctrl_header(void) {
         CHECK(push_ctrl_header_decode(frame, sizeof(frame), &op) && op == reserved);
         CHECK(reserved < PUSH_ST_READY); // 预留区与 STATUS 段零重叠 / no overlap with STATUS
     }
-    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_SET_TIME + 1); // 紧接 SET_TIME，无空洞 / right after SET_TIME, no gap
-    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen25 reserved 0x06-0x0F registered ok\n");
+    CHECK(PUSH_OP_AI_QUERY == PUSH_OP_SET_TIME + 1); // 0x06 紧接 SET_TIME
+    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_AI_RESULT + 1); // 0x08 紧接 AI_RESULT，无空洞 // 紧接 SET_TIME，无空洞 / right after SET_TIME, no gap
+    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen26 0x06/0x07 registered, 0x08-0x0F reserved ok\n");
 }
 
 static void test_begin_codec(void) {
@@ -618,12 +620,147 @@ static void test_py_cross_vector(void) {
     printf("py<->C golden vector: BEGIN/DATA/CTRL decode + CRC end-to-end ok\n");
 }
 
+/* ---- AI 查词帧（gen26，0x06/0x07 + STATUS 0x17/0x18）---- */
+/* AI lookup frames (gen26, 0x06/0x07 + STATUS 0x17/0x18). */
+
+static void test_ai_frames(void) {
+    // AI_QUERY（0x06）编解码往返 + 字节布局。
+    // AI_QUERY (0x06) round-trip plus byte layout.
+    push_ai_query_t q;
+    memset(&q, 0, sizeof(q));
+    snprintf(q.word, sizeof(q.word), "serendipity");
+    uint8_t qf[PUSH_AI_QUERY_MAX];
+    size_t n = push_ai_query_encode(&q, qf, sizeof(qf));
+    CHECK(n == PUSH_AI_QUERY_MAX);
+    CHECK(qf[0] == 0x50 && qf[1] == 0x43);
+    CHECK(qf[2] == PUSH_OP_AI_QUERY);
+    CHECK(qf[3] == PUSH_VERSION);
+    CHECK(qf[4] == (uint8_t)strlen("serendipity"));
+    push_ai_query_t q2;
+    memset(&q2, 0, sizeof(q2));
+    CHECK(push_ai_query_decode(qf, n, &q2));
+    CHECK(strcmp(q2.word, "serendipity") == 0);
+
+    // AI_RESULT（0x07）编解码往返：固定 word 槽 + def 长度(u16 LE)。
+    // AI_RESULT (0x07) round-trip: fixed word slot plus def length (u16 LE).
+    push_ai_result_t r;
+    memset(&r, 0, sizeof(r));
+    snprintf(r.word, sizeof(r.word), "ephemeral");
+    snprintf(r.def, sizeof(r.def), "lasting a very short time");
+    uint8_t rf[PUSH_AI_RESULT_MAX];
+    size_t rn = push_ai_result_encode(&r, rf, sizeof(rf));
+    CHECK(rn == PUSH_AI_RESULT_MAX);
+    CHECK(rf[2] == PUSH_OP_AI_RESULT);
+    CHECK(rf[4] == (uint8_t)strlen("ephemeral"));
+    const size_t def_off = 5u + PUSH_AI_WORD_MAX;
+    const size_t dn = (size_t)rf[def_off] | ((size_t)rf[def_off + 1] << 8);
+    CHECK(dn == strlen("lasting a very short time"));
+    push_ai_result_t r2;
+    memset(&r2, 0, sizeof(r2));
+    CHECK(push_ai_result_decode(rf, rn, &r2));
+    CHECK(strcmp(r2.word, "ephemeral") == 0);
+    CHECK(strcmp(r2.def, "lasting a very short time") == 0);
+
+    // STATUS 0x17（设备→手机，请算释义）编码。
+    // STATUS 0x17 (device to phone: please define) encode.
+    uint8_t sq[2u + PUSH_AI_WORD_MAX];
+    size_t sqn = push_st_ai_query_encode("ubiquitous", sq, sizeof(sq));
+    CHECK(sqn == 2u + PUSH_AI_WORD_MAX);
+    CHECK(sq[0] == PUSH_ST_AI_QUERY);
+    CHECK(sq[1] == (uint8_t)strlen("ubiquitous"));
+
+    // 能力位图（STATUS 0x18）编解码往返。/ Capability bitmap (STATUS 0x18) round-trip.
+    push_caps_t caps = {0};
+    caps.bits = PUSH_CAP_AI_QUERY;
+    uint8_t cf[5];
+    CHECK(push_caps_encode(&caps, cf, sizeof(cf)) == 5);
+    CHECK(cf[0] == PUSH_ST_CAPS);
+    CHECK(((uint32_t)cf[1] | ((uint32_t)cf[2] << 8) | ((uint32_t)cf[3] << 16) | ((uint32_t)cf[4] << 24)) == PUSH_CAP_AI_QUERY);
+    push_caps_t caps2 = {0};
+    CHECK(push_caps_decode(cf, sizeof(cf), &caps2));
+    CHECK(caps2.bits == PUSH_CAP_AI_QUERY);
+
+    // 有牙：坏魔数/坏 op/坏版本/短帧全拒。/ Bite: bad magic, op, version and short frame all refuse.
+    uint8_t bad[PUSH_AI_QUERY_MAX];
+    memcpy(bad, qf, sizeof(bad)); bad[0] = 0x51;
+    CHECK(!push_ai_query_decode(bad, sizeof(bad), &q2));
+    memcpy(bad, qf, sizeof(bad)); bad[2] = PUSH_OP_END;
+    CHECK(!push_ai_query_decode(bad, sizeof(bad), &q2));
+    memcpy(bad, qf, sizeof(bad)); bad[3] = PUSH_VERSION + 1;
+    CHECK(!push_ai_query_decode(bad, sizeof(bad), &q2));
+    CHECK(!push_ai_query_decode(qf, PUSH_AI_QUERY_MAX - 1, &q2));
+    printf("ai frames: query/result/status 0x17/caps round-trip + bad-header teeth ok\n");
+}
+
+/* ---- 搭车离线队列（gen26 块 2）---- */
+/* Ride-along offline queue (gen26 block 2). */
+
+static void test_ai_ridealong(void) {
+    const uint16_t cap = 4;
+    uint8_t buf[512];
+    CHECK(ai_raloc_buf_size(cap) == (size_t)6 + (size_t)cap * (1u + (size_t)PUSH_AI_WORD_MAX));
+    CHECK(ai_raloc_buf_size(cap) <= sizeof(buf));
+    // init 新建 + 容量/count 正确；缓冲不足 init 拒。
+    // init fresh, cap/count correct; too-small buffer refuses.
+    CHECK(ai_raloc_init(buf, sizeof(buf), cap));
+    CHECK(ai_raloc_cap(buf) == cap);
+    CHECK(ai_raloc_count(buf) == 0);
+    CHECK(!ai_raloc_init(buf, 5, cap));
+
+    // 入队 + 去重 + peek。/ enqueue, dedup, peek.
+    CHECK(ai_raloc_enqueue(buf, sizeof(buf), "apple"));
+    CHECK(ai_raloc_count(buf) == 1);
+    CHECK(!ai_raloc_enqueue(buf, sizeof(buf), "apple")); // 去重 / dedup
+    CHECK(ai_raloc_count(buf) == 1);
+    CHECK(ai_raloc_enqueue(buf, sizeof(buf), "banana"));
+    CHECK(ai_raloc_count(buf) == 2);
+    char w[96];
+    CHECK(ai_raloc_peek(buf, w, sizeof(w)));
+    CHECK(strcmp(w, "apple") == 0);
+
+    // 出队前移：apple 出、banana 提前、count 递减、空队列拒。
+    // dequeue shifts forward: apple out, banana promoted, count down, empty refuses.
+    CHECK(ai_raloc_dequeue(buf, w, sizeof(w)));
+    CHECK(strcmp(w, "apple") == 0);
+    CHECK(ai_raloc_count(buf) == 1);
+    CHECK(ai_raloc_peek(buf, w, sizeof(w)));
+    CHECK(strcmp(w, "banana") == 0);
+    CHECK(ai_raloc_dequeue(buf, w, sizeof(w)));
+    CHECK(strcmp(w, "banana") == 0);
+    CHECK(ai_raloc_count(buf) == 0);
+    CHECK(!ai_raloc_dequeue(buf, w, sizeof(w)));
+
+    // 填满到容量，超容量拒。/ fill to capacity, over-capacity refuses.
+    ai_raloc_clear(buf);
+    CHECK(ai_raloc_count(buf) == 0);
+    for (int i = 0; i < (int)cap; ++i) {
+        char tmp[8];
+        snprintf(tmp, sizeof(tmp), "w%d", i);
+        CHECK(ai_raloc_enqueue(buf, sizeof(buf), tmp));
+    }
+    CHECK(ai_raloc_count(buf) == cap);
+    CHECK(!ai_raloc_enqueue(buf, sizeof(buf), "overflow"));
+
+    // 续载：同 cap 续载保留条目，异 cap 拒。/ resume: same cap keeps entries,
+    // mismatched cap refuses.
+    CHECK(ai_raloc_init(buf, sizeof(buf), cap));
+    CHECK(ai_raloc_count(buf) == cap);
+    CHECK(!ai_raloc_init(buf, sizeof(buf), (uint16_t)(cap + 1)));
+    CHECK(ai_raloc_init(buf, sizeof(buf), cap));
+    CHECK(ai_raloc_count(buf) == cap);
+    ai_raloc_clear(buf);
+    CHECK(ai_raloc_cap(buf) == cap); // clear 保留容量 / clear preserves capacity
+    printf("ai ridealong: init/resume/enqueue dedup/peek/dequeue shift/clear/full ok\n");
+}
+
 int main(void) {
     test_crc32();
     test_ctrl_header();
     test_begin_codec();
     test_data_status_codec();
     test_py_cross_vector();
+    test_ai_frames();
+    test_ai_ridealong();
     test_happy_path();
     test_word_card();
     test_resume();

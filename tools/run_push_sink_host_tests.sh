@@ -11,5 +11,6 @@ gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -g -fsanitize=addre
     tools/push_sink_host_test.c \
     components/push_sink/src/push_proto.c \
     components/push_sink/src/push_session.c \
+    components/push_sink/src/ai_ridealong.c \
     -o /tmp/push_sink_test
 /tmp/push_sink_test

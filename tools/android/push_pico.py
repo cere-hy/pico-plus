@@ -76,6 +76,16 @@ PUSH_ST_EVT_READ = 0x14
 PUSH_ST_BATT = 0x15
 PUSH_ST_PROGRESS = 0x16
 
+# gen26 AI 查词操作码（蓝牙代理 + 搭车协议）；与 push_proto.h 一字不差。
+# gen26 AI lookup opcodes (BLE proxy + ride-along); byte-identical to push_proto.h.
+PUSH_OP_AI_QUERY = 0x06   # 手机 -> 设备：触发离线队列回流 / phone to device: flush queue
+PUSH_OP_AI_RESULT = 0x07  # 手机 -> 设备：单词 + 释义 / phone to device: word + definition
+PUSH_ST_AI_QUERY = 0x17   # 设备 -> 手机：用户点词，请算释义 / device to phone: define this word
+PUSH_ST_CAPS = 0x18       # 设备 -> 手机：能力位图上报 / device to phone: capability bitmap
+PUSH_AI_WORD_MAX = 64
+PUSH_AI_DEF_MAX = 170
+PUSH_CAP_AI_QUERY = 1 << 0  # 设备支持 AI 查词 / device supports AI lookup
+
 # 正文类型
 PUSH_TYPE_TEXT = 0
 PUSH_TYPE_MARKDOWN = 1
@@ -183,6 +193,66 @@ def encode_set_time(unix_seconds: int) -> bytes:
         raise ValueError("unix_seconds out of the range the firmware accepts")
     return bytes([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_SET_TIME, PUSH_VERSION]) + \
         struct.pack("<I", unix_seconds & 0xFFFFFFFF)
+
+
+# --------------------------------------------------------------------------
+# gen26 AI 查词帧（蓝牙代理 + 搭车协议）；与 components/push_sink 逐字节一致。
+# gen26 AI lookup frames (BLE proxy + ride-along); byte-identical to push_sink.
+# --------------------------------------------------------------------------
+
+def encode_ai_query(word: str) -> bytes:
+    """gen26 AI_QUERY (0x06): 4-byte header + 1-byte wlen + word，零填充到
+    PUSH_AI_WORD_MAX。与 push_proto.c push_ai_query_encode 逐字节一致。"""
+    raw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    out = bytearray([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_AI_QUERY, PUSH_VERSION])
+    out.append(len(raw))
+    out += raw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(raw))
+    return bytes(out)
+
+
+def encode_ai_result(word: str, definition: str) -> bytes:
+    """gen26 AI_RESULT (0x07): 4-byte header + 1-byte wlen + word(64) + u16 def_len
+    + def(170)。与 push_proto.c push_ai_result_encode 逐字节一致。"""
+    wraw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    draw = definition.encode("utf-8")[:PUSH_AI_DEF_MAX - 1]
+    out = bytearray([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_AI_RESULT, PUSH_VERSION])
+    out.append(len(wraw))
+    out += wraw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(wraw))  # word 固定占 64 槽
+    out += struct.pack("<H", len(draw))              # def 长度 u16 LE
+    out += draw
+    out += b"\x00" * (PUSH_AI_DEF_MAX - len(draw))
+    return bytes(out)
+
+
+def encode_caps(bits: int) -> bytes:
+    """gen26 能力位图 STATUS (0x18): op + u32 LE bits = 5 字节。"""
+    return bytes([PUSH_ST_CAPS]) + struct.pack("<I", bits & 0xFFFFFFFF)
+
+
+def encode_status_ai_query(word: str) -> bytes:
+    """gen26 STATUS 0x17 (设备→手机，请算释义): op + 1-byte wlen + word，总 2+64=66。"""
+    raw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    out = bytearray([PUSH_ST_AI_QUERY, len(raw)])
+    out += raw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(raw))
+    return bytes(out)
+
+
+def decode_caps(frame: bytes) -> int:
+    """解析设备上报的能力位图 STATUS (0x18)：返回 bits(int)。"""
+    if len(frame) < 5 or frame[0] != PUSH_ST_CAPS:
+        raise ValueError("not a CAPS status frame")
+    return struct.unpack("<I", frame[1:5])[0]
+
+
+def decode_ai_query_status(frame: bytes) -> str:
+    """解析设备发出的 STATUS 0x17（用户点词请算释义）：返回 word(str)。"""
+    if len(frame) < 2 or frame[0] != PUSH_ST_AI_QUERY:
+        raise ValueError("not an AI_QUERY status frame")
+    n = frame[1]
+    return frame[2:2 + n].decode("utf-8", "replace")
 
 
 def encode_data(seq: int, payload: bytes) -> bytes:

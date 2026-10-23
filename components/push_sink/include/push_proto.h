@@ -53,7 +53,7 @@ extern "C" {
 ///                        -> ERR(2) and the clock is untouched.
 ///                      · Reference implementations kept in sync: PushProto.encodeSetTime
 ///                        (Java) and push_pico.py encode_set_time / --set-time (Python).
-///   gen25  0x06..0x0F  CTRL 预留区（reserved, not implemented）——为 gen26 代理层
+///   gen25  0x08..0x0F  CTRL 预留区续（0x06/0x07 已由 gen26 启用）——为 gen26 代理层
 ///                      三件套（搭车协议 / 预取释义 / 通用代理层）整段留号。
 ///                      · 登记即冻结：任何一代要启用某个 0x06+ opcode，必须先在本
 ///                        变更记录登记一代一行（格式同 gen14/gen22）、同步 Java/
@@ -62,7 +62,7 @@ extern "C" {
 ///                        ERR(2)，会话状态机一拍不动（宿主测试有断言）。
 ///                      · 刻意选 ERR(2) 而非静默忽略：静默会让手机以为设备收下
 ///                        了，重试/续传语义全乱。
-///   gen25  0x06..0x0F  the reserved CTRL block (registered, not implemented) -
+///   gen25  0x08..0x0F  the reserved CTRL block continues (0x06/0x07 taken by gen26) -
 ///                      a whole range set aside for gen26's proxy trio (the
 ///                      ride-along protocol, definition prefetch and the general
 ///                      proxy layer).
@@ -76,6 +76,30 @@ extern "C" {
 ///                      · ERR(2) over a silent drop on purpose: silence would make
 ///                        the phone believe the device took it, wrecking retry and
 ///                        resume semantics.
+///   gen26  0x06..0x07  AI 查词（蓝牙代理 + 搭车协议首个插件）：
+///                      · 0x06 PUSH_OP_AI_QUERY：手机→设备，触发离线队列回流 /
+///                        即时查询请求（设备此前已用 STATUS 0x17 把待查词通知手机）。
+///                      · 0x07 PUSH_OP_AI_RESULT：手机→设备，单词 + 释义文本回传。
+///                      · 设备→手机方向走 STATUS 0x17（PUSH_ST_AI_QUERY）：用户点词，
+///                        请手机算释义；手机算完用 0x07 回传，设备出释义卡。
+///                      · 能力协商：设备连接后用 STATUS 0x18（PUSH_ST_CAPS）上报
+///                        能力位图，APK 据此显示/隐藏查词入口（见 push_caps_t）。
+///                      · 登记即冻结：本行即登记；帧布局见 push_proto.c 的 ai 编解码。
+///                        Java/Python 参考实现随本代同步（PushProto.encodeAi*、
+///                        push_pico.py）。0x08..0x0F 仍预留（预取/扩展卡等）。
+///   gen26  0x06..0x07  AI word lookup (first plugin of the BLE proxy + ride-along):
+///                      · 0x06 PUSH_OP_AI_QUERY: phone to device, flush the offline
+///                        queue or ask now (the device already notified the word via
+///                        STATUS 0x17).
+///                      · 0x07 PUSH_OP_AI_RESULT: phone to device, word + definition.
+///                      · Device to phone uses STATUS 0x17 (PUSH_ST_AI_QUERY): the
+///                        user tapped a word, the phone computes, replies with 0x07.
+///                      · Capability negotiation: on connect the device reports a
+///                        bitmap via STATUS 0x18 (PUSH_ST_CAPS); the APK gates the
+///                        entry on it (see push_caps_t).
+///                      · Registered and frozen: this line is the registry; the frame
+///                        layout lives in push_proto.c's ai codec. Java/Python
+///                        references sync this generation. 0x08..0x0F stay reserved.
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
@@ -83,8 +107,10 @@ enum {
     PUSH_OP_ABORT = 0x04,         ///< 放弃本次会话 / abandon the session
     PUSH_OP_SET_TIME = 0x05,      ///< gen22：手机下发 UTC 秒（4 字节小端）校准设备时钟 /
                                   ///< phone pushes a UTC second count (4 bytes LE) to set the clock
-    PUSH_OP_RESERVED_FIRST = 0x06, ///< gen25 预留区起点（未实现，收到即 ERR(2)）/
-                                   ///< gen25 reservation start (unimplemented; ERR(2) on receipt)
+    PUSH_OP_AI_QUERY = 0x06,       ///< gen26：AI 查词请求（手机→设备：触发离线队列回流 / AI word-query request）
+    PUSH_OP_AI_RESULT = 0x07,      ///< gen26：AI 释义回传（手机→设备：单词 + 释义文本 / AI definition result）
+    PUSH_OP_RESERVED_FIRST = 0x08, ///< gen25 预留区续（未实现，收到即 ERR(2)）/
+                                   ///< gen25 reservation continues (unimplemented; ERR(2) on receipt)
     PUSH_OP_RESERVED_LAST = 0x0F,  ///< gen25 预留区终点（STATUS 从 0x10 起，零重叠）/
                                    ///< gen25 reservation end (STATUS starts at 0x10, no overlap)
 };
@@ -101,6 +127,8 @@ enum {
     PUSH_ST_EVT_READ = 0x14, ///< 用户在设备上标记已读 / the user marked it read on the device
     PUSH_ST_BATT = 0x15,    ///< 电量百分比 / battery percent
     PUSH_ST_PROGRESS = 0x16, ///< 接收进度 / receive progress
+    PUSH_ST_AI_QUERY = 0x17, ///< gen26：设备→手机，用户点词请算释义 / device to phone: define this word
+    PUSH_ST_CAPS = 0x18,     ///< gen26：设备→手机，能力位图上报（连接后）/ device to phone: capability bitmap
 };
 
 /// 正文类型。/ Body types.
@@ -138,6 +166,59 @@ typedef struct {
 
 #define PUSH_BEGIN_LEN 83u ///< BEGIN 帧字节数 / BEGIN frame size
 #define PUSH_DATA_HDR_LEN 3u ///< DATA 帧头：seq(2)+len(1) / DATA frame header
+
+/* ---- AI 查词帧（gen26，0x06/0x07 + STATUS 0x17）---- */
+/* AI lookup frames (gen26, 0x06/0x07 + STATUS 0x17). */
+
+/// 单词 / 释义文本上限（UTF-8 字节，含结尾 0）。/ Word and definition text caps.
+#define PUSH_AI_WORD_MAX 64u  ///< 单词上限 / word cap
+#define PUSH_AI_DEF_MAX  170u ///< 单帧释义上限（≤ MTU 247 载荷，留头空间）/ one-frame def cap
+
+/// AI_QUERY（0x06）CTRL 载荷：手机→设备，触发离线队列回流或即时查询。
+/// AI_QUERY (0x06) CTRL payload: phone to device, flush the offline queue or ask now.
+typedef struct {
+    char word[PUSH_AI_WORD_MAX]; ///< 待查单词（UTF-8，NUL 结尾）/ the word, NUL-terminated
+} push_ai_query_t;
+
+/// AI_RESULT（0x07）CTRL 载荷：手机→设备，单词 + 释义。/ AI_RESULT (0x07): word + definition.
+typedef struct {
+    char word[PUSH_AI_WORD_MAX]; ///< 单词 / the word
+    char def[PUSH_AI_DEF_MAX];   ///< 释义文本（UTF-8，NUL 结尾）/ the definition, NUL-terminated
+} push_ai_result_t;
+
+/// 编 AI_QUERY 帧：out 至少 `PUSH_AI_QUERY_MAX` 字节，返回写入字节数（0 表示 cap 不够）。
+/// Encode an AI_QUERY frame: out needs `PUSH_AI_QUERY_MAX` bytes; returns bytes written (0 on cap miss).
+size_t push_ai_query_encode(const push_ai_query_t *q, uint8_t *out, size_t cap);
+/// 解 AI_QUERY 帧（含 4 字节 CTRL 头）。坏头/超长返 false。
+/// Decode an AI_QUERY frame (4-byte CTRL header included). false on bad header or overlong body.
+bool push_ai_query_decode(const uint8_t *in, size_t len, push_ai_query_t *q);
+
+/// 编 AI_RESULT 帧。/ Encode an AI_RESULT frame.
+size_t push_ai_result_encode(const push_ai_result_t *r, uint8_t *out, size_t cap);
+/// 解 AI_RESULT 帧（含 4 字节 CTRL 头）。/ Decode an AI_RESULT frame.
+bool push_ai_result_decode(const uint8_t *in, size_t len, push_ai_result_t *r);
+
+/// 设备→手机查询通知（STATUS 0x17）：用户点了单词，请手机算释义。
+/// Device-to-phone query notify (STATUS 0x17): the user tapped a word, compute it.
+size_t push_st_ai_query_encode(const char *word, uint8_t *out, size_t cap);
+
+/// AI 帧字节上限（含 4 字节 CTRL 头 / 含 1 字节 op 的 STATUS）。/ AI frame caps (CTRL header / STATUS op included).
+#define PUSH_AI_QUERY_MAX  (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX)
+#define PUSH_AI_RESULT_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + PUSH_AI_DEF_MAX)
+
+/* ---- 能力位图（gen26 能力协商）---- */
+/* Capability bitmap (gen26 capability negotiation). */
+
+typedef struct {
+    uint32_t bits; ///< 能力位掩码 / capability bitmask
+} push_caps_t;
+
+#define PUSH_CAP_AI_QUERY (1u << 0) ///< 设备支持 AI 查词（0x06/0x07 + 0x17）/ device supports AI lookup
+
+/// 编能力位图 STATUS 帧（op 0x18 + 4 字节小端位掩码）。/ Encode a capability bitmap STATUS frame.
+size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap);
+/// 解能力位图 STATUS 帧。/ Decode a capability bitmap STATUS frame.
+bool push_caps_decode(const uint8_t *in, size_t len, push_caps_t *caps);
 
 /* ---- CRC32 ---- */
 

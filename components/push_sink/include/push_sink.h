@@ -219,25 +219,34 @@ void push_sink_notify_battery(void);
 /// sample and sync the PMU.
 bool push_sink_take_time_sync(uint32_t *utc);
 
-/* ---- gen26 预留：PSRAM 结果缓冲 helper（reserved, not implemented）----
- * Gen26 reservation: the PSRAM result-buffer helper (registered, not implemented).
- * 用途：代理层把预取释义 / AI 结果落到 PSRAM，渲染成卡片时整块消费，避免
- * 大结果挤占内部堆（gen25 数据层同款纪律：≥1-2K 非热路径分配不让内部堆扛）。
- * 预定 API 形态（gen26 启用时照此落实现 + 宿主测试，本注释随之删除）：
- *   uint8_t *push_result_buf_acquire(size_t bytes); // PSRAM 优先、内部堆兜底；失败返回 NULL
- *   void     push_result_buf_release(uint8_t *buf); // 释放；NULL 安全
- * 纪律：MALLOC_CAP_SPIRAM 申请；单块预算 ≤256 KB；生命周期挂会话——ARMED 可
- * 申请、IDLE 全释放（与 .part 同生死）；内容不进协议帧（协议冻结，扩展只走
- * CTRL 预留区 0x06..0x0F）。/ Purpose: the proxy layer parks prefetch/AI
- * results in PSRAM and consumes them whole when rendering a card, so large
- * results never crowd the internal heap (the same gen25 data-layer discipline:
- * allocations of 1-2K+ off the hot path do not ride the internal heap).
- * Planned API shape (gen26 lands the implementation + host test and deletes
- * this comment): acquire prefers PSRAM with an internal fallback and returns
- * NULL on failure; release is NULL-safe. Discipline: MALLOC_CAP_SPIRAM, a
- * 256 KB per-block budget, session lifetime (acquirable while ARMED, all freed
- * at IDLE - same life as the .part), and results never enter protocol frames
- * (the protocol is frozen; extension goes through CTRL 0x06-0x0F only). */
+/* ---- gen26 AI 查词（蓝牙代理 + 搭车协议）---- */
+/* gen26 AI lookup (BLE proxy + ride-along). */
+
+/// 挂接搭车离线队列缓冲（设备侧 PSRAM）。main 启动期分配后调一次；长度不足
+/// 仅记日志，AI 离线缓存不可用但不影响推送。
+/// Attach the ride-along offline buffer (PSRAM on device); main calls once at
+/// boot. A too-small buffer only logs - the offline cache is unavailable but
+/// pushing is unaffected.
+void push_sink_attach_ai_buffer(uint8_t *buf, size_t len, uint16_t cap);
+
+/// 运行期开关 AI 查词（NVS 持久化）：关掉后不再上报能力位图、不再主动发起查词，
+/// 已回流释义仍走预取缓存。/ Toggle AI lookup (NVS-persisted): off drops the
+/// capability bitmap and proactive queries; cached definitions still serve.
+void push_sink_set_ai_enabled(bool on);
+
+/// 当前是否启用 AI 查词。/ Current AI-lookup enable state.
+bool push_sink_ai_enabled(void);
+
+/// 用户在设备上点了一个词（UI 调用）：命中预取缓存秒出卡；连上即请手机算
+/// （STATUS 0x17）；离线则入搭车队列，下次连接回流。
+/// The user tapped a word (UI): a cache hit renders at once; a connected tap
+/// asks the phone (STATUS 0x17); an offline tap queues for the ride-along.
+void push_sink_ai_tap_word(const char *word);
+
+/// 取走一条待展示的释义（块 4 卡片框架入口）；UI 轮询消费，返回 true 表示有。
+/// Take a pending definition to render (block 4 card framework entry); polled
+/// by the UI, true means one was available.
+bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap);
 
 #ifdef __cplusplus
 }

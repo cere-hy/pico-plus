@@ -52,6 +52,8 @@
 
 #include "read_pico_pmu.h"
 
+#include "ai_ridealong.h"
+
 static const char *TAG = "push_sink";
 
 /* ---- 常量 / Constants ---- */
@@ -106,6 +108,7 @@ static const char *TAG = "push_sink";
 #define PUSH_NVS_NS "rp_pushsink"
 #define PUSH_NVS_KEY_SESS "sess"
 #define PUSH_NVS_KEY_UNREAD "unread" // gen21 未读位（独立 u8 key，不动 sess blob 布局）
+#define PUSH_NVS_KEY_AI "ai_en"      // gen26 AI 查词开关位（独立 u8 key）
 #define PUSH_NVS_MAGIC 0x50534E31u // 'P','S','N','1'
 
 // .part 回读算 CRC 的分块大小。/ Chunk size for the partial-file CRC read-back.
@@ -219,9 +222,38 @@ static struct {
     char committed_title[PUSH_TITLE_MAX];
     uint8_t committed_type;
     bool unread; // gen21：正文已落盘且尚未被打开（首页「有新内容」徽章）/ a body landed and not yet opened (home "new content" badge)
+    bool ai_def;        // gen26：一条释义待展示（块 4 卡片框架入口）/ a definition pending display (block 4 card entry)
+    char ai_word[PUSH_AI_WORD_MAX];    // 待展示单词 / the word to show
+    char ai_def_text[PUSH_AI_DEF_MAX]; // 待展示释义 / the definition to show
 } s_ui;
 
 static bool (*s_dict_probe)(void); // 词典可用性探针 / the dictionary-availability probe
+
+/* ---- gen26 AI 查词（蓝牙代理 + 搭车协议）---- */
+/* gen26 AI lookup (BLE proxy + ride-along). */
+
+// 搭车离线队列缓冲（设备侧 PSRAM，由 main 挂接）。点词时若没连手机，单词先
+// 暂存这里，下次连接由 ai_flush_queue 逐个回流（STATUS 0x17）。
+// The ride-along offline buffer (PSRAM on device, attached by main). While the
+// phone is away, tapped words park here and ai_flush_queue streams them back on
+// the next connect (STATUS 0x17).
+static uint8_t *s_ai_buf;
+static size_t s_ai_buf_len;
+static uint16_t s_ai_cap;
+static bool s_ai_ready;   // 缓冲已挂接且 init 成功 / buffer attached and inited
+static bool s_ai_enabled; // 运行期开关（NVS 持久化）/ runtime on/off (NVS-persisted)
+
+// 预取释义缓存（块 3）：最近回流的释义，点词命中即秒出卡，不挤空口。
+// Prefetch cache (block 3): recent definitions; a tap on a cached word renders
+// instantly without touching the radio.
+#define AI_CACHE_N 8u
+typedef struct {
+    char word[PUSH_AI_WORD_MAX];
+    char def[PUSH_AI_DEF_MAX];
+    bool used;
+} ai_cache_t;
+static ai_cache_t s_ai_cache[AI_CACHE_N];
+static uint8_t s_ai_cache_next;
 
 /* ---- 小助手 / Small helpers ---- */
 
@@ -249,6 +281,11 @@ static void ensure_init(void) {
         if (nvs_open(PUSH_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
             uint8_t u = 0;
             if (nvs_get_u8(h, PUSH_NVS_KEY_UNREAD, &u) == ESP_OK) s_ui.unread = u != 0;
+            // gen26：AI 查词开关位（缺省关，首次开过才持久化为 1）。
+            // gen26: the AI-lookup enable bit (defaults off; persisted as 1 only
+            // after the user turns it on at least once).
+            uint8_t ai = 0;
+            if (nvs_get_u8(h, PUSH_NVS_KEY_AI, &ai) == ESP_OK) s_ai_enabled = ai != 0;
             nvs_close(h);
         }
     }
@@ -1106,6 +1143,145 @@ static int begin_precheck(const push_begin_t *b) {
     return PUSH_ERR_NONE;
 }
 
+/* ---- gen26 AI 查词：代理层 + 搭车协议 ---- */
+/* gen26 AI lookup: the proxy layer plus the ride-along protocol. */
+
+// 安全复制：最多 cap-1 字节 + 末尾补 0；绕开 -Werror=stringop-truncation。
+// Bounded copy: at most cap-1 bytes plus a trailing NUL; sidesteps the
+// stringop-truncation -Werror (strncpy trips it on GCC 15.2).
+static void ai_str_put(char *dst, size_t cap, const char *src) {
+    size_t n = strnlen(src, cap - 1);
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+// 进预取缓存（块 3）：环形覆盖，最近回流的释义优先命中。
+// Into the prefetch cache (block 3): ring overwrite, newest definitions win.
+static void ai_cache_put(const char *word, const char *def) {
+    ai_cache_t *e = &s_ai_cache[s_ai_cache_next];
+    ai_str_put(e->word, sizeof(e->word), word);
+    ai_str_put(e->def, sizeof(e->def), def);
+    e->used = true;
+    s_ai_cache_next = (uint8_t)((s_ai_cache_next + 1u) % AI_CACHE_N);
+}
+
+static const char *ai_cache_find(const char *word) {
+    for (uint8_t i = 0; i < AI_CACHE_N; ++i) {
+        if (s_ai_cache[i].used && strcmp(s_ai_cache[i].word, word) == 0) return s_ai_cache[i].def;
+    }
+    return NULL;
+}
+
+// 把一条释义交给 UI 槽（块 4 框架入口）。在 s_ui_lock 下写，UI 轮询取走。
+// Hand a definition to the UI slot (block 4 framework entry); the UI polls it.
+static void ai_surface(const char *word, const char *def) {
+    portENTER_CRITICAL(&s_ui_lock);
+    s_ui.ai_def = true;
+    ai_str_put(s_ui.ai_word, sizeof(s_ui.ai_word), word);
+    ai_str_put(s_ui.ai_def_text, sizeof(s_ui.ai_def_text), def);
+    portEXIT_CRITICAL(&s_ui_lock);
+}
+
+// 连接后上报能力位图（STATUS 0x18）；APK 据此显隐查词入口。
+// Report the capability bitmap (STATUS 0x18) after connect; the APK gates the
+// entry on it.
+static void ai_send_caps(void) {
+    push_caps_t caps = {0};
+    if (s_ai_enabled) caps.bits |= PUSH_CAP_AI_QUERY;
+    uint8_t frame[5];
+    const size_t n = push_caps_encode(&caps, frame, sizeof(frame));
+    if (n) notify_status(frame, n);
+}
+
+// 把离线队列里的待查词逐个回流（STATUS 0x17），出队保持紧凑。
+// Flush the offline queue word by word (STATUS 0x17), staying compact.
+static void ai_flush_queue(void) {
+    if (!s_ai_ready) return;
+    char w[PUSH_AI_WORD_MAX + 1];
+    for (uint16_t guard = 0; ai_raloc_count(s_ai_buf) > 0 && guard <= s_ai_cap; ++guard) {
+        if (!ai_raloc_peek(s_ai_buf, w, sizeof(w))) break;
+        uint8_t frame[2u + PUSH_AI_WORD_MAX];
+        const size_t n = push_st_ai_query_encode(w, frame, sizeof(frame));
+        if (!n) break;
+        notify_status(frame, n);
+        if (!ai_raloc_dequeue(s_ai_buf, w, sizeof(w))) break;
+    }
+}
+
+// 连接建立：上报能力 + 回流离线队列。在 CONNECT 锁区内调用（notify 需持锁）。
+// On connect: report capability and flush the offline queue. Called inside the
+// CONNECT lock region (notify needs the lock held).
+static void ai_on_connect(void) {
+    if (!s_ai_enabled) return;
+    ai_send_caps();
+    ai_flush_queue();
+}
+
+// 释义回流（0x07）：进预取缓存 + 交 UI 槽出卡。/ Definition result (0x07): into
+// the prefetch cache and to the UI slot.
+static void ai_on_result(const char *word, const char *def) {
+    ai_cache_put(word, def);
+    ai_surface(word, def);
+}
+
+/* ---- gen26 AI 查词：公开 API（main / UI 调用）---- */
+/* gen26 AI lookup: the public API (called by main / the UI). */
+
+void push_sink_attach_ai_buffer(uint8_t *buf, size_t len, uint16_t cap) {
+    s_ai_buf = buf;
+    s_ai_buf_len = len;
+    s_ai_cap = cap;
+    s_ai_ready = buf && ai_raloc_init(buf, len, cap);
+    if (buf && !s_ai_ready) {
+        ESP_LOGW(TAG, "ai ride-along buffer attach failed (len=%u cap=%u)", (unsigned)len, (unsigned)cap);
+    }
+}
+
+bool push_sink_ai_enabled(void) { return s_ai_enabled; }
+
+void push_sink_set_ai_enabled(bool on) {
+    s_ai_enabled = on;
+    nvs_handle_t h = 0;
+    if (nvs_open(PUSH_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, PUSH_NVS_KEY_AI, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+void push_sink_ai_tap_word(const char *word) {
+    if (!word || !*word) return;
+    if (s_ai_enabled) {
+        const char *cached = ai_cache_find(word);
+        if (cached) { ai_surface(word, cached); return; } // 命中预取缓存：秒出卡
+    }
+    if (!s_ai_enabled) return;
+    lock();
+    const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
+    if (live) {
+        uint8_t frame[2u + PUSH_AI_WORD_MAX];
+        const size_t n = push_st_ai_query_encode(word, frame, sizeof(frame));
+        if (n) notify_status(frame, n); // 即时：STATUS 0x17
+    } else if (s_ai_ready) {
+        ai_raloc_enqueue(s_ai_buf, s_ai_buf_len, word); // 离线：入搭车队列
+    }
+    unlock();
+}
+
+bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap) {
+    bool got = false;
+    if (!word || wcap == 0 || !def || dcap == 0) return false;
+    portENTER_CRITICAL(&s_ui_lock);
+    if (s_ui.ai_def) {
+        s_ui.ai_def = false;
+        got = true;
+        ai_str_put(word, wcap, s_ui.ai_word);
+        ai_str_put(def, dcap, s_ui.ai_def_text);
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    return got;
+}
+
 static void on_ctrl_write(const uint8_t *data, size_t len) {
     uint8_t op;
     if (!push_ctrl_header_decode(data, len, &op)) {
@@ -1139,6 +1315,25 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         struct timeval tv = {.tv_sec = (time_t)utc, .tv_usec = 0};
         (void)settimeofday(&tv, NULL);
         ESP_LOGI(TAG, "clock set from phone: %lu", (unsigned long)utc);
+        return;
+    }
+    // gen26 AI 查词通道：与 SET_TIME 同属「连上即可用」旁路，不受「必须武装」限制。
+    // 0x06 = 手机→设备触发离线队列回流；0x07 = 手机→设备单词 + 释义回流。
+    // gen26 AI lookup: like SET_TIME, usable on connect, not gated on armed.
+    // 0x06 = phone to device, flush the offline queue; 0x07 = phone to device,
+    // word + definition.
+    if (op == PUSH_OP_AI_QUERY) {
+        ai_flush_queue();
+        return;
+    }
+    if (op == PUSH_OP_AI_RESULT) {
+        push_ai_result_t r;
+        if (!push_ai_result_decode(data, len, &r)) {
+            ESP_LOGW(TAG, "ai result decode rejected: len=%u", (unsigned)len);
+            reply_err(PUSH_ERR_BAD_FRAME);
+            return;
+        }
+        ai_on_result(r.word, r.def);
         return;
     }
     // 未武装：任何 CTRL 写入都回 ERR(1)，状态机看都不看。/ Unarmed: every CTRL
@@ -1318,6 +1513,7 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         s_notify_retry_left = 3; // gen14：每个连接周期 3 次重投配额 / 3 retries per cycle
         ESP_LOGI(TAG, "phone connected");
         exec_actions(push_session_event(&s_sess, PUSH_EVT_CONNECT, NULL));
+        ai_on_connect(); // gen26：上报能力 + 回流离线待查词（持锁内调用）
         unlock();
         return 0;
 

@@ -132,3 +132,97 @@ size_t push_status_encode(uint8_t opcode, const uint8_t *body, size_t body_len, 
     if (body_len) memcpy(out + 1, body, body_len);
     return 1u + body_len;
 }
+
+/* ---- AI 查词帧 / AI lookup frames ---- */
+
+size_t push_ai_query_encode(const push_ai_query_t *q, uint8_t *out, size_t cap) {
+    if (!q || !out || cap < PUSH_AI_QUERY_MAX) return 0;
+    memset(out, 0, PUSH_AI_QUERY_MAX);
+    out[0] = PUSH_MAGIC0;
+    out[1] = PUSH_MAGIC1;
+    out[2] = PUSH_OP_AI_QUERY;
+    out[3] = PUSH_VERSION;
+    size_t n = strnlen(q->word, PUSH_AI_WORD_MAX);
+    if (n >= PUSH_AI_WORD_MAX) n = PUSH_AI_WORD_MAX - 1; // 保 0 / keep NUL
+    out[4] = (uint8_t)n;
+    memcpy(out + 5, q->word, n);
+    return PUSH_AI_QUERY_MAX;
+}
+
+bool push_ai_query_decode(const uint8_t *in, size_t len, push_ai_query_t *q) {
+    if (!in || !q || len < PUSH_AI_QUERY_MAX) return false;
+    if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_QUERY) return false;
+    if (in[3] != PUSH_VERSION) return false;
+    memset(q, 0, sizeof(*q));
+    const size_t n = in[4];
+    if (n >= PUSH_AI_WORD_MAX) return false; // 长度越界 / length out of range
+    memcpy(q->word, in + 5, n);
+    q->word[n] = 0;
+    return true;
+}
+
+size_t push_ai_result_encode(const push_ai_result_t *r, uint8_t *out, size_t cap) {
+    if (!r || !out || cap < PUSH_AI_RESULT_MAX) return 0;
+    memset(out, 0, PUSH_AI_RESULT_MAX);
+    out[0] = PUSH_MAGIC0;
+    out[1] = PUSH_MAGIC1;
+    out[2] = PUSH_OP_AI_RESULT;
+    out[3] = PUSH_VERSION;
+    size_t wn = strnlen(r->word, PUSH_AI_WORD_MAX);
+    if (wn >= PUSH_AI_WORD_MAX) wn = PUSH_AI_WORD_MAX - 1;
+    size_t dn = strnlen(r->def, PUSH_AI_DEF_MAX);
+    if (dn >= PUSH_AI_DEF_MAX) dn = PUSH_AI_DEF_MAX - 1;
+    out[4] = (uint8_t)wn;
+    memcpy(out + 5, r->word, wn);
+    // word 区固定占 PUSH_AI_WORD_MAX 槽位（填满 0），释义长度(u16 LE)接在后面。
+    // The word field occupies a fixed PUSH_AI_WORD_MAX slot (zero-filled); the
+    // definition length (u16 LE) follows.
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    put_u16(out + off, (uint16_t)dn);
+    memcpy(out + off + 2u, r->def, dn);
+    return PUSH_AI_RESULT_MAX;
+}
+
+bool push_ai_result_decode(const uint8_t *in, size_t len, push_ai_result_t *r) {
+    if (!in || !r || len < PUSH_AI_RESULT_MAX) return false;
+    if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_RESULT) return false;
+    if (in[3] != PUSH_VERSION) return false;
+    memset(r, 0, sizeof(*r));
+    const size_t wn = in[4];
+    if (wn >= PUSH_AI_WORD_MAX) return false;
+    memcpy(r->word, in + 5, wn);
+    r->word[wn] = 0;
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    const size_t dn = get_u16(in + off);
+    if (dn >= PUSH_AI_DEF_MAX) return false;
+    memcpy(r->def, in + off + 2u, dn);
+    r->def[dn] = 0;
+    return true;
+}
+
+size_t push_st_ai_query_encode(const char *word, uint8_t *out, size_t cap) {
+    if (!word || !out || cap < 2u + PUSH_AI_WORD_MAX) return 0;
+    memset(out, 0, 2u + PUSH_AI_WORD_MAX);
+    out[0] = PUSH_ST_AI_QUERY;
+    size_t n = strnlen(word, PUSH_AI_WORD_MAX);
+    if (n >= PUSH_AI_WORD_MAX) n = PUSH_AI_WORD_MAX - 1;
+    out[1] = (uint8_t)n;
+    memcpy(out + 2, word, n);
+    return 2u + PUSH_AI_WORD_MAX;
+}
+
+/* ---- 能力位图 / Capability bitmap ---- */
+
+size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap) {
+    if (!caps || !out || cap < 5u) return 0; // op(1) + u32(4)
+    out[0] = PUSH_ST_CAPS;
+    put_u32(out + 1, caps->bits);
+    return 5u;
+}
+
+bool push_caps_decode(const uint8_t *in, size_t len, push_caps_t *caps) {
+    if (!in || !caps || len < 5u) return false;
+    if (in[0] != PUSH_ST_CAPS) return false;
+    caps->bits = get_u32(in + 1);
+    return true;
+}
