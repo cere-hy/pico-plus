@@ -44,6 +44,16 @@ void app_book_request_manage(void);
 bool app_book_reader_body_visible(void);
 /// 模式/对比度变化时释放旧格式封面；绘制前由主循环一次调用。/ Drop obsolete cover formats once on mode/contrast changes, before drawing.
 void app_book_cover_mode_changed(void);
+/// gen26 AI 释义卡入口：主循环从释义 UI 槽取到内容后调用。阅读态且无面板开着时
+/// 暂存释义并开卡（返回 true，调用方随即呈现）；有面板开着或不在阅读态时不抢
+/// 焦点（释义留在预取缓存，下次点同一词秒出）。
+/// Gen26 AI definition card entry: called by the main loop after taking content
+/// from the definition UI slot. While reading with no panel open it stages the
+/// definition and opens the card (returns true; the caller presents right away);
+/// with a panel open or outside reading it never steals focus (the definition
+/// stays in the prefetch cache and the next tap on the same word shows it
+/// instantly).
+bool app_book_ai_def_ready(const char* word, const char* def);
 void app_home_cover_mode_changed(void);
 /// 开书前释放可重建的表盘底图，让解析器使用这部分 PSRAM。/ Release rebuildable clock bases before opening a book so parsing can use that PSRAM.
 void app_home_release_clock_cache(void);

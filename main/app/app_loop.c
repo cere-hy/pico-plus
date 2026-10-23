@@ -639,6 +639,23 @@ void app_loop_run(const app_loop_config_t* config) {
             read_pico_transfer_service_poll();
             app_time_service_poll(!touch.touched && ctx.now_ms - last_input_ms >= 10000 &&
                 !current->holds_pmu && !usb_storage_active() && !pico_online_busy() && !ble_pt_connected());
+            // gen26 AI 查词：轮询释义 UI 槽，来了就交阅读器出卡。沿用 media 分支的
+            // 既定模式——出卡即呈现、丢弃本轮陈旧触摸、delay 后 continue：释义到达
+            // 与触摸分发同一 Tick 撞车的窗口由这次丢弃吸收（与拔卡事件同口径）。
+            // gen26 AI lookup: poll the definition UI slot and hand arrivals to
+            // the reader. Same established pattern as the media branch - present
+            // on arrival, discard this tick's stale touch, delay and continue:
+            // the def-arrival/touch-dispatch same-tick window is absorbed by the
+            // discard (same treatment as card-removal events).
+            char ai_word[PUSH_AI_WORD_MAX + 1];
+            char ai_def[PUSH_AI_DEF_MAX + 1];
+            if (push_sink_take_ai_def(ai_word, sizeof(ai_word), ai_def, sizeof(ai_def)) &&
+                app_book_ai_def_ready(ai_word, ai_def)) {
+                was_touched = touch.touched;
+                app_present(&ctx, current, APP_REDRAW_PAGE);
+                vTaskDelay(pdMS_TO_TICKS(LOOP_TICK_MS));
+                continue;
+            }
         }
         ctx.pressed = pressed;
         ctx.released = released;

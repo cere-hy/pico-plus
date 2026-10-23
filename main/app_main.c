@@ -28,6 +28,7 @@
 #include "display.h"
 #include "epd_highlevel.h"
 #include "epdiy.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "ota_update.h"
 #include "pmu_selftest.h"
@@ -39,6 +40,7 @@
 #include "read_pico_pmu_protocol.h"
 #include "read_pico_transfer.h"
 #include "push_sink.h"
+#include "ai_ridealong.h"
 #include "dict/dict_lookup.h"
 #include "settings.h"
 #include "sleep.h"
@@ -218,6 +220,26 @@ void app_main(void) {
     // written exactly for the "card may not be ready yet" case).
     push_sink_init();
     push_sink_set_dict_probe(dict_warm);
+    // gen26 AI 查词：挂 PSRAM 搭车缓冲 + 开户。缓冲按 cap 最坏情形（每词最长）算
+    // 尺寸，cap=64 词对一次阅读会话足够；开关 NVS 缺省关，main 显式开一次即持久化
+    // （设置位 UI 落地后由 UI 接管该值的写入口，届时改「仅无值时开」语义）。
+    // gen26 AI lookup: attach the PSRAM ride-along buffer and switch the feature
+    // on. The buffer is sized for the worst case (every word at max length); 64
+    // words is plenty for one reading session. The switch defaults off in NVS and
+    // one explicit enable here persists it (once the settings UI lands it takes
+    // over writes and this becomes an "enable only when unset" semantic).
+    {
+        const uint16_t ai_cap = 64;
+        const size_t ai_len = ai_raloc_buf_size(ai_cap);
+        uint8_t* ai_buf = heap_caps_malloc(ai_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ai_buf) {
+            push_sink_attach_ai_buffer(ai_buf, ai_len, ai_cap);
+            ESP_LOGI(TAG, "ai ride-along buffer: %u B cap=%u", (unsigned)ai_len, (unsigned)ai_cap);
+        } else {
+            ESP_LOGW(TAG, "ai ride-along buffer alloc failed (%u B) - offline queue disabled", (unsigned)ai_len);
+        }
+        push_sink_set_ai_enabled(true);
+    }
     app_loop_run(&(app_loop_config_t){
         .hl = &hl,
         .fb = framebuffer,

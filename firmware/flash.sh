@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico26（gen25.2 为 0.3.3-pico25.2；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico26.1（块0 为 0.3.3-pico26；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico26 (gen25.2 was 0.3.3-pico25.2; reusing an older tag makes
+# Version string: 0.3.3-pico26.1 (block 0 was 0.3.3-pico26; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1523,9 +1523,90 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   field; partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…`
 #   byte-identical to gen25.2; bootloader `c720f1bc…` (same 21,232 B, timestamp
 #   difference vs gen25.2's `a399f196…`).
+# gen26.1（块1–5 落码 + main 侧挂接 · AI 查词全链：0x06/0x07 协议 + 蓝牙代理 +
+#   搭车离线队列 + 预取缓存 + UI 释义卡 + AI 开关位）：
+#   版本串：0.3.3-pico26.1（三处同步；相对块0 的 pico26 必须再换串——TF 卡升级路径
+#   判「版本相同」拒绝，块0 用户靠这一跳升级到 AI 包）。
+#   范围：① push_proto.h 登记 PUSH_OP_AI_QUERY=0x06 / PUSH_OP_AI_RESULT=0x07 与
+#   STATUS 0x17(设备→手机请算释义)/0x18(能力位图)，「登记即冻结」一代一行 + Python
+#   参考同步；② ai_ridealong.c 扁平缓冲离线队列（MAGIC 0x5241、去重入队、出队
+#   前移、无分配），设备侧 PSRAM 64 词（4,166 B）；③ push_sink.c 胶水——未武装
+#   闸前挂 0x06/0x07、CONNECT 锁区内上报 CAPS + 回流队列、0x07 释义进预取缓存
+#   (8 词环形) + UI 一次性槽；④ main 挂接：app_main 挂 PSRAM 缓冲 +
+#   set_ai_enabled(true)（NVS 持久化，缺省关）、app_book 点词喂
+#   push_sink_ai_tap_word、app_loop 500ms 轮询 take_ai_def → app_book_ai_def_ready
+#   出卡（无面板开着才开，不抢焦点；释义留预取缓存下次点词秒出）、
+#   dict_popup_show_def 外部释义暂存（复用同一折行/绘制/保存 chip 链路）。
+#   调用方图谱（纪律①）：七个新 API 全部「声明/实现/单一调用方」三点闭环，无孤儿
+#   入口、无漏接；push_sink_ai_enabled 为预留查询口暂无调用方。APK 无需改动——
+#   waitStatus 对非候选 STATUS op（0x17/0x18）丢弃继续等，推送流不受影响；手机端
+#   AI 计算属后续应用侧工作（Python 参考 push_pico.py 已同步编解码，可手动对测）。
+#   门禁：宿主 runner 248 checks, 0 red（gen26 新基线）；fullclean exit 0，7 警告
+#   与紧邻基线逐条一致、零新增；块0 真机已验证（HWM free+used=6144 ×9、开大书
+#   推送 verify ok 零拒收、largest 回 31744、boot 日志 seg1 paddr=002441e0 与
+#   口径公式逐字吻合）。
+#   锚：Read_Pico.bin 4,070,032 B（相对块0 4,066,400 为 **+3,632 B**，双操作数
+#   4,070,032-4,066,400=+3,632）；段级净和 seg0(DROM)+304 / seg2(IRAM)-304 /
+#   seg3(IROM)+3,336 / seg4 len+304 = **+3,640**，尾注对齐差 **-8**（镜像尾 =
+#   零填充 + 1B checksum + 32B validation hash，文件按 16B 对齐收尾；段和增长
+#   挪动对齐余数，块0 尾 48B / 本代 40B）——**分项净和 + 尾注差 = 总差，逐分
+#   闭合**（gen26 新门禁固定项首战：现场差 8 当场查清为尾注填充，非段级错误）。
+#   seg1 File offs `0x00234308`（paddr = offs + 8 + 0x10000 = `0x00244310`）、
+#   Load `0x3fc9c700`、len `0x08a8c`——**Load/len 与块0 零偏移，双锚守住**；
+#   File offs +0x130=+304 系 seg0(DROM) 增长顺移，vaddr 不动。
+#   sha256 `d45c7096…`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#   与块0 逐字节一致；bootloader `15f97791…`（同 21,232 B，时间戳差异）。
+# Gen26.1 (blocks 1-5 landed + main-side attach - the full AI lookup chain:
+#   0x06/0x07 protocol + BLE proxy + ride-along offline queue + prefetch cache +
+#   UI definition card + AI switch bit):
+#   Version string: 0.3.3-pico26.1 (three places in sync; the tag must change
+#   again from block 0's pico26 - the TF-card upgrade path rejects "same version",
+#   and block-0 users need this hop to reach the AI package).
+#   Scope: ① push_proto.h registers PUSH_OP_AI_QUERY=0x06 / PUSH_OP_AI_RESULT=0x07
+#   plus STATUS 0x17 (device->phone, please compute) / 0x18 (capability bitmap),
+#   "registration is freeze" one row per generation + Python reference sync;
+#   ② ai_ridealong.c flat-buffer offline queue (MAGIC 0x5241, dedup enqueue,
+#   compact dequeue, no allocation), 64 words in device PSRAM (4,166 B);
+#   ③ push_sink.c glue - 0x06/0x07 mounted ahead of the unarmed gate, CAPS
+#   report + queue flush inside the CONNECT lock, 0x07 definitions into the
+#   prefetch cache (8-word ring) + a one-shot UI slot; ④ main attach: app_main
+#   attaches the PSRAM buffer + set_ai_enabled(true) (NVS-persisted, default
+#   off), app_book feeds push_sink_ai_tap_word on taps, app_loop polls
+#   take_ai_def every 500 ms -> app_book_ai_def_ready opens the card (only when
+#   no panel is open - never steals focus; the definition stays in the prefetch
+#   cache for an instant re-show on the next tap), dict_popup_show_def stages
+#   external definitions (reusing the same wrap/draw/save-chip chain).
+#   Caller graph (discipline ①): all seven new APIs are closed loops of
+#   "declaration / implementation / single caller", no orphan entries, nothing
+#   unwired; push_sink_ai_enabled is a reserved query entry with no caller yet.
+#   The APK needs no change - waitStatus drops non-candidate STATUS ops
+#   (0x17/0x18) and keeps waiting, so the push flow is unaffected; the phone-side
+#   AI computation is follow-up app work (the Python reference push_pico.py is
+#   already in sync codec-wise and can be used for manual round-trips).
+#   Gate: host runner 248 checks, 0 red (the gen26 baseline); fullclean exit 0,
+#   7 warnings identical to the adjacent baseline line by line, zero new; block-0
+#   hardware verified (HWM free+used=6144 x9, large-book push verify ok with zero
+#   rejections, largest back to 31744, boot-log seg1 paddr=002441e0 matching the
+#   formula character for character).
+#   Anchors: Read_Pico.bin 4,070,032 B (**+3,632 B** vs block 0's 4,066,400; both
+#   operands 4,070,032-4,066,400=+3,632); segment-level sum seg0(DROM)+304 /
+#   seg2(IRAM)-304 / seg3(IROM)+3,336 / seg4 len+304 = **+3,640**, footer
+#   alignment delta **-8** (the image tail = zero padding + 1B checksum + 32B
+#   validation hash, file closed at 16B alignment; the segment growth shifts the
+#   alignment residue, block 0's tail 48B vs this gen's 40B) - **sum of parts +
+#   footer delta = total, closed to the byte** (the gen26 fixed gate item's first
+#   live run: the on-the-spot 8-byte gap was traced to footer padding, not a
+#   segment-level error).
+#   seg1 File offs `0x00234308` (paddr = offs + 8 + 0x10000 = `0x00244310`),
+#   Load `0x3fc9c700`, len `0x08a8c` - **Load/len zero-offset vs block 0, the
+#   double anchor holds**; File offs +0x130=+304 is a pure seg0(DROM) growth
+#   shift, vaddr unmoved.
+#   sha256 `d45c7096…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to block 0; bootloader `15f97791…` (same 21,232 B,
+#   timestamp difference).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="39309cd12e61af87c5fa0f6da235ce32c4760c62a53b4497866d43e3f0077b3e"
+EXPECTED="d45c70965292c03c4c42f162196559ec17106329609354cf14a4a177e36456f6"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

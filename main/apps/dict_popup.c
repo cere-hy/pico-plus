@@ -35,6 +35,12 @@ static const char* TAG = "dict";
 #define DICT_POPUP_SAVE_H 52
 #define DICT_POPUP_SAVE_PX 26
 #define DICT_POPUP_SUMMARY_LINES 3
+// gen26 AI 释义段缓冲：手机侧协议上限 PUSH_AI_DEF_MAX=170（含 NUL 169），段间按
+// \n 切分后任何单段都短于它，192 足够且不引入 push 组件依赖。/ gen26 AI def
+// segment buffer: the phone-side protocol cap is PUSH_AI_DEF_MAX=170 (169 with
+// NUL) and segments split on \n, so 192 holds any single segment without
+// depending on the push component.
+#define DICT_POPUP_AI_SEG 192
 
 static char s_word[DICT_POPUP_WORD_MAX];
 static char* s_lines[DICT_POPUP_LINES];
@@ -226,6 +232,43 @@ bool dict_popup_open(const char* word) {
              word, (int)ok, (long long)(open_us / 1000), (long long)(look_us / 1000),
              (long long)(wrap_us / 1000), (long long)((esp_timer_get_time() - t0) / 1000));
     free(out);
+    if (!ok) dict_popup_reset();
+    return ok;
+}
+
+// gen26 AI 释义开卡：外部释义（手机 0x07 回流 / 预取缓存命中）直接暂存。与
+// dict_popup_open 共用 reset/wrap/store 链路与保存 chip 谓词，唯一区别是不做
+// 本地词典查找。/ gen26 AI definition staging: an external definition (phone
+// 0x07 return / prefetch-cache hit) is staged directly. It shares the
+// reset/wrap/store chain and the save-chip predicate with dict_popup_open; the
+// only difference is that no local dictionary lookup happens.
+bool dict_popup_show_def(const char* word, const char* def) {
+    const int64_t t0 = esp_timer_get_time();
+    dict_popup_reset();
+    if (!word || !*word || !*def) return false;
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    const int text_w = dict_popup_rect().width - 2 * DICT_POPUP_PAD;
+    char seg[DICT_POPUP_AI_SEG];
+    const char* p = def;
+    while (*p && !s_truncated) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        // 协议上限保证单段必小于 seg；此处钳制纯防御，永不触发。/ The protocol cap
+        // guarantees every segment fits in seg; the clamp is pure defence.
+        if (len > sizeof(seg) - 1) len = sizeof(seg) - 1;
+        memcpy(seg, p, len);
+        seg[len] = 0;
+        if (len) wrap_text(seg, DICT_POPUP_TEXT_PX, text_w);
+        if (s_truncated || !nl) break;
+        p = nl + 1;
+    }
+    const bool ok = s_line_count > 0;
+    // 保存 chip 反映生词本真实落盘状态，与本地词典卡同一谓词。/ The save chip
+    // reflects the real vocabulary-book state, same predicate as the dict card.
+    if (ok) s_saved = vocab_log_contains(s_word);
+    ESP_LOGI(TAG, "ai def \"%s\" lines=%d truncated=%d wrap=%lldms",
+             s_word, s_line_count, (int)s_truncated,
+             (long long)((esp_timer_get_time() - t0) / 1000));
     if (!ok) dict_popup_reset();
     return ok;
 }

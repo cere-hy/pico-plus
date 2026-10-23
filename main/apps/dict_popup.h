@@ -29,6 +29,15 @@ void dict_popup_set_anchor(int col, bool split);
 /// 查词并准备弹窗内容；成功返回 true（无词典或未收录返回 false）。
 /// Look up the word and stage the content; false when no dictionary or no entry.
 bool dict_popup_open(const char* word);
+/// gen26 AI 释义：用外部提供的释义直接开卡——不碰本地词典，走同一暂存、折行、
+/// 绘制、命中与保存链路（手机 0x07 回流或预取缓存命中由调用方喂进来）。
+/// word/def 为空、或折行后无行可显示，返回 false。
+/// gen26 AI definition: stage a card straight from an externally provided
+/// definition - the local dictionary is never touched; the same staging,
+/// wrapping, draw, hit-test and save chain applies (the phone's 0x07 return or
+/// a prefetch-cache hit is fed in by the caller). False on empty input or when
+/// wrapping produced no displayable line.
+bool dict_popup_show_def(const char* word, const char* def);
 /// 释放内容与词头。/ Release staged content.
 void dict_popup_reset(void);
 /// 在阅读页内容之上绘制卡片。/ Paint the card over the reader content.

@@ -844,6 +844,23 @@ static void prepare_fast_covers(void) {
     }
 }
 void app_book_cover_mode_changed(void) { invalidate_covers(); }
+
+// gen26 AI 释义卡：阅读态且无面板开着时，接住手机回流（0x07）或预取缓存命中的
+// 释义，暂存后直接走 READER_PANEL_DICT 同一绘制/命中/保存链路。有面板开着不抢
+// 焦点——释义已在预取缓存，下次点同一词秒出。返回是否真的开了卡（主循环据此
+// 决定是否呈现）。/ gen26 AI definition card: while reading with no panel open,
+// take the phone-returned (0x07) or prefetch-cache-hit definition and ride the
+// same READER_PANEL_DICT draw/tap/save chain. Never steals focus from an open
+// panel - the definition stays in the prefetch cache and the next tap on the
+// same word shows it instantly. Returns whether a card was actually staged (the
+// main loop uses it to decide whether to present).
+bool app_book_ai_def_ready(const char* word, const char* def) {
+    if (s_view != READING || !s_text) return false;
+    if (s_reader_panel != READER_PANEL_NONE) return false;
+    if (!dict_popup_show_def(word, def)) return false;
+    s_reader_panel = READER_PANEL_DICT;
+    return true;
+}
 static uint8_t* load_cover_gray(const char* source, const char* title, const char* author,
                                 bool decode, bool* pending) {
     *pending = false;
@@ -5448,6 +5465,16 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     // not extend the time the lock is held. No page has turned, so s_text is still the
     // chapter the hit came from.
     if (hit && english) vocab_log_capture(s_path, s_text, hit_start, hit_end);
+    // gen26 AI 查词搭车：每个英文点词都喂给 push_sink——命中预取缓存秒出卡、连上
+    // 发 0x17 请手机算、离线入搭车队列待下次连接回流。开关/NVS/缓存/加锁语义全在
+    // 组件内，这里只负责「点了什么词」，与本地词典弹窗互为补充、互不阻塞。
+    // gen26 AI ride-along: every English tap feeds push_sink - a prefetch-cache
+    // hit surfaces the card instantly, a live link sends 0x17 for the phone to
+    // compute, and an offline tap queues for the next connection to flush. The
+    // switch/NVS/cache/locking semantics all live inside the component; this
+    // only says which word was tapped, complementing (never blocking) the local
+    // dictionary popup.
+    if (hit && english) push_sink_ai_tap_word(word);
     const int64_t t_hit = esp_timer_get_time();
     // 弹窗避让锚点：按点词 x 选弹出侧——tap 分界与 gutter 中心重合，单栏横屏下同一谓词
     // 成立（与 v2 §5.1 判栏同一谓词）；分半几何随双栏生效，当前单栏横屏维持铺满
