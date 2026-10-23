@@ -53,6 +53,29 @@ extern "C" {
 ///                        -> ERR(2) and the clock is untouched.
 ///                      · Reference implementations kept in sync: PushProto.encodeSetTime
 ///                        (Java) and push_pico.py encode_set_time / --set-time (Python).
+///   gen25  0x06..0x0F  CTRL 预留区（reserved, not implemented）——为 gen26 代理层
+///                      三件套（搭车协议 / 预取释义 / 通用代理层）整段留号。
+///                      · 登记即冻结：任何一代要启用某个 0x06+ opcode，必须先在本
+///                        变更记录登记一代一行（格式同 gen14/gen22）、同步 Java/
+///                        Python 参考实现，再落实现；未登记的 opcode 即使帧头
+///                        合法也按未知 op 走 push_sink.c 的 default 分支 →
+///                        ERR(2)，会话状态机一拍不动（宿主测试有断言）。
+///                      · 刻意选 ERR(2) 而非静默忽略：静默会让手机以为设备收下
+///                        了，重试/续传语义全乱。
+///   gen25  0x06..0x0F  the reserved CTRL block (registered, not implemented) -
+///                      a whole range set aside for gen26's proxy trio (the
+///                      ride-along protocol, definition prefetch and the general
+///                      proxy layer).
+///                      · Registration freezes: any generation enabling a 0x06+
+///                        opcode must first land one change-log line here (same
+///                        shape as gen14/gen22), sync the Java/Python reference
+///                        implementations, and only then implement; an
+///                        unregistered opcode takes push_sink.c's default branch
+///                        as an unknown op -> ERR(2) with the session machine
+///                        untouched (asserted in the host test).
+///                      · ERR(2) over a silent drop on purpose: silence would make
+///                        the phone believe the device took it, wrecking retry and
+///                        resume semantics.
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
@@ -60,6 +83,10 @@ enum {
     PUSH_OP_ABORT = 0x04,         ///< 放弃本次会话 / abandon the session
     PUSH_OP_SET_TIME = 0x05,      ///< gen22：手机下发 UTC 秒（4 字节小端）校准设备时钟 /
                                   ///< phone pushes a UTC second count (4 bytes LE) to set the clock
+    PUSH_OP_RESERVED_FIRST = 0x06, ///< gen25 预留区起点（未实现，收到即 ERR(2)）/
+                                   ///< gen25 reservation start (unimplemented; ERR(2) on receipt)
+    PUSH_OP_RESERVED_LAST = 0x0F,  ///< gen25 预留区终点（STATUS 从 0x10 起，零重叠）/
+                                   ///< gen25 reservation end (STATUS starts at 0x10, no overlap)
 };
 
 /// CTRL 帧头字节数：magic(2) + op(1) + version(1)。/ CTRL header bytes: magic(2)+op(1)+version(1).

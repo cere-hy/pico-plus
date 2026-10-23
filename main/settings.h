@@ -179,6 +179,18 @@ void app_settings_set_shelf_recent_sort(bool on);
 /// and the memory is returned (stack torn down). Off by default.
 bool app_settings_ble_turner(void);
 void app_settings_set_ble_turner(bool on);
+/// gen26 预留：AI 设置位（reserved, not implemented）——通用代理层 / 预取释义
+/// 的主开关将来落这里。已登记的三处：API 形态 app_settings_ai() /
+/// app_settings_set_ai(bool)；NVS 键 "ai_on"（settings.c NVS_KEY_AI，启用前
+/// 不读写）；设置备份 profile.home_full_refresh 的 bit 6（0x40，v5+ 预留位
+/// 惯例）。gen26 启用前不上 UI、不进任何读写路径。
+/// Gen26 reservation: the AI settings bit (registered, not implemented) - the
+/// general proxy layer's / definition prefetch's master switch will land here.
+/// Three places are registered: the API shape app_settings_ai() /
+/// app_settings_set_ai(bool); the NVS key "ai_on" (NVS_KEY_AI in settings.c,
+/// never read or written until enabled); and bit 6 (0x40) of the backup's
+/// profile.home_full_refresh field (the v5+ reserved-bit convention). No UI
+/// and no read/write path until gen26 enables it.
 /// 飞行模式：只关射频（WiFi 与蓝牙），保留 NVS 里已存的 WiFi 凭据；关闭后原网络照旧可用。
 /// Flight mode: drops the radios (Wi-Fi and Bluetooth) only and keeps the saved Wi-Fi
 /// credentials in NVS, so switching it off returns to the same network with no re-entry.

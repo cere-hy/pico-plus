@@ -145,9 +145,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico24.3（gen24.2 为 0.3.3-pico24.2；沿用旧串会让 TF 卡升级
+# 版本串 / Version string: 0.3.3-pico25（gen24.5 为 0.3.3-pico24.5；沿用旧串会让 TF 卡升级
 # 判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico24.3 (gen24.2 was 0.3.3-pico24.2; reusing an older tag makes
+# Version string: 0.3.3-pico25 (gen24.5 was 0.3.3-pico24.5; reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1212,7 +1212,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   transfer_ui 断言 arm/cancel 计数失败）；fullclean exit 0，8 警告同基线
 #   （app_book.c 7 + ui_pinpad.c 1）。锚：Read_Pico.bin 4,062,960 B（相对
 #   gen24.4 4,063,488 为 -528 B，双操作数 4,062,960-4,063,488=-528），
-#   sha256 `5c3bab05…`，seg1 File offs `0x00233d58`（paddr 0x00243d58）、
+#   sha256 `5c3bab05…`，seg1 File offs `0x00233d58`（paddr = offs + 0x10008 =
+#   0x00243d60）、
 #   Load `0x3fc9c700`、len `0x08a8c`；partition-table `9d5d890b…`、
 #   ota_data_initial `7d2c7ac4…` 与 gen24.4 逐字节一致；bootloader
 #   `8e7f7866…`→`cbe2b12a…`（同 21,232 B，编译时间戳差异）。
@@ -1241,13 +1242,126 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   exit 0 with the 8-warning baseline intact (app_book.c 7 + ui_pinpad.c 1).
 #   Anchors: Read_Pico.bin 4,062,960 B (-528 vs gen24.4's 4,063,488;
 #   4,062,960-4,063,488=-528), sha256 `5c3bab05…`, seg1 File offs
-#   `0x00233d58` (paddr 0x00243d58), Load `0x3fc9c700`, len `0x08a8c`;
+#   `0x00233d58` (paddr = offs + 0x10008 = 0x00243d60), Load `0x3fc9c700`,
+#   len `0x08a8c`;
 #   partition-table `9d5d890b…` and ota_data_initial `7d2c7ac4…` are
 #   byte-identical to gen24.4; bootloader `8e7f7866…` -> `cbe2b12a…` (same
 #   21,232 B, build-timestamp difference).
+# gen25（内存三层根治 + 推送让路链 + 内存体检面板 + gen26 四预留）：
+#   版本串：0.3.3-pico25（CMakeLists.txt 一处 + 本记录 + 顶部版本串注释，三处
+#   同步；顺带订正 gen24.4/24.5 漏更的顶部注释漂移）。
+#   背景（gen24 真机）：BLE 推送预检拒绝的直接原因是内部堆最大连续块跌出 19K——
+#   根因三层：数据层（书内大块分配压内部堆）、分配卫生（≥1-2K 非热路径分配
+#   落 PSRAM）、以及 12K 元凶 book_prep 任务栈关书后不归还。
+#   修法四处：
+#     ① 12K 归还：prep_task 改为安全点自删（s_prep_task=NULL → give(s_prep_done)
+#       → vTaskDelete(NULL)），外部路径一律不 vTaskDelete；free_book 有界等待
+#       句柄为空；任务自删前打 `prep stack HWM: N words`（min-so-far，降栈决策
+#       数据）。s_prep_done 为二元信号量（helper 先 take(0) 清残留再等，无
+#       「早完成」竞态）。
+#     ② app_reading.c 内置 reading.md（7,893 B）malloc → PSRAM（内部兜底）。
+#     ③ 推送让路链（惊喜②）：栈 down + 预检不过 + 确实有书开着 三条件同时成立
+#       才让路——request_prep_stop 非阻塞置旗 → on_tick 下一拍确认 prep 已停
+#       （1500ms 观察窗判据是句柄 NULL 不是钟）→ 卸书 → 重过预检 → 武装；
+#       仍不过 → 「内存未能腾出——重启设备后可直接推送」重启兜底（不原地重试）。
+#       收官双路：让路过的推送走 restore_after_push 回原书原位置（失败必须
+#       出声），B 留书架并 mark_push_first_open（首次手动打开仍走一次 GC16，
+#       非让路推送走 open_clean 直达打底，两路不交叉）。
+#     ④ 内存体检面板（惊喜③）：传书方法页长按入口（LONG_PRESS 与 TAP 互斥，
+#       零手势冲突），模态面板只盖方法卡区（224..560），不碰提示条/说明行/
+#       返回键/底栏；读数同源 ble_pt_mem_snapshot + ble_pt_mem_gate（与按钮
+#       预检/start_locked 同一份数字）；红绿灯 largest 主判（红 <15K / 黄
+#       15–20K 碎片率辅显 / 绿 ≥20K=BLE 闸门同门槛），碎片率 = 1−largest/free
+#       （free=0 记 100%，不除零不误导）；【知道了】/再长按/任意按键关闭，
+#       其余手势一律吞；视图被让路收官/收摊切走时面板静默让位。
+#   gen26 四预留（零行为变更）：push_proto.h CTRL 0x06..0x0F 整段登记
+#     reserved-not-implemented（未知 op 仍走 default→ERR(2)，宿主测试断言
+#     解码器原样放行且与 STATUS 0x10 起零重叠）；武装页可扩展卡片渲染骨架
+#     （只留纪律注释不出函数）；push_sink.h PSRAM 结果缓冲 helper 预留
+#     （API 形态/预算/生命周期登记）；AI 设置位预留（settings.h API 形态 +
+#     settings.c NVS_KEY_AI "ai_on" 占号 + 备份 profile.home_full_refresh
+#     bit 6(0x40) 留位）。
+#   门禁：宿主 runner 14/14 全绿（case 级登记 KNOWN-FAIL 维持：ui_kit §1 r93
+#     packed framebuffer + home_recent 上游过期测试，均见 KNOWN_FAILURES.md）；
+#     push_sink 189/0（168 + 预留区登记 21 项）；transfer_ui 新增
+#     push_yield_regression（8 场景）+ mem_panel_regression（阈值/公式/模态/
+#     视图卫兵，变异有牙：长按不开面板 → 930 断言失败）；book_management
+#     73 PASS（reader_fullscreen 补 gen25 符号立式替身）；fullclean exit 0，
+#     8 警告同基线（app_book.c 7 + ui_pinpad.c 1，逐条对表）。锚：
+#     Read_Pico.bin 4,066,576 B（相对 gen24.5 4,062,960 为 +3,616 B，双操作数
+#     4,066,576-4,062,960=+3,616），sha256 `de93e5e4…`，seg1 File offs
+#     `0x002341d8`（paddr = offs + 0x10008 = 0x002441e0）、Load `0x3fc9c700`、
+#     len `0x08a8c`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#     与 gen24.5 逐字节一致；bootloader `cbe2b12a…`→`834ec762…`（同 21,232 B，
+#     编译时间戳差异）。
+# Gen25 (three-layer memory root fix + the push yield chain + the memory health
+#   panel + gen26's four reservations):
+#   Version string: 0.3.3-pico25 (CMakeLists.txt + this record + the top
+#   version comment, three places in sync; also fixes the top-comment drift
+#   gen24.4/24.5 left at 24.3).
+#   Background (gen24 hardware): the BLE push precheck refusals traced to the
+#   internal heap's largest block falling under 19K - three layers: the data
+#   layer (in-book large allocations crowd the internal heap), allocation
+#   hygiene (1-2K+ off-hot-path allocations belong in PSRAM), and the 12K
+#   culprit: the book_prep task stack never returned when a book closed.
+#   Four fixes:
+#     (1) The 12K returned: prep_task now self-deletes at a safe point
+#       (s_prep_task=NULL -> give(s_prep_done) -> vTaskDelete(NULL)); external
+#       paths never call vTaskDelete; free_book waits bounded for a NULL
+#       handle; the task logs `prep stack HWM: N words` (min-so-far, the
+#       stack-shrink decision data) before self-deleting. s_prep_done is a
+#       binary semaphore (the helper takes 0 to clear residue first - no
+#       "done early" race).
+#     (2) app_reading.c's built-in reading.md (7,893 B) malloc -> PSRAM
+#       (internal fallback).
+#     (3) The push yield chain (surprise 2): only when "stack down + precheck
+#       failed + a book is really open" all hold - request_prep_stop sets the
+#       flag non-blocking, on_tick's next tick confirms prep stopped (the
+#       1500 ms window judges by a NULL handle, not the clock), unloads,
+#       re-runs the precheck and arms; still failing -> the restart fallback
+#       "memory could not be freed - push works right after a restart" (no
+#       in-place retry). Finale dual-path: a yielded push restores the original
+#       book at its position (failure must speak up), B stays on the shelf with
+#       mark_push_first_open (its first manual open takes one GC16; a non-yield
+#       push goes through open_clean directly - the two paths never cross).
+#     (4) The memory health panel (surprise 3): long-press on the method page
+#       (LONG_PRESS and TAP are mutually exclusive - zero gesture conflict); a
+#       modal panel covering the method-card area only (224-560), touching
+#       neither the hint banner, info lines, back key nor tab bar; readings
+#       share ble_pt_mem_snapshot + ble_pt_mem_gate with the button precheck /
+#       start_locked; the traffic light is largest-driven (red <15K, yellow
+#       15-20K with fragmentation as a note, green >=20K = the BLE gate's own
+#       threshold), fragmentation = 1-largest/free (free=0 reads 100% - no
+#       division by zero, no misleading ratio); closed by [got it], another
+#       long press or any key, everything else swallowed; the panel steps aside
+#       silently when the yield finale or a close-up switches the view.
+#   gen26's four reservations (zero behavior change): push_proto.h registers
+#     CTRL 0x06-0x0F as reserved-not-implemented (unknown ops still take
+#     default->ERR(2); the host test asserts the decoder passes the op through
+#     and that the block never overlaps STATUS's 0x10); the arm page's
+#     extensible card-render skeleton (a discipline comment, no function);
+#     push_sink.h's PSRAM result-buffer helper reservation (API shape, budget
+#     and lifetime registered); the AI settings bit reservation (settings.h API
+#     shape + settings.c NVS_KEY_AI "ai_on" slot + backup
+#     profile.home_full_refresh bit 6 (0x40) held).
+#   Gate: 14/14 host runners green (case-level registered KNOWN-FAILs stand:
+#     ui_kit (1) r93 packed framebuffer + home_recent's upstream-stale test,
+#     both in KNOWN_FAILURES.md); push_sink 189/0 (168 + the reservation
+#     registry's 21 checks); transfer_ui gains push_yield_regression (8
+#     scenarios) + mem_panel_regression (thresholds/formula/modality/view
+#     guard; mutation bites: long-press not opening fails the assert at 930);
+#     book_management 73 PASS (reader_fullscreen gains the gen25 symbol
+#     stand-ins); fullclean exit 0 with the 8-warning baseline intact
+#     (app_book.c 7 + ui_pinpad.c 1, compared line by line). Anchors:
+#     Read_Pico.bin 4,066,576 B (+3,616 vs gen24.5's 4,062,960; both operands:
+#     4,066,576-4,062,960=+3,616), sha256 `de93e5e4…`, seg1 File offs
+#     `0x002341d8` (paddr = offs + 0x10008 = 0x002441e0), Load `0x3fc9c700`,
+#     len `0x08a8c`; partition-table `9d5d890b…` and ota_data_initial
+#     `7d2c7ac4…` are byte-identical to gen24.5; bootloader `cbe2b12a…` ->
+#     `834ec762…` (same 21,232 B, build-timestamp difference).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="5c3bab059fa5cf519dd995c75b43e77b457caeff0f6d385ddea94d02dc368d84"
+EXPECTED="de93e5e403e9ff4ca504217ef6325b8be29fb1dae9a34b3d49564cd85493df61"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

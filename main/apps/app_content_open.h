@@ -16,6 +16,26 @@ bool app_book_request_open_clean(const char *path);
 bool app_book_request_open_from_home(const char *path);
 /// 一次性深睡恢复；保持保存的正文位置与全屏状态。/ One-shot deep-sleep resume with saved position and fullscreen state.
 bool app_book_request_resume(const char *path, bool fullscreen);
+/// gen25 让路链：预检不过时临时卸下当前书（归还 12K prep 栈与解析缓冲），推送收官后自动重开原位置。位置走既有 book_progress，不引入第二套机制。
+/// Gen25 yield chain: unload the current book when the precheck fails (returns the 12K prep stack and parse buffers), then reopen it at the saved position after the push. Position uses the existing book_progress - no second mechanism.
+/// 返回值 / return: true = 已就绪（无书可卸，或已卸）；false = 无法干净卸下（prep 未停 / 正在渲染）——让路链按失败处理。
+/// true = ready (nothing to yield, or yielded); false = cannot unload cleanly (prep still alive / rendering) - the yield chain treats it as a failure.
+bool app_book_request_yield_for_push(void);
+/// 让路后的恢复：重开被卸下的书。已让路且能重开 → true；用户已开别的书或重开失败 → false（调用方必须给提示，绝不静默）。
+/// Restore after the yield: reopen the unloaded book. true when it was yielded and can be reopened; false when the user opened something else or the reopen failed (the caller must speak up, never stay silent).
+bool app_book_restore_after_push(void);
+/// 当前是否处于「已让路、待恢复」状态。/ Whether a yield is outstanding.
+bool app_book_yield_active(void);
+/// gen25 接线裁定 #1：停机的**非阻塞**一半——只置标志并唤醒任务，不等它退出。调用方据此「先出提示、再分拍等」。
+/// Gen25 wiring ruling #1: the **non-blocking** half of stopping - set the flag and wake the task, never wait for it to exit. The caller shows a hint first and then waits across ticks.
+void app_book_request_prep_stop(void);
+/// 停机的查询一半：prep 任务是否已退出（12K 栈是否已归还）。/ The query half: whether the prep task has exited (the 12K stack is back).
+bool app_book_prep_stopped(void);
+/// 让路触发面收窄用：当前是否真有一本书开着（无书就不必让路）。/ Narrows the yield trigger: is a book actually open (no book means no yield needed).
+bool app_book_has_open_book(void);
+/// gen25：让路收官把推送内容留在书架时置位——它的**首次手动打开**也要一次整屏 GC16 打底（否则首开带残影）。消费一次即止。
+/// Gen25: set by the yield finale when the pushed text is left on the shelf - its **first manual open** also gets one screen-wide GC16 base (otherwise the first open ghosts). Consumed once.
+void app_book_mark_push_first_open(void);
 /// 仅导出已打开阅读上下文。/ Export only an already open reader context.
 bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen);
 bool app_image_request_open(const char *path);

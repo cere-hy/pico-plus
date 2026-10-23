@@ -405,6 +405,10 @@ static bool s_reader_cleanup;
 // completed push also has ghosting". Set only by app_book_request_open_clean
 // and consumed once by present; shelf and home opens keep their cadence.
 static bool s_open_full_once;
+// gen25：让路收官留下的「推送内容首开需 GC16 打底」标记，消费一次即止。
+// Gen25: the "pushed text's first open needs a GC16 base" flag left by the yield
+// finale; consumed once.
+static bool s_push_first_open_once;
 static bool s_reader_footer_pending;
 static bool s_water_turn_pending;
 static e0470_turn_dir_t s_water_turn_dir;
@@ -425,6 +429,29 @@ static book_layout_draw_cursor_t s_prep_cursor;
 static uint32_t s_next_generation;
 static uint8_t* s_next_fb;
 static int s_next_page = -1, s_prep_page = -1;
+// gen25（高水位采样，用户裁定「要」）：book_prep 任务栈的 min-so-far 剩余量
+// （FreeRTOS 以 word 为单位，S3 上 1 word = 4 B）。12K 栈是开书后内部最大块从
+// 31744 掉到 19456 的属主（差正好 12288），若实测高水位只剩 3-4K，把栈降到
+// 6-8K 还能再省 4-6K 内部堆——比任何搬移都直接。任务在**自删前**打这一行，
+// 覆盖整个生命周期；只在外部删时打会漏掉中途低谷。
+// Gen25 (high-water sampling, the user ruled "yes"): book_prep's stack
+// min-so-far (FreeRTOS counts words; 4 B each on the S3). The 12K stack owns
+// the 31744 -> 19456 drop (a difference of exactly 12288); if the measured high
+// water mark is only 3-4K, shrinking the stack to 6-8K saves another 4-6K of
+// internal RAM - more directly than any relocation. The task logs the line
+// **before self-deleting** so the whole lifetime is covered; logging only from
+// the outside would miss mid-life troughs.
+static UBaseType_t s_prep_hwm_words;
+// 停机等待上限：一次 prep 的工作单元是「预绘一页」的行循环（每行都查一次
+// s_prep_stop），真机一页预绘在百毫秒量级，这里给 1s——约 3-10 倍余量，足以
+// 覆盖最大书最长 prep。关键是**超时不强删**（见 prep_task_request_stop），
+// 所以这个值只影响「本次能否立刻归还 12K」，不影响安全。
+// Stop-wait ceiling: one prep unit is the row loop that pre-renders a page
+// (every row re-checks s_prep_stop); a page pre-render runs in the hundreds of
+// milliseconds on hardware, so 1 s leaves roughly 3-10x headroom. What matters
+// is that a timeout never force-deletes (see prep_task_request_stop), so this
+// only decides whether the 12K comes back right now, never safety.
+#define BOOK_PREP_STOP_WAIT_MS 1000
 
 #define s_toolbar (s_reader_panel != READER_PANEL_NONE)
 
@@ -436,6 +463,7 @@ static void copy_text(char* dst, size_t cap, const char* src);
 static void fit_text(char* text, int px, int width);
 static void free_book(void);
 static void save_progress(void);
+static void prep_task_request_stop(const char *why); // gen25：让路链要提前停机 / gen25: the yield chain needs to stop prep early
 static void invalidate_prep(void);
 static void prepare_inline_image(void);
 static void release_page_images(void);
@@ -448,6 +476,15 @@ bool app_book_request_open(const char* path) {
     copy_text(s_requested_open, sizeof(s_requested_open), path);
     s_requested_open_home = false;
     s_requested_fullscreen = true;
+    // gen25：让路收官留下的推送内容首开标记在这里消费——B 的第一次手动打开
+    // 也享受一次整屏 GC16，避免「被让路推来的书第一次打开有残影」。
+    // Gen25: the yield finale's first-open flag is consumed here - B's first
+    // manual open also gets one screen-wide GC16, so a push that arrived via the
+    // yield does not show ghosting on its first open.
+    if (s_push_first_open_once && !strcmp(path, PUSH_TEXT_PATH)) {
+        s_push_first_open_once = false;
+        s_open_full_once = true;
+    }
     return true;
 }
 // gen24.4（渲染发灰根治）：带一次整屏 GC16 的开书。供推送收官使用——武装页
@@ -461,6 +498,16 @@ bool app_book_request_open_clean(const char* path) {
     s_open_full_once = true;
     return true;
 }
+// gen25：让路场景下被留在书架的推送内容，它的「首开 GC16 打底」要单独保证。
+// 非让路推送走收官自动开书（clean 打底，gen24.4）；让路推送改走「恢复原书」，
+// 推送内容 B 留在书架等用户手动打开——若不管，B 第一次打开就是差分，会带残影。
+// 这里由让路收官置位，下一次打开 B 时消费一次。
+// Gen25: the pushed text left on the shelf by a yield needs its own "first open
+// gets a GC16 base". A normal push opens it automatically at the finale (clean,
+// gen24.4); a yielded push restores the book instead, leaving B on the shelf for
+// a manual open - unhandled, B's first open would be a differential with
+// ghosting. The yield finale sets this flag and the next open of B consumes it.
+void app_book_mark_push_first_open(void) { s_push_first_open_once = true; }
 bool app_book_request_open_from_home(const char* path) {
     if (!app_book_request_open(path)) return false;
     s_requested_open_home = true;
@@ -470,6 +517,73 @@ bool app_book_request_resume(const char *path, bool fullscreen) {
     if (!app_book_request_open_from_home(path)) return false;
     s_requested_fullscreen = fullscreen;
     return true;
+}
+
+/* ---- gen25 让路链（yield / restore）---- */
+// 预检不过时把当前这本「临时卸下」，把它的 12K prep 栈与整批解析缓冲还给内部
+// 堆，让 BLE 闸门过得去；推送收官后再自动重开、回到原位置（位置走既有
+// book_progress 单一真源，不引入第二套机制）。
+// Yield the current book away when the precheck fails, handing its 12K prep stack
+// and the whole parse buffer set back to the internal heap so the BLE gate
+// passes; the push finale then reopens it at the saved position (position uses
+// the existing book_progress single source - no second mechanism).
+static bool s_book_yielded;
+static char s_yield_path[BOOK_STORE_PATH_MAX];
+
+bool app_book_yield_active(void) { return s_book_yielded; }
+
+// gen25 接线裁定 #1（异步等待形态）：把停机拆成「非阻塞请求」与「查询是否已停」
+// 两步，让调用方（传书页）能**先出提示、再分拍等**——同步等 done 最长 1000ms
+// 会让按钮按下去 1 秒无 UI 变化，那正是「点了没反应」的死感。
+// Gen25 wiring ruling #1 (async wait shape): split stopping into a non-blocking
+// request and a "stopped?" query so the caller (the transfer page) can **show a
+// hint first and then wait across ticks** - waiting for done synchronously for up
+// to 1000 ms would leave the tap with a full second of no UI change, exactly the
+// "tapped and nothing happened" dead feel.
+void app_book_request_prep_stop(void) {
+    if (!s_prep_task) return;
+    atomic_store_explicit(&s_prep_stop, true, memory_order_release);
+    xTaskNotifyGive(s_prep_task); // 只请求，不等 / request only, never wait
+}
+bool app_book_prep_stopped(void) { return !s_prep_task; }
+bool app_book_has_open_book(void) { return s_text && s_path[0]; }
+
+bool app_book_request_yield_for_push(void) {
+    if (s_book_yielded) return true;             // 幂等：已卸过就不再卸 / idempotent
+    if (!s_text || !s_path[0]) return true;      // 无书可卸 = 无需让路，直接就绪 / nothing open: nothing to yield, already ready
+    // ① prep 停机（12K 栈归还）。/ Stop prep first (returns the 12K stack).
+    prep_task_request_stop("yield");
+    if (s_prep_task) return false;               // 超时未停 → 按失败处理，不原地空等 / still busy: report failure, never wait it out here
+    // ② 无活跃渲染：拿得到绘制锁才算空闲。/ No rendering in flight: idle means we can take the draw lock.
+    bool idle = false;
+    if (s_draw_lock && xSemaphoreTake(s_draw_lock, 0) == pdTRUE) { xSemaphoreGive(s_draw_lock); idle = true; }
+    else if (!s_draw_lock) idle = true;
+    if (!idle) return false;
+    // ③ 存位置 → 卸书（free_book 释放 text/blocks/runs/images/page_images 并
+    //    book_close）。/ Save the position, then unload (free_book releases
+    //    text/blocks/runs/images/page_images and calls book_close).
+    save_progress();
+    copy_text(s_yield_path, sizeof(s_yield_path), s_path);
+    free_book();
+    s_book_yielded = true;
+    ESP_LOGI(TAG, "yield for push: unloaded, internal free=%u largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return true;
+}
+
+bool app_book_restore_after_push(void) {
+    if (!s_book_yielded) return false;
+    s_book_yielded = false;
+    if (!s_yield_path[0]) return false;
+    // 让路期间用户自己开了别的书 → 放弃恢复，不抢用户操作。
+    // The user opened something else during the yield: give up rather than
+    // override them.
+    if (s_text && s_path[0]) { s_yield_path[0] = 0; return false; }
+    bool ok = app_book_request_resume(s_yield_path, true);
+    ESP_LOGI(TAG, "restore after push: %s (%s)", ok ? "requested" : "FAILED", s_yield_path);
+    s_yield_path[0] = 0;
+    return ok;
 }
 bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen) {
     if (!s_text || !s_path[0] || s_view == SHELF || s_view == MANAGE || s_view == BULK ||
@@ -3562,16 +3676,75 @@ static bool reader_prefetch_buffer(void) {
         s_next_fb=heap_caps_aligned_alloc(16,need,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     return s_next_fb!=NULL;
 }
+static void prep_task_self_stop(void); // 任务自删出口，prep_task 循环里调用 / the task's self-delete exit, called from prep_task's loop
+
 static void prep_task(void *arg) {
     (void)arg;
     for(;;){
         ulTaskNotifyTake(pdTRUE,portMAX_DELAY);
+        // gen25（自删形态）：醒来先看停机标志——外部只置位 + notify，绝不
+        // vTaskDelete 本任务。强删一个正在干活的任务，FreeRTOS 只回收栈与 TCB，
+        // 任务内部 malloc 的缓冲/临时指针会漏还，那才是新的碎片源，甚至可能
+        // 持锁被删留下死锁隐患。这里由任务自己在安全点（无锁、无临时缓冲）
+        // 交还：置空句柄 → give(done) → vTaskDelete(NULL)。
+        // Gen25 (self-delete shape): check the stop flag first thing after waking -
+        // the outside only sets the flag and notifies, it never vTaskDelete()s this
+        // task. Force-deleting a task that is mid-work reclaims only the stack and
+        // TCB; whatever the task malloc'ed leaks, and that becomes a fresh
+        // fragmentation source - plus a task deleted while holding a lock invites
+        // deadlock. The task hands itself back at a safe point instead (no lock,
+        // no live scratch): clear the handle -> give(done) -> vTaskDelete(NULL).
+        if (atomic_load_explicit(&s_prep_stop, memory_order_acquire)) { prep_task_self_stop(); }
         lock_draw();
         while(!atomic_load_explicit(&s_prep_stop,memory_order_acquire)){
             if(reader_prefetch_step()!=0)break;
         }
         unlock_draw();
+        // 高水位 min-so-far：每轮工作结束采一次，取最小值。
+        // High-water min-so-far: sampled at the end of every work round, keeping the minimum.
+        UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+        if (!s_prep_hwm_words || hwm < s_prep_hwm_words) s_prep_hwm_words = hwm;
+        if (atomic_load_explicit(&s_prep_stop, memory_order_acquire)) { prep_task_self_stop(); }
         xSemaphoreGive(s_prep_done);
+    }
+}
+
+// 任务自删的唯一出口。/ The single exit the task takes when it stops itself.
+static void prep_task_self_stop(void) {
+    ESP_LOGI(TAG, "prep stack HWM: %u words (%u B) of 12288 B stack",
+             (unsigned)s_prep_hwm_words, (unsigned)(s_prep_hwm_words * sizeof(StackType_t)));
+    // 先置空句柄（外部据此判定已停，天然幂等），再 give 让等待者继续，最后自删。
+    // Clear the handle first (the outside reads it to see "stopped", which makes
+    // this idempotent by construction), then give so the waiter proceeds, then
+    // delete self.
+    s_prep_task = NULL;
+    if (s_prep_done) xSemaphoreGive(s_prep_done);
+    vTaskDelete(NULL);
+}
+
+// 外部停机请求：置位 → 唤醒 → 等任务自删；**超时从不强删**，只记日志保留任务
+// （12K 这次不还，下次让路链/开书再收）。/ The outside's stop request: set the
+// flag, wake the task, wait for it to delete itself; a timeout never force-deletes,
+// it only logs and leaves the task in place (the 12K waits for the next pass).
+static void prep_task_request_stop(const char *why) {
+    if (!s_prep_task) return;
+    atomic_store_explicit(&s_prep_stop, true, memory_order_release);
+    xTaskNotifyGive(s_prep_task); // 唤醒，让它自查退出 / wake it so it checks the flag
+    bool stopped = false;
+    if (s_prep_done) {
+        (void)xSemaphoreTake(s_prep_done, 0); // 清掉上一轮的残留 / drain a stale give
+        stopped = xSemaphoreTake(s_prep_done, pdMS_TO_TICKS(BOOK_PREP_STOP_WAIT_MS)) == pdTRUE;
+    }
+    if (stopped) {
+        ESP_LOGI(TAG, "prep task stopped (%s): 12K stack returned", why ? why : "close");
+    } else {
+        // 不强删：任务仍持有内部缓冲/可能持锁，强删会漏内存。保留它，等它自己
+        // 走到安全点退出；期间 kick_prep 会复用同一个任务，不会重复创建。
+        // Never force-delete: the task may still hold internal buffers or a lock,
+        // and deleting it would leak. Leave it; it exits at its own safe point,
+        // and kick_prep reuses that same task meanwhile instead of creating a second.
+        ESP_LOGW(TAG, "prep task still busy after %d ms (%s): kept alive, 12K stack stays for now",
+                 BOOK_PREP_STOP_WAIT_MS, why ? why : "close");
     }
 }
 static bool kick_prep(void) {
@@ -4030,6 +4203,40 @@ static void free_book(void) {
     s_text_len = 0;
     s_selected_toc = SIZE_MAX;
     s_jump_offset = SIZE_MAX;
+    // gen25（池化 · 生命周期收口）：book_prep 的 12K 任务栈随书归还。
+    // 数据层硬事实：内部最大块健康常驻 31744，开书后跌到 19456——差正好
+    // 12288 = 12×1024，即 kick_prep() 里 `xTaskCreatePinnedToCore(prep_task,
+    // "book_prep", 12*1024, ...)` 建在内部 DRAM 的任务栈。任务栈是每帧热路径，
+    // 按冷热纪律**不可搬 PSRAM**，所以解法是把它变成边界清晰的租户：关书即停
+    // 即删，下次开书 kick_prep 会按 `if (!s_prep_task && ...)` 重建。
+    // 原先只有 book_on_exit（离页）才 vTaskDelete，于是「关掉一本书」后这笔 12K
+    // 仍常驻内部堆，推送预检因此卡在 19456 < 闸门 20K 被拒——这正是真机
+    // 「开大书后点推送被拒」的直接属主。
+    // Gen25 (pooling, lifetime closure): book_prep's 12K task stack is returned
+    // with the book. Data-layer fact: the internal largest block sits at 31744
+    // when healthy and drops to 19456 once a book is open - the difference is
+    // exactly 12288 = 12*1024, the stack kick_prep() creates in internal DRAM
+    // with xTaskCreatePinnedToCore(prep_task, "book_prep", 12*1024, ...). A task
+    // stack is per-frame hot, so the冷热 discipline forbids moving it to PSRAM;
+    // the fix is to make it a well-bounded tenant: stop and delete it on close,
+    // and let the next open rebuild it (kick_prep()'s `if (!s_prep_task && ...)`
+    // already does). Until now only book_on_exit (leaving the app) deleted it, so
+    // closing a book left the 12K resident and the push precheck sat at
+    // 19456 < the 20K gate - the direct owner of the hardware "push refused
+    // after opening a big book" report.
+    // 停机协议见 prep_task_request_stop()：**只请求，不强删**——任务自己在
+    // 安全点（无锁、无临时缓冲）退出并回收栈，task self-delete 天然幂等，
+    // 两条路径（关书 / 离页）先后调用也不会重复删。
+    // The stop protocol lives in prep_task_request_stop(): **request, never
+    // force-delete** - the task exits at its own safe point (no lock, no live
+    // scratch) and reclaims the stack; self-deletion is idempotent by
+    // construction, so the two paths (close / exit) calling it in sequence can
+    // never double-delete.
+    prep_task_request_stop("close");
+    s_prep_page = -1;
+    s_next_page = -1;
+    s_next_generation = 0;
+    s_prep_cursor.started = false;
     book_close();
     s_path[0] = 0;
     s_reader_favorite = false;
@@ -6675,12 +6882,26 @@ static void book_on_exit(app_ctx_t* ctx) {
     s_reader_return_home = false;
     ui_reader_background_release();
     free(s_backgrounds); s_backgrounds = NULL; s_background_count = 0;
-    free_book();
+    free_book(); // 内部已请求停机（自删形态），离页前再要一次，幂等 / already requests the stop (self-delete shape); asking again before leaving is idempotent
     free(s_next_fb);
     s_next_fb = NULL;
-    if(s_prep_task){vTaskDelete(s_prep_task);s_prep_task=NULL;}
-    if(s_prep_done){vSemaphoreDelete(s_prep_done);s_prep_done=NULL;}
-    if (s_draw_lock) { vSemaphoreDelete(s_draw_lock); s_draw_lock = NULL; }
+    // gen25：与 free_book 同一协议——只请求、不强删。free_book 已经请求过一次，
+    // 这里再请求一次是幂等的（s_prep_task 为空时直接返回）。
+    // Gen25: same protocol as free_book - request, never force-delete. free_book
+    // already asked once; asking again is idempotent (a NULL s_prep_task returns
+    // immediately).
+    prep_task_request_stop("exit");
+    // 任务若因超时未停（仍在跑），它仍握着 s_prep_done / s_draw_lock 的句柄——
+    // 此时删信号量会给它留下一对悬挂句柄。只有确认已停（句柄被任务自己置空）
+    // 才回收信号量；未停就留着，等它自查退出。
+    // If the task did not stop (timeout, still running) it still holds the
+    // s_prep_done / s_draw_lock handles - deleting them now would leave it two
+    // dangling handles. Reclaim the semaphores only once it is confirmed stopped
+    // (the task cleared its own handle); otherwise leave them for its own exit.
+    if (!s_prep_task) {
+        if(s_prep_done){vSemaphoreDelete(s_prep_done);s_prep_done=NULL;}
+        if (s_draw_lock) { vSemaphoreDelete(s_draw_lock); s_draw_lock = NULL; }
+    }
     dict_popup_reset();
     dict_close();
     vocab_log_invalidate();

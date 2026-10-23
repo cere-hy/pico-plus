@@ -42,6 +42,36 @@ bool app_book_request_open_clean(const char *path) {
     test_book_open_clean = true;
     return true;
 }
+/* gen25 让路链的宿主替身（book 侧 API）：旋钮驱动「有书开着 / prep 已停 /
+   卸书成败 / 恢复成败」四种组合。/ Gen25 yield chain host doubles (the book
+   side): knobs drive the four combinations of "book open / prep stopped /
+   unload ok / restore ok". */
+static bool test_book_open_held;      // 当前是否有一本书开着 / whether a book is open
+static bool test_prep_stopped = true; // prep 是否已退出（12K 栈归还）/ whether prep exited
+static bool test_yield_ok = true;     // 卸书是否成功 / whether the unload succeeds
+static bool test_restore_ok = true;   // 恢复是否成功 / whether the restore succeeds
+static bool test_yield_active;
+static int test_prep_stop_calls_book, test_yield_calls, test_restore_calls;
+void app_book_request_prep_stop(void) { ++test_prep_stop_calls_book; }
+bool app_book_prep_stopped(void) { return test_prep_stopped; }
+bool app_book_has_open_book(void) { return test_book_open_held; }
+bool app_book_yield_active(void) { return test_yield_active; }
+static int test_push_first_open_marks;
+void app_book_mark_push_first_open(void) { ++test_push_first_open_marks; }
+bool app_book_request_yield_for_push(void) {
+    ++test_yield_calls;
+    if (!test_yield_ok) return false;
+    test_yield_active = true;
+    test_book_open_held = false; // 卸下后确实无书 / after unloading there really is no book
+    return true;
+}
+bool app_book_restore_after_push(void) {
+    ++test_restore_calls;
+    if (!test_restore_ok) return false;
+    test_yield_active = false;
+    test_book_open_held = true;
+    return true;
+}
 static char test_dict_word[64];
 static bool test_dict_open_ok = true;
 void dict_popup_set_anchor(int col, bool split) { (void)col; (void)split; }
@@ -728,11 +758,220 @@ static void push_pending_ui_regression(app_ctx_t *ctx) {
     // 无事件时方法页安静待命 / With no events the method page waits quietly.
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_NONE);
+
     // 归还现场 / hand the field back.
     test_push_pending = false;
     test_push_armed = false;
     test_push_start_failed = test_push_closed = false;
     s_last_cancel_why[0] = 0;
+}
+
+// gen25 让路链回归：预检不过 + 有书 → 先出提示 + 非阻塞停机请求（不让按钮同步
+// 等满 1000ms）→ 下一拍卸书 → 重过预检 → 武装；让路失败/仍不过闸 → 重启兜底
+// 文案；收官走「恢复原书」，失败必须出声。
+// Gen25 yield chain regression: precheck fails with a book open -> show the hint
+// and issue the non-blocking stop request (the tap never blocks for the full
+// 1000 ms) -> next tick unloads the book -> re-runs the precheck -> arms; a
+// failed yield or a still-failing gate lands on the restart fallback wording;
+// the finale restores the book and must speak up when that fails.
+static void push_yield_regression(app_ctx_t *ctx) {
+    // 现场：栈 down、有一本书、最大块 19K（低于 20K 闸门）。
+    // Field: stack down, a book open, largest block 19K (below the 20K gate).
+    test_ble_largest_internal = 19 * 1024;
+    test_book_open_held = true;
+    test_prep_stopped = true;
+    test_yield_ok = true;
+    test_restore_ok = true;
+    test_yield_active = false;
+    test_prep_stop_calls_book = test_yield_calls = test_restore_calls = 0;
+    test_push_armed = false;
+    test_push_state = PUSH_STATE_IDLE;
+    s_view = TRANSFER_METHODS;
+    s_push_yield_phase = 0;
+    s_push_yield_deadline = 0;
+    s_method_message[0] = 0;
+    // 点按钮：预检不过 → 进入让路 phase 1，提示立刻上屏，只发非阻塞停机请求。
+    // Tap: the precheck fails -> yield phase 1, the hint is on screen at once and
+    // only the non-blocking stop request goes out.
+    tap(ctx, method_control_rect(2));
+    assert(s_push_yield_phase == 1);
+    assert(!strcmp(s_method_message, "正在为推送腾出内存…"));
+    assert(test_prep_stop_calls_book == 1);
+    assert(!test_push_armed); // 这一拍还不武装 / no arming on this tick yet
+    // 下一拍：prep 已停 → 卸书 → 闸门恢复（32K）→ 武装。
+    // Next tick: prep stopped -> unload -> gate restored (32K) -> arm.
+    test_ble_largest_internal = 32 * 1024;
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(test_yield_calls == 1 && s_push_yield_phase == 0);
+    assert(test_push_armed);
+    // 让路后闸门仍不过 → 重启兜底文案（不原地重试）。
+    // Gate still failing after the yield -> the restart fallback (no retry in place).
+    test_push_armed = false;
+    test_yield_active = false;
+    test_book_open_held = true;
+    test_ble_largest_internal = 19 * 1024;
+    s_push_yield_phase = 0;
+    s_view = TRANSFER_METHODS; // 上一场景已武装进推送页，回到方法页再点 / the previous scene armed into the push page; back to the method page before tapping
+    s_method_message[0] = 0;
+    tap(ctx, method_control_rect(2));
+    assert(s_push_yield_phase == 1);
+    ctx->now_ms += 500;
+    assert(on_tick(ctx) == APP_REDRAW_PAGE);
+    assert(!strcmp(s_method_message, "内存未能腾出——重启设备后可直接推送"));
+    assert(!test_push_armed);
+    // 收官：让路过的推送走「恢复原书」，不再开 push.txt；restore 失败要出声。
+    // Finale: a yielded push restores the book instead of opening push.txt; a
+    // failed restore must speak up.
+    s_view = TRANSFER_PUSH;
+    test_push_state = PUSH_STATE_WINDOW;
+    test_push_armed = true;
+    test_yield_active = true;
+    test_restore_ok = true;
+    test_book_open_clean = false;
+    test_book_open_path[0] = 0;
+    ctx->request_app = NULL;
+    test_push_open = true;
+    snprintf(test_push_title, sizeof(test_push_title), "让路收到的书");
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    assert(test_restore_calls == 1 && !test_book_open_clean); // 不开 push.txt / push.txt is not opened
+    assert(test_push_first_open_marks == 1); // B 首开打底已标记 / B's first open is flagged for the GC16 base
+    assert(ctx->request_app == &app_book);
+    assert(!strncmp(s_method_message, "已收到《让路收到的书》", strlen("已收到《让路收到的书》")));
+    // restore 失败：仍然回到阅读页，但文案说明要手动打开。
+    // Restore fails: still hands over to the reader, but the wording says to open it manually.
+    test_yield_active = true;
+    test_restore_ok = false;
+    test_push_open = true;
+    ctx->request_app = NULL;
+    assert(on_tick(ctx) == APP_REDRAW_NONE);
+    assert(ctx->request_app == &app_book);
+    assert(strstr(s_method_message, "原书未能自动重开"));
+    // 触发面收窄：无书开着时不让路（直接给内存不足提示）。
+    // Narrow trigger: with no book open there is no yield (straight to the memory hint).
+    s_view = TRANSFER_METHODS;
+    test_push_state = PUSH_STATE_IDLE; // 回到 IDLE，否则再点即取消而非走四门 / back to IDLE, or another tap cancels instead of running the gates
+    test_push_armed = false;
+    test_book_open_held = false;
+    test_yield_calls = 0;
+    s_push_yield_phase = 0;
+    s_method_message[0] = 0;
+    tap(ctx, method_control_rect(2));
+    assert(s_push_yield_phase == 0 && test_yield_calls == 0);
+    assert(strstr(s_method_message, "内存碎片不足"));
+    // 归还现场 / hand the field back.
+    test_ble_largest_internal = 32 * 1024;
+    test_book_open_held = false;
+    test_yield_active = false;
+    test_push_armed = false;
+    test_push_open = false;
+    s_push_yield_phase = 0;
+    ctx->request_app = NULL;
+}
+
+static void mem_panel_regression(app_ctx_t *ctx) {
+    // gen25 内存体检面板回归：纯函数阈值 → 位置边界 → 开关模态 → 视图卫兵。
+    // Gen25 memory-health panel regression: pure thresholds -> position bounds
+    // -> open/close modality -> the view guard.
+    // 红绿灯阈值边界（裁定：largest 主判；黄区才看碎片率）。
+    // Traffic-light threshold bounds (the ruling: largest decides; only the
+    // yellow tier reads fragmentation).
+    assert(mem_health_level(0) == MEM_LEVEL_RED);
+    assert(mem_health_level(15 * 1024 - 1) == MEM_LEVEL_RED);
+    assert(mem_health_level(15 * 1024) == MEM_LEVEL_YELLOW);
+    assert(mem_health_level(20 * 1024 - 1) == MEM_LEVEL_YELLOW);
+    assert(mem_health_level(BLE_PT_MIN_LARGEST_INTERNAL) == MEM_LEVEL_GREEN);
+    // 碎片率边界：free=0 记 100%（最坏解释、不除零）；largest≥free 记 0%。
+    // Fragmentation bounds: free=0 reads 100% (worst case, no division by
+    // zero); largest >= free reads 0%.
+    assert(mem_fragmentation_pct(0, 0) == 100);
+    assert(mem_fragmentation_pct(0, 999) == 100);
+    assert(mem_fragmentation_pct(40 * 1024, 40 * 1024) == 0);
+    assert(mem_fragmentation_pct(40 * 1024, 10 * 1024) == 75);
+    assert(mem_fragmentation_pct(100, 101) == 0);
+    // 判定文案对表：绿区过闸/绿区未过闸/黄区两档/红区。
+    // Verdict wording: green passing/failing the full gate, both yellow tiers, red.
+    char verdict[96];
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_GREEN, 0, true);
+    assert(!strcmp(verdict, "内存充足，可以开启推送"));
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_GREEN, 0, false);
+    assert(!strcmp(verdict, "连续块充足，总内存未达推送门槛"));
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 30, true);
+    assert(!strcmp(verdict, "内存偏紧，建议退出阅读后再试"));
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 50, true);
+    assert(!strcmp(verdict, "内存偏紧且碎片较多，建议退出阅读"));
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_RED, 90, false);
+    assert(!strcmp(verdict, "内存不足，请重启设备"));
+    // 位置边界（预审点 2②）：面板恰好盖住方法卡三行（224..560），下沿不进
+    // 提示条横幅（584 起），【知道了】按钮不越面板。
+    // Position bounds (pre-audit 2-(2)): the panel covers exactly the three
+    // method rows (224-560), its bottom never enters the hint banner (584 up),
+    // and the [got it] button stays inside the panel.
+    const EpdRect panel = mem_panel_rect();
+    const EpdRect row2 = method_control_rect(2);
+    assert(panel.y == method_control_rect(0).y && panel.y + panel.height == row2.y + row2.height);
+    assert(panel.y + panel.height <= 584);
+    const EpdRect close_all = ui_rect_union(panel, mem_panel_close_rect());
+    assert(close_all.y == panel.y && close_all.y + close_all.height == panel.y + panel.height);
+    // 开关与模态：长按开；开着时底栏/返回键/方法行点击全吞；【知道了】或再
+    // 长按关。/ Open/close and modality: long press opens; with the panel up
+    // every tab-bar / back-key / method-row tap is swallowed; [got it] or
+    // another long press closes.
+    s_view = TRANSFER_METHODS;
+    s_mem_panel = false;
+    s_pressed = -1;
+    ctx->request_return = false; // 先前流程遗留，归零再验 / left over from earlier flows; zero it first
+    ctx->request_app = NULL;
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
+    test_push_arm_calls = 0;
+    ui_gesture_event_t ev = {.type = UI_GESTURE_LONG_PRESS, .x0 = 342, .y0 = 300, .x = 342, .y = 300};
+    assert(on_gesture(ctx, &ev) == APP_REDRAW_PAGE);
+    assert(s_mem_panel);
+    int nav_before = test_nav_index;
+    ui_gesture_event_t tab = {.type = UI_GESTURE_TAP, .x0 = 342, .y0 = UI_NAV_TOP + 16, .x = 342, .y = UI_NAV_TOP + 16};
+    assert(on_gesture(ctx, &tab) == APP_REDRAW_NONE);
+    assert(test_nav_index == nav_before && s_view == TRANSFER_METHODS && s_mem_panel);
+    ui_gesture_event_t back = {.type = UI_GESTURE_TAP, .x0 = 50, .y0 = 100, .x = 50, .y = 100};
+    assert(on_gesture(ctx, &back) == APP_REDRAW_NONE);
+    assert(!ctx->request_return && s_mem_panel);
+    tap(ctx, method_control_rect(0)); // 方法行点击被吞，不切页 / a method-row tap is swallowed, no switch
+    assert(s_view == TRANSFER_METHODS && s_mem_panel);
+    tap(ctx, mem_panel_close_rect()); // 【知道了】关 / [got it] closes
+    assert(!s_mem_panel);
+    ev.type = UI_GESTURE_LONG_PRESS; // 再长按开、再长按关 / long press toggles open, then closed
+    assert(on_gesture(ctx, &ev) == APP_REDRAW_PAGE && s_mem_panel);
+    assert(on_gesture(ctx, &ev) == APP_REDRAW_PAGE && !s_mem_panel);
+    // 有牙：长按「手机推送」行只开面板，绝不顺带武装（LONG_PRESS 不是 TAP）。
+    // Tooth: a long press on the phone-push row only opens the panel and never
+    // arms (LONG_PRESS is not a TAP).
+    const EpdRect push_row = method_control_rect(2);
+    ui_gesture_event_t row_lp = {.type = UI_GESTURE_LONG_PRESS,
+        .x0 = (uint16_t)(push_row.x + push_row.width / 2), .y0 = (uint16_t)(push_row.y + push_row.height / 2),
+        .x = (uint16_t)(push_row.x + push_row.width / 2), .y = (uint16_t)(push_row.y + push_row.height / 2)};
+    assert(on_gesture(ctx, &row_lp) == APP_REDRAW_PAGE);
+    assert(s_mem_panel && test_push_arm_calls == 0);
+    assert(on_gesture(ctx, &row_lp) == APP_REDRAW_PAGE && !s_mem_panel);
+    // 视图卫兵：面板开着时视图被切走（让路收官/收摊），拦截立即让位。
+    // View guard: with the panel up a view switch (yield finale / close-up)
+    // stops the interception at once.
+    s_mem_panel = true;
+    s_view = TRANSFER_PUSH;
+    assert(on_gesture(ctx, &row_lp) == APP_REDRAW_NONE && !s_mem_panel);
+    // 按键关面板。/ A key closes the panel.
+    s_mem_panel = true;
+    s_view = TRANSFER_METHODS;
+    assert(on_key(ctx, UI_KEY_2) == APP_REDRAW_PAGE && !s_mem_panel);
+    // on_enter 不跨回合存活。/ on_enter never lets it survive a round.
+    s_mem_panel = true;
+    on_enter(ctx);
+    assert(!s_mem_panel && s_view == TRANSFER_METHODS);
+    // 归还现场 / hand the field back.
+    test_push_state = PUSH_STATE_IDLE;
+    test_push_armed = false;
+    test_push_arm_calls = 0;
+    ctx->request_return = false;
+    ctx->request_app = NULL;
 }
 
 int main(void) {
@@ -936,5 +1175,7 @@ int main(void) {
     push_multistate_regression(&ctx);
     push_gate_regression(&ctx);
     push_pending_ui_regression(&ctx);
+    push_yield_regression(&ctx);
+    mem_panel_regression(&ctx);
     puts("transfer_ui_host_test: PASS");
 }

@@ -84,6 +84,13 @@
 #define NVS_KEY_FONTS_DIR "fonts_dir"
 #define NVS_KEY_BOOK_FONTS "bk_fonts"
 #define NVS_KEY_BOOK_VERTICAL "bk_vert"
+// gen26 预留：AI 设置位键名（reserved, not implemented——启用前不读写此键，
+// 登记只为占号防撞；配套备份位与 API 形态见 settings.h 的 gen26 注释块）。
+// Gen26 reservation: the AI settings bit's key name (registered, not
+// implemented - never read or written until enabled; registered only to hold
+// the slot. The matching backup bit and API shape live in settings.h's gen26
+// comment block).
+#define NVS_KEY_AI "ai_on"
 #define FONT_PATH_MAX 160
 #define MEDIA_DIR_MAX 96
 
@@ -1032,7 +1039,13 @@ esp_err_t app_settings_backup_save(void) {
     strlcpy(profile.avatar, s_avatar, sizeof(profile.avatar));
     strlcpy(profile.status_signature, s_status_signature, sizeof(profile.status_signature));
     // v5 及之后复用此字段的预留位；v7 在其后追加 WiFi 与阅读资料。
+    // bit 6（0x40）为 gen26 AI 设置位预留（登记未实现，见 settings.h 的 gen26
+    // 注释块）；恢复侧本就只认已知位，未知位随旧备份读 0，零行为变化。
     // V5+ use reserved bits here; v7 appends WiFi/reading records, and v9 stores main mode in the extension.
+    // Bit 6 (0x40) is reserved for gen26's AI settings bit (registered, not
+    // implemented - see settings.h's gen26 comment block); the restore side only
+    // ever reads known bits, unknown bits come back 0 from older backups, so
+    // this changes no behavior.
     profile.home_full_refresh = (s_home_full_refresh ? 1 : 0) |
                                 (s_reader_hide_images ? 2 : 0) |
                                 (s_shelf_recent_sort ? 4 : 0) |

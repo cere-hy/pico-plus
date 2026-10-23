@@ -132,7 +132,23 @@ static bool line_is_bold(char* line, const char** out) {
 static void parse_md(void) {
     if (s_md != NULL) return;
     size_t len = (size_t)(reading_md_end - reading_md_start);
-    s_md = malloc(len + 1);
+    // gen25（分配卫生层 · 低频可搬）：这块是内置 reading.md 的**一次性常驻拷贝**
+    // （实测 7,893 B），读完只做只读解析，既不进渲染热路径也不逐帧访问——原先走
+    // 无 cap 的 malloc 落在内部堆，进过一次阅读说明页就在内部堆留下一个近 8K 的
+    // 常驻洞，正是开书后最大块被切碎的帮凶之一。搬 PSRAM：PSRAM 慢约 8 倍只惩罚
+    // 每帧读写，这里总共只写一次，无性能代价。（热路径纪律见账本 §二十四：
+    // epdiy 的 dirty_lines / line_queue / render_lcd buffer 一律不动。）
+    // Gen25 (allocation hygiene, the cold tier): this is the one-shot resident
+    // copy of the built-in reading.md (7,893 B measured) - parsed once, then
+    // read-only. It never enters the render hot path, yet the bare malloc landed
+    // it in internal RAM, leaving a near-8K resident hole in the internal heap
+    // after one visit to the reading notes page - one of the things chopping up
+    // the largest block once a book is open. Moved to PSRAM: the ~8x PSRAM
+    // penalty only bites per-frame traffic, and this is written once. (The hot
+    // path discipline is in ledger section 24: epdiy's dirty_lines,
+    // line_queue and render_lcd buffers stay where they are.)
+    s_md = heap_caps_malloc(len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_md == NULL) s_md = malloc(len + 1); // PSRAM 不在时退回内部 / fall back when there is no PSRAM
     if (s_md == NULL) return;
     memcpy(s_md, reading_md_start, len);
     s_md[len] = '\0';

@@ -101,6 +101,17 @@ static void book_layout_set_first_line_indent(unsigned em){assert(draw_locked);l
 static void book_layout_set_first_line_indent_adjust(int px){assert(draw_locked);layout_adjustment=px;}
 """
 unit += function('apply_reader_indent', BOOK) + '\n'
+# gen25：让路收官的 B 首开标记——app_book_request_open 的提取体消费
+# s_push_first_open_once / s_open_full_once / PUSH_TEXT_PATH，宿主给立式替身；
+# 首开 GC16 语义由 book_ui / transfer_ui 宿主测试覆盖，本测试只验证开书标记。
+# Gen25: the yield finale's B first-open flag - the extracted
+# app_book_request_open consumes s_push_first_open_once / s_open_full_once /
+# PUSH_TEXT_PATH; the host stands them up here. The first-open GC16 semantics
+# are covered by the book_ui / transfer_ui host tests; this one only pins the
+# open-request flags.
+unit += '#define PUSH_DIR "/sdcard/.readpico"\n'
+unit += '#define PUSH_TEXT_PATH PUSH_DIR "/push.txt"\n'
+unit += 'static bool s_open_full_once, s_push_first_open_once;\n'
 for name in ('app_book_request_open', 'app_book_request_open_from_home', 'app_book_request_resume',
              'toggle_reader_fullscreen', 'reader_turn_chrome', 'turn_page'):
     unit += function(name, BOOK) + '\n'

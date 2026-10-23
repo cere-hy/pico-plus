@@ -261,6 +261,23 @@ static transfer_view_t s_view;
 // down - the sink moves to a background owner and the phone can still push
 // within the grace/window. Manual exits close up as before.
 static bool s_push_handed_off;
+// gen25 让路链（接线裁定 #1 异步形态）：0 = 无让路；1 = 已发停机请求、等 prep
+// 退出（12K 栈归还）；UI 在 phase 1 期间显示「正在为推送腾出内存…」，收尾由
+// push_tick 的下一拍完成，绝不在一个按钮回调里同步等满 1000ms。
+// Gen25 yield chain (wiring ruling #1, async shape): 0 = no yield; 1 = stop
+// requested, waiting for prep to exit (12K stack back). During phase 1 the UI
+// shows "freeing memory for the push..."; the next push_tick finishes the job -
+// a button callback never blocks for the full 1000 ms.
+static int s_push_yield_phase;
+static int64_t s_push_yield_deadline;
+// 分拍等待上限：prep 一轮是百毫秒量级，给 1500ms（3 个 500ms tick）覆盖最大书
+// 的最长 prep；到点未停即按失败处理（裁定 #3：不原地重试，等待 = 卡死观感）。
+// Tick-wait ceiling: a prep round runs in the hundreds of milliseconds, so
+// 1500 ms (three 500 ms ticks) covers the longest prep of the biggest book; on
+// expiry it is treated as a failure (ruling #3: never retry in place - waiting
+// reads as a freeze).
+#define PUSH_YIELD_WAIT_MS 1500
+static void push_arm_now(void); // gen25：让路链收尾在 push_tick 里武装，早于其定义 / gen25: the yield chain arms from push_tick, above push_arm_now's definition
 static read_pico_transfer_network_t s_networks[READ_PICO_TRANSFER_SCAN_MAX], s_selected;
 static size_t s_network_count, s_network_page;
 static bool s_scan_pending, s_network_connect_pending, s_saved_configured, s_password_visible, s_forget_confirm;
@@ -300,6 +317,149 @@ static void transfer_header(uint8_t *fb, const char *title, const char *subtitle
 
 static EpdRect method_control_rect(int id) {
     return (EpdRect){36, 224 + id * 112, 612, 112};
+}
+
+/* ---- gen25 内存体检面板 / gen25 memory health panel ---- */
+// 入口：方法页长按。手势边界（预审点 2①）：ui_gesture.c 里 LONG_PRESS 置位
+// long_fired 后松手只发 CANCEL，TAP 永不随之发出——长按与三行点按天然互斥，
+// 零冲突；按下反馈只画了行底，面板整页盖上去不留半按态。
+// Entry: a long press on the method page. Gesture boundary (pre-audit 2-(1)):
+// once LONG_PRESS sets long_fired the release emits only CANCEL and a TAP is
+// never sent alongside - the long press and the three row taps are naturally
+// exclusive, zero conflict; the press feedback only painted the row base and
+// the panel covers the page whole, leaving no half-pressed state.
+// 读数同源（预审点 1 的另一半）：ble_pt_mem_snapshot + ble_pt_mem_gate——与
+// 「手机推送」按钮预检、start_locked 同一份数字与判定，面板不说第二家话。
+// Same-source readings (the other half of pre-audit 1): ble_pt_mem_snapshot +
+// ble_pt_mem_gate - the very figures and verdict the phone-push button's
+// precheck and start_locked use, so the panel never speaks a second dialect.
+// 红绿灯（用户裁定定案）：以最大连续块为主判、碎片率为辅显——红 <15K 直接
+// 判红（不看碎片率）；黄 15–20K 时碎片率只作附加说明；绿 ≥20K（即 BLE 闸门的
+// 最大块门槛）。free 趋于 0 时 1−largest/free 会虚低（free=4K、largest=4K
+// →0% 但实际濒危），主判根本不读它，误导显示从结构上出局。
+// The traffic light (the user's ruling, now settled): the largest block
+// decides and fragmentation only annotates - red below 15K outright
+// (fragmentation unread), yellow 15-20K with fragmentation as a note only,
+// green from 20K (the BLE gate's own largest threshold). As free approaches
+// zero 1-largest/free reads artificially low (free=4K with largest=4K says 0%
+// while the heap is dying); the verdict never reads it, so the misleading
+// display is designed out structurally.
+#define MEM_HEALTH_RED_BELOW (15 * 1024) // 红线：低于此直接判红 / the red line
+typedef enum { MEM_LEVEL_RED, MEM_LEVEL_YELLOW, MEM_LEVEL_GREEN } mem_level_t;
+
+static mem_level_t mem_health_level(size_t largest_internal) {
+    if (largest_internal < MEM_HEALTH_RED_BELOW) return MEM_LEVEL_RED;
+    if (largest_internal < BLE_PT_MIN_LARGEST_INTERNAL) return MEM_LEVEL_YELLOW;
+    return MEM_LEVEL_GREEN;
+}
+
+// 碎片率 = 1 − largest/free（整数百分比）。free 为 0 按 100% 计——最坏解释，
+// 顺带杜绝除零；此刻 largest 必为 0、主判早已判红，比值只剩展示意义。
+// Fragmentation = 1 - largest/free as an integer percent. A zero free heap
+// reads 100% (worst case, which also rules out division by zero); largest is
+// necessarily 0 there and the largest-driven verdict has long since gone red,
+// so the ratio is display-only.
+static unsigned mem_fragmentation_pct(size_t free_internal, size_t largest_internal) {
+    if (free_internal == 0) return 100;
+    if (largest_internal >= free_internal) return 0;
+    return (unsigned)(((free_internal - largest_internal) * 100u) / free_internal);
+}
+
+// 一句准话（纯函数，宿主对表）。绿区再核一遍总闸门：连续块够但总内存/PSRAM
+// 未达门槛时不许说「充足」——那是红绿灯只看 largest 的镜像误导。
+// One honest sentence (pure, host-tested). The green zone re-checks the full
+// gate: when the largest block is fine but total/PSRAM misses the gate it must
+// not say "ample" - the mirror image of trusting the largest-only light.
+static void mem_panel_verdict(char *out, size_t cap, mem_level_t level,
+                              unsigned frag_pct, bool gate_ok) {
+    switch (level) {
+    case MEM_LEVEL_RED:
+        snprintf(out, cap, "内存不足，请重启设备");
+        break;
+    case MEM_LEVEL_YELLOW:
+        snprintf(out, cap, frag_pct >= 50 ? "内存偏紧且碎片较多，建议退出阅读"
+                                          : "内存偏紧，建议退出阅读后再试");
+        break;
+    default:
+        snprintf(out, cap, gate_ok ? "内存充足，可以开启推送"
+                                   : "连续块充足，总内存未达推送门槛");
+        break;
+    }
+}
+
+static void mem_size_text(char *out, size_t cap, size_t bytes) {
+    if (bytes >= 1024u * 1024u) snprintf(out, cap, "%.1f M", bytes / 1048576.0);
+    else snprintf(out, cap, "%.1f K", bytes / 1024.0);
+}
+
+// 位置边界（预审点 2②）：面板只盖方法卡（224..560），不碰提示条横幅
+// （584..660，gen24.1 起可挂两行）、两行说明（694/734）、返回键（36,79 起）
+// 与底栏（1096 起）——gen24.5 刚为按钮糊团动过布局，面板不再叠新问题。
+// Position boundary (pre-audit 2-(2)): the panel covers the method card
+// (224-560) only, touching neither the hint banner (584-660, two lines since
+// gen24.1), the two info lines (694/734), the back key (36,79 up) nor the tab
+// bar (1096 up) - gen24.5 just moved the layout for the button blob; the panel
+// adds no new collisions.
+static bool s_mem_panel;
+static EpdRect mem_panel_rect(void) { return (EpdRect){36, 224, 612, 336}; }
+static EpdRect mem_panel_close_rect(void) { return (EpdRect){246, 496, 192, 44}; }
+
+static void draw_mem_panel(uint8_t *fb) {
+    const EpdRect panel = mem_panel_rect();
+    ui_fill_round_rect(fb, panel, 24, UI_GRAY_WHITE);
+    ui_draw_round_rect(fb, panel, 24, UI_GRAY_BLACK);
+    ui_draw_round_rect(fb, (EpdRect){panel.x + 1, panel.y + 1, panel.width - 2, panel.height - 2}, 23, UI_GRAY_BLACK);
+    ui_text(fb, 64, 246, 27, "内存体检", EPD_DRAW_ALIGN_LEFT, false);
+    ui_hairline(fb, 292, 64, 556, UI_GRAY_LIGHT);
+    size_t free_internal, largest_internal, free_psram;
+    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+    const mem_level_t level = mem_health_level(largest_internal);
+    const unsigned frag = mem_fragmentation_pct(free_internal, largest_internal);
+    const bool gate_ok = ble_pt_mem_gate(free_internal, largest_internal, free_psram);
+    const struct { const char *label; size_t bytes; } rows[] = {
+        {"内部可用内存", free_internal}, {"最大连续块", largest_internal}, {"PSRAM 可用", free_psram},
+    };
+    int y = 308;
+    char value[32];
+    for (size_t i = 0; i < 3; ++i, y += 38) {
+        ui_text(fb, 64, y, 19, rows[i].label, EPD_DRAW_ALIGN_LEFT, false);
+        mem_size_text(value, sizeof(value), rows[i].bytes);
+        ui_text(fb, 620, y, 19, value, EPD_DRAW_ALIGN_RIGHT, false);
+    }
+    snprintf(value, sizeof(value), "%u%%", frag);
+    ui_text(fb, 64, y, 19, "内部碎片率", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 620, y, 19, value, EPD_DRAW_ALIGN_RIGHT, false);
+    // 红绿灯：三圆点左→右 = 红/黄/绿，实心为当前档。墨水屏无彩色，实心/空心
+    // 即档位语言，判定与「手机推送」按钮预检同源。/ The traffic light: three
+    // dots left to right = red/yellow/green, the solid one marks the level. An
+    // e-ink panel has no colour, so solid vs hollow is the level language - and
+    // the verdict shares the phone-push button's precheck source.
+    const int cy = 470;
+    for (int i = 0; i < 3; ++i) {
+        EpdRect dot = {80 + i * 24 - 8, cy - 8, 16, 16};
+        if ((mem_level_t)i == level) ui_fill_round_rect(fb, dot, 8, UI_GRAY_BLACK);
+        else ui_draw_round_rect(fb, dot, 8, 0x88);
+    }
+    char verdict[96];
+    mem_panel_verdict(verdict, sizeof(verdict), level, frag, gate_ok);
+    fit_label(verdict, 20, 460);
+    ui_text(fb, 152, cy - 10, 20, verdict, EPD_DRAW_ALIGN_LEFT, false);
+    ui_draw_button(fb, mem_panel_close_rect(), "知道了", false);
+}
+
+// 面板手势：模态。只有【知道了】与再长按能关；其余一律吞——底栏、返回键、
+// 方法行都不该被顺手误触，正在读的数字不因一次误触消失。
+// The panel's gestures: modal. Only [got it] and another long press close it;
+// everything else is swallowed - the tab bar, the back key and the method rows
+// must not fall to a stray tap, and the readings must not vanish mid-read.
+static app_redraw_t mem_panel_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    (void)ctx;
+    if (ev->type == UI_GESTURE_LONG_PRESS ||
+        (ev->type == UI_GESTURE_TAP && ui_rect_hit(mem_panel_close_rect(), ev->x, ev->y))) {
+        s_mem_panel = false;
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
 }
 
 // S05：入口只负责选择传输方式，具体服务信息留给下一页。
@@ -404,7 +564,17 @@ static void draw_methods(uint8_t *fb) {    ui_clear_page(fb);
     }
     ui_text(fb, 42, 694, 19, "浏览器传书支持 EPUB、TXT、字体和图片文件。", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 42, 734, 18, "传输完成后，新内容会自动出现在书架或字体列表。", EPD_DRAW_ALIGN_LEFT, false);
+    // gen25 内存体检的入口指引：长按无图无标不可发现，一行静态小字指路
+    // （774..795 空白区，上离说明行 755、下离底栏 1096，无任何遮挡）。
+    // Gen25: the memory-health entry needs a signpost - a long press has no
+    // icon to find. One static small line in blank space (774-795: 20px below
+    // the info line, 300px above the tab bar) covers nothing.
+    ui_text(fb, 42, 774, 18, "长按本页任意位置，可查看内存体检。", EPD_DRAW_ALIGN_LEFT, false);
     ui_nav_draw(fb, 2);
+    // 体检面板最上层：模态卡片压住方法卡区，提示条/说明行/返回键/底栏全留白。
+    // The health panel on top: a modal card over the method-card area; the hint
+    // banner, info lines, back key and tab bar all stay visible.
+    if (s_mem_panel) draw_mem_panel(fb);
 }
 
 /* ---- 设备端配网 / Device provisioning ---- */
@@ -941,6 +1111,24 @@ static const char *push_state_text(push_state_t st) {    switch (st) {
 // dead code (plus one stray -Wunused-function, breaking the 8-warning
 // baseline). Bring this pair back if the hold entry ever returns.
 
+/* ---- gen26 预留：可扩展卡片渲染骨架（只留骨架不出函数）----
+ * Gen26 reservation: the extensible card-render skeleton (shape only, no function).
+ * 现状清单：武装页两卡——广播名卡 {36,168,612,116}、状态卡 {36,308,612,224}；
+ * 活区 push_dynamic_rect() = 两卡并集，每秒 DU 快刷只落在活区。
+ * gen26 扩展位（代理层三件套落地时照此办理）：
+ *   1. 新卡（AI 释义卡 / 代理结果卡）二选一：a) 模态——照单词卡先例
+ *      （dict_popup_draw 盖页 + push_gesture 先问卡片）；b) 第三张静态卡——
+ *      状态卡下移，卡区计入 push_dynamic_rect() 与否必须显式裁定并写进
+ *      该代记录（静态卡混进每秒 DU 就是 gen24.5 按钮糊团的复刻）。
+ *   2. 渲染派发沿 draw_push 自上而下：每卡一个 draw_* 静态函数，命中区一个
+ *      rect() 静态函数，手势由 push_gesture 统一先问模态、再问卡内控件。
+ *   3. 内容进入渠道走 push_proto.h：CTRL 预留区 0x06..0x0F（gen25 已整段留号），
+ *      启用哪个号先在协议变更记录登记一行。
+ * 冻结：本骨架只登记形状与纪律，不出任何函数/结构体；gen26 启用时删本注释、
+ * 按上述三条落码。
+ * Frozen: this skeleton registers shape and discipline only - no function, no
+ * struct. Gen26 deletes this comment and lands the code per the three rules. */
+
 static void draw_push(uint8_t *fb) {
     ui_clear_page(fb);
     ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
@@ -1155,6 +1343,30 @@ static app_redraw_t push_tick(app_ctx_t *ctx) {
     char title[PUSH_TITLE_MAX];
     uint8_t type = 0;
     if (push_sink_take_open(title, sizeof(title), &type)) {
+        // gen25 让路链收官：这次推送是靠「临时卸书」才过闸的，收官就把用户送回
+        // 原来那本书（位置由 book_progress 单一真源恢复）；推送内容留在书架，
+        // 首页/书架看得到。restore 失败**必须出声**（裁定 #2）：给一句准话 +
+        // 方法页保留「返回阅读」入口，绝不静默把书弄丢。
+        // Gen25 yield chain finale: this push only cleared the gate because the
+        // book was unloaded, so the finale walks the user back to that book
+        // (position restored by book_progress, the single source); the pushed
+        // text stays on the shelf, visible from home/shelf. A failed restore
+        // **must speak** (ruling #2): a definite sentence plus the method page's
+        // "back to reading" entry - never silently lose the book.
+        if (app_book_yield_active()) {
+            extern const app_desc_t app_book; // 与下方开书分支同款 / same shape as the open branch below
+            const bool restored = app_book_restore_after_push();
+            // B 留在书架：标记它的首次手动打开仍走一次 GC16 打底（真机项 f）。
+            // B stays on the shelf: flag its first manual open for one GC16 base
+            // (hardware item f).
+            app_book_mark_push_first_open();
+            snprintf(s_method_message, sizeof(s_method_message),
+                     restored ? "已收到《%s》，可在书架查看" : "已收到《%s》；原书未能自动重开，请手动打开",
+                     title);
+            ESP_LOGW(TAG, "push finale after yield: restore %s", restored ? "ok" : "FAILED");
+            ctx->request_app = &app_book;
+            return APP_REDRAW_NONE;
+        }
         // 虚拟书：标题覆盖成推送标题、清掉旧进度，再切阅读页——「收完统一写
         // push.txt → 一次全刷」的全刷落在 app_book 的开书路径上，武装页不抢。
         // Virtual book: override the display title with the pushed one, drop
@@ -1557,6 +1769,31 @@ static void push_button_action(void) {
             // Boot1 proved leaving the book recovers the largest block on its own
             // (19456 -> 31744), so the primary path is "exit the current book and
             // retry", with restart as the fallback.
+            // gen25（让路链，接线裁定 #2 触发面收窄）：只有「栈 down + 预检不过
+            // + 确实有书开着」三条件同时成立才让路——栈 up（D2 直达）、无书、
+            // 预检过一律不触发，不让让路变成所有预检失败的默认动作。
+            // Gen25 (yield chain, wiring ruling #2 narrowing): yield only when
+            // "stack down + precheck failed + a book is really open" all hold -
+            // never when the stack is up (D2 goes straight through), never with
+            // no book, never when the precheck passes. Yielding must not become
+            // the default action for every precheck failure.
+            if (app_book_has_open_book()) {
+                // 裁定 #1：**先出提示，再异步分拍等**——同步等 done 最长 1000ms
+                // 会让按钮按下去整整 1 秒没有 UI 变化（死感）。这里只发非阻塞
+                // 停机请求，UI 立刻画出「正在为推送腾出内存…」，让路的收尾交给
+                // push_tick 的下一拍（见 s_push_yield_phase）。
+                // Ruling #1: **show the hint first, then wait across ticks** -
+                // waiting for done synchronously for up to 1000 ms would leave a
+                // full second with no UI change (the dead feel). This only issues
+                // the non-blocking stop request; the hint paints immediately and
+                // push_tick's next tick finishes the yield (see s_push_yield_phase).
+                app_book_request_prep_stop();
+                s_push_yield_phase = 1;
+                s_push_yield_deadline = 0; // 由 push_tick 首拍按 ctx->now_ms 记起点 / push_tick stamps the start on its first tick
+                snprintf(s_method_message, sizeof(s_method_message), "正在为推送腾出内存…");
+                s_method_inline_enable = false;
+                return;
+            }
             snprintf(s_method_message, sizeof(s_method_message),
                      "内存碎片不足（最大块 %uK，需 %uK）——退出当前书籍后重试；若仍失败，请重启设备",
                      (unsigned)(largest_internal / 1024),
@@ -1686,6 +1923,7 @@ static void on_enter(app_ctx_t* ctx) {
     clear_password();
     s_session_started = false;
     s_pressed = -1;
+    s_mem_panel = false; // gen25：体检面板不跨回合存活 / gen25: the health panel never survives a round
     s_settle = s_any_changed = false;
     // gen24.4：进场先清零强制全刷标记，防上一回合的陈旧标记在本回合某次
     // 普通整页刷新上误放全刷；本回合真落武装页时由下面两个入口重新置位。
@@ -1865,6 +2103,45 @@ static void transfer_on_exit(app_ctx_t* ctx) {
 }
 
 static app_redraw_t on_tick(app_ctx_t* ctx) {
+    // gen25 让路链 phase 1 的收尾：prep 已停 → 卸书 → 重过预检 → 武装。
+    // 分拍执行是接线裁定 #1 的另一半：这一拍只做一步，UI 在 phase 1 期间已有
+    // 提示在屏上，不会出现「按下去没反应」。裁定 #3：任何失败都直接落到重启
+    // 兜底提示，不原地重试。/ Gen25 yield chain, finishing phase 1: prep stopped
+    // -> unload the book -> re-run the precheck -> arm. Running one step per tick
+    // is the other half of wiring ruling #1: the hint is already on screen during
+    // phase 1, so the tap never looks dead. Ruling #3: any failure falls straight
+    // through to the restart fallback hint - never retried in place.
+    if (s_push_yield_phase == 1) {
+        if (!s_push_yield_deadline) s_push_yield_deadline = ctx->now_ms + PUSH_YIELD_WAIT_MS;
+        if (app_book_prep_stopped()) {
+            s_push_yield_phase = 0;
+            if (app_book_request_yield_for_push()) {
+                size_t free_internal, largest_internal, free_psram;
+                ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+                if (ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
+                    ESP_LOGW(TAG, "yield ok: arming after unload (internal %u B free / %u B largest)",
+                             (unsigned)free_internal, (unsigned)largest_internal);
+                    push_arm_now();
+                    return APP_REDRAW_PAGE;
+                }
+                ESP_LOGW(TAG, "yield done but gate still fails: internal %u B free / %u B largest",
+                         (unsigned)free_internal, (unsigned)largest_internal);
+            }
+            // 让路失败或让路后仍不过闸 → 重启兜底（裁定 #3 真实文案）。
+            // Yield failed or the gate still fails after it -> the restart
+            // fallback (ruling #3's honest wording).
+            snprintf(s_method_message, sizeof(s_method_message),
+                     "内存未能腾出——重启设备后可直接推送");
+            s_method_inline_enable = false;
+            return APP_REDRAW_PAGE;
+        }
+        if (ctx->now_ms < s_push_yield_deadline) return APP_REDRAW_NONE; // 提示已在屏上，静默等下一拍 / hint is on screen; quietly wait for the next tick
+        s_push_yield_phase = 0;
+        snprintf(s_method_message, sizeof(s_method_message),
+                 "内存未能腾出——重启设备后可直接推送");
+        s_method_inline_enable = false;
+        return APP_REDRAW_PAGE;
+    }
     if (s_view == TRANSFER_PASSWORD) {
         if (ctx->consumed) return APP_REDRAW_NONE;
         bool held = !ctx->released && ctx->touch && ctx->touch->touched && ctx->touch->count == 1;
@@ -1995,6 +2272,14 @@ static app_redraw_t stop_usb_for_navigation(app_ctx_t *ctx, bool home) {
 }
 
 static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    // gen25 内存体检入口：方法页长按整页打开面板（见面板节的手势边界注释）。
+    // Gen25 memory-health entry: a long press anywhere on the method page opens
+    // the panel whole-page (see the gesture-boundary note in the panel section).
+    if (ev->type == UI_GESTURE_LONG_PRESS) {
+        s_mem_panel = true;
+        s_pressed = -1;
+        return APP_REDRAW_PAGE;
+    }
     int old = s_pressed;
     // gen24.2 块 3：行内【开启】按钮——门 2 提示条挂着时才出现，命中即原地
     // 写设置项 + 重走四门，不跳设置页（§二-4 边界：其他门无此控件）。
@@ -2046,6 +2331,16 @@ static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
 
 static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
     if (s_status.state == READ_PICO_TRANSFER_UPLOADING) return APP_REDRAW_NONE;
+    // gen25 内存体检面板：模态拦截（mem_panel_gesture）。面板只属于方法页——
+    // on_tick 的让路收官（push_arm_now 切武装页）或收摊事件可能在面板开着时
+    // 改变视图，届时面板静默让位，武装页/其它视图的手势照常。
+    // Gen25 memory-health panel: the modal intercept (mem_panel_gesture). The
+    // panel belongs to the method page alone - on_tick's yield finale
+    // (push_arm_now switches to the arm view) or close-up events can change the
+    // view while it is open, so the panel steps aside silently and the arm
+    // page's (or any other view's) gestures carry on.
+    if (s_mem_panel && s_view != TRANSFER_METHODS) s_mem_panel = false;
+    if (s_mem_panel) return mem_panel_gesture(ctx, ev);
     if (ev->type == UI_GESTURE_TAP && s_view != TRANSFER_PASSWORD && !usb_storage_active()) {
         int tab = ui_nav_hit(ev->x0, ev->y0);
         if (tab >= 0 && tab == ui_nav_hit(ev->x, ev->y)) {
@@ -2122,6 +2417,13 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
 }
 
 static app_redraw_t on_key(app_ctx_t *ctx, int key) {
+    // gen25：面板开着时按键只负责关面板，不叠页面动作（与手势的模态语义一致）。
+    // Gen25: with the panel open a key only closes it - no page action rides
+    // along (the same modal semantics as gestures).
+    if (s_mem_panel) {
+        s_mem_panel = false;
+        return APP_REDRAW_PAGE;
+    }
     if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, key == UI_KEY_2);
     if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
     // 武装页：任何离页按键都先收摊，再按既有规则走。/ The arm page: any leaving

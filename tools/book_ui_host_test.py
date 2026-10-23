@@ -390,6 +390,13 @@ static int book_progress_forget(const char* path){for(book_progress_watch_t* w=t
 static void book_store_notify_changed(void){test_notify_count++;}
 static unsigned book_store_revision(void){return (unsigned)test_notify_count;}
 static void free_book(void){s_text=NULL;s_path[0]=0;}
+// gen25：停机请求的宿主替身（自删形态）。真身 book_on_exit 会调它；这里只记一次
+// 计数，测试据此断言「离页确实请求过停机」，不碰任务。
+// Gen25: host double of the stop request (self-delete shape). The real
+// book_on_exit calls it; this only bumps a counter so the test can assert that
+// leaving the page really requested the stop - it never touches a task.
+static int test_prep_stop_calls;
+static void prep_task_request_stop(const char* why){(void)why;test_prep_stop_calls++;}
 static void refresh_cached_progress(app_ctx_t* ctx);
 static void return_to_cached_shelf(app_ctx_t* ctx){(void)ctx;}
 static bool open_book(app_ctx_t* ctx,const char* path){(void)ctx;assert(path[0]);test_open_calls++;s_view=READING;return true;}

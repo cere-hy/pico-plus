@@ -135,7 +135,21 @@ static void test_ctrl_header(void) {
     CHECK(!push_ctrl_header_decode(bad, 4, &op));
     memcpy(bad, ok_end, 4); bad[3] = PUSH_VERSION + 1;
     CHECK(!push_ctrl_header_decode(bad, 4, &op));
-    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse ok\n");
+    // gen25 预留区登记（0x06..0x0F，见 push_proto.h 变更记录）：帧头解码器必须
+    // 原样放行 op（gen26 启用时不必改解码层），且预留段与 STATUS 段（0x10 起）
+    // 零重叠——重叠了 gen26 第一天就会撞号。
+    // Gen25 reservation registry (0x06-0x0F, see push_proto.h's change log): the
+    // header decoder must pass the op through untouched (gen26 enables one
+    // without touching the decode layer), and the reserved block must not
+    // overlap the STATUS block (0x10 up) - an overlap would collide on day one.
+    for (unsigned reserved = PUSH_OP_RESERVED_FIRST; reserved <= PUSH_OP_RESERVED_LAST; ++reserved) {
+        const uint8_t frame[4] = {0x50, 0x43, (uint8_t)reserved, PUSH_VERSION};
+        op = 0xFF;
+        CHECK(push_ctrl_header_decode(frame, sizeof(frame), &op) && op == reserved);
+        CHECK(reserved < PUSH_ST_READY); // 预留区与 STATUS 段零重叠 / no overlap with STATUS
+    }
+    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_SET_TIME + 1); // 紧接 SET_TIME，无空洞 / right after SET_TIME, no gap
+    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen25 reserved 0x06-0x0F registered ok\n");
 }
 
 static void test_begin_codec(void) {
