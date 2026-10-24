@@ -641,7 +641,11 @@ public class MainActivity extends Activity {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                doPush(text, isWord);
+                // M1.1（B②）：外包一层监听守卫——推送前干净停监听、推完自动恢复。
+                // doPush 本体一行不动（零侵入承诺延续）。/ M1.1 (B2): wrap with the
+                // listen guard - stop listening cleanly before the push, restore it
+                // after. doPush's body stays untouched (the zero-intrusion promise).
+                pushWithListenGuard(text, isWord);
             }
         }).start();
     }
@@ -821,6 +825,46 @@ public class MainActivity extends Activity {
             toast("推送完成 ✓");
         } finally {
             closeQuietly();
+        }
+    }
+
+    /* ---- M1.1（B②）：推送的监听守卫 ---- */
+
+    /**
+     * 推送前后对监听的一层外包：doPush 本体一行不动。
+     *
+     * 背景（M1 联测反馈一）：doPush 的 resetState() 不动 listenMode/GATT，
+     * finally 的 closeQuietly() 拆了监听连接但 UI 仍显示「监听中」——假状态；
+     * 且监听会话占着 GATT，推送要么连不上、要么把监听链路拆坏后不恢复。
+     *
+     * 本守卫：推送前若在监听，先 stopListen() 干净停掉（清 listenMode + 断 GATT，
+     * 按钮回「连接并监听点词」）；推完自动恢复——重走 startListen() 同路径
+     * （扫描 + 连接 + 订阅）。恢复失败由 startListen 内部如实 uiLog（如
+     * 「未发现设备」），listenMode 保持 false、按钮可手动重试——**不无限重试**。
+     * Background (M1 live-test finding 1): doPush's resetState() leaves
+     * listenMode/GATT alone, so the finally closeQuietly() tears down the
+     * listening link while the UI still shows "listening" - a phantom state;
+     * worse, the listening session occupies the GATT client, so the push either
+     * cannot connect or wrecks the listen link without restoring it. This guard
+     * stops listening cleanly before the push (clears listenMode, drops GATT,
+     * the button returns to "connect and listen") and restores it after by
+     * re-running startListen()'s own path (scan + connect + subscribe). A
+     * failed restore is logged honestly by startListen itself, listenMode stays
+     * false and the button offers a manual retry - **never an endless retry**.
+     */
+    private void pushWithListenGuard(String text, boolean wordCard) {
+        final boolean wasListening = listenMode;
+        if (wasListening) {
+            uiLog("推送前先停监听（推完自动恢复）……");
+            stopListen();
+        }
+        try {
+            doPush(text, wordCard);
+        } finally {
+            if (wasListening) {
+                uiLog("推送结束，正在恢复监听……");
+                startListen();
+            }
         }
     }
 
