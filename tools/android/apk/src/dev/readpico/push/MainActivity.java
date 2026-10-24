@@ -139,6 +139,12 @@ public class MainActivity extends Activity {
     // M1.2 item-1: the staged JSON while exporting the template library (written in
     // onActivityResult).
     private String pendingExportJson = null;
+    // M1.2.1：AI 设置页的激活模板编辑框引用。模板库任何操作后必须回填它，
+    // 保证「主编辑框内容 == 存储里的激活模板」——单一真相源，不做内存双份。
+    // M1.2.1: handle to the active-template editor in the AI settings page. After
+    // any template-library op it MUST be refreshed so the editor == the stored
+    // active template (single source of truth, no dual in-memory copy).
+    private EditText mActiveTplEditor = null;
 
     private static final String PREF = "ai";
     private static final String PREF_KEY = "api_key";
@@ -1407,6 +1413,9 @@ public class MainActivity extends Activity {
         edTpl.setMaxLines(4);
         edTpl.setGravity(android.view.Gravity.TOP);
         box.addView(edTpl);
+        // M1.2.1：登记为激活模板编辑框，供模板库操作后回填对齐。
+        // M1.2.1: register as the active-template editor for post-op refresh.
+        mActiveTplEditor = edTpl;
 
         Button btnTplLib = new Button(this);
         btnTplLib.setText("管理模板库（切换 / 新建 / 导出 / 导入 / 分享）");
@@ -1425,14 +1434,32 @@ public class MainActivity extends Activity {
         new android.app.AlertDialog.Builder(this)
                 .setTitle("AI 释义设置（默认 DeepSeek）")
                 .setView(box)
+                .setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                    @Override
+                    public void onDismiss(android.content.DialogInterface d) {
+                        // 对话框关：释放编辑框引用，避免模板库操作写进已销毁的视图。
+                        // Dialog gone: drop the editor handle so later ops don't
+                        // touch a dead view.
+                        if (mActiveTplEditor == edTpl) {
+                            mActiveTplEditor = null;
+                        }
+                    }
+                })
                 .setNegativeButton("取消", null)
                 .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(android.content.DialogInterface d, int which) {
-                        // 仅重置编辑框文本为出厂默认（word:{word}），待用户点「保存」才落库。
-                        // Only reset the box text to the factory default; the library is
-                        // touched when the user taps 保存.
-                        edTpl.setText(AiClient.DEFAULT_TEMPLATE);
+                        // M1.2.1：恢复默认必须**立即落库**——旧版只改编辑框文本、对话框
+                        // 随即关闭，不点「保存」等于没生效（真机实测 bug）。写入存储后
+                        // 回填编辑框，UI 与存储即刻一致。
+                        // M1.2.1: reset-to-default MUST persist immediately - the old
+                        // version only changed the box text, then the dialog closed, so
+                        // without tapping 保存 it never took effect (real-device bug).
+                        // Persist, then refresh the editor so UI == storage at once.
+                        setActiveTemplateContent(AiClient.DEFAULT_TEMPLATE);
+                        refreshActiveTemplateEditor();
+                        refreshAiStatus();
+                        uiLog("提示模板已恢复默认（word: {word}）");
                     }
                 })
                 .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
@@ -1689,6 +1716,14 @@ public class MainActivity extends Activity {
         getSharedPreferences(PREF, MODE_PRIVATE).edit().putString(PREF_TPL_ACTIVE, name).apply();
     }
 
+    /** M1.2.1：把存储里的激活模板内容回填到设置页编辑框（UI 与存储对齐）。 */
+    private void refreshActiveTemplateEditor() {
+        final EditText ed = mActiveTplEditor;
+        if (ed != null) {
+            ed.setText(getActiveTemplateContent());
+        }
+    }
+
     /** 当前激活模板的内容（供 aiConfig 注入 user 角色）。 */
     private String getActiveTemplateContent() {
         String active = getActiveName();
@@ -1769,6 +1804,13 @@ public class MainActivity extends Activity {
                         switch (which) {
                             case 0: // 切换为当前
                                 setActiveName(tpl.name);
+                                // M1.2.1：回填设置页编辑框到新激活模板内容——旧版只改激活名、
+                                // 编辑框仍显示旧模板，用户一保存就把旧内容覆盖到新模板（擦除）。
+                                // M1.2.1: refresh the settings editor to the new active
+                                // template - the old version only switched the active name
+                                // while the editor kept the old content, so a later 保存
+                                // overwrote the new template with the stale text (erasure).
+                                refreshActiveTemplateEditor();
                                 refreshAiStatus();
                                 uiLog("已切换提示模板：" + tpl.name);
                                 break;
@@ -1805,11 +1847,29 @@ public class MainActivity extends Activity {
                 .setPositiveButton("删除", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface d, int which) {
-                        lib.remove(tpl);
+                        // M1.2.1：按名字删——旧版用 lib.remove(tpl) 按对象身份删，而 tpl
+                        // 来自另一份 loadLibrary() 快照、Tpl 未覆写 equals，identity 不等
+                        // → 删除静默无效（真机实测 bug）。这里按 name 精确移除。
+                        // M1.2.1: delete by name - the old lib.remove(tpl) relied on
+                        // object identity; tpl comes from a different loadLibrary()
+                        // snapshot and Tpl has no equals(), so removal was a silent
+                        // no-op (real-device bug). Remove precisely by name here.
+                        boolean removed = false;
+                        for (int i = lib.size() - 1; i >= 0; i--) {
+                            if (lib.get(i).name != null && lib.get(i).name.equals(tpl.name)) {
+                                lib.remove(i);
+                                removed = true;
+                            }
+                        }
+                        if (!removed) {
+                            uiLog("删除失败：模板不在库中");
+                            return;
+                        }
                         saveLibrary(lib);
                         if (tpl.name != null && tpl.name.equals(getActiveName())) {
                             setActiveName(lib.get(0).name);
                         }
+                        refreshActiveTemplateEditor(); // M1.2.1：删的是激活模板时回填到新激活
                         refreshAiStatus();
                         uiLog("已删除模板：" + tpl.name);
                         showTemplateManager(); // 刷新列表
@@ -1865,6 +1925,7 @@ public class MainActivity extends Activity {
                         lib.add(new Tpl(name, content));
                         saveLibrary(lib);
                         setActiveName(name); // 新建/编辑后即设为当前
+                        refreshActiveTemplateEditor(); // M1.2.1：回填设置页编辑框到新模板
                         refreshAiStatus();
                         uiLog((isNew ? "已新建并启用模板：" : "已保存模板：") + name);
                         showTemplateManager(); // 刷新列表
@@ -1971,6 +2032,7 @@ public class MainActivity extends Activity {
                 String raw = readUri(data.getData());
                 if (importLibraryJson(raw)) {
                     uiLog("模板库已导入");
+                    refreshActiveTemplateEditor(); // M1.2.1：导入后回填编辑框到新激活模板
                     showTemplateManager(); // 刷新列表
                     refreshAiStatus();
                 } else {
