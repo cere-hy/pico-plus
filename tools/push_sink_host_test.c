@@ -901,7 +901,89 @@ static void test_ai_frames(void) {
     CHECK(push_st_ai_query_emit(NULL, 1u, 1u, true, em, sizeof(em)) == 0u);
     CHECK(push_st_ai_query_emit("ephemeral", 1u, 1u, true, NULL, sizeof(em)) == 0u);
 
+    // ---- gen26.5：TTS 页文本（STATUS 0x19，241B 定长）----
+    // gen26.5: TTS page text (STATUS 0x19, fixed 241B).
+    //
+    // 帧长断言先行（登记纪律）：0x08 那次 243>241 就是靠这道断言在登记期擒住的。
+    // Frame-length assertion first (registration discipline): this is the assertion
+    // that caught 0x08's 243 > 241 at registration time.
+    CHECK(PUSH_ST_TTS_TEXT_FRAME_MAX == 241u);
+    CHECK(PUSH_ST_TTS_TEXT_FRAME_MAX <= 244u); // STATUS notify 帽 = MTU 247 - 3 ATT
+    CHECK(PUSH_TTS_TEXT_MAX == 234u);
+    CHECK(PUSH_ST_TTS_TEXT == 0x19);
+
+    // 整页一帧（total==1）。/ Whole page in one frame.
+    push_tts_text_t tt;
+    memset(&tt, 0, sizeof(tt));
+    tt.seq = 0;
+    tt.total = 1;
+    snprintf(tt.text, sizeof(tt.text), "It was a bright cold day in April.");
+    uint8_t tf[PUSH_ST_TTS_TEXT_FRAME_MAX];
+    CHECK(push_st_tts_text_encode(&tt, tf, sizeof(tf)) == PUSH_ST_TTS_TEXT_FRAME_MAX);
+    CHECK(tf[0] == PUSH_ST_TTS_TEXT);
+    CHECK(((uint32_t)tf[1] | ((uint32_t)tf[2] << 8)) == 0u);   // seq
+    CHECK(((uint32_t)tf[3] | ((uint32_t)tf[4] << 8)) == 1u);   // total
+    CHECK(((uint32_t)tf[5] | ((uint32_t)tf[6] << 8)) == strlen("It was a bright cold day in April."));
+    push_tts_text_t tt2;
+    memset(&tt2, 0, sizeof(tt2));
+    CHECK(push_st_tts_text_decode(tf, sizeof(tf), &tt2));
+    CHECK(tt2.seq == 0 && tt2.total == 1);
+    CHECK(strcmp(tt2.text, "It was a bright cold day in April.") == 0);
+    CHECK(tt2.len == strlen("It was a bright cold day in April."));
+
+    // 3 帧重组前站：拼接 == 原文（Step10 实现前的协议层验证）。
+    // Three-frame reassembly front-stop: concatenation == original (protocol layer).
+    static const char *page_text = "The clocks were striking thirteen. Winston "
+        "Smith, his chin nuzzled into his breast in an effort to escape the "
+        "vile wind, slipped quickly through the glass doors of Victory Mansions.";
+    const size_t pt_len = strlen(page_text);
+    const size_t pt_per = (pt_len + 2) / 3;
+    CHECK(pt_per < PUSH_TTS_TEXT_MAX);
+    char pt_back[512];
+    size_t pt_got = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        push_tts_text_t part;
+        memset(&part, 0, sizeof(part));
+        part.seq = (uint16_t)i;
+        part.total = 3;
+        size_t take = pt_len - i * pt_per;
+        if (take > pt_per) take = pt_per;
+        memcpy(part.text, page_text + i * pt_per, take);
+        part.text[take] = 0;
+        uint8_t pf[PUSH_ST_TTS_TEXT_FRAME_MAX];
+        CHECK(push_st_tts_text_encode(&part, pf, sizeof(pf)) == PUSH_ST_TTS_TEXT_FRAME_MAX);
+        push_tts_text_t pb;
+        memset(&pb, 0, sizeof(pb));
+        CHECK(push_st_tts_text_decode(pf, sizeof(pf), &pb));
+        CHECK(pb.seq == i && pb.total == 3);
+        CHECK(strlen(pb.text) == take);
+        memcpy(pt_back + pt_got, pb.text, take);
+        pt_got += take;
+    }
+    pt_back[pt_got] = 0;
+    CHECK(pt_got == pt_len);
+    CHECK(strcmp(pt_back, page_text) == 0);
+
+    // 有牙：序号越界 / 总数为 0 / 短帧 / 坏 op / len 越界全拒。
+    // Teeth: bad index, zero total, short frame, bad op, overlong len all refuse.
+    CHECK(!push_st_tts_text_encode(&(push_tts_text_t){.seq = 1, .total = 1, .text = "x"}, tf, sizeof(tf)));
+    CHECK(!push_st_tts_text_encode(&(push_tts_text_t){.seq = 0, .total = 0, .text = "x"}, tf, sizeof(tf)));
+    CHECK(!push_st_tts_text_decode(tf, PUSH_ST_TTS_TEXT_FRAME_MAX - 1, &tt2));
+    {
+        uint8_t tmp[PUSH_ST_TTS_TEXT_FRAME_MAX];
+        CHECK(push_st_tts_text_encode(&tt, tmp, sizeof(tmp)) == PUSH_ST_TTS_TEXT_FRAME_MAX);
+        tmp[0] = PUSH_ST_CAPS;                       // 坏 op / bad op
+        CHECK(!push_st_tts_text_decode(tmp, sizeof(tmp), &tt2));
+        CHECK(push_st_tts_text_encode(&tt, tmp, sizeof(tmp)) == PUSH_ST_TTS_TEXT_FRAME_MAX);
+        tmp[5] = 0xFF; tmp[6] = 0xFF;                // len = 65535 ≥ 槽 / overlong
+        CHECK(!push_st_tts_text_decode(tmp, sizeof(tmp), &tt2));
+        CHECK(push_st_tts_text_encode(&tt, tmp, sizeof(tmp)) == PUSH_ST_TTS_TEXT_FRAME_MAX);
+        tmp[2] = 0x01;                               // seq = 0x0100 ≥ total / out of range
+        CHECK(!push_st_tts_text_decode(tmp, sizeof(tmp), &tt2));
+    }
+
     printf("ai frames: query/result/status 0x17/caps round-trip + bad-header teeth ok\n");
+    printf("tts text gen26.5: STATUS 0x19 fixed 241 (single + 3-frame reassembly) + teeth ok\n");
     printf("ai frames gen26.5: ctx 77/74, seg 241 (single+multi reassembly), enable 8, len-dispatch ok\n");
     printf("ai emit gen26.5: legacy-by-default dispatch (66/74 by enable+context) + cap teeth ok\n");
 }

@@ -335,6 +335,36 @@ public final class PushProtoTest {
         check(vecInt(v, "caps_ai_only_bits") == PushProto.CAP_AI_QUERY,
                 "旧对照位图仅 CAP_AI_QUERY（未使能时的基线）");
 
+        // 12) gen26.5 TTS 页文本（STATUS 0x19，241B 定长，设备主动 notify）
+        //     与 0x08 不同方向、不同语义：0x08 是手机→设备的释义分帧，不复用。
+        check(PushProto.ST_TTS_TEXT == 0x19, "TTS_TEXT opcode 0x19（STATUS 空间，非 CTRL 预留区）");
+        check(PushProto.TTS_TEXT_FRAME_MAX == 241, "TTS_TEXT 帧长 241（帧帽内）");
+        check(PushProto.TTS_TEXT_FRAME_MAX <= 244, "TTS_TEXT 帧长 <= STATUS notify 帽 244");
+        check(PushProto.TTS_TEXT_MAX == 234, "TTS_TEXT 文本槽 234（含 NUL）");
+
+        check(hex(PushProto.encodeTtsText("It was a bright cold day in April.", 0, 1))
+                .equals(v.get("tts_single")), "0x19 单帧（1/1）逐字节一致");
+        byte[] ttsFirst = unhex(v.get("tts_first"));
+        byte[] ttsMid = unhex(v.get("tts_mid"));
+        byte[] ttsLast = unhex(v.get("tts_last"));
+        check(PushProto.ttsTextSeq(ttsFirst) == 0, "0x19 首帧 seq == 0");
+        check(PushProto.ttsTextSeq(ttsLast) == vecInt(v, "tts_count") - 1, "0x19 末帧 seq == total-1");
+        check(PushProto.ttsTextTotal(ttsFirst) == vecInt(v, "tts_count"), "0x19 总帧数与参考一致");
+        check(v.get("tts_text_mid").equals(PushProto.ttsText(ttsMid)), "0x19 中段文本与参考一致");
+        check(PushProto.ttsTextSeq(ttsMid) == vecInt(v, "tts_seq_mid"), "0x19 中段 seq 一致");
+        check(PushProto.ttsTextTotal(ttsMid) == vecInt(v, "tts_total_mid"), "0x19 中段 total 一致");
+        check(hex(PushProto.encodeTtsText(PushProto.ttsText(ttsMid), PushProto.ttsTextSeq(ttsMid),
+                PushProto.ttsTextTotal(ttsMid))).equals(v.get("tts_mid")),
+                "0x19 解码后重编 == 原帧（编解码互逆）");
+        // 有牙：不产非法帧 + 不误收别的 STATUS 帧 / 坏帧
+        check(PushProto.encodeTtsText("x", 1, 1) == null, "0x19 seq==total 拒绝编码");
+        check(PushProto.encodeTtsText("x", 0, 0) == null, "0x19 total==0 拒绝编码");
+        check(PushProto.ttsText(unhex(v.get("caps_ai"))) == null, "0x19 解码器拒 0x18 CAPS 帧（不混线）");
+        byte[] badTts = unhex(v.get("tts_single"));
+        badTts[5] = (byte) 0xFF;
+        badTts[6] = (byte) 0xFF;
+        check(PushProto.ttsText(badTts) == null, "0x19 len 越界拒收（坏帧不误收）");
+
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));
         System.exit(fail == 0 ? 0 : 1);

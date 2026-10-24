@@ -336,6 +336,35 @@ bool push_ai_caps_enable_decode(const uint8_t *in, size_t len, push_caps_t *caps
 
 /* ---- 能力位图 / Capability bitmap ---- */
 
+size_t push_st_tts_text_encode(const push_tts_text_t *t, uint8_t *out, size_t cap) {
+    if (!t || !out || cap < PUSH_ST_TTS_TEXT_FRAME_MAX) return 0;
+    if (t->total == 0 || t->seq >= t->total) return 0; // 序号须在界内
+    memset(out, 0, PUSH_ST_TTS_TEXT_FRAME_MAX);
+    out[0] = PUSH_ST_TTS_TEXT;
+    put_u16(out + 1, t->seq);
+    put_u16(out + 3, t->total);
+    size_t n = strnlen(t->text, PUSH_TTS_TEXT_MAX);
+    if (n >= PUSH_TTS_TEXT_MAX) n = PUSH_TTS_TEXT_MAX - 1; // 保 NUL，与 word/def/seg 槽同构
+    put_u16(out + 5, (uint16_t)n);
+    memcpy(out + 7, t->text, n);
+    return PUSH_ST_TTS_TEXT_FRAME_MAX;
+}
+
+bool push_st_tts_text_decode(const uint8_t *in, size_t len, push_tts_text_t *t) {
+    if (!in || !t || len != PUSH_ST_TTS_TEXT_FRAME_MAX) return false; // 严格定长
+    if (in[0] != PUSH_ST_TTS_TEXT) return false;
+    memset(t, 0, sizeof(*t));
+    t->seq = get_u16(in + 1);
+    t->total = get_u16(in + 3);
+    const size_t n = get_u16(in + 5);
+    if (t->total == 0 || t->seq >= t->total) return false;
+    if (n >= PUSH_TTS_TEXT_MAX) return false;
+    memcpy(t->text, in + 7, n);
+    t->text[n] = 0;
+    t->len = (uint16_t)n;
+    return true;
+}
+
 size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap) {
     if (!caps || !out || cap < 5u) return 0; // op(1) + u32(4)
     out[0] = PUSH_ST_CAPS;

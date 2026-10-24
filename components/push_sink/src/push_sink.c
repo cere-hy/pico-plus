@@ -1447,7 +1447,12 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
             reply_err(PUSH_ERR_BAD_FRAME);
             return;
         }
-        s_apk_caps = caps.bits; // 未知位原样保留（前向兼容）/ unknown bits kept as-is
+        // 只认本代已知的协商位：未来 APK 声明新位时旧固件不会被未知位污染
+        // （未知位一律忽略，行为与「未声明」一致）。
+        // Only the negotiation bits this build knows: a future APK declaring new
+        // bits cannot pollute old firmware - unknown bits are ignored, i.e. behave
+        // exactly like "not declared".
+        s_apk_caps = caps.bits & (PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI);
         ESP_LOGI(TAG, "apk caps enable: bits=0x%08x (ctx=%d multi=%d)",
                  (unsigned)s_apk_caps,
                  (s_apk_caps & PUSH_CAP_AI_CONTEXT) ? 1 : 0,

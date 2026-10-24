@@ -90,6 +90,9 @@ PUSH_OP_AI_RESULT_SEG = 0x08
 PUSH_OP_AI_CAPS_ENABLE = 0x09
 PUSH_ST_AI_QUERY = 0x17   # 设备 -> 手机：用户点词，请算释义 / device to phone: define this word
 PUSH_ST_CAPS = 0x18       # 设备 -> 手机：能力位图上报 / device to phone: capability bitmap
+PUSH_ST_TTS_TEXT = 0x19   # gen26.5 设备 -> 手机：当前页纯文本（TTS 听书）/ device to phone: page text
+PUSH_TTS_TEXT_MAX = 234   # 页文本槽（含 NUL）：241 - op1 - seq2 - total2 - len2 / page-text slot
+PUSH_ST_TTS_TEXT_FRAME_MAX = 1 + 2 + 2 + 2 + PUSH_TTS_TEXT_MAX  # = 241
 PUSH_AI_WORD_MAX = 64
 PUSH_AI_DEF_MAX = 170
 PUSH_CAP_AI_QUERY = 1 << 0   # 设备支持 AI 查词 / device supports AI lookup
@@ -392,6 +395,32 @@ def decode_ai_caps_enable(frame: bytes) -> int:
     return struct.unpack("<I", frame[4:8])[0]
 
 
+def encode_tts_text(text: str, seq: int, total: int) -> bytes:
+    """gen26.5 STATUS 0x19 页文本（TTS 听书）：op + seq(u16 LE) + total(u16 LE) +
+    len(u16 LE) + text[234]，零填充定长 241。与 push_proto.c push_st_tts_text_encode
+    一致；total==1 即整页一帧。"""
+    if total < 1 or not (0 <= seq < total):
+        raise ValueError("tts seq/total out of range")
+    raw = text.encode("utf-8")[:PUSH_TTS_TEXT_MAX - 1]
+    return bytes([PUSH_ST_TTS_TEXT]) + struct.pack("<HHH", seq, total, len(raw)) + \
+        raw + b"\x00" * (PUSH_TTS_TEXT_MAX - len(raw))
+
+
+def decode_tts_text(frame: bytes):
+    """解 STATUS 0x19 页文本（严格 241B）：返回 (text, seq, total)。
+    Decode STATUS 0x19 page text (strict 241B): (text, seq, total)."""
+    if len(frame) != PUSH_ST_TTS_TEXT_FRAME_MAX:
+        raise ValueError("not a TTS_TEXT status frame")
+    if frame[0] != PUSH_ST_TTS_TEXT:
+        raise ValueError("bad TTS_TEXT opcode")
+    seq, total, n = struct.unpack("<HHH", frame[1:7])
+    if total < 1 or seq >= total:
+        raise ValueError("tts seq/total out of range")
+    if n >= PUSH_TTS_TEXT_MAX:
+        raise ValueError("tts text length out of range")
+    return frame[7:7 + n].decode("utf-8", "replace"), seq, total
+
+
 def encode_data(seq: int, payload: bytes) -> bytes:
     """DATA 帧：seq(u16 LE) + len(1) + payload。/ seq(u16 LE) + len(1) + payload."""
     if len(payload) > PUSH_DATA_PAYLOAD_MAX:
@@ -679,6 +708,44 @@ def _selftest() -> int:
             check(False, f"使能帧 {bad_len}B 应抛错")
         except ValueError:
             check(True, f"使能帧 {bad_len}B 抛 ValueError（严格 8B）")
+
+    # 8) gen26.5 TTS 页文本（STATUS 0x19，241B 定长）
+    #    帧长断言先行：0x08 那次 243>241 就是靠这道断言在登记期擒住的。
+    check(PUSH_ST_TTS_TEXT_FRAME_MAX == 241, f"TTS_TEXT 帧长 == 241（实际 {PUSH_ST_TTS_TEXT_FRAME_MAX}）")
+    check(PUSH_ST_TTS_TEXT_FRAME_MAX <= 244, "TTS_TEXT 帧长 <= STATUS notify 帽 244")
+    tt = encode_tts_text("It was a bright cold day in April.", 0, 1)
+    check(len(tt) == 241, f"TTS_TEXT 单帧长度 == 241（实际 {len(tt)}）")
+    check(tt[0] == PUSH_ST_TTS_TEXT, "TTS_TEXT op == 0x19")
+    check(decode_tts_text(tt) == ("It was a bright cold day in April.", 0, 1), "TTS_TEXT 单帧往返")
+    page = ("The clocks were striking thirteen. Winston Smith, his chin nuzzled "
+            "into his breast, slipped quickly through the glass doors.")
+    chunks = [page[i:i + 60] for i in range(0, len(page), 60)]
+    joined = ""
+    for i, c in enumerate(chunks):
+        fr = encode_tts_text(c, i, len(chunks))
+        t2, s2, tt2 = decode_tts_text(fr)
+        check((s2, tt2, t2) == (i, len(chunks), c), f"TTS_TEXT 分帧 {i + 1}/{len(chunks)} 往返")
+        joined += t2
+    check(joined == page, "TTS_TEXT 分帧重组拼接 == 原文")
+    for bad in (("x", 1, 1), ("x", 0, 0)):
+        try:
+            encode_tts_text(*bad)
+            check(False, f"TTS_TEXT 坏参数 {bad} 应抛错")
+        except ValueError:
+            check(True, f"TTS_TEXT 坏参数 {bad} 抛 ValueError")
+    for bad_len in (240, 242):
+        try:
+            decode_tts_text(tt[:bad_len] if bad_len == 240 else tt + b"\x00")
+            check(False, f"TTS_TEXT {bad_len}B 应抛错")
+        except ValueError:
+            check(True, f"TTS_TEXT {bad_len}B 抛 ValueError（严格 241B）")
+    bad_op = bytearray(tt)
+    bad_op[0] = PUSH_ST_CAPS
+    try:
+        decode_tts_text(bytes(bad_op))
+        check(False, "TTS_TEXT 坏 op 应抛错")
+    except ValueError:
+        check(True, "TTS_TEXT 坏 op 抛 ValueError（不误收 0x18）")
 
     print("自检结果 / result:", "ALL PASS" if ok else "HAS FAILURES")
     return 0 if ok else 1

@@ -73,6 +73,10 @@ public final class PushProto {
     // word, 0x18 reports the capability bitmap.
     public static final int ST_AI_QUERY = 0x17;
     public static final int ST_CAPS = 0x18;
+    // gen26.5 TTS 听书：设备→手机，当前页纯文本（STATUS notify，无 CTRL 头）。
+    // 编号说明见 push_proto.h 变更记录块：STATUS 空间从 0x10 起，故取 0x19
+    // （0x0A 仍属 CTRL 预留区，手机→设备方向）。
+    public static final int ST_TTS_TEXT = 0x19;
 
     /* ---- gen26 AI 帧长与上限（与 push_proto.h 逐字一致）---- */
     public static final int AI_WORD_MAX = 64;   // 单词 UTF-8 槽（含结尾 0）
@@ -93,6 +97,8 @@ public final class PushProto {
     public static final int AI_SEG_MAX = 166;                               // 分帧释义槽：241 - 头4 - wlen1 - word64 - idx2 - total2 - dlen2
     public static final int AI_SEG_FRAME_MAX = 4 + 1 + AI_WORD_MAX + 2 + 2 + 2 + AI_SEG_MAX; // 0x08 = 241
     public static final int AI_CAPS_ENABLE_MAX = 4 + 4;                    // 0x09 = 8（头4 + bits u32）
+    public static final int TTS_TEXT_MAX = 234;                            // 页文本槽（含 NUL）
+    public static final int TTS_TEXT_FRAME_MAX = 1 + 2 + 2 + 2 + TTS_TEXT_MAX; // 0x19 = 241
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MARKDOWN = 1;
@@ -472,6 +478,60 @@ public final class PushProto {
             return -1L;
         }
         return getU32(frame, 4) & 0xFFFFFFFFL;
+    }
+
+    /* ---- gen26.5 TTS 页文本（STATUS 0x19，241 B 定长）----
+     * op + seq(u16 LE) + total(u16 LE) + len(u16 LE) + text[234]；与 push_proto.c
+     * 的 push_st_tts_text_encode、push_pico.py 的 encode_tts_text 逐字节一致。
+     * 由设备主动 notify，旧 APK 对未知 STATUS 帧本就丢弃，无需能力协商。
+     */
+
+    /** STATUS 0x19 页文本（241 B）；seq/total 越界返回 null（不产非法帧）。 */
+    public static byte[] encodeTtsText(String text, int seq, int total) {
+        if (total < 1 || seq < 0 || seq >= total) {
+            return null; // 序号须在界内 / index must be in range
+        }
+        byte[] raw = fitUtf8(text, TTS_TEXT_MAX - 1);
+        byte[] out = new byte[TTS_TEXT_FRAME_MAX];
+        out[0] = (byte) ST_TTS_TEXT;
+        putU16(out, 1, seq);
+        putU16(out, 3, total);
+        putU16(out, 5, raw.length);
+        System.arraycopy(raw, 0, out, 7, raw.length);
+        return out;
+    }
+
+    /** 0x19 校验（严格 241B + 序号在界内）：合法返回文本长度，否则 -1。 */
+    private static int ttsTextLen(byte[] frame) {
+        if (frame == null || frame.length != TTS_TEXT_FRAME_MAX) {
+            return -1;
+        }
+        if ((frame[0] & 0xFF) != ST_TTS_TEXT) {
+            return -1;
+        }
+        int n = getU16(frame, 5);
+        int seq = getU16(frame, 1);
+        int total = getU16(frame, 3);
+        if (total < 1 || seq >= total || n >= TTS_TEXT_MAX) {
+            return -1;
+        }
+        return n;
+    }
+
+    /** 解 0x19 → 本帧文本；非法帧返回 null。 */
+    public static String ttsText(byte[] frame) {
+        int n = ttsTextLen(frame);
+        return n < 0 ? null : new String(frame, 7, n, UTF8);
+    }
+
+    /** 解 0x19 → 本帧序号；非法帧返回 -1。 */
+    public static int ttsTextSeq(byte[] frame) {
+        return ttsTextLen(frame) < 0 ? -1 : getU16(frame, 1);
+    }
+
+    /** 解 0x19 → 总帧数；非法帧返回 -1。 */
+    public static int ttsTextTotal(byte[] frame) {
+        return ttsTextLen(frame) < 0 ? -1 : getU16(frame, 3);
     }
 
     public static byte[] encodeBegin(long totalLen, long crc, long sessionId,

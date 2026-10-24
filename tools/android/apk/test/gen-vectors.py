@@ -162,13 +162,32 @@ def main() -> int:
     # 旧 APK 不使能时的对照位图（仅 AI_QUERY）
     v["caps_ai_only_bits"] = pp.PUSH_CAP_AI_QUERY
 
+    # ---- gen26.5 TTS 页文本（STATUS 0x19，241B 定长）----
+    v["tts_frame_len"] = pp.PUSH_ST_TTS_TEXT_FRAME_MAX          # 241
+    v["tts_slot"] = pp.PUSH_TTS_TEXT_MAX                        # 234
+    v["tts_single"] = pp.encode_tts_text("It was a bright cold day in April.", 0, 1).hex()
+    page = ("The clocks were striking thirteen. Winston Smith, his chin nuzzled "
+            "into his breast, slipped quickly through the glass doors.")
+    pt = [page[i:i + 60] for i in range(0, len(page), 60)]
+    assert "".join(pt) == page, "TTS 页文本切段必须无损拼回"
+    v["tts_count"] = len(pt)
+    v["tts_first"] = pp.encode_tts_text(pt[0], 0, len(pt)).hex()
+    v["tts_last"] = pp.encode_tts_text(pt[-1], len(pt) - 1, len(pt)).hex()
+    mid_pt = len(pt) // 2
+    v["tts_mid"] = pp.encode_tts_text(pt[mid_pt], mid_pt, len(pt)).hex()
+    t, s, tot = pp.decode_tts_text(pp.encode_tts_text(pt[mid_pt], mid_pt, len(pt)))
+    v["tts_text_mid"], v["tts_seq_mid"], v["tts_total_mid"] = t, s, tot
+
     # 有牙：定长帧的向量绝不能短一字节（帧帽纪律的最后一道闸）。
     # Teeth: fixed-length frame vectors must never come up one byte short.
     for key, want in (("ai_seg_first", v["ai_seg_frame_len"]),
                       ("ai_seg_last", v["ai_seg_frame_len"]),
                       ("ai_ctx_query_serendipity", v["ai_ctx_query_len"]),
                       ("status_ai_ctx_serendipity", v["ai_status_ctx_len"]),
-                      ("ai_caps_enable_all", v["ai_caps_enable_len"])):
+                      ("ai_caps_enable_all", v["ai_caps_enable_len"]),
+                      ("tts_first", v["tts_frame_len"]),
+                      ("tts_last", v["tts_frame_len"]),
+                      ("tts_single", v["tts_frame_len"])):
         assert len(v[key]) == want * 2, f"{key} 向量长度 {len(v[key]) // 2}B != {want}B"
 
     with open(OUT, "w", encoding="utf-8") as f:

@@ -121,6 +121,22 @@ extern "C" {
 ///                        上下文」缓存匹配关连。
 ///                      · 登记即冻结：本行即登记；帧布局见 push_proto.c 的 ai 编解码
 ///                        （gen26.5 节）。Java/Python 参考实现同代同步。
+///   gen26.5 0x19       TTS 听书（M2 Step10；三端登记即冻结）：
+///                      · 0x19 PUSH_ST_TTS_TEXT：设备→手机，当前页纯文本（STATUS
+///                        notify 方向）。布局：op(1)+seq(u16 LE)+total(u16 LE)+
+///                        len(u16 LE)+text[234]，零填充定长 **241B**（帧帽 244 内，
+///                        与 CTRL 载荷同宽，留 3B 诊断余量）；text 槽保留 NUL，
+///                        有效字节 ≤233；UTF-8 字符边界由编码方保证。
+///                      · **不复用 0x08**：0x08 是手机→设备的释义分帧（CTRL 写方向），
+///                        方向不同、语义不同，混用会让设备端解码器互相误收。
+///                      · **不加 CAPS 协商位**：设备主动发，手机收不收得住由 APK 版本
+///                        定——旧 APK 对未知 STATUS notify 帧本就丢弃（waitStatus
+///                        实证），零协商需求，不过度设计。
+///                      · 编号说明：开工令原拟 0x0A，但 0x0A 属 CTRL 预留区（手机→
+///                        设备方向空间，PUSH_OP_RESERVED_FIRST）。设备→手机帧落在
+///                        STATUS 空间（0x10 起）才守住「一个字节辨方向」的诊断纪律，
+///                        故取 STATUS 空间下一个空位 **0x19**（0x10..0x18 已用）。
+///                        0x0A 继续留作 CTRL 预留。
 ///   gen26.5 0x08        AI contextual definitions + multi-frame (M2 closing round,
 ///                      registered and frozen across all three ends):
 ///                      · 0x17/0x06 gain context: word[64] + book_id(u32 LE) +
@@ -149,6 +165,29 @@ extern "C" {
 ///                      · Registered and frozen: this line is the registry; layouts
 ///                        live in push_proto.c's ai codec (gen26.5 section). Java and
 ///                        Python references sync this generation.
+///   gen26.5 0x19       TTS read-aloud (M2 Step10; registered and frozen across
+///                      all three ends):
+///                      · 0x19 PUSH_ST_TTS_TEXT: device to phone, the current page's
+///                        plain text (a STATUS notify). Layout: op(1) + seq(u16 LE) +
+///                        total(u16 LE) + len(u16 LE) + text[234], zero-padded to a
+///                        fixed **241 B** (inside the 244 cap, same width as a CTRL
+///                        payload, 3 B of diagnostic headroom); the slot keeps its
+///                        NUL, so <= 233 valid bytes; the encoder owns UTF-8
+///                        character boundaries.
+///                      · **Not 0x08**: that is the phone-to-device definition
+///                        segment (a CTRL write) - different direction, different
+///                        meaning; sharing would make decoders mis-accept.
+///                      · **No CAPS bit**: the device pushes, and whether the phone
+///                        copes is an APK-version matter; old APKs already drop
+///                        unknown STATUS notify frames (measured via waitStatus), so
+///                        there is nothing to negotiate - no over-engineering.
+///                      · Numbering note: the directive proposed 0x0A, but 0x0A sits
+///                        in the CTRL reservation (phone-to-device space,
+///                        PUSH_OP_RESERVED_FIRST). Device-to-phone frames belong to
+///                        the STATUS space (from 0x10) to keep the "one byte tells
+///                        you the direction" diagnostic rule, so the next free
+///                        STATUS slot **0x19** is taken (0x10..0x18 are used).
+///                        0x0A stays reserved for CTRL.
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
@@ -182,6 +221,7 @@ enum {
     PUSH_ST_PROGRESS = 0x16, ///< 接收进度 / receive progress
     PUSH_ST_AI_QUERY = 0x17, ///< gen26：设备→手机，用户点词请算释义 / device to phone: define this word
     PUSH_ST_CAPS = 0x18,     ///< gen26：设备→手机，能力位图上报（连接后）/ device to phone: capability bitmap
+    PUSH_ST_TTS_TEXT = 0x19, ///< gen26.5：设备→手机，当前页纯文本（TTS 听书，跟随模式）/ device to phone: page text for read-aloud
 };
 
 /// 正文类型。/ Body types.
@@ -323,6 +363,30 @@ size_t push_ai_seg_encode(const push_ai_seg_t *s, uint8_t *out, size_t cap);
 /// gen26.5 解 AI_RESULT_SEG（241B 定长；校验 idx < total、total ≥ 1）。
 /// Decode an AI_RESULT_SEG (fixed 241B; validates idx < total and total >= 1).
 bool push_ai_seg_decode(const uint8_t *in, size_t len, push_ai_seg_t *s);
+
+/* ---- TTS 页文本分帧（gen26.5，STATUS 0x19）---- */
+/* TTS page-text segments (gen26.5, STATUS 0x19). */
+
+#define PUSH_TTS_TEXT_MAX 234u ///< 页文本槽（UTF-8 字节）：241 - op1 - seq2 - total2 - len2 / page-text slot
+
+/// TTS_TEXT（0x19）STATUS 载荷：当前页纯文本（可分片）。
+/// TTS_TEXT (0x19) STATUS payload: the current page's plain text (segmentable).
+typedef struct {
+    uint16_t seq;                   ///< 本帧序号，从 0 起 / this frame's index, 0-based
+    uint16_t total;                 ///< 总帧数；==1 即整页一帧 / total frames; 1 = one frame per page
+    uint16_t len;                   ///< 本帧 text 有效字节数（≤ PUSH_TTS_TEXT_MAX-1）/ valid bytes
+    char text[PUSH_TTS_TEXT_MAX];   ///< 本帧文本片段（UTF-8，边界由编码方保证）/ this frame's slice
+} push_tts_text_t;
+
+/// STATUS 0x19 定长帧（无 CTRL 头）：= 241，落在 notify 帽 244 内。
+/// Fixed STATUS 0x19 frame (no CTRL header): 241, inside the 244 notify cap.
+#define PUSH_ST_TTS_TEXT_FRAME_MAX (1u + 2u + 2u + 2u + PUSH_TTS_TEXT_MAX) ///< = 241
+
+/// gen26.5 编 STATUS 0x19 页文本（241B 零填充定长）。/ Encode a STATUS 0x19 page text (241B).
+size_t push_st_tts_text_encode(const push_tts_text_t *t, uint8_t *out, size_t cap);
+/// gen26.5 解 STATUS 0x19（241B 定长；校验 seq < total、total ≥ 1、len < 槽）。
+/// Decode STATUS 0x19 (fixed 241B; validates seq < total, total >= 1, len < slot).
+bool push_st_tts_text_decode(const uint8_t *in, size_t len, push_tts_text_t *t);
 
 /* ---- 能力位图（gen26 能力协商）---- */
 /* Capability bitmap (gen26 capability negotiation). */
