@@ -45,12 +45,44 @@ public final class AiClient {
     /** 连接与读取超时（毫秒）：LLM 秒级返回，15s 足够且不让用户干等。 */
     public static final int DEFAULT_TIMEOUT_MS = 15000;
 
+    /**
+     * 默认用户提示模板（M1.2 ① Prompt 自定义）。占位符 {word} 在渲染时被实际
+     * 单词替换，语义等价于历史硬编码的 "word: " + word。用户可在 APK 设置页
+     * 编辑自己的模板，但系统指令（systemPrompt，40 字硬约束）永远独立钉在
+     * system 角色、不可被模板覆盖——这就是「分层铁律」。
+     *
+     * Default user-prompt template (M1.2 item-1 Prompt customization). The
+     * {word} placeholder is substituted with the actual word at render time,
+     * semantically identical to the old hard-coded "word: " + word. Users may
+     * edit their own template in the APK settings, but the system instruction
+     * (systemPrompt, the 40-char hard constraint) is always pinned in the
+     * system role, never overridable by the template - the "layering rule".
+     */
+    public static final String DEFAULT_TEMPLATE = "word: {word}";
+
+    /**
+     * 用户模板渲染后的 UTF-8 字节硬上限：防止用户在设置页误填巨长模板把请求体
+     * 撑爆（模板是输入侧，不进设备帧帽，这里只做内存/成本的朴素保护）。超长
+     * 时按字符边界裁剪并补「…」。/ UTF-8 byte cap on the rendered user template
+     * (input side, never touches the device frame cap) - a naive guard against
+     * accidental giant templates.
+     */
+    public static final int TEMPLATE_MAX_BYTES = 2000;
+
     /** 连接配置。/ Connection config (all vendor-specific bits live here). */
     public static final class Config {
         public String baseUrl = DEFAULT_BASE_URL;
         public String model = DEFAULT_MODEL;
         public String apiKey = "";
         public int timeoutMs = DEFAULT_TIMEOUT_MS;
+        /**
+         * 用户提示模板（含 {word} 占位符）。null 或空表示用 DEFAULT_TEMPLATE。
+         * 注意：这只决定 user 角色的内容/风格，系统指令不在此列。
+         * / User prompt template (with {word} placeholder). null or empty means
+         * DEFAULT_TEMPLATE. This only drives the user-role content/style; the
+         * system instruction is NOT here.
+         */
+        public String promptTemplate = null;
     }
 
     /** 查词结果。/ Lookup result. */
@@ -181,14 +213,57 @@ public final class AiClient {
         }
     }
 
-    /** 构造 OpenAI 兼容的 chat/completions 请求体。/ Build the chat/completions body. */
+    /**
+     * 构造 OpenAI 兼容的 chat/completions 请求体。
+     *
+     * 分层铁律在这里落地：
+     *   - system 角色恒为 systemPrompt()（40 字硬约束），永远最后追加、不可被
+     *     用户模板覆盖；
+     *   - user 角色为 renderTemplate 渲染后的用户模板（内容/风格由用户掌控）。
+     * 两条消息天然分属不同角色，模板再怎么改也碰不到 system 的约束。
+     *
+     * Build the OpenAI-compatible chat/completions body.
+     *
+     * The layering rule lands here: the system role is always systemPrompt()
+     * (40-char hard constraint) - appended last, never overridable by the user
+     * template; the user role is the rendered user template (content/style owned
+     * by the user). The two messages live in different roles, so no template
+     * edit can touch the system constraint.
+     */
     static String buildRequest(Config cfg, String word) {
         String model = (cfg.model == null || cfg.model.trim().isEmpty())
                 ? DEFAULT_MODEL : cfg.model.trim();
+        String userContent = renderTemplate(cfg.promptTemplate, word);
         return "{\"model\":" + jsonString(model)
                 + ",\"temperature\":0,\"stream\":false,\"messages\":["
                 + "{\"role\":\"system\",\"content\":" + jsonString(systemPrompt()) + "},"
-                + "{\"role\":\"user\",\"content\":" + jsonString("word: " + word) + "}]}";
+                + "{\"role\":\"user\",\"content\":" + jsonString(userContent) + "}]}";
+    }
+
+    /**
+     * 渲染用户提示模板：把 {word} 占位符替换成实际单词，并裁到 TEMPLATE_MAX_BYTES。
+     *
+     * 规则：
+     *   - 模板为 null/空 → 退化为 DEFAULT_TEMPLATE；
+     *   - 含 {word} → 就地替换（可多处）；
+     *   - 不含 {word} → 在模板末尾补一个空格 + 单词，保证单词绝不被静默吞掉
+     *     （用户漏写占位符时仍能正常查词，不会出现「没给词」的诡异请求）。
+     *
+     * Render the user-prompt template: substitute {word}, then trim to
+     * TEMPLATE_MAX_BYTES.
+     */
+    static String renderTemplate(String template, String word) {
+        String t = (template == null || template.trim().isEmpty())
+                ? DEFAULT_TEMPLATE : template;
+        String w = (word == null) ? "" : word;
+        String rendered;
+        if (t.contains("{word}")) {
+            rendered = t.replace("{word}", w);
+        } else {
+            // 漏写占位符：末尾补词，保证单词在场
+            rendered = t + " " + w;
+        }
+        return fitUtf8(rendered, TEMPLATE_MAX_BYTES);
     }
 
     /**

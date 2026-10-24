@@ -146,6 +146,52 @@ public final class AiClientTest {
         check(AiClient.buildRequest(cfg, "serendipity").contains("40 字"),
                 "请求体真的带着 40 字约束（prompt 进了 system 消息）");
 
+        // 15) M1.2 ① 提示模板渲染 + 分层铁律
+        // M1.2 item-1: prompt-template rendering + the layering rule.
+        check(AiClient.DEFAULT_TEMPLATE.equals("word: {word}"),
+                "默认模板 = word:{word}（语义等价于历史硬编码）");
+
+        // 渲染：null / 空 → 退化为默认模板
+        check(AiClient.renderTemplate(null, "apple").equals("word: apple"),
+                "renderTemplate(null) 退化为默认模板");
+        check(AiClient.renderTemplate("", "apple").equals("word: apple"),
+                "renderTemplate(\"\") 退化为默认模板");
+
+        // 渲染：含 {word} → 就地替换
+        check(AiClient.renderTemplate("解释一下 {word} 的意思", "apple")
+                        .equals("解释一下 apple 的意思"),
+                "renderTemplate 替换 {word} 占位符");
+        // 多处 {word} 都替换
+        check(AiClient.renderTemplate("{word}/{word}", "x").equals("x/x"),
+                "renderTemplate 多处 {word} 均替换");
+
+        // 渲染：漏写 {word} → 末尾补词，单词绝不被吞
+        check(AiClient.renderTemplate("请翻译 apple", "apple").equals("请翻译 apple apple"),
+                "漏写占位符时末尾补词（单词不丢失）");
+
+        // 渲染：超长模板按字符边界裁剪并补「…」
+        StringBuilder huge = new StringBuilder();
+        for (int i = 0; i < 2000; i++) {
+            huge.append("长"); // 每字 3 字节，远超 TEMPLATE_MAX_BYTES
+        }
+        String cutT = AiClient.renderTemplate(huge.toString(), "w");
+        check(bytes(cutT) <= AiClient.TEMPLATE_MAX_BYTES,
+                "超长模板渲染后 <= 2000 字节（实测 " + bytes(cutT) + "）");
+        check(cutT.endsWith("…"), "超长模板被裁剪时补「…」");
+
+        // 分层铁律：自定义模板只进 user 角色，system 角色恒为 systemPrompt()
+        Config tplCfg = new Config();
+        tplCfg.promptTemplate = "用户说：{word}";
+        String tplReq = AiClient.buildRequest(tplCfg, "apple");
+        check(tplReq.contains("\"role\":\"system\""), "请求体有 system 角色");
+        check(tplReq.contains("\"role\":\"user\""), "请求体有 user 角色");
+        check(tplReq.contains("用户说：apple"), "自定义模板进了 user 消息");
+        check(!tplReq.contains("word: apple"), "user 消息用的是自定义模板而非默认");
+        check(tplReq.contains("40 字"), "系统 40 字约束仍在（模板碰不到 system）");
+        // 最强一条：system 消息内容恒等于 systemPrompt()——模板不可覆盖
+        check(tplReq.contains(AiClient.jsonString(AiClient.systemPrompt())),
+                "system 消息内容恒等于 systemPrompt()（分层铁律：模板不可覆盖）");
+
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));
         System.exit(fail == 0 ? 0 : 1);

@@ -63,12 +63,19 @@ import android.widget.Toast;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 public class MainActivity extends Activity {
 
@@ -81,6 +88,8 @@ public class MainActivity extends Activity {
     private static boolean sShortcutMode = false;
     private static final int REQ_PERMS = 1;
     private static final int REQ_ENABLE_BT = 2;
+    private static final int REQ_IMPORT = 3;    // SAF 打开模板库 JSON
+    private static final int REQ_EXPORT = 4;    // SAF 创建模板库 JSON
     private static final long SCAN_TIMEOUT_MS = 12000;
     private static final long CONNECT_TIMEOUT_MS = 20000;
     private static final long STEP_TIMEOUT_MS = 20000;
@@ -126,11 +135,25 @@ public class MainActivity extends Activity {
     private volatile BluetoothGattCharacteristic cCtrlAi = null; // 回 0x07 用的 CTRL 特征
     /** BLE 写串行锁：GATT 同时只容一个操作，AI 回帧与推送不得并发。 */
     private final Object writeLock = new Object();
+    // M1.2 ①：导出模板库时的暂存 JSON 串（onActivityResult 里写盘用）。
+    // M1.2 item-1: the staged JSON while exporting the template library (written in
+    // onActivityResult).
+    private String pendingExportJson = null;
 
     private static final String PREF = "ai";
     private static final String PREF_KEY = "api_key";
     private static final String PREF_BASE = "base_url";
     private static final String PREF_MODEL = "model";
+    // M1.2 ①：提示模板库（命名模板列表，JSON 数组）与当前激活模板名。
+    // M1.2 item-1: the prompt-template library (named templates, JSON array) and
+    // the name of the currently active template.
+    private static final String PREF_TPL_LIB = "tpl_lib";
+    private static final String PREF_TPL_ACTIVE = "tpl_active";
+    private static final String DEFAULT_TPL_NAME = "默认";
+    // 模板导出/导入的 JSON 文件 MIME 与后缀。
+    // MIME / extension for the template-library JSON file.
+    private static final String TPL_MIME = "application/json";
+    private static final String TPL_SUFFIX = ".templates.json";
 
     /* ---- 同步门：worker 线程等待 BLE 回调 ---- */
     private final Object lock = new Object();
@@ -1297,6 +1320,12 @@ public class MainActivity extends Activity {
         cfg.baseUrl = base.isEmpty() ? AiClient.DEFAULT_BASE_URL : base;
         String model = sp.getString(PREF_MODEL, "");
         cfg.model = model.isEmpty() ? AiClient.DEFAULT_MODEL : model;
+        // M1.2 ①：激活模板注入 user 角色；系统指令（40 字硬约束）仍由 AiClient
+        // 恒定钉在 system 角色，模板永远碰不到。
+        // M1.2 item-1: inject the active template into the user role; the system
+        // instruction (40-char hard constraint) stays pinned in the system role by
+        // AiClient and is never reachable from the template.
+        cfg.promptTemplate = getActiveTemplateContent();
         return cfg;
     }
 
@@ -1337,7 +1366,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** AI 设置对话框：key / base_url / model 三项，服务商可换（不锁死）。 */
+    /** AI 设置对话框：key / base_url / model 三项 + M1.2 ① 提示模板编辑。 */
     private void showAiSettings() {
         AiClient.Config cfg = aiConfig();
         LinearLayout box = new LinearLayout(this);
@@ -1363,16 +1392,58 @@ public class MainActivity extends Activity {
         edModel.setSingleLine(true);
         box.addView(edModel);
 
+        // ---- M1.2 ① 提示模板：多行编辑，{word} 占位符，恢复默认 ----
+        // M1.2 item-1 prompt template: multi-line, {word} placeholder, reset-to-default.
+        TextView tplHint = new TextView(this);
+        tplHint.setText("提示模板（可用 {word} 占位符，系统 40 字约束始终生效且不可被覆盖）");
+        tplHint.setTextSize(12);
+        tplHint.setPadding(0, dp(8), 0, dp(4));
+        box.addView(tplHint);
+
+        final EditText edTpl = new EditText(this);
+        edTpl.setHint("word: {word}");
+        edTpl.setText(getActiveTemplateContent());
+        edTpl.setSingleLine(false);
+        edTpl.setMaxLines(4);
+        edTpl.setGravity(android.view.Gravity.TOP);
+        box.addView(edTpl);
+
+        Button btnTplLib = new Button(this);
+        btnTplLib.setText("管理模板库（切换 / 新建 / 导出 / 导入 / 分享）");
+        btnTplLib.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // 先把当前编辑暂存进库，再打开管理页，避免来回丢改。
+                // Stash the in-progress edit into the library first, then open the
+                // manager, so we don't lose the edit when bouncing between dialogs.
+                setActiveTemplateContent(edTpl.getText().toString());
+                showTemplateManager();
+            }
+        });
+        box.addView(btnTplLib);
+
         new android.app.AlertDialog.Builder(this)
                 .setTitle("AI 释义设置（默认 DeepSeek）")
                 .setView(box)
                 .setNegativeButton("取消", null)
+                .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        // 仅重置编辑框文本为出厂默认（word:{word}），待用户点「保存」才落库。
+                        // Only reset the box text to the factory default; the library is
+                        // touched when the user taps 保存.
+                        edTpl.setText(AiClient.DEFAULT_TEMPLATE);
+                    }
+                })
                 .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(android.content.DialogInterface d, int which) {
                         saveAiConfig(edKey.getText().toString().trim(),
                                 edBase.getText().toString().trim(),
                                 edModel.getText().toString().trim());
+                        // 把编辑后的模板写回当前激活的命名模板。
+                        // Persist the edited template back into the active named template.
+                        setActiveTemplateContent(edTpl.getText().toString());
                         uiLog("AI 设置已保存到本机（key 不进仓库）");
                         refreshAiStatus();
                     }
@@ -1532,6 +1603,418 @@ public class MainActivity extends Activity {
                 }
             }
         }).start();
+    }
+
+    /* ================= M1.2 ① 提示模板库 =================
+     * 命名模板列表存 SharedPreferences（JSON 数组），激活模板按名字引用。
+     * 系统指令（40 字硬约束）永远独立于模板、恒定钉在 system 角色——模板只能
+     * 改 user 角色的内容/风格，永远碰不到系统约束。这就是「分层铁律」。
+     * Named templates live in SharedPreferences (JSON array); the active one is
+     * referenced by name. The system instruction (40-char hard constraint) is
+     * always pinned in the system role, independent of templates - the "layering
+     * rule": a template edits only the user-role content/style.
+     */
+
+    /** 命名模板。/ A named prompt template. */
+    private static final class Tpl {
+        String name;
+        String content;
+        Tpl(String name, String content) {
+            this.name = name;
+            this.content = content;
+        }
+    }
+
+    /** 首启或升级时播种默认库（仅含「默认」一条）与默认激活名。 */
+    private void ensureLibrary() {
+        android.content.SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
+        if (!sp.contains(PREF_TPL_LIB)) {
+            List<Tpl> seed = new ArrayList<Tpl>();
+            seed.add(new Tpl(DEFAULT_TPL_NAME, AiClient.DEFAULT_TEMPLATE));
+            saveLibrary(seed);
+        }
+        if (!sp.contains(PREF_TPL_ACTIVE)) {
+            sp.edit().putString(PREF_TPL_ACTIVE, DEFAULT_TPL_NAME).apply();
+        }
+    }
+
+    private List<Tpl> loadLibrary() {
+        ensureLibrary();
+        android.content.SharedPreferences sp = getSharedPreferences(PREF, MODE_PRIVATE);
+        List<Tpl> out = new ArrayList<Tpl>();
+        String raw = sp.getString(PREF_TPL_LIB, "");
+        if (raw == null || raw.isEmpty()) {
+            out.add(new Tpl(DEFAULT_TPL_NAME, AiClient.DEFAULT_TEMPLATE));
+            return out;
+        }
+        try {
+            JSONArray arr = new JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name", DEFAULT_TPL_NAME);
+                String content = o.optString("content", AiClient.DEFAULT_TEMPLATE);
+                out.add(new Tpl(name, content));
+            }
+        } catch (JSONException e) {
+            // 损坏就回退单条默认，不崩。
+            out.clear();
+            out.add(new Tpl(DEFAULT_TPL_NAME, AiClient.DEFAULT_TEMPLATE));
+        }
+        if (out.isEmpty()) {
+            out.add(new Tpl(DEFAULT_TPL_NAME, AiClient.DEFAULT_TEMPLATE));
+        }
+        return out;
+    }
+
+    private void saveLibrary(List<Tpl> lib) {
+        JSONArray arr = new JSONArray();
+        for (Tpl t : lib) {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("name", t.name == null ? "" : t.name);
+                o.put("content", t.content == null ? "" : t.content);
+            } catch (JSONException ignored) {
+            }
+            arr.put(o);
+        }
+        getSharedPreferences(PREF, MODE_PRIVATE).edit().putString(PREF_TPL_LIB, arr.toString()).apply();
+    }
+
+    private String getActiveName() {
+        ensureLibrary();
+        return getSharedPreferences(PREF, MODE_PRIVATE).getString(PREF_TPL_ACTIVE, DEFAULT_TPL_NAME);
+    }
+
+    private void setActiveName(String name) {
+        getSharedPreferences(PREF, MODE_PRIVATE).edit().putString(PREF_TPL_ACTIVE, name).apply();
+    }
+
+    /** 当前激活模板的内容（供 aiConfig 注入 user 角色）。 */
+    private String getActiveTemplateContent() {
+        String active = getActiveName();
+        for (Tpl t : loadLibrary()) {
+            if (t.name != null && t.name.equals(active)) {
+                return t.content;
+            }
+        }
+        return AiClient.DEFAULT_TEMPLATE;
+    }
+
+    /** 把内容写回当前激活的命名模板（按 active 名定位）。 */
+    private void setActiveTemplateContent(String content) {
+        String active = getActiveName();
+        List<Tpl> lib = loadLibrary();
+        boolean found = false;
+        for (Tpl t : lib) {
+            if (t.name != null && t.name.equals(active)) {
+                t.content = content;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            // 激活名在库里失踪（理论不该发生）：补一条。
+            lib.add(new Tpl(active, content));
+        }
+        saveLibrary(lib);
+    }
+
+    /** 模板库管理页：一键切换 + 新建 + 导入 + 逐项编辑/删除/分享/导出。 */
+    private void showTemplateManager() {
+        final List<Tpl> lib = loadLibrary();
+        String active = getActiveName();
+        CharSequence[] items = new CharSequence[lib.size()];
+        for (int i = 0; i < lib.size(); i++) {
+            items[i] = (lib.get(i).name != null && lib.get(i).name.equals(active) ? "✔ " : "   ")
+                    + lib.get(i).name;
+        }
+        AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle("提示模板库（✔ = 当前）");
+        if (lib.isEmpty()) {
+            b.setMessage("（空）");
+        } else {
+            b.setItems(items, new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface d, int which) {
+                    showTemplateActions(lib.get(which));
+                }
+            });
+        }
+        b.setPositiveButton("新建模板", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface d, int which) {
+                showTemplateEdit(new Tpl("", AiClient.DEFAULT_TEMPLATE), true);
+            }
+        });
+        b.setNeutralButton("导入文件", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface d, int which) {
+                Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                it.addCategory(Intent.CATEGORY_OPENABLE);
+                it.setType(TPL_MIME);
+                startActivityForResult(it, REQ_IMPORT);
+            }
+        });
+        b.setNegativeButton("关闭", null);
+        b.show();
+    }
+
+    /** 单条模板的操作菜单：切换 / 编辑 / 删除 / 分享 / 导出全部。 */
+    private void showTemplateActions(final Tpl tpl) {
+        final CharSequence[] acts = {"切换为当前", "编辑", "删除", "分享", "导出全部"};
+        new AlertDialog.Builder(this)
+                .setTitle(tpl.name)
+                .setItems(acts, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        switch (which) {
+                            case 0: // 切换为当前
+                                setActiveName(tpl.name);
+                                refreshAiStatus();
+                                uiLog("已切换提示模板：" + tpl.name);
+                                break;
+                            case 1: // 编辑
+                                showTemplateEdit(tpl, false);
+                                break;
+                            case 2: // 删除
+                                deleteTemplate(tpl);
+                                break;
+                            case 3: // 分享
+                                shareTemplate(tpl);
+                                break;
+                            case 4: // 导出全部
+                                exportLibrary();
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void deleteTemplate(final Tpl tpl) {
+        final List<Tpl> lib = loadLibrary();
+        if (lib.size() <= 1) {
+            uiLog("至少保留一条模板，无法删除");
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("删除模板「" + tpl.name + "」？")
+                .setMessage("删除后不可恢复。")
+                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        lib.remove(tpl);
+                        saveLibrary(lib);
+                        if (tpl.name != null && tpl.name.equals(getActiveName())) {
+                            setActiveName(lib.get(0).name);
+                        }
+                        refreshAiStatus();
+                        uiLog("已删除模板：" + tpl.name);
+                        showTemplateManager(); // 刷新列表
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 新建 / 编辑模板对话框。 */
+    private void showTemplateEdit(final Tpl tpl, final boolean isNew) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(16);
+        box.setPadding(p, p, p, p);
+
+        final EditText edName = new EditText(this);
+        edName.setHint("模板名（如：默认 / 学术 / 口语）");
+        edName.setText(isNew ? "" : (tpl.name == null ? "" : tpl.name));
+        edName.setSingleLine(true);
+        box.addView(edName);
+
+        final EditText edContent = new EditText(this);
+        edContent.setHint("模板内容，用 {word} 占位实际单词");
+        edContent.setText(tpl.content);
+        edContent.setSingleLine(false);
+        edContent.setMaxLines(4);
+        edContent.setGravity(android.view.Gravity.TOP);
+        box.addView(edContent);
+
+        new AlertDialog.Builder(this)
+                .setTitle(isNew ? "新建模板" : ("编辑模板「" + tpl.name + "」"))
+                .setView(box)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("保存", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int which) {
+                        String name = edName.getText().toString().trim();
+                        String content = edContent.getText().toString();
+                        if (name.isEmpty()) {
+                            uiLog("模板名不能为空");
+                            return;
+                        }
+                        List<Tpl> lib = loadLibrary();
+                        // 移除同名（含改名后的目标名）旧条目，再追加新条目。
+                        // Drop any same-name (including the rename target) entry, then append.
+                        for (int i = lib.size() - 1; i >= 0; i--) {
+                            String n = lib.get(i).name;
+                            if (n != null && n.equals(name)) {
+                                lib.remove(i);
+                            }
+                        }
+                        lib.add(new Tpl(name, content));
+                        saveLibrary(lib);
+                        setActiveName(name); // 新建/编辑后即设为当前
+                        refreshAiStatus();
+                        uiLog((isNew ? "已新建并启用模板：" : "已保存模板：") + name);
+                        showTemplateManager(); // 刷新列表
+                    }
+                })
+                .show();
+    }
+
+    /** 导出整库为 JSON 文件（SAF 选路径，真正写盘在 onActivityResult）。 */
+    private void exportLibrary() {
+        List<Tpl> lib = loadLibrary();
+        JSONArray arr = new JSONArray();
+        for (Tpl t : lib) {
+            JSONObject o = new JSONObject();
+            try {
+                o.put("name", t.name == null ? "" : t.name);
+                o.put("content", t.content == null ? "" : t.content);
+            } catch (JSONException ignored) {
+            }
+            arr.put(o);
+        }
+        pendingExportJson = arr.toString();
+        Intent it = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        it.addCategory(Intent.CATEGORY_OPENABLE);
+        it.setType(TPL_MIME);
+        it.putExtra(Intent.EXTRA_TITLE, "readpico" + TPL_SUFFIX);
+        startActivityForResult(it, REQ_EXPORT);
+    }
+
+    /** 分享单条模板（纯文本，便于直接发给别人用）。 */
+    private void shareTemplate(Tpl tpl) {
+        Intent it = new Intent(Intent.ACTION_SEND);
+        it.setType("text/plain");
+        it.putExtra(Intent.EXTRA_SUBJECT, "ReadPico 提示模板：" + (tpl.name == null ? "" : tpl.name));
+        it.putExtra(Intent.EXTRA_TEXT, tpl.content == null ? "" : tpl.content);
+        startActivity(Intent.createChooser(it, "分享提示模板"));
+    }
+
+    private String readUri(android.net.Uri uri) {
+        if (uri == null) {
+            return "";
+        }
+        InputStream in = null;
+        try {
+            in = getContentResolver().openInputStream(uri);
+            if (in == null) {
+                return "";
+            }
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            return new String(bos.toByteArray(), UTF8);
+        } catch (Exception e) {
+            return "";
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private boolean writeUri(android.net.Uri uri, String text) {
+        if (uri == null) {
+            return false;
+        }
+        OutputStream os = null;
+        try {
+            os = getContentResolver().openOutputStream(uri);
+            if (os == null) {
+                return false;
+            }
+            os.write(text.getBytes(UTF8));
+            return true;
+        } catch (Exception e) {
+            return false;
+        } finally {
+            if (os != null) {
+                try {
+                    os.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_EXPORT) {
+            if (resultCode == Activity.RESULT_OK && data != null && pendingExportJson != null
+                    && data.getData() != null) {
+                boolean ok = writeUri(data.getData(), pendingExportJson);
+                uiLog(ok ? "模板库已导出" : "模板库导出失败");
+            }
+            pendingExportJson = null;
+        } else if (requestCode == REQ_IMPORT) {
+            if (resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+                String raw = readUri(data.getData());
+                if (importLibraryJson(raw)) {
+                    uiLog("模板库已导入");
+                    showTemplateManager(); // 刷新列表
+                    refreshAiStatus();
+                } else {
+                    uiLog("模板库导入失败（文件格式不对）");
+                }
+            }
+        }
+        // REQ_ENABLE_BT / REQ_PERMS 等其它请求不在此处理。
+    }
+
+    /** 解析导入的 JSON 并替换整库；返回是否成功。 */
+    private boolean importLibraryJson(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return false;
+        }
+        try {
+            JSONArray arr = new JSONArray(raw);
+            List<Tpl> lib = new ArrayList<Tpl>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                String name = o.optString("name", DEFAULT_TPL_NAME);
+                String content = o.optString("content", AiClient.DEFAULT_TEMPLATE);
+                lib.add(new Tpl(name, content));
+            }
+            if (lib.isEmpty()) {
+                return false;
+            }
+            saveLibrary(lib);
+            // 激活名若不在新库里，退到第一条。
+            String active = getActiveName();
+            boolean has = false;
+            for (Tpl t : lib) {
+                if (t.name != null && t.name.equals(active)) {
+                    has = true;
+                    break;
+                }
+            }
+            if (!has) {
+                setActiveName(lib.get(0).name);
+            }
+            return true;
+        } catch (JSONException e) {
+            return false;
+        }
     }
 
     private void loadClipboard() {
