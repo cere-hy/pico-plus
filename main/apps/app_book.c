@@ -3017,6 +3017,51 @@ static void reader_logical_pages(size_t visual, size_t* left, size_t* right) {
     if (right) *right = next;
 }
 
+/* ---- gen26.5 Step6：阅读上下文锚点（book_id / pos）----
+ * Reading context anchors (book_id / pos) carried by the contextual 0x17 frame.
+ */
+
+/**
+ * 书标识 = 文件名 basename（去扩展名）的 FNV-1a32 哈希。
+ * Book id = FNV-1a32 of the file's basename (extension stripped).
+ *
+ * 取 basename 而非全路径：跨会话/跨目录稳定、不把用户的目录结构送出去；同名书
+ * 哈希冲突可接受——哈希只作**不透明锚点**，设备侧另有 s_path 精确记录（与
+ * vocab_log_capture(s_path, …) 的既有惯例一致）。0 保留为「无书上下文」。
+ * Basename over full path: stable across sessions and directories, and it keeps the
+ * user's directory layout private; a same-name collision is acceptable because the
+ * hash is only an opaque anchor while s_path stays the precise record (matching the
+ * existing vocab_log_capture(s_path, …) convention). 0 means "no book context".
+ */
+static uint32_t reader_book_id(void) {
+    const char *base = s_path;
+    for (const char *p = s_path; *p; ++p) {
+        if (*p == '/') base = p + 1; // 最后一个 '/' 之后 / after the last slash
+    }
+    const char *dot = NULL;
+    for (const char *p = base; *p; ++p) {
+        if (*p == '.') dot = p;      // 最后一个 '.' / the last dot
+    }
+    const size_t n = (dot && dot > base) ? (size_t)(dot - base) : strlen(base);
+    uint32_t h = 2166136261u;        // FNV-1a 偏移基 / FNV offset basis
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (uint8_t)base[i];
+        h *= 16777619u;              // FNV 质数 / FNV prime
+    }
+    return h ? h : 1u;
+}
+
+/**
+ * 当前视觉页在章内的起始字节偏移（双栏取左栏）；不可得返回 0。
+ * Start byte offset of the current visual page inside the chapter (left column when
+ * two-column); 0 when unknown.
+ */
+static size_t reader_page_start_offset(void) {
+    size_t left = 0, right = SIZE_MAX;
+    reader_logical_pages(s_page, &left, &right);
+    return book_layout_page_start_offset(left);
+}
+
 // 字节偏移 → 视觉页（续读、目录与书签落点）；偏移经 book_layout 夹到末页再归视觉页。
 // Byte offset to visual page (resume, TOC and bookmark landings); the offset is clamped
 // to the last page by book_layout before it is folded into a visual page.
@@ -4282,6 +4327,9 @@ static void free_book(void) {
     book_layout_set_runs(NULL, 0);
     s_text = NULL;
     s_text_len = 0;
+    // gen26.5 Step6：正文卸下 = 上下文源不再就绪（0x18 撤掉 CONTEXT 位，0x17 回 legacy）。
+    // Chapter text released = the context source is gone (0x18 drops CONTEXT, 0x17 legacy).
+    push_sink_ai_set_context_ready(false);
     s_selected_toc = SIZE_MAX;
     s_jump_offset = SIZE_MAX;
     // gen25（池化 · 生命周期收口）+ gen26（降栈 12K→6K）：book_prep 的 6K 任务栈随书归还。
@@ -4577,6 +4625,10 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     free(s_runs);
     s_text = loaded.utf8;
     s_text_len = loaded.len;
+    // gen26.5 Step6：正文在手 = 上下文源就绪（书锚点 + 位置都可采），此后 0x18 才
+    // 上报 CAP_AI_CONTEXT（不虚报能力）。/ Chapter text in hand = the context source
+    // is ready, and only then does 0x18 advertise CAP_AI_CONTEXT (no false claims).
+    push_sink_ai_set_context_ready(s_text != NULL);
     s_blocks = loaded.blocks;
     s_block_count = loaded.count;
     s_runs = loaded.runs;
@@ -5553,7 +5605,12 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     // collected" notice only fires when AI is off.
     bool pending = false;
     if (hit && english && !found) {
-        push_sink_ai_tap_word(word);
+        // gen26.5 Step6：带上书锚点 + 命中词在章内的字节偏移（hit_start，与
+        // vocab_log_capture 同坐标系）。帧格式由协商结果决定（未使能 → 66B legacy）。
+        // gen26.5 Step6: carry the book anchor and the hit word's byte offset in the
+        // chapter (hit_start, same coordinate space as vocab_log_capture). The frame
+        // format follows the negotiation (legacy 66B until enabled).
+        push_sink_ai_tap_word_ctx(word, reader_book_id(), hit_start);
         ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
         if (push_sink_ai_enabled()) pending = dict_popup_show_pending(word);
     }
@@ -6085,7 +6142,12 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             // its lifetime is decoupled from the card state.
             char wbuf[64];
             copy_text(wbuf, sizeof(wbuf), dict_popup_word());
-            push_sink_ai_tap_word(wbuf);   // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
+            // gen26.5 Step6：词典卡入口没有命中区间，pos 退到当前视觉页起始偏移
+            // （比 0 有用，仍属「有书上下文」）。/ The dict-card entry has no hit span,
+            // so pos falls back to the current visual page's start offset (better than
+            // 0, still "has book context").
+            push_sink_ai_tap_word_ctx(wbuf, reader_book_id(), reader_page_start_offset());
+            // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
             dict_popup_force_ai(wbuf);     // 卡切查询态并标记 over_dict（超时回退词典）
             ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);
             invalidate_prep();
