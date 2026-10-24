@@ -18,6 +18,19 @@ import push_pico as pp  # noqa: E402
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectors.txt")
 
 
+def utf8_chunks(text: str, size: int):
+    """按 UTF-8 字节切段，不切断多字节序列。/ chunk by UTF-8 bytes, never mid-sequence."""
+    raw = text.encode("utf-8")
+    out, i = [], 0
+    while i < len(raw):
+        j = min(i + size, len(raw))
+        while j > i and j < len(raw) and (raw[j] & 0xC0) == 0x80:  # 0x80..0xBF = 续字节
+            j -= 1
+        out.append(raw[i:j].decode("utf-8", "replace"))
+        i = j
+    return out
+
+
 def main() -> int:
     v = {}
 
@@ -88,6 +101,74 @@ def main() -> int:
     v["ai_result_cjk"] = pp.encode_ai_result("ephemeral", "adj. 短暂的；朝生暮死的").hex()
     v["ai_result_long"] = pp.encode_ai_result("ephemeral", "x" * 200).hex()
     v["ai_result_empty_def"] = pp.encode_ai_result("ephemeral", "").hex()
+
+    # ---- gen26.5 上下文 / 分帧 / 能力使能 ----
+    # 0x06/0x17 带 book_id + pos；0x08 释义分帧；0x09 APK 显式使能。
+    # Contextual query/status (book_id + pos), segmented definition, capability enable.
+    BOOK_ID, POS = 42, 123456
+
+    v["ai_ctx_query_len"] = 4 + 1 + pp.PUSH_AI_WORD_MAX + 8      # 0x06 ctx = 77
+    v["ai_status_ctx_len"] = 1 + 1 + pp.PUSH_AI_WORD_MAX + 8     # 0x17 ctx = 74
+    v["ai_seg_frame_len"] = 4 + 1 + pp.PUSH_AI_WORD_MAX + 6 + pp.PUSH_AI_SEG_MAX  # 0x08 = 241
+    v["ai_seg_slot"] = pp.PUSH_AI_SEG_MAX                        # 释义槽 166（含 NUL）
+    v["ai_caps_enable_len"] = 8                                  # 0x09 = 头4 + bits u32
+
+    v["ai_ctx_query_serendipity"] = pp.encode_ai_query_ctx("serendipity", BOOK_ID, POS).hex()
+    v["ai_ctx_query_cjk"] = pp.encode_ai_query_ctx("你好", 7, 0).hex()
+    v["ai_ctx_query_long"] = pp.encode_ai_query_ctx(long_word, 1, 2).hex()
+    # 解码标量（上下文档严格 77B）/ decode scalars the Java ctx decoder must reproduce
+    w, b, p = pp.decode_ai_query_ctx(pp.encode_ai_query_ctx("serendipity", BOOK_ID, POS))
+    v["ai_ctx_word_serendipity"], v["ai_ctx_book_serendipity"], v["ai_ctx_pos_serendipity"] = w, b, p
+
+    v["status_ai_ctx_serendipity"] = pp.encode_status_ai_query_ctx("serendipity", BOOK_ID, POS).hex()
+    v["status_ai_ctx_cjk"] = pp.encode_status_ai_query_ctx("你好", 7, 0).hex()
+    v["status_ai_ctx_long"] = pp.encode_status_ai_query_ctx(long_word, 1, 2).hex()
+    w, b, p = pp.decode_status_ai_query_ctx(pp.encode_status_ai_query_ctx("serendipity", BOOK_ID, POS))
+    v["ai_ctx_status_word"], v["ai_ctx_status_book"], v["ai_ctx_status_pos"] = w, b, p
+    # 新旧互连：旧解码器读 74B 上下文档仍得词（上下文静默丢失）
+    v["ai_word_via_legacy_decoder"] = pp.decode_ai_query_status(
+        pp.encode_status_ai_query_ctx("serendipity", BOOK_ID, POS))
+
+    # 0x08 分帧：单帧 + 三帧首/中/末（UTF-8 边界不切断）
+    v["ai_seg_single"] = pp.encode_ai_result_seg("ephemeral", "adj. 短暂的", 0, 1).hex()
+    long_def = ("释义分段测试-" * 60)
+    segs = utf8_chunks(long_def, pp.PUSH_AI_SEG_MAX - 1)
+    v["ai_seg_count"] = len(segs)
+    v["ai_seg_def_len"] = len(long_def.encode("utf-8"))
+    v["ai_seg_first"] = pp.encode_ai_result_seg("serendipity", segs[0], 0, len(segs)).hex()
+    v["ai_seg_last"] = pp.encode_ai_result_seg(
+        "serendipity", segs[-1], len(segs) - 1, len(segs)).hex()
+    mid = len(segs) // 2
+    # 重组前站：三段（首/中/末）拼回原文必须与切分前逐字节相等
+    assert "".join(segs) == long_def, "UTF-8 切段不可无损拼回"
+    w, s, si, st = pp.decode_ai_result_seg(
+        pp.encode_ai_result_seg("serendipity", segs[mid], mid, len(segs)))
+    v["ai_seg_word_mid"], v["ai_seg_text_mid"] = w, s
+    v["ai_seg_idx_mid"], v["ai_seg_total_mid"] = si, st
+
+    # 0x09 使能帧 + 0x18 新能力位（设备侧上报）
+    v["ai_caps_enable_ctx"] = pp.encode_ai_caps_enable(
+        pp.PUSH_CAP_AI_QUERY | pp.PUSH_CAP_AI_CONTEXT).hex()
+    v["ai_caps_enable_ctx_bits"] = pp.decode_ai_caps_enable(
+        pp.encode_ai_caps_enable(pp.PUSH_CAP_AI_QUERY | pp.PUSH_CAP_AI_CONTEXT))
+    v["ai_caps_enable_all"] = pp.encode_ai_caps_enable(
+        pp.PUSH_CAP_AI_QUERY | pp.PUSH_CAP_AI_CONTEXT | pp.PUSH_CAP_AI_MULTI).hex()
+    v["ai_caps_enable_all_bits"] = pp.decode_ai_caps_enable(
+        pp.encode_ai_caps_enable(pp.PUSH_CAP_AI_QUERY | pp.PUSH_CAP_AI_CONTEXT | pp.PUSH_CAP_AI_MULTI))
+    caps_new = pp.encode_caps(pp.PUSH_CAP_AI_QUERY | pp.PUSH_CAP_AI_CONTEXT | pp.PUSH_CAP_AI_MULTI)
+    v["caps_ai_ctx_multi"] = caps_new.hex()
+    v["caps_ai_ctx_multi_bits"] = pp.decode_caps(caps_new)
+    # 旧 APK 不使能时的对照位图（仅 AI_QUERY）
+    v["caps_ai_only_bits"] = pp.PUSH_CAP_AI_QUERY
+
+    # 有牙：定长帧的向量绝不能短一字节（帧帽纪律的最后一道闸）。
+    # Teeth: fixed-length frame vectors must never come up one byte short.
+    for key, want in (("ai_seg_first", v["ai_seg_frame_len"]),
+                      ("ai_seg_last", v["ai_seg_frame_len"]),
+                      ("ai_ctx_query_serendipity", v["ai_ctx_query_len"]),
+                      ("status_ai_ctx_serendipity", v["ai_status_ctx_len"]),
+                      ("ai_caps_enable_all", v["ai_caps_enable_len"])):
+        assert len(v[key]) == want * 2, f"{key} 向量长度 {len(v[key]) // 2}B != {want}B"
 
     with open(OUT, "w", encoding="utf-8") as f:
         for k in sorted(v):

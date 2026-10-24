@@ -261,11 +261,135 @@ def decode_caps(frame: bytes) -> int:
 
 
 def decode_ai_query_status(frame: bytes) -> str:
-    """解析设备发出的 STATUS 0x17（用户点词请算释义）：返回 word(str)。"""
+    """解析设备发出的 STATUS 0x17（用户点词请算释义）：返回 word(str)。
+
+    宽容路径（与 C push_ai_query_decode 同构）：74B 上下文档也能解出词，上下文
+    静默丢失——需要上下文用 decode_status_ai_query_ctx。Tolerant path (mirrors
+    the C legacy decoder): a 74B contextual frame still yields the word here.
+    """
     if len(frame) < 2 or frame[0] != PUSH_ST_AI_QUERY:
         raise ValueError("not an AI_QUERY status frame")
     n = frame[1]
     return frame[2:2 + n].decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------
+# gen26.5 AI 上下文档 / 分帧 / 能力使能；与 components/push_sink 逐字节一致。
+# gen26.5 contextual frames / segments / capability enable; byte-identical.
+# --------------------------------------------------------------------------
+
+def encode_ai_query_ctx(word: str, book_id: int, pos: int) -> bytes:
+    """gen26.5 AI_QUERY ctx (0x06): 4-byte header + wlen + word(64) + book_id(u32 LE)
+    + pos(u32 LE)，零填充定长 77。与 push_proto.c push_ai_query_ctx_encode 一致。"""
+    wraw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    out = bytearray([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_AI_QUERY, PUSH_VERSION])
+    out.append(len(wraw))
+    out += wraw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(wraw))
+    out += struct.pack("<II", book_id & 0xFFFFFFFF, pos & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def decode_ai_query_ctx(frame: bytes):
+    """解 AI_QUERY ctx（严格 77B）：返回 (word, book_id, pos)。Decode contextual
+    AI_QUERY (strict 77B): (word, book_id, pos)."""
+    if len(frame) != 4 + 1 + PUSH_AI_WORD_MAX + 8:
+        raise ValueError("not a contextual AI_QUERY frame")
+    if frame[0] != PUSH_MAGIC0 or frame[1] != PUSH_MAGIC1 or frame[2] != PUSH_OP_AI_QUERY:
+        raise ValueError("bad AI_QUERY header")
+    if frame[3] != PUSH_VERSION:
+        raise ValueError("bad AI_QUERY version")
+    n = frame[4]
+    if n >= PUSH_AI_WORD_MAX:
+        raise ValueError("word length out of range")
+    off = 5 + PUSH_AI_WORD_MAX
+    book_id, pos = struct.unpack("<II", frame[off:off + 8])
+    return frame[5:5 + n].decode("utf-8", "replace"), book_id, pos
+
+
+def encode_status_ai_query_ctx(word: str, book_id: int, pos: int) -> bytes:
+    """gen26.5 STATUS 0x17 ctx: op + wlen + word(64) + book_id(u32 LE) + pos(u32 LE)
+    = 74B 体。与 push_proto.c push_st_ai_query_ctx_encode 一致。"""
+    raw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    out = bytearray([PUSH_ST_AI_QUERY, len(raw)])
+    out += raw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(raw))
+    out += struct.pack("<II", book_id & 0xFFFFFFFF, pos & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def decode_status_ai_query_ctx(frame: bytes):
+    """解 STATUS 0x17 ctx（严格 74B）：返回 (word, book_id, pos)。Decode contextual
+    STATUS 0x17 (strict 74B): (word, book_id, pos)."""
+    if len(frame) != 1 + 1 + PUSH_AI_WORD_MAX + 8:
+        raise ValueError("not a contextual AI_QUERY status frame")
+    if frame[0] != PUSH_ST_AI_QUERY:
+        raise ValueError("not an AI_QUERY status frame")
+    n = frame[1]
+    if n >= PUSH_AI_WORD_MAX:
+        raise ValueError("word length out of range")
+    off = 2 + PUSH_AI_WORD_MAX
+    book_id, pos = struct.unpack("<II", frame[off:off + 8])
+    return frame[2:2 + n].decode("utf-8", "replace"), book_id, pos
+
+
+def encode_ai_result_seg(word: str, seg: str, seg_idx: int, seg_total: int) -> bytes:
+    """gen26.5 AI_RESULT_SEG (0x08): 4-byte header + wlen + word(64) + seg_idx(u16 LE)
+    + seg_total(u16 LE) + dlen(u16 LE) + seg(166)，零填充定长 241。与 push_proto.c
+    push_ai_seg_encode 一致；seg_total==1 语义等价 0x07。"""
+    wraw = word.encode("utf-8")[:PUSH_AI_WORD_MAX - 1]
+    sraw = seg.encode("utf-8")[:PUSH_AI_SEG_MAX - 1]
+    if seg_total < 1 or not (0 <= seg_idx < seg_total):
+        raise ValueError("seg index/total out of range")
+    out = bytearray([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_AI_RESULT_SEG, PUSH_VERSION])
+    out.append(len(wraw))
+    out += wraw
+    out += b"\x00" * (PUSH_AI_WORD_MAX - len(wraw))
+    out += struct.pack("<HHH", seg_idx & 0xFFFF, seg_total & 0xFFFF, len(sraw))
+    out += sraw
+    out += b"\x00" * (PUSH_AI_SEG_MAX - len(sraw))
+    return bytes(out)
+
+
+def decode_ai_result_seg(frame: bytes):
+    """解 AI_RESULT_SEG（严格 241B）：返回 (word, seg, seg_idx, seg_total)。
+    Decode AI_RESULT_SEG (strict 241B): (word, seg, seg_idx, seg_total)."""
+    if len(frame) != 4 + 1 + PUSH_AI_WORD_MAX + 2 + 2 + 2 + PUSH_AI_SEG_MAX:
+        raise ValueError("not an AI_RESULT_SEG frame")
+    if frame[0] != PUSH_MAGIC0 or frame[1] != PUSH_MAGIC1 or frame[2] != PUSH_OP_AI_RESULT_SEG:
+        raise ValueError("bad AI_RESULT_SEG header")
+    if frame[3] != PUSH_VERSION:
+        raise ValueError("bad AI_RESULT_SEG version")
+    n = frame[4]
+    if n >= PUSH_AI_WORD_MAX:
+        raise ValueError("word length out of range")
+    off = 5 + PUSH_AI_WORD_MAX
+    seg_idx, seg_total, dlen = struct.unpack("<HHH", frame[off:off + 6])
+    if seg_total < 1 or seg_idx >= seg_total:
+        raise ValueError("seg index/total out of range")
+    if dlen >= PUSH_AI_SEG_MAX:
+        raise ValueError("seg length out of range")
+    return (frame[5:5 + n].decode("utf-8", "replace"),
+            frame[off + 6:off + 6 + dlen].decode("utf-8", "replace"),
+            seg_idx, seg_total)
+
+
+def encode_ai_caps_enable(bits: int) -> bytes:
+    """gen26.5 AI_CAPS_ENABLE (0x09): 4-byte header + bits(u32 LE) = 8B。APK 订阅
+    STATUS 后发一次；设备收前 0x17 一律 legacy。Sent once after STATUS subscribe."""
+    return bytes([PUSH_MAGIC0, PUSH_MAGIC1, PUSH_OP_AI_CAPS_ENABLE, PUSH_VERSION]) + \
+        struct.pack("<I", bits & 0xFFFFFFFF)
+
+
+def decode_ai_caps_enable(frame: bytes) -> int:
+    """解 AI_CAPS_ENABLE（严格 8B）：返回 bits(int)。Decode AI_CAPS_ENABLE (strict 8B)."""
+    if len(frame) != 4 + 4:
+        raise ValueError("not an AI_CAPS_ENABLE frame")
+    if frame[0] != PUSH_MAGIC0 or frame[1] != PUSH_MAGIC1 or frame[2] != PUSH_OP_AI_CAPS_ENABLE:
+        raise ValueError("bad AI_CAPS_ENABLE header")
+    if frame[3] != PUSH_VERSION:
+        raise ValueError("bad AI_CAPS_ENABLE version")
+    return struct.unpack("<I", frame[4:8])[0]
 
 
 def encode_data(seq: int, payload: bytes) -> bytes:
@@ -502,6 +626,59 @@ def _selftest() -> int:
     # 6) 广播名 -> token
     check(token_from_adv_name("PicoPush-1A2B") == 0x1A2B, "广播名解析 token")
     check(token_from_adv_name("Other-ABCD") is None, "非本服务广播名返回 None")
+
+    # 7) gen26.5 AI 上下文档 / 分帧 / 使能
+    cq = encode_ai_query_ctx("individuation", 0x9E3779B9, 0x0000F3A0)
+    check(len(cq) == 77, f"AI_QUERY ctx 长度 == 77（实际 {len(cq)}）")
+    check(cq[2] == PUSH_OP_AI_QUERY, "AI_QUERY ctx op")
+    check(struct.unpack("<II", cq[69:77]) == (0x9E3779B9, 0x0000F3A0), "AI_QUERY ctx book_id/pos(u32 LE)")
+    w, bid, pos = decode_ai_query_ctx(cq)
+    check((w, bid, pos) == ("individuation", 0x9E3779B9, 0x0000F3A0), "AI_QUERY ctx 往返")
+    # len 分流互斥：旧 69B 帧喂 ctx 解码必须抛错
+    try:
+        decode_ai_query_ctx(encode_ai_query("serendipity"))
+        check(False, "旧 69B 帧喂 ctx 解码应抛错")
+    except ValueError:
+        check(True, "旧 69B 帧喂 ctx 解码抛 ValueError（len 分流）")
+    # 宽容路径：74B 帧喂 legacy 词解码仍得词（上下文静默丢）
+    scq = encode_status_ai_query_ctx("parent-child", 0x12345678, 0x42)
+    check(len(scq) == 74, f"STATUS 0x17 ctx 长度 == 74（实际 {len(scq)}）")
+    check(scq[0] == PUSH_ST_AI_QUERY, "STATUS 0x17 ctx op")
+    check(decode_ai_query_status(scq) == "parent-child", "74B 帧喂 legacy 词解码得词（宽容）")
+    check(decode_status_ai_query_ctx(scq) == ("parent-child", 0x12345678, 0x42), "STATUS 0x17 ctx 往返")
+    # 分帧：单帧（等价 0x07）+ 3 帧重组
+    sf = encode_ai_result_seg("uncooperative", "not willing to help or agree", 0, 1)
+    check(len(sf) == 241, f"AI_RESULT_SEG 长度 == 241（实际 {len(sf)}）")
+    check(sf[2] == PUSH_OP_AI_RESULT_SEG, "AI_RESULT_SEG op")
+    check(decode_ai_result_seg(sf) == ("uncooperative", "not willing to help or agree", 0, 1),
+          "AI_RESULT_SEG 单帧往返（seg_total==1 等价 0x07）")
+    long_def = ("The quality of being unwilling to cooperate or agree with others, "
+                "often seen in children who resist peer or parent influence.")
+    parts = [long_def[i:i + 60] for i in range(0, len(long_def), 60)]
+    reassembled = ""
+    for i, part in enumerate(parts):
+        frame = encode_ai_result_seg("uncooperative", part, i, len(parts))
+        w2, s2, idx2, total2 = decode_ai_result_seg(frame)
+        check(idx2 == i and total2 == len(parts) and s2 == part, f"分帧 {i + 1}/{len(parts)} 往返")
+        reassembled += s2
+    check(reassembled == long_def, "分帧重组拼接 == 原文")
+    # 分帧有牙
+    for bad_args in (("x", "y", 1, 1), ("x", "y", 0, 0)):
+        try:
+            encode_ai_result_seg(*bad_args)
+            check(False, f"分帧坏参数 {bad_args} 应抛错")
+        except ValueError:
+            check(True, f"分帧坏参数 {bad_args} 抛 ValueError")
+    # 使能帧
+    en = encode_ai_caps_enable(PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI)
+    check(len(en) == 8, f"AI_CAPS_ENABLE 长度 == 8（实际 {len(en)}）")
+    check(decode_ai_caps_enable(en) == (PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI), "AI_CAPS_ENABLE 往返")
+    for bad_len in (7, 9):
+        try:
+            decode_ai_caps_enable(en[:bad_len] if bad_len == 7 else en + b"\x00")
+            check(False, f"使能帧 {bad_len}B 应抛错")
+        except ValueError:
+            check(True, f"使能帧 {bad_len}B 抛 ValueError（严格 8B）")
 
     print("自检结果 / result:", "ALL PASS" if ok else "HAS FAILURES")
     return 0 if ok else 1
