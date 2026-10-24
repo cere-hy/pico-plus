@@ -232,6 +232,109 @@ public final class PushProtoTest {
         check(PushProto.capsBits(new byte[] { (byte) PushProto.ST_CAPS, 1 }) == -1L,
                 "CAPS 帧过短返回 -1（不误判）");
 
+        // 11) gen26.5：上下文档（0x06 / 0x17 ctx）/ 分帧释义（0x08）/ 能力使能（0x09）
+        //     编码与 Python 参考逐字节一致；解码做往返、互逆与拒绝非目标帧。
+        check(PushProto.AI_CTX_QUERY_MAX == 77, "0x06 ctx 帧长 77（词槽后接 book_id+pos）");
+        check(PushProto.AI_STATUS_CTX_QUERY_LEN == 74, "0x17 ctx 帧长 74");
+        check(PushProto.AI_SEG_FRAME_MAX == 241, "0x08 分帧 241（帧帽恰好用尽）");
+        check(PushProto.AI_SEG_MAX == 166, "0x08 释义槽 166（含 NUL）");
+        check(PushProto.AI_CAPS_ENABLE_MAX == 8, "0x09 使能帧 8B");
+
+        check(hex(PushProto.encodeAiQueryCtx("serendipity", 42, 123456))
+                .equals(v.get("ai_ctx_query_serendipity")), "0x06 ctx serendipity 逐字节一致");
+        check(hex(PushProto.encodeAiQueryCtx("你好", 7, 0))
+                .equals(v.get("ai_ctx_query_cjk")), "0x06 ctx 中文词逐字节一致");
+        check(hex(PushProto.encodeAiQueryCtx(longWord(), 1, 2))
+                .equals(v.get("ai_ctx_query_long")), "0x06 ctx 超长词按 63 字节截断");
+        check(hex(PushProto.encodeStatusAiQueryCtx("serendipity", 42, 123456))
+                .equals(v.get("status_ai_ctx_serendipity")), "0x17 ctx serendipity 逐字节一致");
+        check(hex(PushProto.encodeStatusAiQueryCtx("你好", 7, 0))
+                .equals(v.get("status_ai_ctx_cjk")), "0x17 ctx 中文词逐字节一致");
+        check(hex(PushProto.encodeStatusAiQueryCtx(longWord(), 1, 2))
+                .equals(v.get("status_ai_ctx_long")), "0x17 ctx 超长词按 63 字节截断");
+
+        byte[] ctxFrame = unhex(v.get("ai_ctx_query_serendipity"));
+        check("serendipity".equals(PushProto.aiQueryCtxWord(ctxFrame)), "解 0x06 ctx -> serendipity");
+        check(PushProto.aiQueryCtxBookId(ctxFrame) == vecInt(v, "ai_ctx_book_serendipity"),
+                "解 0x06 ctx -> book_id == 42");
+        check(PushProto.aiQueryCtxPos(ctxFrame) == vecInt(v, "ai_ctx_pos_serendipity"),
+                "解 0x06 ctx -> pos == 123456");
+        byte[] stCtx = unhex(v.get("status_ai_ctx_serendipity"));
+        check("serendipity".equals(PushProto.aiQueryStatusCtxWord(stCtx)), "解 0x17 ctx -> serendipity");
+        check(PushProto.aiQueryStatusCtxBookId(stCtx) == vecInt(v, "ai_ctx_status_book"),
+                "解 0x17 ctx -> book_id == 42");
+        check(PushProto.aiQueryStatusCtxPos(stCtx) == vecInt(v, "ai_ctx_status_pos"),
+                "解 0x17 ctx -> pos == 123456");
+
+        // 新旧互连两向闭环：旧解码器读 ctx 仍得词；ctx 解码器拒旧帧
+        check(v.get("ai_word_via_legacy_decoder").equals(PushProto.aiQueryWord(stCtx)),
+                "旧解码器读 74B ctx 仍得词（上下文静默丢失）");
+        check(PushProto.aiQueryStatusCtxWord(unhex(v.get("status_ai_serendipity"))) == null,
+                "ctx 解码器拒 66B 旧帧（不误判）");
+        check(PushProto.aiQueryCtxWord(unhex(v.get("ai_query_serendipity"))) == null,
+                "ctx 解码器拒 69B 旧 0x06 帧（不误判）");
+        check(PushProto.aiQueryCtxBookId(unhex(v.get("ai_query_serendipity"))) == -1L,
+                "ctx book_id 在旧帧上返回 -1");
+
+        // 0x08 分帧：首 / 中 / 末
+        check(hex(PushProto.encodeAiResultSeg("ephemeral", "adj. 短暂的", 0, 1))
+                .equals(v.get("ai_seg_single")), "0x08 单帧（1/1）逐字节一致");
+        byte[] segFirst = unhex(v.get("ai_seg_first"));
+        byte[] segMid = unhex(v.get("ai_seg_mid"));
+        byte[] segLast = unhex(v.get("ai_seg_last"));
+        check(PushProto.aiResultSegIdx(segFirst) == 0, "0x08 首段 idx == 0");
+        check(PushProto.aiResultSegIdx(segLast) == vecInt(v, "ai_seg_count") - 1,
+                "0x08 末段 idx == total-1");
+        check(PushProto.aiResultSegTotal(segFirst) == vecInt(v, "ai_seg_count"),
+                "0x08 总段数与参考一致");
+        check(v.get("ai_seg_word_mid").equals(PushProto.aiResultSegWord(segMid)),
+                "0x08 中段取词与参考一致");
+        check(v.get("ai_seg_text_mid").equals(PushProto.aiResultSegText(segMid)),
+                "0x08 中段释义与参考一致（UTF-8 不切断多字节序列）");
+        check(PushProto.aiResultSegIdx(segMid) == vecInt(v, "ai_seg_idx_mid"), "0x08 中段 idx 一致");
+        check(PushProto.aiResultSegTotal(segMid) == vecInt(v, "ai_seg_total_mid"), "0x08 中段 total 一致");
+        check(hex(PushProto.encodeAiResultSeg(PushProto.aiResultSegWord(segMid),
+                PushProto.aiResultSegText(segMid), PushProto.aiResultSegIdx(segMid),
+                PushProto.aiResultSegTotal(segMid))).equals(v.get("ai_seg_mid")),
+                "0x08 解码后重编 == 原帧（编解码互逆）");
+        // 有牙：不产非法帧 + 拒收坏帧
+        check(PushProto.encodeAiResultSeg("w", "x", 3, 3) == null, "0x08 idx==total 拒绝编码");
+        check(PushProto.encodeAiResultSeg("w", "x", 0, 0) == null, "0x08 total==0 拒绝编码");
+        check(PushProto.aiResultSegWord(unhex(v.get("ai_result_basic"))) == null,
+                "0x08 解码器拒 0x07 帧（op 不符不误收）");
+        byte[] badSeg = unhex(v.get("ai_seg_single"));
+        int dlenOff = 5 + PushProto.AI_WORD_MAX + 4;
+        badSeg[dlenOff] = (byte) 0xFF;
+        badSeg[dlenOff + 1] = (byte) 0xFF;
+        check(PushProto.aiResultSegText(badSeg) == null, "0x08 dlen 越界拒收（坏帧不误收）");
+
+        // 0x09 能力使能：APK 订阅 STATUS 后发一次，设备收前 0x17 一律 legacy
+        check(hex(PushProto.encodeAiCapsEnable(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT))
+                .equals(v.get("ai_caps_enable_ctx")), "0x09 使能帧（QUERY|CONTEXT）逐字节一致");
+        check(PushProto.aiCapsEnableBits(unhex(v.get("ai_caps_enable_ctx")))
+                == vecInt(v, "ai_caps_enable_ctx_bits"), "0x09 解出 bits == 3");
+        check(hex(PushProto.encodeAiCapsEnable(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT
+                | PushProto.CAP_AI_MULTI)).equals(v.get("ai_caps_enable_all")),
+                "0x09 使能帧（全三位）逐字节一致");
+        check(PushProto.aiCapsEnableBits(unhex(v.get("ai_caps_enable_all")))
+                == vecInt(v, "ai_caps_enable_all_bits"), "0x09 解出 bits == 7");
+        check(PushProto.aiCapsEnableBits(new byte[] { 0x50, 0x43, 0x09, 0x01, 0x01 }) == -1L,
+                "0x09 帧长 5B 拒（严格 8B）");
+        check(PushProto.aiCapsEnableBits(
+                new byte[] { 0x50, 0x43, 0x09, 0x01, 0x01, 0, 0, 0, 0 }) == -1L,
+                "0x09 帧长 9B 拒（严格 8B）");
+        check(PushProto.aiCapsEnableBits(unhex(v.get("caps_ai"))) == -1L,
+                "0x09 解码器拒 0x18 CAPS 帧（两条线不混）");
+
+        // 0x18 设备上报的新能力位
+        check(hex(PushProto.encodeCaps(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT
+                | PushProto.CAP_AI_MULTI)).equals(v.get("caps_ai_ctx_multi")),
+                "0x18 新能力位（CONTEXT|MULTI）逐字节一致");
+        check(PushProto.capsBits(unhex(v.get("caps_ai_ctx_multi")))
+                == vecInt(v, "caps_ai_ctx_multi_bits"), "0x18 解出 bits == 7");
+        check(vecInt(v, "caps_ai_only_bits") == PushProto.CAP_AI_QUERY,
+                "旧对照位图仅 CAP_AI_QUERY（未使能时的基线）");
+
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));
         System.exit(fail == 0 ? 0 : 1);

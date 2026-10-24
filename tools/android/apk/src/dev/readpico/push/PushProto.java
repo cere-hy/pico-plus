@@ -258,6 +258,222 @@ public final class PushProto {
         return getU32(frame, 1) & 0xFFFFFFFFL;
     }
 
+    /* ---- gen26.5：上下文档（0x06 / STATUS 0x17）/ 分帧释义（0x08）/ 能力使能（0x09）----
+     * 与 push_proto.c、push_pico.py 逐字节一致：ctx 帧 = 词槽 64 后接 book_id u32 +
+     * pos u32（u32 一律 LE）；分帧释义槽 166（含 NUL）；使能帧严格 8B。
+     * 长度分流即协议边界：ctx 解码严格等长（旧 69B / 66B 一律 null），而旧解码器
+     * 读 ctx 上下文档仍得词（上下文静默丢失）——新旧互连两向都不断。
+     * Byte-identical to push_proto.c / push_pico.py. Length is the protocol
+     * boundary: ctx decoders are strict (old frames -> null) while the legacy
+     * decoder still reads a ctx frame's word, so both interop directions hold.
+     */
+
+    /** CTRL 0x06 上下文档（77 B）：头4 + wlen1 + word[64] + book_id u32 + pos u32。 */
+    public static byte[] encodeAiQueryCtx(String word, long bookId, long pos) {
+        byte[] raw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] out = new byte[AI_CTX_QUERY_MAX];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_AI_QUERY;
+        out[3] = (byte) VERSION;
+        out[4] = (byte) raw.length;
+        System.arraycopy(raw, 0, out, 5, raw.length);
+        int off = 5 + AI_WORD_MAX;
+        putU32(out, off, bookId);
+        putU32(out, off + 4, pos);
+        return out;
+    }
+
+    /** 0x06 ctx 校验（严格 77B）：合法返回词长，否则 -1。/ strict check; -1 = not a ctx frame. */
+    private static int aiCtxWordLen(byte[] frame) {
+        if (frame == null || frame.length != AI_CTX_QUERY_MAX) {
+            return -1;
+        }
+        if ((frame[0] & 0xFF) != MAGIC0 || (frame[1] & 0xFF) != MAGIC1) {
+            return -1;
+        }
+        if ((frame[2] & 0xFF) != OP_AI_QUERY || (frame[3] & 0xFF) != VERSION) {
+            return -1;
+        }
+        int n = frame[4] & 0xFF;
+        return (n < AI_WORD_MAX) ? n : -1;
+    }
+
+    /** 解 0x06 ctx → 词；非 ctx 帧（含旧 69B）返回 null。 */
+    public static String aiQueryCtxWord(byte[] frame) {
+        int n = aiCtxWordLen(frame);
+        return n < 0 ? null : new String(frame, 5, n, UTF8);
+    }
+
+    /** 解 0x06 ctx → book_id；非 ctx 帧返回 -1。 */
+    public static long aiQueryCtxBookId(byte[] frame) {
+        if (aiCtxWordLen(frame) < 0) {
+            return -1L;
+        }
+        return getU32(frame, 5 + AI_WORD_MAX) & 0xFFFFFFFFL;
+    }
+
+    /** 解 0x06 ctx → pos（书内位置）；非 ctx 帧返回 -1。 */
+    public static long aiQueryCtxPos(byte[] frame) {
+        if (aiCtxWordLen(frame) < 0) {
+            return -1L;
+        }
+        return getU32(frame, 5 + AI_WORD_MAX + 4) & 0xFFFFFFFFL;
+    }
+
+    /** STATUS 0x17 上下文档（74 B）：op + wlen1 + word[64] + book_id u32 + pos u32。 */
+    public static byte[] encodeStatusAiQueryCtx(String word, long bookId, long pos) {
+        byte[] raw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] out = new byte[AI_STATUS_CTX_QUERY_LEN];
+        out[0] = (byte) ST_AI_QUERY;
+        out[1] = (byte) raw.length;
+        System.arraycopy(raw, 0, out, 2, raw.length);
+        putU32(out, 2 + AI_WORD_MAX, bookId);
+        putU32(out, 2 + AI_WORD_MAX + 4, pos);
+        return out;
+    }
+
+    /** 0x17 ctx 校验（严格 74B）：合法返回词长，否则 -1。 */
+    private static int aiStatusCtxWordLen(byte[] frame) {
+        if (frame == null || frame.length != AI_STATUS_CTX_QUERY_LEN) {
+            return -1;
+        }
+        if ((frame[0] & 0xFF) != ST_AI_QUERY) {
+            return -1;
+        }
+        int n = frame[1] & 0xFF;
+        return (n < AI_WORD_MAX) ? n : -1;
+    }
+
+    /** 解 STATUS 0x17 ctx → 词；非 ctx 帧（含旧 66B）返回 null。 */
+    public static String aiQueryStatusCtxWord(byte[] frame) {
+        int n = aiStatusCtxWordLen(frame);
+        return n < 0 ? null : new String(frame, 2, n, UTF8);
+    }
+
+    /** 解 STATUS 0x17 ctx → book_id；非 ctx 帧返回 -1。 */
+    public static long aiQueryStatusCtxBookId(byte[] frame) {
+        if (aiStatusCtxWordLen(frame) < 0) {
+            return -1L;
+        }
+        return getU32(frame, 2 + AI_WORD_MAX) & 0xFFFFFFFFL;
+    }
+
+    /** 解 STATUS 0x17 ctx → pos；非 ctx 帧返回 -1。 */
+    public static long aiQueryStatusCtxPos(byte[] frame) {
+        if (aiStatusCtxWordLen(frame) < 0) {
+            return -1L;
+        }
+        return getU32(frame, 2 + AI_WORD_MAX + 4) & 0xFFFFFFFFL;
+    }
+
+    /**
+     * CTRL 0x08 分帧释义（241 B）：头4 + wlen1 + word[64] + idx u16 + total u16 +
+     * dlen u16 + seg[166]。idx/total 越界返回 null（不产非法帧）。
+     */
+    public static byte[] encodeAiResultSeg(String word, String seg, int segIdx, int segTotal) {
+        if (segTotal < 1 || segIdx < 0 || segIdx >= segTotal) {
+            return null; // 序号须在界内 / index must be in range
+        }
+        byte[] wraw = fitUtf8(word, AI_WORD_MAX - 1);
+        byte[] sraw = fitUtf8(seg, AI_SEG_MAX - 1);
+        byte[] out = new byte[AI_SEG_FRAME_MAX];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_AI_RESULT_SEG;
+        out[3] = (byte) VERSION;
+        out[4] = (byte) wraw.length;
+        System.arraycopy(wraw, 0, out, 5, wraw.length);
+        int off = 5 + AI_WORD_MAX;
+        putU16(out, off, segIdx);
+        putU16(out, off + 2, segTotal);
+        putU16(out, off + 4, sraw.length);
+        System.arraycopy(sraw, 0, out, off + 6, sraw.length);
+        return out;
+    }
+
+    /** 0x08 校验（严格 241B + 序号在界内）：合法返回词长，否则 -1。 */
+    private static int aiSegWordLen(byte[] frame) {
+        if (frame == null || frame.length != AI_SEG_FRAME_MAX) {
+            return -1;
+        }
+        if ((frame[0] & 0xFF) != MAGIC0 || (frame[1] & 0xFF) != MAGIC1) {
+            return -1;
+        }
+        if ((frame[2] & 0xFF) != OP_AI_RESULT_SEG || (frame[3] & 0xFF) != VERSION) {
+            return -1;
+        }
+        int n = frame[4] & 0xFF;
+        if (n >= AI_WORD_MAX) {
+            return -1;
+        }
+        int off = 5 + AI_WORD_MAX;
+        int idx = getU16(frame, off);
+        int total = getU16(frame, off + 2);
+        int dlen = getU16(frame, off + 4);
+        if (total < 1 || idx >= total || dlen >= AI_SEG_MAX) {
+            return -1;
+        }
+        return n;
+    }
+
+    /** 解 0x08 → 词；非法帧返回 null。 */
+    public static String aiResultSegWord(byte[] frame) {
+        int n = aiSegWordLen(frame);
+        return n < 0 ? null : new String(frame, 5, n, UTF8);
+    }
+
+    /** 解 0x08 → 本段释义文本；非法帧返回 null。 */
+    public static String aiResultSegText(byte[] frame) {
+        if (aiSegWordLen(frame) < 0) {
+            return null;
+        }
+        int off = 5 + AI_WORD_MAX;
+        int dlen = getU16(frame, off + 4);
+        return new String(frame, off + 6, dlen, UTF8);
+    }
+
+    /** 解 0x08 → 段序号；非法帧返回 -1。 */
+    public static int aiResultSegIdx(byte[] frame) {
+        if (aiSegWordLen(frame) < 0) {
+            return -1;
+        }
+        return getU16(frame, 5 + AI_WORD_MAX);
+    }
+
+    /** 解 0x08 → 总段数；非法帧返回 -1。 */
+    public static int aiResultSegTotal(byte[] frame) {
+        if (aiSegWordLen(frame) < 0) {
+            return -1;
+        }
+        return getU16(frame, 5 + AI_WORD_MAX + 2);
+    }
+
+    /** CTRL 0x09 能力使能（8 B）：头4 + bits u32 LE；APK 订阅 STATUS 后发一次。 */
+    public static byte[] encodeAiCapsEnable(long bits) {
+        byte[] out = new byte[AI_CAPS_ENABLE_MAX];
+        out[0] = (byte) MAGIC0;
+        out[1] = (byte) MAGIC1;
+        out[2] = (byte) OP_AI_CAPS_ENABLE;
+        out[3] = (byte) VERSION;
+        putU32(out, 4, bits & 0xFFFFFFFFL);
+        return out;
+    }
+
+    /** 解 0x09 → 能力位图；非使能帧或长度 ≠ 8 返回 -1（严格等长）。 */
+    public static long aiCapsEnableBits(byte[] frame) {
+        if (frame == null || frame.length != AI_CAPS_ENABLE_MAX) {
+            return -1L;
+        }
+        if ((frame[0] & 0xFF) != MAGIC0 || (frame[1] & 0xFF) != MAGIC1) {
+            return -1L;
+        }
+        if ((frame[2] & 0xFF) != OP_AI_CAPS_ENABLE || (frame[3] & 0xFF) != VERSION) {
+            return -1L;
+        }
+        return getU32(frame, 4) & 0xFFFFFFFFL;
+    }
+
     public static byte[] encodeBegin(long totalLen, long crc, long sessionId,
                                      int token, int ptype, String title) {
         byte[] out = new byte[ BEGIN_LEN ];
@@ -407,6 +623,10 @@ public final class PushProto {
         out[off + 1] = (byte) ((v >> 8) & 0xFF);
         out[off + 2] = (byte) ((v >> 16) & 0xFF);
         out[off + 3] = (byte) ((v >> 24) & 0xFF);
+    }
+
+    private static int getU16(byte[] in, int off) {
+        return (in[off] & 0xFF) | ((in[off + 1] & 0xFF) << 8);
     }
 
     private static int getU32(byte[] in, int off) {

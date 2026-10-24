@@ -139,6 +139,7 @@ def main() -> int:
     v["ai_seg_last"] = pp.encode_ai_result_seg(
         "serendipity", segs[-1], len(segs) - 1, len(segs)).hex()
     mid = len(segs) // 2
+    v["ai_seg_mid"] = pp.encode_ai_result_seg("serendipity", segs[mid], mid, len(segs)).hex()
     # 重组前站：三段（首/中/末）拼回原文必须与切分前逐字节相等
     assert "".join(segs) == long_def, "UTF-8 切段不可无损拼回"
     w, s, si, st = pp.decode_ai_result_seg(
