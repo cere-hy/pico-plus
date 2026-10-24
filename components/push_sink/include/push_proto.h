@@ -287,6 +287,20 @@ bool push_ai_query_ctx_decode(const uint8_t *in, size_t len, push_ai_query_ctx_t
 size_t push_st_ai_query_ctx_encode(const char *word, uint32_t book_id, uint32_t pos,
                                    uint8_t *out, size_t cap);
 
+/// gen26.5 设备侧 0x17 发送决策（唯一出口）：按「APK 是否使能 CONTEXT」+「有无真实
+/// 上下文」选帧格式。**默认 legacy**——旧 APK 从不发 0x09，故永远走 66B 旧路，零感知。
+/// Device-side 0x17 emission decision (the single exit point): legacy vs contextual.
+/// **Legacy by default** — an old APK never sends 0x09, so it always gets the 66B
+/// frame and notices nothing.
+///
+/// 决策表 / decision table：
+///   - ctx_enabled == false                    → 66B legacy（旧 APK / 未使能 / 断连后）
+///   - ctx_enabled == true 且 book_id != 0     → 74B ctx（词 + 书 + 位置）
+///   - ctx_enabled == true 且 book_id == 0     → 66B legacy（词典弹窗等无书场景：不编造上下文）
+/// out 至少 PUSH_ST_AI_CTX_QUERY_LEN（74）字节以容纳两种帧；返回帧长，0 = 参数/cap 非法。
+size_t push_st_ai_query_emit(const char *word, uint32_t book_id, uint32_t pos,
+                             bool ctx_enabled, uint8_t *out, size_t cap);
+
 /* ---- AI 释义分帧（gen26.5，0x08）---- */
 /* AI definition segments (gen26.5, 0x08). */
 

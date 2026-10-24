@@ -243,6 +243,27 @@ bool push_sink_ai_enabled(void);
 /// asks the phone (STATUS 0x17); an offline tap queues for the ride-along.
 void push_sink_ai_tap_word(const char *word);
 
+/// gen26.5 带上下文点词：book_id = TF 卡书名 FNV-1a（0 = 无书上下文），pos = 章内
+/// 字节偏移。帧格式由协商结果决定——APK 未用 0x09 声明 CAP_AI_CONTEXT（或 book_id
+/// 为 0）时一律发 66B legacy，对旧 APK 零感知。
+/// gen26.5 contextual tap: book_id = FNV-1a of the book name (0 = none), pos = byte
+/// offset in the chapter. The frame format follows the negotiation - unless the APK
+/// declared CAP_AI_CONTEXT via 0x09 (and book_id != 0), a 66B legacy frame goes out,
+/// which old APKs read without noticing anything.
+void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos);
+
+/// gen26.5 上下文源就绪开关：阅读器挂接 book_id/pos 采集后置 true。未就绪时 0x18
+/// 能力上报**不带** CAP_AI_CONTEXT（不虚报能力），0x17 恒 legacy。
+/// gen26.5 context-source readiness: the reader sets it once it can supply
+/// book_id/pos. While false, 0x18 never advertises CAP_AI_CONTEXT (no false
+/// claims) and 0x17 stays legacy.
+void push_sink_ai_set_context_ready(bool ready);
+
+/// gen26.5 当前 APK 声明的能力位（0 = 未使能，旧 APK 或断连后）。真机排障用。
+/// gen26.5 capabilities the APK declared (0 = not enabled: old APK or after
+/// disconnect). For on-hardware diagnosis.
+uint32_t push_sink_apk_caps(void);
+
 /// 取走一条待展示的释义（块 4 卡片框架入口）；UI 轮询消费，返回 true 表示有。
 /// Take a pending definition to render (block 4 card framework entry); polled
 /// by the UI, true means one was available.

@@ -842,8 +842,68 @@ static void test_ai_frames(void) {
         CHECK(!push_ai_caps_enable_decode(bad_en, sizeof(bad_en), &en2));
     }
 
+    // ---- gen26.5：0x17 发送决策（协商分流唯一出口）----
+    // gen26.5: the 0x17 emission decision (the single dispatch exit point).
+    //
+    // 这是「默认 legacy + APK 显式使能」的协议层落点：设备未收到 0x09 前永远发
+    // 66B 旧帧，旧 APK 零感知；使能后且确有书内上下文才升 74B。
+    // This is where "legacy by default + explicit APK enable" lands in the protocol
+    // layer: until 0x09 arrives the device always emits the 66B frame, which an old
+    // APK reads without noticing; only after enable, and only with a real in-book
+    // context, does it upgrade to 74B.
+    uint8_t em[PUSH_ST_AI_CTX_QUERY_LEN]; // 74B：两种格式共用一槽 / one slot fits both
+    size_t emn;
+
+    // ① 未使能（旧 APK / 断连后）→ 66B legacy，即便有上下文也不升档。
+    // Not enabled (old APK / after disconnect) -> 66B legacy even with context.
+    emn = push_st_ai_query_emit("ephemeral", 0x9e3779b9u, 0x1234u, false, em, sizeof(em));
+    CHECK(emn == PUSH_ST_AI_LEGACY_QUERY_LEN);
+    CHECK(emn == 66u);
+    CHECK(em[0] == PUSH_ST_AI_QUERY);
+
+    // ② 未使能 + 无上下文 → 仍然 66B。/ Not enabled, no context -> still 66B.
+    emn = push_st_ai_query_emit("ephemeral", 0u, 0u, false, em, sizeof(em));
+    CHECK(emn == 66u);
+
+    // ③ 使能 + 有书上下文 → 74B。/ Enabled + in-book context -> 74B.
+    emn = push_st_ai_query_emit("ephemeral", 0x9e3779b9u, 0x1234u, true, em, sizeof(em));
+    CHECK(emn == PUSH_ST_AI_CTX_QUERY_LEN);
+    CHECK(emn == 74u);
+    {
+        // 用旧解码器的读法（op + wlen + 词）解 74B 上下文档：词必须正确——这就是
+        // 新旧互连的「新设备 → 旧 APK」半环（Python/Java 侧同名断言已各自钉死）。
+        // Read the 74B frame the legacy way (op + wlen + word): the word must be
+        // intact - the "new device -> old APK" half of interop (the Python/Java
+        // sides pin the same claim in their own tests).
+        const size_t wn = em[1];
+        CHECK(wn == strlen("ephemeral"));
+        CHECK(memcmp(em + 2, "ephemeral", wn) == 0);
+        // 词槽之后是 8B 上下文（book_id + pos，小端）；旧 APK 视而不见，新 APK 读得出。
+        // After the word slot come 8B of context (book_id + pos, LE): invisible to
+        // an old APK, readable by a new one.
+        const uint32_t got_book = (uint32_t)em[2u + PUSH_AI_WORD_MAX] |
+            ((uint32_t)em[2u + PUSH_AI_WORD_MAX + 1u] << 8) |
+            ((uint32_t)em[2u + PUSH_AI_WORD_MAX + 2u] << 16) |
+            ((uint32_t)em[2u + PUSH_AI_WORD_MAX + 3u] << 24);
+        CHECK(got_book == 0x9e3779b9u);
+    }
+
+    // ④ 使能但无书上下文（词典弹窗）→ 退回 66B，不编造上下文。
+    // Enabled but no book context (dictionary popup) -> back to 66B; no invented context.
+    emn = push_st_ai_query_emit("ephemeral", 0u, 0u, true, em, sizeof(em));
+    CHECK(emn == 66u);
+
+    // ⑤ cap 有牙：ctx 需要 74、legacy 需要 66，少一字节就返 0（绝不发半帧）。
+    // Cap teeth: ctx needs 74, legacy needs 66; one byte short returns 0.
+    CHECK(push_st_ai_query_emit("ephemeral", 1u, 1u, true, em, 73u) == 0u);
+    CHECK(push_st_ai_query_emit("ephemeral", 1u, 1u, false, em, 65u) == 0u);
+    CHECK(push_st_ai_query_emit("ephemeral", 1u, 1u, false, em, 66u) == 66u);
+    CHECK(push_st_ai_query_emit(NULL, 1u, 1u, true, em, sizeof(em)) == 0u);
+    CHECK(push_st_ai_query_emit("ephemeral", 1u, 1u, true, NULL, sizeof(em)) == 0u);
+
     printf("ai frames: query/result/status 0x17/caps round-trip + bad-header teeth ok\n");
     printf("ai frames gen26.5: ctx 77/74, seg 241 (single+multi reassembly), enable 8, len-dispatch ok\n");
+    printf("ai emit gen26.5: legacy-by-default dispatch (66/74 by enable+context) + cap teeth ok\n");
 }
 
 /* ---- 搭车离线队列（gen26 块 2）---- */

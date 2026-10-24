@@ -1540,6 +1540,22 @@ public class MainActivity extends Activity {
                     uiLog("订阅失败");
                     return;
                 }
+                // gen26.5 能力使能（0x09）：订阅建立的同一时刻声明「本 APK 支持
+                // 74B 上下文档」。设备默认发 66B legacy，收到本帧并置起
+                // CAP_AI_CONTEXT 后才改发 74B；老固件不认 0x09 → 回 ERR(2)，
+                // 双方行为都不变（本 APK 的旧解码路径照读 66B）。写失败也不致命。
+                // gen26.5 capability enable (0x09): declare support for the 74B
+                // contextual frame at the same moment the subscription lands. The
+                // device emits 66B legacy by default and only upgrades after this
+                // frame sets CAP_AI_CONTEXT; old firmware rejects 0x09 with ERR(2)
+                // and both sides carry on (our legacy decode path still reads 66B).
+                final byte[] capsEnable = PushProto.encodeAiCapsEnable(
+                        PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT);
+                uiLog("声明 APK 能力（0x09，bits=0x"
+                        + Long.toHexString(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT) + "）……");
+                if (!writeChar(cCtrl, capsEnable)) {
+                    uiLog("能力声明未送达，按旧帧（66B）工作");
+                }
                 listenMode = true;
                 uiLog("已连接并保持监听——在墨水屏上点英文词，释义会自动回传（约 2-5 秒出卡）。");
                 refreshAiStatus();
@@ -1574,17 +1590,33 @@ public class MainActivity extends Activity {
             if (!listenMode) {
                 return; // 没开监听就不应答（老行为：推送流程不处理 AI 帧）
             }
-            String word = PushProto.aiQueryWord(frame);
+            // gen26.5：优先按上下文档（74B）解，解不出再退回旧帧（66B）——同一份宽容
+            // 顺序，新旧固件 × 新旧 APK 任意组合都拿得到词；拿不到上下文就当 0（
+            // Step6 起用它把「这一本、这一处」写进提示词）。
+            // Prefer the contextual frame (74B), fall back to legacy (66B): any
+            // firmware x APK combination still yields the word; missing context
+            // reads as 0 (Step6 feeds it into the prompt).
+            String word = PushProto.aiQueryStatusCtxWord(frame);
+            long bookId = 0L;
+            long pos = 0L;
+            if (word != null) {
+                bookId = PushProto.aiQueryStatusCtxBookId(frame);
+                pos = PushProto.aiQueryStatusCtxPos(frame);
+            } else {
+                word = PushProto.aiQueryWord(frame); // 旧 66B 帧 / legacy 66B frame
+            }
             if (word == null || word.isEmpty()) {
                 return;
             }
-            onAiQuery(word);
+            onAiQuery(word, bookId, pos);
         }
     }
 
     /** 收到点词：后台调 LLM，拿到释义后回 0x07。 */
-    private void onAiQuery(final String word) {
-        uiLog("墨水屏点词「" + word + "」，查询中……");
+    private void onAiQuery(final String word, final long bookId, final long pos) {
+        uiLog("墨水屏点词「" + word + "」，查询中……"
+                + (bookId != 0L ? "（上下文：书 0x" + Long.toHexString(bookId)
+                        + " @ " + pos + "B）" : ""));
         new Thread(new Runnable() {
             @Override
             public void run() {

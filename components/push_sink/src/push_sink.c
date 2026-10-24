@@ -242,6 +242,19 @@ static size_t s_ai_buf_len;
 static uint16_t s_ai_cap;
 static bool s_ai_ready;   // 缓冲已挂接且 init 成功 / buffer attached and inited
 static bool s_ai_enabled; // 运行期开关（NVS 持久化）/ runtime on/off (NVS-persisted)
+// gen26.5 协商状态：APK 用 CTRL 0x09 声明它支持的能力位。**默认 0（未使能）**——
+// 设备收使能前 STATUS 0x17 一律 66B legacy，旧 APK 不发 0x09 即零感知兼容；
+// 断连清零，重连后等 APK 重发（对端进程可能被杀，能力声明不可跨连接继承）。
+// gen26.5 negotiation state: the APK declares what it supports via CTRL 0x09.
+// **Defaults to 0** - until then, STATUS 0x17 stays 66B legacy, so an old APK
+// that never sends 0x09 notices nothing. Cleared on disconnect: the peer process
+// may have been killed, so a capability declaration never survives a connection.
+static uint32_t s_apk_caps;
+// 设备侧上下文源是否就绪（Step6 由阅读器注册 book_id/pos 采集后置 true）。
+// 不就绪就不在 0x18 里报 CAP_AI_CONTEXT——不虚报能力。
+// Is the device-side context source ready? (Step6 registers the book_id/pos
+// collector.) While false, 0x18 never advertises CAP_AI_CONTEXT - no false claims.
+static bool s_ai_ctx_ready;
 
 // 预取释义缓存（块 3）：最近回流的释义，点词命中即秒出卡，不挤空口。
 // Prefetch cache (block 3): recent definitions; a tap on a cached word renders
@@ -1199,6 +1212,11 @@ static void ai_surface(const char *word, const char *def) {
 static void ai_send_caps(void) {
     push_caps_t caps = {0};
     if (s_ai_enabled) caps.bits |= PUSH_CAP_AI_QUERY;
+    // gen26.5：上下文能力只在确有上下文源时报（不虚报）；MULTI 等 Step7 重组器
+    // 落地后再报——报了就得收 0x08，收不了就是骗对端。
+    // gen26.5: advertise CONTEXT only with a real context source; MULTI waits for
+    // the Step7 reassembler - advertising it means we must accept 0x08.
+    if (s_ai_ctx_ready) caps.bits |= PUSH_CAP_AI_CONTEXT;
     uint8_t frame[5];
     const size_t n = push_caps_encode(&caps, frame, sizeof(frame));
     if (n) notify_status(frame, n);
@@ -1217,13 +1235,28 @@ static void ai_send_caps(void) {
 // 100 ms retry by notify_retry_schedule, and the next subscribe event or
 // reconnect resumes the flush - ending the gen26.2-noted "dropped frame,
 // eaten word, offline queue silently emptied".
+// APK 已声明支持上下文 **且** 设备确有上下文源可填，才走 74B 上下文档。
+// Both sides must agree: the APK declared CONTEXT and we can actually supply one.
+static bool ai_ctx_enabled(void) {
+    return s_ai_ctx_ready && (s_apk_caps & PUSH_CAP_AI_CONTEXT) != 0u;
+}
+
 static void ai_flush_queue(void) {
     if (!s_ai_ready) return;
     char w[PUSH_AI_WORD_MAX + 1];
+    // gen26.5 自擒：原实现把 sizeof(w)=65 传给 push_st_ai_query_encode（它要 66）
+    // → 恒返回 0 → 离线搭车队列**一个词都回不了流**（该路径无宿主断言覆盖，真机
+    // 才可见）。帧槽按最大帧 74B 开，legacy 66B 装得下，两种格式共用一槽。
+    // gen26.5 self-catch: the old call passed sizeof(w)=65 to
+    // push_st_ai_query_encode (needs 66) -> always 0 -> the offline ride-along
+    // queue never flushed a single word (no host assertion covered this path).
+    // The slot is sized for the largest frame (74B); legacy 66B fits too.
+    uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
     for (uint16_t guard = 0; ai_raloc_count(s_ai_buf) > 0 && guard <= s_ai_cap; ++guard) {
         if (!ai_raloc_peek(s_ai_buf, w, sizeof(w))) break;
-        uint8_t frame[2u + PUSH_AI_WORD_MAX];
-        const size_t n = push_st_ai_query_encode(w, frame, sizeof(w));
+        // 离线队列只存词（无书上下文）→ book_id=0 → 恒走 legacy，不编造上下文。
+        // The queue holds words only (no book context) -> book_id=0 -> always legacy.
+        const size_t n = push_st_ai_query_emit(w, 0u, 0u, ai_ctx_enabled(), frame, sizeof(frame));
         if (!n) break;
         if (!notify_status(frame, n)) break; // 未交付：词留队 / not delivered: word stays
         if (!ai_raloc_dequeue(s_ai_buf, w, sizeof(w))) break;
@@ -1291,7 +1324,24 @@ void push_sink_set_ai_enabled(bool on) {
     }
 }
 
+void push_sink_ai_set_context_ready(bool ready) {
+    s_ai_ctx_ready = ready;
+    // 就绪状态变了要重报能力：APK 可能正等着 CONTEXT 位才发 0x09。
+    // Re-advertise on change: the APK may be waiting on the CONTEXT bit.
+    if (ready && s_status_subscribed) {
+        lock();
+        ai_send_caps();
+        unlock();
+    }
+}
+
+uint32_t push_sink_apk_caps(void) { return s_apk_caps; }
+
 void push_sink_ai_tap_word(const char *word) {
+    push_sink_ai_tap_word_ctx(word, 0u, 0u); // 无书上下文（词典弹窗等）/ no book context
+}
+
+void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos) {
     if (!word || !*word) return;
     if (s_ai_enabled) {
         const char *cached = ai_cache_find(word);
@@ -1301,8 +1351,11 @@ void push_sink_ai_tap_word(const char *word) {
     lock();
     const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
     if (live) {
-        uint8_t frame[2u + PUSH_AI_WORD_MAX];
-        const size_t n = push_st_ai_query_encode(word, frame, sizeof(frame));
+        // gen26.5：帧格式由协商结果决定（未使能 → 66B legacy，旧 APK 零感知）。
+        // gen26.5: the frame format follows the negotiation (legacy until enabled).
+        uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
+        const size_t n = push_st_ai_query_emit(word, book_id, pos, ai_ctx_enabled(),
+                                               frame, sizeof(frame));
         if (n) notify_status(frame, n); // 即时：STATUS 0x17
     } else if (s_ai_ready) {
         ai_raloc_enqueue(s_ai_buf, s_ai_buf_len, word); // 离线：入搭车队列
@@ -1376,6 +1429,29 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
             return;
         }
         ai_on_result(r.word, r.def);
+        return;
+    }
+    // gen26.5 能力使能（0x09）：与 SET_TIME / AI 通道同模型——连上即可用，不受
+    // 「必须武装」限制。APK 订阅 STATUS 后发一次，声明它支持哪些设备能力；
+    // 设备据此决定 0x17 帧格式（见 push_st_ai_query_emit）。断连清零见 DISCONNECT。
+    // gen26.5 capability enable (0x09): same model as SET_TIME / the AI channel -
+    // usable on connect, not gated on armed. The APK sends it once after
+    // subscribing, declaring which device capabilities it supports; that decides
+    // the 0x17 frame format (push_st_ai_query_emit). Cleared on DISCONNECT.
+    if (op == PUSH_OP_AI_CAPS_ENABLE) {
+        push_caps_t caps;
+        if (!push_ai_caps_enable_decode(data, len, &caps)) {
+            ESP_LOGW(TAG, "ai caps enable rejected: len=%u head=%02x %02x %02x %02x",
+                     (unsigned)len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
+                     len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
+            reply_err(PUSH_ERR_BAD_FRAME);
+            return;
+        }
+        s_apk_caps = caps.bits; // 未知位原样保留（前向兼容）/ unknown bits kept as-is
+        ESP_LOGI(TAG, "apk caps enable: bits=0x%08x (ctx=%d multi=%d)",
+                 (unsigned)s_apk_caps,
+                 (s_apk_caps & PUSH_CAP_AI_CONTEXT) ? 1 : 0,
+                 (s_apk_caps & PUSH_CAP_AI_MULTI) ? 1 : 0);
         return;
     }
     // 未武装：任何 CTRL 写入都回 ERR(1)，状态机看都不看。/ Unarmed: every CTRL
@@ -1568,6 +1644,12 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         lock();
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_status_subscribed = false;
+        // gen26.5：能力声明随连接作废。对端进程可能已被杀，能力不可跨连接继承——
+        // 重连后 0x17 一律回到 legacy，等 APK 重新发 0x09（旧 APK 不发即恒 legacy）。
+        // gen26.5: the capability declaration dies with the connection. The peer
+        // process may be gone, so capabilities never carry over - after reconnect
+        // 0x17 falls back to legacy until the APK re-sends 0x09.
+        s_apk_caps = 0u;
         // gen14：断开即撤重投配额，防 timer 到点往下一个连接周期野发。
         // gen14: drop the retry quota on disconnect so the timer cannot fire
         // into the next connection cycle.

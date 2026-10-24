@@ -261,6 +261,17 @@ size_t push_st_ai_query_ctx_encode(const char *word, uint32_t book_id, uint32_t 
 
 /* ---- gen26.5 释义分帧 / segmented definitions (gen26.5) ---- */
 
+size_t push_st_ai_query_emit(const char *word, uint32_t book_id, uint32_t pos,
+                             bool ctx_enabled, uint8_t *out, size_t cap) {
+    if (!word || !out) return 0;
+    // 上下文档只在「APK 声明支持」且「确有书内上下文」时发出；其余一律 legacy。
+    // Contextual only when the APK opted in AND a real in-book context exists.
+    if (ctx_enabled && book_id != 0u) {
+        return push_st_ai_query_ctx_encode(word, book_id, pos, out, cap);
+    }
+    return push_st_ai_query_encode(word, out, cap);
+}
+
 size_t push_ai_seg_encode(const push_ai_seg_t *s, uint8_t *out, size_t cap) {
     if (!s || !out || cap < PUSH_AI_SEG_FRAME_MAX) return 0;
     if (s->seg_total == 0 || s->seg_idx >= s->seg_total) return 0; // 序号须在界内
