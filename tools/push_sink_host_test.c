@@ -16,6 +16,7 @@
 #include "push_proto.h"
 #include "push_session.h"
 #include "ai_ridealong.h"
+#include "ai_segasm.h"
 
 static int s_checks;
 static int s_red;
@@ -988,6 +989,146 @@ static void test_ai_frames(void) {
     printf("ai emit gen26.5: legacy-by-default dispatch (66/74 by enable+context) + cap teeth ok\n");
 }
 
+/* ---- 0x08 释义分帧重组器（gen26.5 Step7，纯逻辑）---- */
+/* 0x08 definition reassembler (gen26.5 Step7, pure logic). */
+static void test_ai_segasm(void) {
+    ai_segasm_t a;
+    const char *text = NULL;
+    size_t len = 0;
+
+    // 单帧（total==1）立即完成，语义等价 0x07。/ A single frame completes at once.
+    ai_segasm_reset(&a);
+    push_ai_seg_t one;
+    memset(&one, 0, sizeof(one));
+    snprintf(one.word, sizeof(one.word), "ephemeral");
+    one.seg_total = 1;
+    snprintf(one.seg, sizeof(one.seg), "lasting a very short time");
+    CHECK(ai_segasm_feed(&a, &one, &text, &len) == AI_SEGASM_DONE);
+    CHECK(len == strlen("lasting a very short time"));
+    CHECK(strcmp(text, "lasting a very short time") == 0);
+    CHECK(strcmp(a.word, "ephemeral") == 0);
+
+    // 3 帧顺序重组：拼接 == 原文。/ Three frames in order: concatenation == original.
+    static const char *full = "The quality of being unwilling to cooperate or agree "
+        "with others, often seen in children who resist peer or parent influence "
+        "and assert their own will strongly, even when it costs them dearly.";
+    const size_t flen = strlen(full);
+    const size_t per = (flen + 2) / 3; // 3 帧均分 / across three frames
+    CHECK(per < PUSH_AI_SEG_MAX);
+    ai_segasm_reset(&a);
+    ai_segasm_status_t st = AI_SEGASM_PENDING;
+    for (size_t i = 0; i < 3; ++i) {
+        push_ai_seg_t part;
+        memset(&part, 0, sizeof(part));
+        snprintf(part.word, sizeof(part.word), "uncooperative");
+        part.seg_idx = (uint16_t)i;
+        part.seg_total = 3;
+        size_t take = flen - i * per;
+        if (take > per) take = per;
+        memcpy(part.seg, full + i * per, take);
+        part.seg[take] = 0;
+        st = ai_segasm_feed(&a, &part, &text, &len);
+        CHECK(st == (i < 2 ? AI_SEGASM_PENDING : AI_SEGASM_DONE));
+    }
+    CHECK(st == AI_SEGASM_DONE);
+    CHECK(len == flen);
+    CHECK(strcmp(text, full) == 0); // 重组无损 / lossless reassembly
+
+    // 有牙①：首帧不是 seq==0 → 拒（没有在建条目可续）。
+    // Teeth 1: a first frame whose seq != 0 is refused (nothing in flight).
+    ai_segasm_reset(&a);
+    push_ai_seg_t mid;
+    memset(&mid, 0, sizeof(mid));
+    snprintf(mid.word, sizeof(mid.word), "w");
+    mid.seg_idx = 1;
+    mid.seg_total = 3;
+    snprintf(mid.seg, sizeof(mid.seg), "tail");
+    CHECK(ai_segasm_feed(&a, &mid, &text, &len) == AI_SEGASM_REJECT);
+    CHECK(!a.active); // 且已重置 / and reset
+
+    // 有牙②：跳号 / 重复序号 → 拒并重置。/ Teeth 2: a gap or repeat is refused + reset.
+    ai_segasm_reset(&a);
+    push_ai_seg_t p0;
+    memset(&p0, 0, sizeof(p0));
+    snprintf(p0.word, sizeof(p0.word), "w");
+    p0.seg_idx = 0;
+    p0.seg_total = 3;
+    snprintf(p0.seg, sizeof(p0.seg), "aaa");
+    CHECK(ai_segasm_feed(&a, &p0, &text, &len) == AI_SEGASM_PENDING);
+    push_ai_seg_t p2;
+    memset(&p2, 0, sizeof(p2));
+    snprintf(p2.word, sizeof(p2.word), "w");
+    p2.seg_idx = 2; // 跳过了 1 / skipped 1
+    p2.seg_total = 3;
+    snprintf(p2.seg, sizeof(p2.seg), "ccc");
+    CHECK(ai_segasm_feed(&a, &p2, &text, &len) == AI_SEGASM_REJECT);
+
+    // 有牙③：中途换词 → 拒（两个词的释义绝不拼在一起）。/ Teeth 3: a word change.
+    ai_segasm_reset(&a);
+    CHECK(ai_segasm_feed(&a, &p0, &text, &len) == AI_SEGASM_PENDING);
+    push_ai_seg_t other;
+    memset(&other, 0, sizeof(other));
+    snprintf(other.word, sizeof(other.word), "other");
+    other.seg_idx = 1;
+    other.seg_total = 3;
+    snprintf(other.seg, sizeof(other.seg), "bbb");
+    CHECK(ai_segasm_feed(&a, &other, &text, &len) == AI_SEGASM_REJECT);
+
+    // 有牙④：total 中途变化 → 拒。/ Teeth 4: total changes mid-stream.
+    ai_segasm_reset(&a);
+    CHECK(ai_segasm_feed(&a, &p0, &text, &len) == AI_SEGASM_PENDING);
+    push_ai_seg_t retotal;
+    memset(&retotal, 0, sizeof(retotal));
+    snprintf(retotal.word, sizeof(retotal.word), "w");
+    retotal.seg_idx = 1;
+    retotal.seg_total = 4; // 与首帧的 3 不一致 / disagrees with the head frame's 3
+    snprintf(retotal.seg, sizeof(retotal.seg), "bbb");
+    CHECK(ai_segasm_feed(&a, &retotal, &text, &len) == AI_SEGASM_REJECT);
+
+    // 有牙⑤：seq==0 重发 = 开新条（旧条目作废，不拼接）。
+    // Teeth 5: re-sending seq==0 starts fresh (the old item is dropped, never spliced).
+    ai_segasm_reset(&a);
+    CHECK(ai_segasm_feed(&a, &p0, &text, &len) == AI_SEGASM_PENDING);
+    push_ai_seg_t again;
+    memset(&again, 0, sizeof(again));
+    snprintf(again.word, sizeof(again.word), "w");
+    again.seg_idx = 0;
+    again.seg_total = 1;
+    snprintf(again.seg, sizeof(again.seg), "zzz");
+    CHECK(ai_segasm_feed(&a, &again, &text, &len) == AI_SEGASM_DONE);
+    CHECK(strcmp(text, "zzz") == 0); // 只有新条的内容 / only the new item's text
+
+    // 有牙⑥：超上限 → OVERFLOW 且重置（绝不截断成半截释义）。
+    // Teeth 6: over the cap -> OVERFLOW and reset (never a truncated definition).
+    ai_segasm_reset(&a);
+    push_ai_seg_t big;
+    memset(&big, 0, sizeof(big));
+    snprintf(big.word, sizeof(big.word), "w");
+    big.seg_idx = 0;
+    big.seg_total = 64; // 与续帧一致，否则走的是「total 变了」分支而非溢出分支
+    memset(big.seg, 'x', PUSH_AI_SEG_MAX - 1); // 单帧塞满 / fill one frame
+    big.seg[PUSH_AI_SEG_MAX - 1] = 0;
+    CHECK(ai_segasm_feed(&a, &big, &text, &len) == AI_SEGASM_PENDING);
+    CHECK(a.len == PUSH_AI_SEG_MAX - 1);
+    // 续到超过 AI_SEGASM_MAX / keep feeding past AI_SEGASM_MAX
+    ai_segasm_status_t over = AI_SEGASM_PENDING;
+    for (size_t i = 1; i < 64 && over == AI_SEGASM_PENDING; ++i) {
+        push_ai_seg_t more;
+        memset(&more, 0, sizeof(more));
+        snprintf(more.word, sizeof(more.word), "w");
+        more.seg_idx = (uint16_t)i;
+        more.seg_total = 64;
+        memset(more.seg, 'y', PUSH_AI_SEG_MAX - 1);
+        more.seg[PUSH_AI_SEG_MAX - 1] = 0;
+        over = ai_segasm_feed(&a, &more, &text, &len);
+    }
+    CHECK(over == AI_SEGASM_OVERFLOW);
+    CHECK(!a.active && a.len == 0);
+
+    printf("ai segasm gen26.5: single + 3-frame reassembly == original, seq0 new item, "
+           "gap/word-change/retotal/overflow all refuse ok\n");
+}
+
 /* ---- 搭车离线队列（gen26 块 2）---- */
 /* Ride-along offline queue (gen26 block 2). */
 
@@ -1057,6 +1198,7 @@ int main(void) {
     test_py_cross_vector();
     test_ai_frames();
     test_ai_ridealong();
+    test_ai_segasm();
     test_happy_path();
     test_word_card();
     test_resume();

@@ -68,6 +68,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -1639,23 +1640,73 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    /** 写 CTRL 0x07 回传释义（BLE 写串行化，且必须离主线程）。 */
+    /** 按 UTF-8 字节切段，不切断多字节序列。/ chunk by UTF-8 bytes, never mid-sequence. */
+    private static List<byte[]> utf8Chunks(String s, int size) {
+        byte[] raw = s.getBytes(UTF8);
+        List<byte[]> out = new ArrayList<byte[]>();
+        int i = 0;
+        while (i < raw.length) {
+            int j = Math.min(i + size, raw.length);
+            while (j > i && j < raw.length && (raw[j] & 0xC0) == 0x80) {
+                j--; // 0x80..0xBF = 续字节 / continuation byte
+            }
+            out.add(Arrays.copyOfRange(raw, i, j));
+            i = j;
+        }
+        return out;
+    }
+
+    /**
+     * 写 CTRL 回传释义：短释义走 0x07 单帧；**长释义且设备上报 CAP_AI_MULTI** 时
+     * 走 0x08 分帧（每帧带同一单词作关连键，seq 从 0 起，末帧收齐才出卡）。
+     * BLE 写串行化，且必须离主线程。
+     * Short definitions go out as one 0x07 frame; a long one, when the device
+     * reports CAP_AI_MULTI, goes as 0x08 segments (every frame carries the word as
+     * the correlation key, seq starts at 0, the card surfaces on the last frame).
+     */
     private void sendAiResult(String word, String def) {
         final BluetoothGattCharacteristic c = cCtrlAi;
-        final byte[] frame = PushProto.encodeAiResult(word, def);
         if (c == null) {
             uiLog("未持有 CTRL 特征，无法回传释义");
             return;
         }
+        final byte[] defBytes = def.getBytes(UTF8);
+        final boolean multi = devCaps >= 0 && (devCaps & PushProto.CAP_AI_MULTI) != 0;
+        final List<byte[]> frames = new ArrayList<byte[]>();
+        final boolean segmented = multi && defBytes.length > PushProto.AI_DEF_MAX - 1;
+        if (segmented) {
+            List<byte[]> chunks = utf8Chunks(def, PushProto.AI_SEG_MAX - 1);
+            for (int i = 0; i < chunks.size(); i++) {
+                byte[] f = PushProto.encodeAiResultSeg(word, new String(chunks.get(i), UTF8),
+                        i, chunks.size());
+                if (f == null) { // 不产非法帧：整条退回单帧（可能被截断，但不发坏帧）
+                    frames.clear();
+                    break;
+                }
+                frames.add(f);
+            }
+        }
+        if (frames.isEmpty()) {
+            frames.add(PushProto.encodeAiResult(word, def)); // 单帧路（0x07）
+        }
+        final boolean seg = frames.size() > 1;
+        final byte[][] out = frames.toArray(new byte[0][]);
         new Thread(new Runnable() {
             @Override
             public void run() {
                 synchronized (writeLock) {
-                    final boolean ok = writeChar(c, frame);
+                    boolean ok = true;
+                    for (int i = 0; i < out.length; i++) {
+                        ok = writeChar(c, out[i]) && ok;
+                    }
+                    final boolean done = ok;
+                    final int n = out.length;
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
-                            uiLog(ok ? "释义已回传设备（0x07，" + frame.length + " B）"
+                            uiLog(done
+                                    ? ("释义已回传设备（" + (seg ? "0x08 分帧 " + n + " 帧" : "0x07 单帧")
+                                            + "）")
                                     : "释义回传失败（设备未接受写入）");
                         }
                     });

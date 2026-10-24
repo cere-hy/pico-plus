@@ -53,6 +53,7 @@
 #include "read_pico_pmu.h"
 
 #include "ai_ridealong.h"
+#include "ai_segasm.h"
 
 static const char *TAG = "push_sink";
 
@@ -255,6 +256,10 @@ static uint32_t s_apk_caps;
 // Is the device-side context source ready? (Step6 registers the book_id/pos
 // collector.) While false, 0x18 never advertises CAP_AI_CONTEXT - no false claims.
 static bool s_ai_ctx_ready;
+// gen26.5 Step7：0x08 分帧重组器（纯逻辑模块，宿主有断言；设备侧只管喂帧与取结果）。
+// gen26.5 Step7: the 0x08 reassembler (pure module with host assertions; the
+// device side only feeds frames and takes the result).
+static ai_segasm_t s_ai_segasm;
 
 // 预取释义缓存（块 3）：最近回流的释义，点词命中即秒出卡，不挤空口。
 // Prefetch cache (block 3): recent definitions; a tap on a cached word renders
@@ -1217,6 +1222,9 @@ static void ai_send_caps(void) {
     // gen26.5: advertise CONTEXT only with a real context source; MULTI waits for
     // the Step7 reassembler - advertising it means we must accept 0x08.
     if (s_ai_ctx_ready) caps.bits |= PUSH_CAP_AI_CONTEXT;
+    // MULTI：0x08 重组器已落地，收得住长释义，故如实上报（报了就得收）。
+    // MULTI: the 0x08 reassembler exists, so long definitions are accepted.
+    if (s_ai_enabled) caps.bits |= PUSH_CAP_AI_MULTI;
     uint8_t frame[5];
     const size_t n = push_caps_encode(&caps, frame, sizeof(frame));
     if (n) notify_status(frame, n);
@@ -1429,6 +1437,35 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
             return;
         }
         ai_on_result(r.word, r.def);
+        return;
+    }
+    // gen26.5 释义分帧（0x08）：手机把长释义切帧回传，设备重组后出卡。重组器是
+    // 纯逻辑模块（ai_segasm，宿主有断言），这里只做解码 + 喂帧 + 取结果。
+    // gen26.5 segmented definition (0x08): the phone slices a long definition across
+    // frames and the device reassembles it. The reassembler is pure logic (ai_segasm,
+    // host-asserted); this site only decodes, feeds and takes the result.
+    if (op == PUSH_OP_AI_RESULT_SEG) {
+        push_ai_seg_t seg;
+        if (!push_ai_seg_decode(data, len, &seg)) {
+            ESP_LOGW(TAG, "ai seg decode rejected: len=%u", (unsigned)len);
+            ai_segasm_reset(&s_ai_segasm);
+            reply_err(PUSH_ERR_BAD_FRAME);
+            return;
+        }
+        const char *text = NULL;
+        size_t tlen = 0;
+        const ai_segasm_status_t st = ai_segasm_feed(&s_ai_segasm, &seg, &text, &tlen);
+        if (st == AI_SEGASM_DONE) {
+            ai_on_result(s_ai_segasm.word, text); // 收齐才出卡（不出半截释义）
+            ai_segasm_reset(&s_ai_segasm);
+        } else if (st == AI_SEGASM_REJECT) {
+            ESP_LOGW(TAG, "ai seg rejected: idx=%u/%u word=%s (out of order or word changed)",
+                     (unsigned)seg.seg_idx, (unsigned)seg.seg_total, seg.word);
+            reply_err(PUSH_ERR_BAD_FRAME);
+        } else if (st == AI_SEGASM_OVERFLOW) {
+            ESP_LOGW(TAG, "ai seg overflow: > %u bytes (whole item dropped)", (unsigned)AI_SEGASM_MAX);
+            reply_err(PUSH_ERR_TOO_LARGE);
+        }
         return;
     }
     // gen26.5 能力使能（0x09）：与 SET_TIME / AI 通道同模型——连上即可用，不受
@@ -1655,6 +1692,7 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         // process may be gone, so capabilities never carry over - after reconnect
         // 0x17 falls back to legacy until the APK re-sends 0x09.
         s_apk_caps = 0u;
+        ai_segasm_reset(&s_ai_segasm); // 半截重组不跨连接 / no half item survives
         // gen14：断开即撤重投配额，防 timer 到点往下一个连接周期野发。
         // gen14: drop the retry quota on disconnect so the timer cannot fire
         // into the next connection cycle.
