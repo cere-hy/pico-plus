@@ -4,12 +4,23 @@ name: Publish web flasher
 # Publishes the web-flasher/ directory as the GitHub Pages site root.
 # 因此网页刷机地址为 https://<用户名>.github.io/<仓库名>/，没有 /web-flasher/ 后缀。
 # The flasher URL is therefore https://<user>.github.io/<repo>/ with no /web-flasher/ suffix.
+#
+# ⚠️ 触发引信已拆（2026-10-24，gen26.3 基装轮）：此前 push 到 main 且触动
+#    web-flasher/** 即自动发布——而「部署」是发布动作，受 B 策略冻结（发布攒到
+#    M2 一次发）。任何含 web-flasher/ 改动的提交（如仓库侧同步 bin/版本串）
+#    一旦 push 就会把未发布固件静默送上线，正是要防的。现只留手动
+#    workflow_dispatch：部署 = 显式点击发布，与代码 push 解耦。
+#    （线上站仍指已发布的 gen22，不动。）
+# ⚠️ The auto-publish trigger was removed (2026-10-24, gen26.3 base-install
+#    round): a push to main touching web-flasher/** used to deploy
+#    automatically - but deployment is a release action, frozen by the B
+#    strategy (releases batch at M2). Any commit touching web-flasher/ (e.g. a
+#    repo-side bin/version sync) would silently ship unreleased firmware the
+#    moment it is pushed. Only manual workflow_dispatch remains: deploying =
+#    explicitly clicking publish, decoupled from code pushes. (The live site
+#    still points at the released gen22, untouched.)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - web-flasher/**
   workflow_dispatch:
 
 permissions:
