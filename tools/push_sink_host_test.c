@@ -150,8 +150,12 @@ static void test_ctrl_header(void) {
         CHECK(reserved < PUSH_ST_READY); // 预留区与 STATUS 段零重叠 / no overlap with STATUS
     }
     CHECK(PUSH_OP_AI_QUERY == PUSH_OP_SET_TIME + 1); // 0x06 紧接 SET_TIME
-    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_AI_RESULT + 1); // 0x08 紧接 AI_RESULT，无空洞 // 紧接 SET_TIME，无空洞 / right after SET_TIME, no gap
-    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen26 0x06/0x07 registered, 0x08-0x0F reserved ok\n");
+    // gen26.5：0x08/0x09 由 gen26.5 启用（分帧/使能），预留区首顺移 0x0A，仍无空洞。
+    // gen26.5: 0x08/0x09 taken by gen26.5 (segments/enable); the reserved block
+    // now starts at 0x0A, still gap-free.
+    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_AI_CAPS_ENABLE + 1); // 0x0A 紧接 0x09，无空洞
+    CHECK(PUSH_OP_RESERVED_FIRST > PUSH_OP_AI_RESULT); // 0x08/0x09 已出预留区 / out of the reserved block
+    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen26 0x06/0x07 + gen26.5 0x08/0x09 registered, 0x0A-0x0F reserved ok\n");
 }
 
 static void test_begin_codec(void) {
@@ -689,7 +693,157 @@ static void test_ai_frames(void) {
     memcpy(bad, qf, sizeof(bad)); bad[3] = PUSH_VERSION + 1;
     CHECK(!push_ai_query_decode(bad, sizeof(bad), &q2));
     CHECK(!push_ai_query_decode(qf, PUSH_AI_QUERY_MAX - 1, &q2));
+
+    // ---- gen26.5：上下文档（0x06 ctx / STATUS 0x17 ctx）----
+    // gen26.5: contextual frames (0x06 ctx / STATUS 0x17 ctx).
+
+    // AI_QUERY ctx（77B）往返 + 字节布局。/ AI_QUERY ctx (77B) round-trip + layout.
+    push_ai_query_ctx_t cq;
+    memset(&cq, 0, sizeof(cq));
+    snprintf(cq.word, sizeof(cq.word), "individuation");
+    cq.book_id = 0x9e3779b9u; // 书名 FNV-1a 哈希的示意值 / illustrative book-name hash
+    cq.pos = 0x0000f3a0u;
+    uint8_t cqf[PUSH_AI_CTX_QUERY_MAX];
+    size_t cqn = push_ai_query_ctx_encode(&cq, cqf, sizeof(cqf));
+    CHECK(cqn == PUSH_AI_CTX_QUERY_MAX);
+    CHECK(cqn == 77u);
+    CHECK(cqf[2] == PUSH_OP_AI_QUERY);
+    CHECK(cqf[4] == (uint8_t)strlen("individuation"));
+    const size_t ctx_off = 5u + PUSH_AI_WORD_MAX;
+    CHECK(((uint32_t)cqf[ctx_off] | ((uint32_t)cqf[ctx_off + 1] << 8) |
+           ((uint32_t)cqf[ctx_off + 2] << 16) | ((uint32_t)cqf[ctx_off + 3] << 24)) == cq.book_id);
+    CHECK(((uint32_t)cqf[ctx_off + 4] | ((uint32_t)cqf[ctx_off + 5] << 8) |
+           ((uint32_t)cqf[ctx_off + 6] << 16) | ((uint32_t)cqf[ctx_off + 7] << 24)) == cq.pos);
+    push_ai_query_ctx_t cq2;
+    memset(&cq2, 0, sizeof(cq2));
+    CHECK(push_ai_query_ctx_decode(cqf, cqn, &cq2));
+    CHECK(strcmp(cq2.word, "individuation") == 0);
+    CHECK(cq2.book_id == cq.book_id && cq2.pos == cq.pos);
+
+    // len 分流互斥：旧 69B 帧喂 ctx 解码必须拒（严格等长）。/ Length dispatch:
+    // the legacy 69B frame must be refused by the strict ctx decoder.
+    CHECK(!push_ai_query_ctx_decode(qf, n, &cq2));
+    // 反向宽容路径钉死：ctx 77B 帧喂 legacy 解码返 true，词正确、上下文静默丢失
+    // （旧解码器不会被新帧搞崩）。Reverse tolerance pinned: the legacy decoder
+    // accepts a 77B frame, decodes the word correctly, silently drops context.
+    push_ai_query_t ql;
+    memset(&ql, 0, sizeof(ql));
+    CHECK(push_ai_query_decode(cqf, cqn, &ql));
+    CHECK(strcmp(ql.word, "individuation") == 0);
+
+    // STATUS 0x17 ctx（74B 体）编码 + 布局。/ STATUS 0x17 ctx (74B body) encode + layout.
+    uint8_t scq[PUSH_ST_AI_CTX_QUERY_LEN];
+    size_t scqn = push_st_ai_query_ctx_encode("parent-child", 0x12345678u, 0x00000042u, scq, sizeof(scq));
+    CHECK(scqn == PUSH_ST_AI_CTX_QUERY_LEN);
+    CHECK(scqn == 74u);
+    CHECK(scq[0] == PUSH_ST_AI_QUERY);
+    CHECK(scq[1] == (uint8_t)strlen("parent-child"));
+    const size_t sc_off = 2u + PUSH_AI_WORD_MAX;
+    CHECK(((uint32_t)scq[sc_off] | ((uint32_t)scq[sc_off + 1] << 8) |
+           ((uint32_t)scq[sc_off + 2] << 16) | ((uint32_t)scq[sc_off + 3] << 24)) == 0x12345678u);
+    CHECK(((uint32_t)scq[sc_off + 4] | ((uint32_t)scq[sc_off + 5] << 8) |
+           ((uint32_t)scq[sc_off + 6] << 16) | ((uint32_t)scq[sc_off + 7] << 24)) == 0x42u);
+
+    // ---- gen26.5：释义分帧（0x08）----
+    // gen26.5: segmented definitions (0x08).
+
+    // 单帧（seg_total==1，语义等价 0x07）。/ Single frame (seg_total==1 == plain 0x07).
+    push_ai_seg_t sg;
+    memset(&sg, 0, sizeof(sg));
+    snprintf(sg.word, sizeof(sg.word), "uncooperative");
+    sg.seg_idx = 0;
+    sg.seg_total = 1;
+    snprintf(sg.seg, sizeof(sg.seg), "not willing to help or agree");
+    uint8_t sf[PUSH_AI_SEG_FRAME_MAX];
+    size_t sfn = push_ai_seg_encode(&sg, sf, sizeof(sf));
+    CHECK(sfn == PUSH_AI_SEG_FRAME_MAX);
+    CHECK(sfn == 241u);
+    CHECK(sf[2] == PUSH_OP_AI_RESULT_SEG);
+    const size_t seg_off = 5u + PUSH_AI_WORD_MAX;
+    CHECK(((uint32_t)sf[seg_off] | ((uint32_t)sf[seg_off + 1] << 8)) == 0u);      // idx
+    CHECK(((uint32_t)sf[seg_off + 2] | ((uint32_t)sf[seg_off + 3] << 8)) == 1u);  // total
+    CHECK(((uint32_t)sf[seg_off + 4] | ((uint32_t)sf[seg_off + 5] << 8)) == strlen("not willing to help or agree"));
+    push_ai_seg_t sg2;
+    memset(&sg2, 0, sizeof(sg2));
+    CHECK(push_ai_seg_decode(sf, sfn, &sg2));
+    CHECK(strcmp(sg2.word, "uncooperative") == 0);
+    CHECK(sg2.seg_idx == 0 && sg2.seg_total == 1);
+    CHECK(strcmp(sg2.seg, "not willing to help or agree") == 0);
+
+    // 多帧重组前站：3 帧序列逐帧往返 + 拼接等价原文（Step7 重组器的协议层验证）。
+    // Multi-frame reassembly front-stop: a 3-frame sequence round-trips frame by
+    // frame and concatenates back to the original (protocol layer of Step7).
+    static const char *long_def = "The quality of being unwilling to cooperate or "
+        "agree with others, often seen in children who resist peer or parent "
+        "influence and assert their own will strongly.";
+    const size_t total_len = strlen(long_def);
+    const size_t per = (total_len + 2) / 3; // 3 帧均分 / split across 3 frames
+    CHECK(per < PUSH_AI_SEG_MAX);
+    char reassembled[512];
+    size_t got = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        push_ai_seg_t part;
+        memset(&part, 0, sizeof(part));
+        snprintf(part.word, sizeof(part.word), "uncooperative");
+        part.seg_idx = (uint16_t)i;
+        part.seg_total = 3;
+        size_t take = total_len - i * per;
+        if (take > per) take = per;
+        memcpy(part.seg, long_def + i * per, take);
+        part.seg[take] = 0;
+        uint8_t pf[PUSH_AI_SEG_FRAME_MAX];
+        CHECK(push_ai_seg_encode(&part, pf, sizeof(pf)) == PUSH_AI_SEG_FRAME_MAX);
+        push_ai_seg_t part2;
+        memset(&part2, 0, sizeof(part2));
+        CHECK(push_ai_seg_decode(pf, PUSH_AI_SEG_FRAME_MAX, &part2));
+        CHECK(part2.seg_idx == i && part2.seg_total == 3);
+        CHECK(strlen(part2.seg) == take);
+        memcpy(reassembled + got, part2.seg, take);
+        got += take;
+    }
+    reassembled[got] = 0;
+    CHECK(got == total_len);
+    CHECK(strcmp(reassembled, long_def) == 0);
+
+    // 分帧有牙：序号越界/总数为 0/短帧/坏 op 全拒。/ Segment teeth: bad index,
+    // zero total, short frame and bad op all refuse.
+    CHECK(!push_ai_seg_encode(&(push_ai_seg_t){.word = "x", .seg_idx = 1, .seg_total = 1, .seg = "y"}, sf, sizeof(sf)));
+    CHECK(!push_ai_seg_encode(&(push_ai_seg_t){.word = "x", .seg_idx = 0, .seg_total = 0, .seg = "y"}, sf, sizeof(sf)));
+    CHECK(!push_ai_seg_decode(sf, PUSH_AI_SEG_FRAME_MAX - 1, &sg2));
+    {
+        uint8_t tmp[PUSH_AI_SEG_FRAME_MAX];
+        CHECK(push_ai_seg_encode(&sg, tmp, sizeof(tmp)) == PUSH_AI_SEG_FRAME_MAX);
+        tmp[2] = PUSH_OP_AI_RESULT;
+        CHECK(!push_ai_seg_decode(tmp, sizeof(tmp), &sg2));
+        CHECK(push_ai_seg_encode(&sg, tmp, sizeof(tmp)) == PUSH_AI_SEG_FRAME_MAX);
+        tmp[seg_off + 1] = 0x01; // seg_idx=0x0100 > total → 越界 / index out of range
+        CHECK(!push_ai_seg_decode(tmp, sizeof(tmp), &sg2));
+    }
+
+    // ---- gen26.5：能力使能帧（0x09，8B）----
+    // gen26.5: capability enable frame (0x09, 8B).
+
+    push_caps_t en;
+    en.bits = PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI;
+    uint8_t ef[PUSH_AI_CAPS_ENABLE_LEN];
+    CHECK(push_ai_caps_enable_encode(&en, ef, sizeof(ef)) == PUSH_AI_CAPS_ENABLE_LEN);
+    CHECK(ef[2] == PUSH_OP_AI_CAPS_ENABLE);
+    push_caps_t en2;
+    CHECK(push_ai_caps_enable_decode(ef, sizeof(ef), &en2));
+    CHECK(en2.bits == (PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI));
+    // 严格 8B：7B/9B 都拒。/ Strict 8B: 7B and 9B both refuse.
+    CHECK(!push_ai_caps_enable_decode(ef, 7u, &en2));
+    CHECK(!push_ai_caps_enable_decode(ef, 9u, &en2));
+    {
+        uint8_t bad_en[PUSH_AI_CAPS_ENABLE_LEN];
+        memcpy(bad_en, ef, sizeof(bad_en)); bad_en[2] = PUSH_OP_AI_QUERY;
+        CHECK(!push_ai_caps_enable_decode(bad_en, sizeof(bad_en), &en2));
+        memcpy(bad_en, ef, sizeof(bad_en)); bad_en[3] = PUSH_VERSION + 1;
+        CHECK(!push_ai_caps_enable_decode(bad_en, sizeof(bad_en), &en2));
+    }
+
     printf("ai frames: query/result/status 0x17/caps round-trip + bad-header teeth ok\n");
+    printf("ai frames gen26.5: ctx 77/74, seg 241 (single+multi reassembly), enable 8, len-dispatch ok\n");
 }
 
 /* ---- 搭车离线队列（gen26 块 2）---- */

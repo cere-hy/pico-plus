@@ -211,6 +211,118 @@ size_t push_st_ai_query_encode(const char *word, uint8_t *out, size_t cap) {
     return 2u + PUSH_AI_WORD_MAX;
 }
 
+/* ---- gen26.5 上下文档 / contextual frames (gen26.5) ---- */
+
+size_t push_ai_query_ctx_encode(const push_ai_query_ctx_t *q, uint8_t *out, size_t cap) {
+    if (!q || !out || cap < PUSH_AI_CTX_QUERY_MAX) return 0;
+    memset(out, 0, PUSH_AI_CTX_QUERY_MAX);
+    out[0] = PUSH_MAGIC0;
+    out[1] = PUSH_MAGIC1;
+    out[2] = PUSH_OP_AI_QUERY;
+    out[3] = PUSH_VERSION;
+    size_t n = strnlen(q->word, PUSH_AI_WORD_MAX);
+    if (n >= PUSH_AI_WORD_MAX) n = PUSH_AI_WORD_MAX - 1;
+    out[4] = (uint8_t)n;
+    memcpy(out + 5, q->word, n);
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    put_u32(out + off, q->book_id);
+    put_u32(out + off + 4u, q->pos);
+    return PUSH_AI_CTX_QUERY_MAX;
+}
+
+bool push_ai_query_ctx_decode(const uint8_t *in, size_t len, push_ai_query_ctx_t *q) {
+    if (!in || !q || len != PUSH_AI_CTX_QUERY_MAX) return false; // 严格 77B；旧 69B 帧走 legacy 解码
+    if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_QUERY) return false;
+    if (in[3] != PUSH_VERSION) return false;
+    memset(q, 0, sizeof(*q));
+    const size_t n = in[4];
+    if (n >= PUSH_AI_WORD_MAX) return false;
+    memcpy(q->word, in + 5, n);
+    q->word[n] = 0;
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    q->book_id = get_u32(in + off);
+    q->pos = get_u32(in + off + 4u);
+    return true;
+}
+
+size_t push_st_ai_query_ctx_encode(const char *word, uint32_t book_id, uint32_t pos,
+                                   uint8_t *out, size_t cap) {
+    if (!word || !out || cap < PUSH_ST_AI_CTX_QUERY_LEN) return 0;
+    memset(out, 0, PUSH_ST_AI_CTX_QUERY_LEN);
+    out[0] = PUSH_ST_AI_QUERY;
+    size_t n = strnlen(word, PUSH_AI_WORD_MAX);
+    if (n >= PUSH_AI_WORD_MAX) n = PUSH_AI_WORD_MAX - 1;
+    out[1] = (uint8_t)n;
+    memcpy(out + 2, word, n);
+    put_u32(out + 2u + PUSH_AI_WORD_MAX, book_id);
+    put_u32(out + 2u + PUSH_AI_WORD_MAX + 4u, pos);
+    return PUSH_ST_AI_CTX_QUERY_LEN;
+}
+
+/* ---- gen26.5 释义分帧 / segmented definitions (gen26.5) ---- */
+
+size_t push_ai_seg_encode(const push_ai_seg_t *s, uint8_t *out, size_t cap) {
+    if (!s || !out || cap < PUSH_AI_SEG_FRAME_MAX) return 0;
+    if (s->seg_total == 0 || s->seg_idx >= s->seg_total) return 0; // 序号须在界内
+    memset(out, 0, PUSH_AI_SEG_FRAME_MAX);
+    out[0] = PUSH_MAGIC0;
+    out[1] = PUSH_MAGIC1;
+    out[2] = PUSH_OP_AI_RESULT_SEG;
+    out[3] = PUSH_VERSION;
+    size_t wn = strnlen(s->word, PUSH_AI_WORD_MAX);
+    if (wn >= PUSH_AI_WORD_MAX) wn = PUSH_AI_WORD_MAX - 1;
+    out[4] = (uint8_t)wn;
+    memcpy(out + 5, s->word, wn);
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    put_u16(out + off, s->seg_idx);
+    put_u16(out + off + 2u, s->seg_total);
+    size_t dn = strnlen(s->seg, PUSH_AI_SEG_MAX);
+    if (dn >= PUSH_AI_SEG_MAX) dn = PUSH_AI_SEG_MAX - 1; // 保 NUL，与 word/def 槽同构
+    put_u16(out + off + 4u, (uint16_t)dn);
+    memcpy(out + off + 6u, s->seg, dn);
+    return PUSH_AI_SEG_FRAME_MAX;
+}
+
+bool push_ai_seg_decode(const uint8_t *in, size_t len, push_ai_seg_t *s) {
+    if (!in || !s || len != PUSH_AI_SEG_FRAME_MAX) return false;
+    if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_RESULT_SEG) return false;
+    if (in[3] != PUSH_VERSION) return false;
+    memset(s, 0, sizeof(*s));
+    const size_t wn = in[4];
+    if (wn >= PUSH_AI_WORD_MAX) return false;
+    memcpy(s->word, in + 5, wn);
+    s->word[wn] = 0;
+    const size_t off = 5u + PUSH_AI_WORD_MAX;
+    s->seg_idx = get_u16(in + off);
+    s->seg_total = get_u16(in + off + 2u);
+    const size_t dn = get_u16(in + off + 4u);
+    if (s->seg_total == 0 || s->seg_idx >= s->seg_total) return false; // 序号须在界内
+    if (dn >= PUSH_AI_SEG_MAX) return false; // 长度越界（槽保 NUL，同 word/def 模式）
+    memcpy(s->seg, in + off + 6u, dn);
+    s->seg[dn] = 0;
+    return true;
+}
+
+/* ---- gen26.5 能力使能帧 / capability enable frame (gen26.5) ---- */
+
+size_t push_ai_caps_enable_encode(const push_caps_t *caps, uint8_t *out, size_t cap) {
+    if (!caps || !out || cap < PUSH_AI_CAPS_ENABLE_LEN) return 0;
+    out[0] = PUSH_MAGIC0;
+    out[1] = PUSH_MAGIC1;
+    out[2] = PUSH_OP_AI_CAPS_ENABLE;
+    out[3] = PUSH_VERSION;
+    put_u32(out + 4, caps->bits);
+    return PUSH_AI_CAPS_ENABLE_LEN;
+}
+
+bool push_ai_caps_enable_decode(const uint8_t *in, size_t len, push_caps_t *caps) {
+    if (!in || !caps || len != PUSH_AI_CAPS_ENABLE_LEN) return false; // 严格 8B
+    if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_CAPS_ENABLE) return false;
+    if (in[3] != PUSH_VERSION) return false;
+    caps->bits = get_u32(in + 4);
+    return true;
+}
+
 /* ---- 能力位图 / Capability bitmap ---- */
 
 size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap) {

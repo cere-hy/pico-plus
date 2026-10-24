@@ -276,6 +276,17 @@ typedef struct {
 #define PUSH_ST_AI_CTX_QUERY_LEN (1u + 1u + PUSH_AI_WORD_MAX + 4u + 4u)              ///< = 74（STATUS 0x17 帧全长：op+wlen+word+ctx）
 #define PUSH_ST_AI_LEGACY_QUERY_LEN (1u + 1u + PUSH_AI_WORD_MAX)                     ///< = 66（旧 0x17 帧全长；len 分流：66→旧路，74→新路）
 
+/// gen26.5 编 AI_QUERY 上下文档（CTRL 0x06，77B 零填充）。/ Encode a contextual AI_QUERY (gen26.5, 77B).
+size_t push_ai_query_ctx_encode(const push_ai_query_ctx_t *q, uint8_t *out, size_t cap);
+/// gen26.5 解 AI_QUERY 上下文档（严格 77B；旧 69B 帧喂本函数返 false，走 legacy 解码）。
+/// Decode a contextual AI_QUERY (strict 77B; a legacy 69B frame returns false here).
+bool push_ai_query_ctx_decode(const uint8_t *in, size_t len, push_ai_query_ctx_t *q);
+
+/// gen26.5 编 STATUS 0x17 上下文档（74B 体：op+wlen+word+book_id+pos）。
+/// Encode a contextual STATUS 0x17 (gen26.5, 74B body: op+wlen+word+book_id+pos).
+size_t push_st_ai_query_ctx_encode(const char *word, uint32_t book_id, uint32_t pos,
+                                   uint8_t *out, size_t cap);
+
 /* ---- AI 释义分帧（gen26.5，0x08）---- */
 /* AI definition segments (gen26.5, 0x08). */
 
@@ -293,8 +304,11 @@ typedef struct {
 /// AI 分帧字节上限（含 4 字节 CTRL 头；零填充定长）。/ Segmented frame cap (CTRL header included; zero-padded).
 #define PUSH_AI_SEG_FRAME_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + 2u + 2u + PUSH_AI_SEG_MAX) ///< = 241
 
-/// AI_CAPS_ENABLE（0x09）帧字节数：头(4) + bits(u32 LE)。/ AI_CAPS_ENABLE (0x09) frame size: header + bits.
-#define PUSH_AI_CAPS_ENABLE_LEN (PUSH_CTRL_HDR_LEN + 4u) ///< = 8
+/// gen26.5 编 AI_RESULT_SEG（0x08，241B 零填充定长）。/ Encode an AI_RESULT_SEG (gen26.5, 241B).
+size_t push_ai_seg_encode(const push_ai_seg_t *s, uint8_t *out, size_t cap);
+/// gen26.5 解 AI_RESULT_SEG（241B 定长；校验 idx < total、total ≥ 1）。
+/// Decode an AI_RESULT_SEG (fixed 241B; validates idx < total and total >= 1).
+bool push_ai_seg_decode(const uint8_t *in, size_t len, push_ai_seg_t *s);
 
 /* ---- 能力位图（gen26 能力协商）---- */
 /* Capability bitmap (gen26 capability negotiation). */
@@ -311,6 +325,14 @@ typedef struct {
 size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap);
 /// 解能力位图 STATUS 帧。/ Decode a capability bitmap STATUS frame.
 bool push_caps_decode(const uint8_t *in, size_t len, push_caps_t *caps);
+
+/// AI_CAPS_ENABLE（0x09）帧字节数：头(4) + bits(u32 LE)。/ AI_CAPS_ENABLE (0x09) frame size: header + bits.
+#define PUSH_AI_CAPS_ENABLE_LEN (PUSH_CTRL_HDR_LEN + 4u) ///< = 8
+
+/// gen26.5 编 AI_CAPS_ENABLE（CTRL 0x09，8B）。/ Encode an AI_CAPS_ENABLE (gen26.5, CTRL 0x09, 8B).
+size_t push_ai_caps_enable_encode(const push_caps_t *caps, uint8_t *out, size_t cap);
+/// gen26.5 解 AI_CAPS_ENABLE（严格 8B）。/ Decode an AI_CAPS_ENABLE (strict 8B).
+bool push_ai_caps_enable_decode(const uint8_t *in, size_t len, push_caps_t *caps);
 
 /* ---- CRC32 ---- */
 
