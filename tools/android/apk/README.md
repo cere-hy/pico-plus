@@ -1,7 +1,7 @@
 # ReadPicoPush APK 使用说明（傻瓜版）
 
 > 适用：荣耀 / Android 16 / 无 Google Play 的手机。不用装任何第三方自动化软件，
-> 不用 root。安装包就是 `ReadPicoPush.apk`（25 KB，debug 签名，侧载即用）。
+> 不用 root。安装包就是 `ReadPicoPush.apk`（37 KB，debug 签名，侧载即用）。
 
 ## 一、安装（1 分钟）
 

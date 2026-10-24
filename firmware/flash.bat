@@ -19,7 +19,14 @@ rem 烧前请把完整输出存盘（esptool 的哈希/摘要行是烧录证据�
 rem Save the FULL output (esptool hash lines are the flashing evidence).
 
 setlocal enabledelayedexpansion
-set EXPECTED=fdd48866a8cc18237f0abc06f9c492d4e67c1ce8d39ae35b2f7ef9762331248d
+rem 锚：gen26.3 五项终版 Read_Pico.bin 4,070,704 B / d441107b…（2026-10-24 重锚，
+rem   与 firmware/flash.sh 同值；三代未更新的 gen22 锚 fdd48866… 会把正确 bin 也
+rem   拒烧——certutil 拒烧语义同 flash.sh：exit 1）。
+rem Anchor: the gen26.3 five-item final Read_Pico.bin 4,070,704 B / d441107b...
+rem (re-anchored 2026-10-24, same value as firmware/flash.sh; the three-generation
+rem stale gen22 anchor fdd48866... would refuse even the correct bin - certutil
+rem refusal semantics match flash.sh: exit 1).
+set EXPECTED=d441107b6d6c0fddf1ae56cf5be5474922ae81d4e3db5b5649540a21907f04cc
 set DIR=%~dp0
 set PORT=%1
 if "%PORT%"=="" set PORT=COM3
