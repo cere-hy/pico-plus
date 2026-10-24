@@ -88,4 +88,28 @@ p.write_text(s)
 EOF
 run_mutation "M6 AI entry gate ignores s_ai_on"
 
+# M7：别名防御被拆（show_pending 恢复「先 reset 后查空」的原始 bug 形态）——
+# 传 dict_popup_word()（别名 s_word）的调用会被 reset 清掉参数，查询态建不起来。
+# M7: the aliasing defense is torn out (show_pending back to the original
+# "reset first, check after" buggy shape) - a caller passing dict_popup_word()
+# (aliased to s_word) gets its argument cleared by the reset and the query
+# state never forms.
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '''    char own[DICT_POPUP_WORD_MAX];
+    if (!word || !*word) { dict_popup_reset(); return false; }
+    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    dict_popup_reset();
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, own);'''
+new = '''    if (!word || !*word) { dict_popup_reset(); return false; }
+    dict_popup_reset();
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word); /* MUTATION M7 */'''
+assert old in s, "M7 target not found"
+s = s.replace(old, new)
+p.write_text(s)
+EOF
+run_mutation "M7 aliasing defense torn out"
+
 echo "---- mutation sweep done ----"

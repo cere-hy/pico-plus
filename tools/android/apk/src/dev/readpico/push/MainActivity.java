@@ -2055,6 +2055,17 @@ public class MainActivity extends Activity {
                 JSONObject o = arr.getJSONObject(i);
                 String name = o.optString("name", DEFAULT_TPL_NAME);
                 String content = o.optString("content", AiClient.DEFAULT_TEMPLATE);
+                // 唯一性规范化（M1.2.1 审计尾巴）：按 name 删除依赖「模板名唯一」，
+                // 文件内重名会让删除连删多条。与保存路径的 upsert 语义一致——同名
+                // 保留后出现的条目。/ Uniqueness normalization (M1.2.1 audit tail):
+                // name-based delete assumes unique names; duplicate entries in a
+                // file would make one delete wipe several. Same upsert stance as
+                // the save path - the later entry wins.
+                for (int j = lib.size() - 1; j >= 0; j--) {
+                    if (lib.get(j).name != null && lib.get(j).name.equals(name)) {
+                        lib.remove(j);
+                    }
+                }
                 lib.add(new Tpl(name, content));
             }
             if (lib.isEmpty()) {

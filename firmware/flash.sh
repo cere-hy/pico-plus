@@ -145,55 +145,52 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico26.4（gen26.3 收官后的 M1.2.1 配套轮：词典卡加
-# 「AI」入口——词典命中仍弹词典卡，卡上加可点「AI」chip，点击强制发 0x17 绕过 found
-# 走查询卡状态机，15s 超时回退词典释义；协议零变）。沿用旧串会让 TF 卡升级判
-# 「版本相同」而拒绝，故每代 fork 专属可区分串。
-# Version string: 0.3.3-pico26.4 (the M1.2.1 companion round after gen26.3: the
-# dictionary card gains an "AI" entry - a dictionary hit still pops the
-# dictionary card, a tappable "AI" chip now forces a 0x17 query bypassing
-# "found" through the querying-card state machine, and a 15 s timeout falls
-# back to the dictionary definition; the protocol is unchanged). Reusing an
-# older tag makes the TF-card upgrade path reject the package as "same
-# version", so each generation gets its own fork-specific distinguishable tag).
+# 版本串 / Version string: 0.3.3-pico26.4.1（gen26.4 真机 defect 热修：词典卡「AI」
+# 入口的自引用别名——调用方传 dict_popup_word()（= &s_word 自身），show_pending 入口
+# 先 reset 再查空把别名参数一起清空，查询态建不起来、词典卡被清空、0x07 回来被门 A
+# 丢弃 = 词典命中词的 AI 释义全丢。修 show_pending/open 入口先拷贝再 reset +
+# app_book 取词落局部缓冲；APK v1.4.2 同轮补导入重名去重）。沿用旧串会让 TF 卡升级
+# 判「版本相同」而拒绝，故每代 fork 专属可区分串。
+# Version string: 0.3.3-pico26.4.1 (gen26.4 device-defect hotfix: a self-referential
+# alias in the dict card's "AI" entry - a caller passing dict_popup_word() (= &s_word
+# itself) had that argument cleared by show_pending's reset-first-then-check entry,
+# so the query state never formed, the dict card was wiped, and 0x07 was dropped by
+# gate A = every dict-hit word's AI definition lost. Fixed by copying before the
+# reset in show_pending/open plus a local-buffer copy in app_book; APK v1.4.2 adds
+# import dedup in the same round). Reusing an older tag makes the TF-card upgrade
+# path reject the package as "same version", so each generation gets its own
+# fork-specific distinguishable tag).
 #
-# 段表锚（esptool image-info，与 gen26.3 对照）：
-#   seg1 DRAM  Load addr(vaddr)=0x3fc9c700 世代不变锚（与 gen26.3 逐代相同）；
-#   seg1 len=0x08a8c（与 gen26.3 持平）；File offs=0x00234418（gen26.3 为 0x002343a8，
-#   差 +0x70=112B）—— 仅因 seg0(DROM) 增长顺移，vaddr 不动。
-#   真机 boot 日志预测锚：seg1 paddr = 0x00234418 + 8(段头) + 0x10000(ota_0 基址) = 0x00244420
-#   （该公式由 gen5/6/10 三轮真机日志实证：gen10 实测 paddr=0x00242040 ✓；
-#   gen14 实测 paddr=0x00243250 与预测 0x00243250 逐字吻合 ✓）。
-#   体积：4,071,616 B，相对 gen26.3（4,070,704 B）**+912 B**（双操作数：
-#   4,071,616 − 4,070,704 = 912），段级闭合：seg0(DROM)+112（0x234388→0x2343f8，
-#   AI chip 文案/几何常量）+ seg3(IROM)+796（0x18c78c→0x18caa8，AI chip 绘制 /
-#   tap 门禁 / force_ai / ai_over_dict / app_book AI 分支与超时回退）+
-#   seg3 对齐垫 +4（0x18c790→0x18cab0）—— 分项净和 + 尾注差 = 总差，逐分闭合。
-#   bootloader 21,232 B（哈希 e7ab5130…，gen26.3 为 79b992dd…；bootloader 带构建
-#   时间戳，哈希每代必变，零行为变化——该结论由 gen12→gen13 逐字节 diff 实证：
-#   0x54 处时间串 6B + 0x52cf-0x52ef 摘要 33B）；
-#   partition-table / ota_data_initial 与 gen26.3 同尺寸同内容（sha256 逐字节一致：
+# 段表锚（esptool image-info，与 gen26.4 对照）：
+#   seg1 DRAM  Load addr(vaddr)=0x3fc9c700 世代不变锚（逐代相同）；
+#   seg1 len=0x08a8c（与 gen26.4 持平）；File offs=0x00234418（与 gen26.4 持平，
+#   seg0 无增长）。真机 boot 日志预测锚：seg1 paddr = 0x00234418 + 8(段头) +
+#   0x10000(ota_0 基址) = 0x00244420（与 gen26.4 同值——用户实测日志
+#   `segment 1: paddr=00244420` 与预测逐字吻合 ✓，公式再添一代实证）。
+#   体积：4,071,680 B，相对 gen26.4（4,071,616 B）**+64 B**（双操作数：
+#   4,071,680 − 4,071,616 = 64），段级闭合：seg3(IROM)+64（0x18caa8→0x18cae8，
+#   show_pending/open 的 own 拷贝 + app_book wbuf 局部缓冲），seg0/seg1/其余持平，
+#   尾注差 0——分项净和 = 总差，逐分闭合。
+#   bootloader 21,232 B（哈希 c8069ead…，gen26.4 为 e7ab5130…；bootloader 带构建
+#   时间戳，哈希每代必变，零行为变化）；
+#   partition-table / ota_data_initial 与 gen26.4 同尺寸同内容（sha256 逐字节一致：
 #   9d5d890b… / 7d2c7ac4…）。
-# Segment anchor (esptool image-info, vs gen26.3): seg1 DRAM Load addr (vaddr) =
-# 0x3fc9c700 generation-invariant (identical to gen26.3); seg1
-# len = 0x08a8c (flat vs gen26.3); File offs = 0x00234418 (gen26.3 0x002343a8, +0x70
-# = 112B) - a shift from seg0 (DROM) growth, vaddr unmoved. Predicted hardware
+# Segment anchor (esptool image-info, vs gen26.4): seg1 DRAM Load addr (vaddr) =
+# 0x3fc9c700 generation-invariant; seg1 len = 0x08a8c (flat vs gen26.4);
+# File offs = 0x00234418 (flat vs gen26.4, no seg0 growth). Predicted hardware
 # boot-log anchor: seg1 paddr = 0x00234418 + 8 (segment header) + 0x10000 (ota_0
-# base) = 0x00244420; that formula is empirically confirmed by gen5/gen6/gen10
-# device logs (gen10 measured paddr = 0x00242040) and again by gen14, whose
-# measured paddr=0x00243250 matched its prediction character for character.
-# Size: 4,071,616 B, **+912 B** vs gen26.3 (4,070,704 B) - both operands:
-# 4,071,616 − 4,070,704 = 912 - closed segment by segment: seg0 (DROM) +112
-# (0x234388->0x2343f8, the AI chip label/geometry constants) + seg3 (IROM) +796
-# (0x18c78c->0x18caa8, the AI chip draw / tap gate / force_ai / ai_over_dict /
-# app_book AI branch and timeout fallback) + seg3 alignment pad +4
-# (0x18c790->0x18cab0) - the per-item net plus the tail-note delta equals the
-# total delta, closed item by item.
-# bootloader 21,232 B (hash e7ab5130…, gen26.3 was 79b992dd…; the bootloader embeds a
-# build timestamp so its hash changes every generation with zero behavior change -
-# proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
-# at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
-# gen26.3 (sha256 byte-identical: 9d5d890b… / 7d2c7ac4…).
+# base) = 0x00244420 (same value as gen26.4 - the user's live log
+# `segment 1: paddr=00244420` matched the prediction character for character,
+# one more generation of empirical confirmation).
+# Size: 4,071,680 B, **+64 B** vs gen26.4 (4,071,616 B) - both operands:
+# 4,071,680 − 4,071,616 = 64 - closed segment by segment: seg3 (IROM) +64
+# (0x18caa8->0x18cae8, the own[] copies in show_pending/open plus app_book's
+# wbuf local buffer), seg0/seg1/the rest flat, tail-note delta 0 - the
+# per-item net equals the total delta, closed item by item.
+# bootloader 21,232 B (hash c8069ead…, gen26.4 was e7ab5130…; the bootloader
+# embeds a build timestamp so its hash changes every generation with zero
+# behavior change); partition-table / ota_data_initial same size and content as
+# gen26.4 (sha256 byte-identical: 9d5d890b… / 7d2c7ac4…).
 #
 # 重锚记录（2026-10-22，gen24.4：推送/传书界面渲染发灰根治——跨页进入武装页与
 #   推送收官开书强制一次整屏 GC16 擦旧底，gen24.3 真机验收全绿后报的观感缺陷，
@@ -1999,9 +1996,96 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (switch / delete / restore defaults / edit-save) the main editor and the
 #   active template name match storage (APK-side M1.2.1); (5) the regression
 #   surface.
+# 重锚记录（2026-10-24 深夜，gen26.4.1：gen26.4 真机 defect 热修——词典命中词点
+#   「AI」释义全丢。日志铁证：`ai force ""`（词空）+ 无 `ai pending`/`ai force over
+#   dict` + 0x17 的 notify 在 ai force 日志前 1ms（103109→103111）。
+#   根因（自引用别名）：app_book TAP_AI 分支 `w = dict_popup_word()` 拿到的是
+#   &s_word 自身；push_sink_ai_tap_word(w) 在 s_word 尚存时正常发出 0x17（APK
+#   确实收到词并回了 0x07）；dict_popup_force_ai(w) → show_pending(w) 入口先
+#   dict_popup_reset()（清 s_word = 清掉别名参数指向的内容）再 `if (!*word)
+#   return false` → 误判空词提前返回——查询态没建、词典卡被清空；0x07 回来时
+#   is_pending 已不成立，门 A 丢弃进预取缓存 = 用户看到「词典卡内容消失、AI
+#   释义全丢」。miss 路径正常是因为传的是局部缓冲；15s 超时回退也不触发
+#   （s_pending=false，pending_expired 恒假）。宿主测试没抓到：force_ai 断言传的
+#   是字面量（.rodata 不别名）。
+#   修法（三层）：① show_pending 入口先拷贝 word 到局部 own[] 再 reset（API 契约
+#   根治：传入词可以是任何东西，包括卡自己的词头）；② dict_popup_open 同型隐患
+#   对称修复；③ app_book TAP_AI 分支取词立即拷贝到局部 wbuf（调用侧根治，词的
+#   生命周期与卡状态解耦）。宿主回归补别名路径断言（force_ai(dict_popup_word())
+#   / open(dict_popup_word())），变异新增 M7「别名防御被拆」被擒（7/7）。
+#   APK 同轮 v1.4.2（code 7，a6877152…）：审计尾巴①——导入 JSON 文件内重名
+#   去重（与保存路径 upsert 语义一致，同名保留后出现的条目；按 name 删除依赖
+#   「模板名唯一」）。
+#   门禁：16/16 runner 全绿（dict_popup 含别名回归断言，变异 7/7 全擒）；
+#     fullclean（删 build 真全量）exit 0；8 警告逐条同基线（app_book.c 7 +
+#     ui_pinpad.c 1）；APK 45/45 + 52/52 + 七步 BUILD_OK；家族五件对表 5/5。
+#   锚：Read_Pico.bin 4,071,680 B（相对 gen26.4 的 4,071,616 为 **+64 B**，双操作数
+#   4,071,680-4,071,616=+64）；段级闭合：seg3(IROM)+64（0x18caa8→0x18cae8，
+#   own 拷贝 + wbuf），seg0/seg1/其余持平，尾注差 0；seg1 File offs `0x00234418`
+#   与 gen26.4 持平，paddr 预测 `0x00244420`（与 gen26.4 同值——用户实测日志
+#   `segment 1: paddr=00244420` 与预测逐字吻合，公式再添一代实证）；seg1 Load
+#   `0x3fc9c700` 世代不变 + len `0x08a8c` 持平——双锚再守。
+#   sha256 `a13d0b5e…`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#   与 gen26.4 逐字节一致；bootloader `c8069ead…`（仅时间戳）。
+#   本代干跑 zip 不 push、不打 tag（既定纪律）。真机复测面（待验）：① 词典命中词
+#   点「AI」→「AI 查询中」→ 2-5s 释义原地更新（gen26.4 的丢释义场景必须转绿）；
+#   ② 15s 超时回退词典释义（断网/杀 APK）；③ 命中缓存秒出；④ APK v1.4.2 覆盖
+#   装后模板库四操作回归（应与 v1.4.1 全绿表现一致）。
+# Gen26.4.1 re-anchor (2026-10-24 late night: gen26.4 device-defect hotfix - the
+#   AI definition was lost for every dictionary-hit word tapped via "AI". Log
+#   evidence: `ai force ""` (empty word), no `ai pending`/`ai force over dict`,
+#   and the 0x17 notify 1 ms before the ai force log (103109->103111).
+#   Root cause (self-referential alias): app_book's TAP_AI branch took
+#   `w = dict_popup_word()` - the pointer IS &s_word; push_sink_ai_tap_word(w)
+#   sent the 0x17 fine (the phone answered - see the notify 1 ms earlier);
+#   then dict_popup_force_ai(w) -> show_pending(w) first ran
+#   dict_popup_reset() (clearing s_word = the aliased argument's content) and
+#   only then checked `if (!*word) return false` - a misread empty word bailed
+#   out, the query state never formed, the dict card was wiped; when 0x07
+#   landed, is_pending no longer held and gate A dropped it into the prefetch
+#   cache = the user saw the dict card lose its content and every AI
+#   definition vanish. The miss path worked because it passes a local buffer;
+#   the 15 s fallback never fired either (s_pending=false, pending_expired
+#   always false). The host test missed it because the force_ai assertion
+#   passed a literal (.rodata, never aliased).
+#   Fix (three layers): (1) show_pending copies word into a local own[] BEFORE
+#   the reset (the API contract now holds for any argument, including the
+#   card's own head); (2) dict_popup_open's same-shape hazard fixed
+#   symmetrically; (3) app_book's TAP_AI branch copies the word into a local
+#   wbuf at once (call-site fix, the word's lifetime decoupled from card
+#   state). Host regression adds the aliased-path assertions
+#   (force_ai(dict_popup_word()) / open(dict_popup_word())); the mutation
+#   sweep gains M7 "aliasing defense torn out", caught (7/7).
+#   APK same round v1.4.2 (code 7, a6877152…): audit tail (1) - dedupe
+#   duplicate names inside an imported JSON file (same upsert stance as the
+#   save path, the later entry wins; name-based delete assumes unique names).
+#   Gating: 16/16 runners green (dict_popup includes the aliased-path
+#   assertions; mutation 7/7 all caught); fullclean (build dir removed, a true
+#   full rebuild) exit 0; the 8 warnings match the baseline item for item
+#   (app_book.c 7 + ui_pinpad.c 1); APK 45/45 + 52/52 + seven-step BUILD_OK;
+#   deliverable-family check 5/5.
+#   Anchors: Read_Pico.bin 4,071,680 B (**+64 B** vs gen26.4's 4,071,616; both
+#   operands 4,071,680-4,071,616=+64); closed segment by segment: seg3 (IROM)
+#   +64 (0x18caa8->0x18cae8, the own copies plus wbuf), seg0/seg1/the rest
+#   flat, tail-note delta 0; seg1 File offs `0x00234418` flat vs gen26.4,
+#   paddr predicted `0x00244420` (same as gen26.4 - the user's live log
+#   `segment 1: paddr=00244420` matched the prediction character for
+#   character, one more empirical generation); seg1 Load `0x3fc9c700`
+#   generation-invariant + len `0x08a8c` flat - the double anchor holds again.
+#   sha256 `a13d0b5e…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to gen26.4; bootloader `c8069ead…` (timestamp
+#   only).
+#   This generation's dry-run zip is not pushed and no tag is cut (standing
+#   discipline). Live re-test surface (pending): (1) a dict-hit word tapped
+#   via "AI" gives the "AI 查询中" card then the definition in place within
+#   2-5 s (the gen26.4 losing scenario must turn green); (2) a 15 s timeout
+#   falls back to the dictionary definition (offline / killed APK); (3) the
+#   prefetch cache answers instantly on a second tap; (4) after installing
+#   v1.4.2 over the old APK the four template-library operations regress green
+#   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="bb9c39632c3ba70e6029c3203088098b5a621f23fcb0a18c502331f36c43de39"
+EXPECTED="a13d0b5e4fb6c83542bd996ef6c8ec85bbce1c796ea282cda623ed007cae7402"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

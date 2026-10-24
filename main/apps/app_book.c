@@ -6070,10 +6070,24 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
                 s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
                 return APP_REDRAW_PAGE;
             }
-            const char* w = dict_popup_word();
-            push_sink_ai_tap_word(w);   // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
-            dict_popup_force_ai(w);     // 卡切查询态并标记 over_dict（超时回退词典）
-            ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", w);
+            // gen26.4.1 真机 defect 根治：dict_popup_word() 返回的就是卡内词头
+            // 指针（&s_word），跨 force_ai/show_pending 的入口 reset 传递会被别名
+            // 清空——0x17 发的是旧值（时序上在 reset 前）、查询态却建不起来
+            // （「!*word」误判），词典卡被清空、0x07 回来门 B 失配被丢弃 = 释义
+            // 全丢。取词立即拷贝到局部缓冲，词的生命周期与卡状态解耦。
+            // gen26.4.1 device-defect fix at the call site: dict_popup_word()
+            // returns the card's own head pointer (&s_word); passing it across
+            // force_ai/show_pending's entry reset aliases it away - the 0x17
+            // went out with the old value (sent before the reset) while the
+            // query state never formed ("!*word" misread), the dict card was
+            // wiped, and when 0x07 landed gate B missed so gate A dropped it =
+            // every definition lost. Copy the word into a local buffer at once;
+            // its lifetime is decoupled from the card state.
+            char wbuf[64];
+            copy_text(wbuf, sizeof(wbuf), dict_popup_word());
+            push_sink_ai_tap_word(wbuf);   // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
+            dict_popup_force_ai(wbuf);     // 卡切查询态并标记 over_dict（超时回退词典）
+            ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);
             invalidate_prep();
             return APP_REDRAW_PAGE;
         }

@@ -247,8 +247,17 @@ bool dict_popup_open(const char* word) {
     // 计时：真机上想知道「打开 / 查词 / 折行」各占多少，串口直接读。
     // Timing: report how the cost splits across open, lookup and wrapping.
     const int64_t t0 = esp_timer_get_time();
+    // 别名防御（与 show_pending 同一隐患，gen26.4.1 对称修复）：word 可能指向
+    // s_word 自身（dict_popup_word() 的返回值），入口 reset 会把它一起清空。
+    // 先拷贝到局部缓冲再 reset。/ Aliasing defense (same hazard as
+    // show_pending, fixed symmetrically in gen26.4.1): word may point at
+    // s_word itself (dict_popup_word()'s return), which the entry reset would
+    // clear along with the card. Copy to a local buffer before the reset.
+    char own[DICT_POPUP_WORD_MAX];
+    if (!word || !*word) { dict_popup_reset(); return false; }
+    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
     dict_popup_reset();
-    if (!word || !*word) return false;
+    word = own;
     // 释义缓冲放 PSRAM：主任务栈只有 8KB，不能在这里开大数组。
     // The definition buffer lives in PSRAM; the main task stack is only 8KB.
     char* out = heap_caps_malloc(DICT_ENTRY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -306,9 +315,21 @@ bool dict_popup_open(const char* word) {
 // False on an empty word or a staging failure, leaving no half card, so the
 // caller takes its notice path as before.
 bool dict_popup_show_pending(const char* word) {
+    // 别名防御（gen26.4 真机 defect 根因）：调用方可能直接传 dict_popup_word()——
+    // 返回值就是 &s_word 自身。旧代码先 reset 再查空，reset 把别名参数一起清空，
+    // 「!*word」误判空词提前返回 → 查询态没建、词典卡被清空，0x07 回来门 B 失配
+    // 被门 A 丢弃 = 释义全丢。先拷贝到局部缓冲再 reset。
+    // Aliasing defense (direct root cause of the gen26.4 device defect): a caller
+    // may pass dict_popup_word() - the return value IS &s_word. The old code
+    // reset first and checked emptiness after, so the reset cleared the aliased
+    // argument too, "!*word" misread an empty word and bailed - no query state,
+    // a wiped dict card, and when 0x07 landed gate B missed so gate A dropped
+    // it = every definition lost. Copy to a local buffer before the reset.
+    char own[DICT_POPUP_WORD_MAX];
+    if (!word || !*word) { dict_popup_reset(); return false; }
+    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
     dict_popup_reset();
-    if (!word || !*word) return false;
-    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, own);
     if (!store_line(DICT_POPUP_PENDING_TEXT, strlen(DICT_POPUP_PENDING_TEXT))) {
         dict_popup_reset(); // 不留半张卡 / leave no half card
         return false;

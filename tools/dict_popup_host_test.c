@@ -377,6 +377,14 @@ static void test_ai_entry(void) {
     g_dict_hit = true;
     snprintf(g_dict_def, sizeof(g_dict_def), "偶然发现珍宝的运气");
     CHECK(dict_popup_open("serendipity"));
+    // 真机路径复现（gen26.4 真机 defect 回归断言）：open 成功后 word() 必须保持该词
+    // ——app_book 的 TAP_AI 分支靠 dict_popup_word() 取词传给 force_ai，历史上这里
+    // 返回空导致 0x17 发空词、AI 释义全丢。/ Real-path repro (gen26.4 device
+    // defect regression): after a successful open, word() must keep the word -
+    // app_book's TAP_AI branch takes the word from dict_popup_word() for
+    // force_ai, and an empty return here once burned 0x17 with an empty word
+    // and lost every AI definition.
+    CHECK(strcmp(dict_popup_word(), "serendipity") == 0);
     // 默认（AI 开关未置）：无 AI chip，AI 区点击不吞（MISSED）。/ Default (AI switch
     // unset): no AI chip; a tap on the AI zone does not swallow (MISSED).
     EpdRect ai = dict_popup_ai_rect();
@@ -396,6 +404,25 @@ static void test_ai_entry(void) {
     CHECK(drew_text("AI"));
     CHECK(dict_popup_tap((uint16_t)(ai.x + ai.width / 2), (uint16_t)(ai.y + ai.height / 2))
           == DICT_POPUP_TAP_AI);
+    // 真机 defect 回归（gen26.4.1）：真机 TAP_AI 分支传的是 dict_popup_word()——
+    // 返回值就是 &s_word 自身。旧 show_pending 入口先 reset 再查空，别名参数被
+    // 一起清空 → 「!*word」误判、查询态没建、词典卡被清空（0x07 回来门 B 失配
+    // 被门 A 丢弃 = 释义全丢）。别名路径必须成功且查询态为真。
+    // Device-defect regression (gen26.4.1): the real TAP_AI branch passes
+    // dict_popup_word() - the return value IS &s_word. The old show_pending
+    // reset first and checked emptiness after, clearing the aliased argument
+    // too, "!*word" misread and bailed - no query state, a wiped dict card
+    // (when 0x07 landed gate B missed so gate A dropped it = defs all lost).
+    // The aliased call must succeed and enter the query state.
+    CHECK(dict_popup_force_ai(dict_popup_word()));
+    CHECK(dict_popup_is_pending("serendipity"));
+    CHECK(dict_popup_ai_over_dict());
+    // 释义落定重开词典卡，再以别名路径验证 open 的入口 reset 同样不吃掉别名词。
+    // Once the def lands reopen the dict card, then verify open's entry reset
+    // also leaves an aliased word intact.
+    CHECK(dict_popup_show_def("serendipity", "偶然发现珍宝的运气"));
+    CHECK(dict_popup_open(dict_popup_word()));
+    CHECK(strcmp(dict_popup_word(), "serendipity") == 0);
     // force_ai：切查询态 + 标记 over_dict（超时回退词典）。/ force_ai: enter the query
     // state + mark over_dict (fall back to the dict on timeout).
     CHECK(dict_popup_force_ai("serendipity"));

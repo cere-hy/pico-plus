@@ -19,12 +19,12 @@ rem 烧前请把完整输出存盘（esptool 的哈希/摘要行是烧录证据�
 rem Save the FULL output (esptool hash lines are the flashing evidence).
 
 setlocal enabledelayedexpansion
-rem 锚：gen26.4 词典卡「AI」入口 Read_Pico.bin 4,071,616 B / bb9c3963…（2026-10-24 重锚，
-rem   与 firmware/flash.sh 同值；拒烧语义同 flash.sh：exit 1）。
-rem Anchor: the gen26.4 dictionary-card "AI" entry Read_Pico.bin 4,071,616 B /
-rem bb9c3963... (re-anchored 2026-10-24, same value as firmware/flash.sh;
-rem refusal semantics match flash.sh: exit 1).
-set EXPECTED=bb9c39632c3ba70e6029c3203088098b5a621f23fcb0a18c502331f36c43de39
+rem 锚：gen26.4.1 真机 defect 热修（AI 入口自引用别名）Read_Pico.bin 4,071,680 B /
+rem   a13d0b5e…（2026-10-24 重锚，与 firmware/flash.sh 同值；拒烧语义同 flash.sh：exit 1）。
+rem Anchor: the gen26.4.1 device-defect hotfix (the AI entry's self-referential
+rem alias) Read_Pico.bin 4,071,680 B / a13d0b5e... (re-anchored 2026-10-24, same
+rem value as firmware/flash.sh; refusal semantics match flash.sh: exit 1).
+set EXPECTED=a13d0b5e4fb6c83542bd996ef6c8ec85bbce1c796ea282cda623ed007cae7402
 set DIR=%~dp0
 set PORT=%1
 if "%PORT%"=="" set PORT=COM3
