@@ -8,6 +8,9 @@
 #include "ui_power_dialog.h"
 #include "ui_quick_menu.h"
 #include "boot_state.h"
+// gen26 AI 释义轮询的 API/尺寸宏来源（PUSH_AI_WORD_MAX 等）。
+// Source of the gen26 AI poll API and size macros (PUSH_AI_WORD_MAX etc.).
+#include "push_sink.h"
 uint8_t app_settings_system_contrast(void) {return 100;}
 void pico_boot_ready(void) {}
 void app_book_cover_mode_changed(void) {}
@@ -67,6 +70,26 @@ static int quick_draws, quick_gl, quick_du, wifi_starts, wifi_stops, ble_resets,
 static bool push_armed;
 static int push_cancel_calls;
 static char push_cancel_why[64];
+// gen26 AI 释义卡轮询替身：take 一次一取（模拟 UI 槽被取空），ready 的可受理性
+// 可编程（false=有面板开着/非阅读态，阅读器不收）。M1 引入 app_loop 轮询分支时
+// 漏同步这两个桩，app_loop/book_management 两个 runner 编译红到 gen26.3 才暴露
+// ——与 gen21 cancel_why 桩同型第三次，教训见下方桩定义处。
+// gen26 AI definition poll shims: the take drains the slot once (mimicking the
+// UI slot emptying) and acceptance is programmable (false = a panel is open or
+// not reading, so the reader refuses). M1 added the poll branch without these
+// stubs and two runners stayed compile-red until gen26.3 - the third incident
+// of the same shape as the gen21 cancel_why stub; see the note there.
+static bool ai_take_hit, ai_ready_ok = true;
+static int ai_presents, ai_ready_calls;
+static char ai_seen_word[PUSH_AI_WORD_MAX + 1], ai_seen_def[PUSH_AI_DEF_MAX + 1];
+// 出卡观测点：挂到 current->present 上，只数 PAGE 呈现（AI 分支专用参数；
+// 首帧 FULL 与 tick 尾部 NONE 不计）。返回 false 让 app_present 继续走常规
+// 呈现路径，不改变被测行为。
+// Card-present observation: hangs off current->present and counts only PAGE
+// presents (the AI branch's argument; the startup FULL and tick-tail NONE are
+// not counted). Returning false lets app_present continue down its normal
+// path, changing nothing.
+static bool ai_present(app_ctx_t *c, app_redraw_t r) { (void)c; if (r == APP_REDRAW_PAGE) ++ai_presents; return false; }
 
 static app_redraw_t long_key(app_ctx_t* c, int k) { assert(k==UI_KEY_2); ++long_keys; c->request_menu=true; return APP_REDRAW_NONE; }
 static app_redraw_t response;
@@ -228,6 +251,8 @@ static void reset(void) {
     transfer_status=(read_pico_transfer_status_t){0};
     quick_draws=quick_gl=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
     push_armed=false;push_cancel_calls=0;push_cancel_why[0]='\0';
+    ai_take_hit=false;ai_ready_ok=true;ai_presents=ai_ready_calls=0;
+    ai_seen_word[0]=ai_seen_def[0]='\0';
     main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
@@ -633,6 +658,33 @@ int main(void) {
     reset();host_rotation=EPD_ROT_LANDSCAPE;first.render=landscape_render;power_trigger_step=1;time_step=3000000;
     add(0,0,0,0);add(0,0,0,0);add(446,960,1,0);add(0,0,0,0);add(0,0,0,0);run();
     assert(power_open_draws==1&&landscape_renders==2&&host_rotation==EPD_ROT_LANDSCAPE&&!shutdowns&&!restarts);
+    // 守门用例三（gen26.3 补 M1 漏桩）：AI 释义卡轮询三分支——
+    // ①槽有货且阅读器收：当 tick 出卡（present=首帧+卡=2）、词与释义原样透传、
+    //   该 tick 的 press 被丢弃（touch_calls 不增）——释义到达与触摸同一 tick
+    //   撞车的窗口由这次丢弃吸收，不产生半幅触摸；
+    // ②阅读器不收（ai_ready_ok=false，有面板开着/非阅读态）：不出卡、不吞触摸，
+    //   正常走完当 tick（释义按设计留在预取缓存）；
+    // ③槽空：轮询零副作用。
+    // Gatekeeper 3 (gen26.3 backfills the stubs M1 missed): the AI definition
+    // poll's three branches - (1) slot filled and accepted: the card presents
+    // this tick (presents = startup + card = 2), word/def pass through
+    // verbatim, and that tick's press is discarded (touch_calls stays put) -
+    // the def-arrival/touch same-tick collision window is absorbed by the
+    // discard, never a half-dispatched touch; (2) refused (a panel open or not
+    // reading): no card, no swallowed touch, the tick runs normally (the
+    // definition stays in the prefetch cache by design); (3) empty slot: zero
+    // side effects.
+    reset();first.present=ai_present;ai_take_hit=true;time_step=600000;
+    add(100,400,1,0);add(0,0,0,0);run();
+    assert(ai_ready_calls==1&&!strcmp(ai_seen_word,"serf")&&!strcmp(ai_seen_def,"a person bound to the land"));
+    assert(ai_presents==1&&!touch_calls&&ticks==1); // 出卡 tick 跳过 on_tick 与触摸分发
+    reset();first.present=ai_present;ai_take_hit=true;ai_ready_ok=false;time_step=600000;
+    add(100,400,1,0);add(0,0,0,0);run();
+    assert(ai_ready_calls==1&&ai_presents==0&&touch_calls==1&&ticks==2); // 不收：不出卡、不吞触摸
+    reset();first.present=ai_present;ai_take_hit=false;time_step=600000;
+    add(100,400,1,0);add(0,0,0,0);run();
+    assert(ai_ready_calls==0&&ai_presents==0&&touch_calls==1); // 槽空：零副作用
+    puts("PASS: gen26 AI definition poll: filled+accepted presents the card and drops the tick's press, refused keeps normal dispatch, empty slot has zero side effects");
     puts("PASS: real loop and power recognizer: DU-only contact, release commits off/staged sleep/restart once, cancel restores full navigation, touch/multitouch errors and entry-held suppression");
     puts("PASS: shutdown dialog gatekeepers: landscape long-press resets the dialog branch to portrait, and cancel repaints through render() to restore landscape");
     puts("PASS: gen21 manual-sleep gatekeeper: armed manual sleep silently disarms (one cancel_why \"manual sleep\") then sleeps; armed auto lock stays blocked with no cancel");
@@ -652,6 +704,24 @@ bool pico_online_busy(void) { return online_busy; }
    page's rendering paths are covered by the transfer_ui regression alone. */
 bool push_sink_armed(void) { return push_armed; }
 void push_sink_poll(void) {}
+// gen26 AI 释义回流替身（M1 漏同步、两 runner 编译红躺到 gen26.3 补）：
+// take 命中即取空（与真实 UI 槽语义一致），ready 的可受理性由 ai_ready_ok 编程。
+// gen26 AI definition return shims (M1 missed these and two runners stayed
+// compile-red until gen26.3): a take hit drains the slot (matching the real UI
+// slot), acceptance is programmed by ai_ready_ok.
+bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap) {
+    if (!ai_take_hit) return false;
+    ai_take_hit = false;
+    snprintf(word, wcap, "serf");
+    snprintf(def, dcap, "a person bound to the land");
+    return true;
+}
+bool app_book_ai_def_ready(const char *word, const char *def) {
+    ++ai_ready_calls;
+    snprintf(ai_seen_word, sizeof(ai_seen_word), "%s", word);
+    snprintf(ai_seen_def, sizeof(ai_seen_def), "%s", def);
+    return ai_ready_ok;
+}
 // gen21：手动息屏经 prepare_lock(manual=true) 调 cancel_why("manual sleep")。
 // 记录调用次数与 why 文本，供守门用例断言「武装期手动息屏静默取消武装」。
 // 此桩自 gen21（2ea51cb）起漏同步补定义，宿主链接失败躺了三代——教训同

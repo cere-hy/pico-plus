@@ -145,10 +145,13 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico26.2（gen26.1 为 AI 查词包；本代修回流时序
-# defect。沿用旧串会让 TF 卡升级判「版本相同」而拒绝，故每代 fork 专属可区分串）。
-# Version string: 0.3.3-pico26.2 (gen26.1 was the AI-lookup package; this
-# generation fixes the ride-along flush timing defect. Reusing an older tag makes
+# 版本串 / Version string: 0.3.3-pico26.3（gen26.2 修回流时序；本代 M1 联测三项
+# 反馈根治：AI 查词改词典补充非替代、18-a 收紧、搭车出队改确认成功）。沿用旧串会让
+# TF 卡升级判「版本相同」而拒绝，故每代 fork 专属可区分串。
+# Version string: 0.3.3-pico26.3 (gen26.2 fixed the reflux timing; this
+# generation roots out the three M1 live-test findings: AI lookup becomes a
+# supplement to the dictionary rather than a replacement, 18-a tightens, the
+# ride-along dequeue moves to confirmed-success). Reusing an older tag makes
 # the TF-card upgrade path reject the package as "same version", so each
 # generation gets its own fork-specific distinguishable tag).
 #
@@ -1688,9 +1691,122 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   re-test with android-tools/push_pico.py - words tapped while disconnected
 #   enqueue -> reconnect -> CAPS + word-by-word 0x17 delivered at the SUBSCRIBE
 #   event -> PC replies 0x07 -> the definition card opens.
+#
+# 重锚记录（gen26.3，M1 联测三项反馈根治——用户裁定 A① 本地优先 + B② 停监听/恢复，
+#   届时不重新决策；M1 主链已于 gen26.2 结案推入，本轮只做三项反馈的修复）：
+#   背景（M1 联测回报「功能正常」+ 三条反馈，gen26.2ai-log 双实证）：
+#     ① 监听查词与发送墨水屏互斥、push.txt 打不开；
+#     ② 词典有释义的词显示词典内容、与 APK 返回不一致；
+#     ③ 词典查失败的才返回 AI 结果（12/14 次点词白烧 LLM）。
+#   根因（读码 + 日志双实证）：
+#     ②③ 同根——搭车协议每词必发 0x17，而 app_book_ai_def_ready 的面板门
+#     （s_reader_panel != NONE 即丢帧）把词典卡开着时的 AI 释义全丢：一词两答 +
+#     白烧 LLM；① 的两半根因不同——APK 侧 doPush 的 resetState 不动 listenMode
+#     （M1.1 修），设备侧 gen18 18-a 在 CONNECTED 态即弹回、撞上 gen25 后台保活
+#     的长驻监听会话（本代②修）。
+#   改动（gen26.3 三项，最小集）：
+#     ① app_book.c start_dict_lookup：push_sink_ai_tap_word 移到 dict_popup_open
+#        之后，仅 hit && english && !found（含词典不可用）才发——AI = 词典的补充
+#        （未收词才补位），不是替代；M2 场景不经本入口，协议不动；
+#     ② app_book.c on_tick 18-a：弹回条件 {CONNECTED,RECEIVING,PROCESSING} 收紧为
+#        {RECEIVING,PROCESSING}——数据真正在飞才弹；监听态长驻 CONNECTED 不弹，
+#        M1.1 推完恢复监听的流程同样不弹；
+#     ③ push_sink.c：notify_status 改返回 bool（交付确认），ai_flush_queue 改
+#        dequeue-on-success——notify 确认成功才出队，失败（未订阅/mbuf/rc≠0）词留队，
+#        帧已由既有 100ms 重投通道兜底；杜绝 gen26.2 注释挂账的「帧丢词被吃」。
+#   M1 遗留缺陷顺手结案：app_loop.c 的 AI 释义轮询分支（M1 引入）漏同步宿主桩
+#   （app_content_open.h 桩缺 ai_def_ready 声明 + push_sink_take_ai_def 定义），
+#   app_loop/book_management 两 runner 编译红躺一代——与 gen21 cancel_why 桩同型
+#   第三次。本轮补桩 + app_loop_host_test 三分支用例（出卡透传/丢弃 press/拒绝不抢/
+#   槽空零副作用），变异三连擒（去 ready 门、去 continue、等价变换对照）。
+#   门禁：宿主 14/14 runner 全绿（push_sink 248 checks, 0 red；app_loop 55 场景
+#   + 新增 AI 三分支）；fullclean（删 build 真全量）exit 0，C 1244 / CXX 28 /
+#   ASM 26 = 1,298 编译单元全量在编（gen26.2 基线持平，本轮零增删单元）；8 警告
+#   与 §33 原始基线逐条一致（app_book.c 7 + ui_pinpad.c 1，均不在改动面）；变异
+#   有牙 3/3。
+#   锚：Read_Pico.bin 4,070,144 B（相对 gen26.2 的 4,070,048 为 **+96 B**，双操作数
+#   4,070,144-4,070,048=+96）；段级净和 seg0(DROM)+48（0x2342e8→0x234318，
+#   app_book.c 双语注释增量）+ seg3(IROM)+48（0x18c59c→0x18c5cc，三处逻辑）
+#   + 尾注差 0——**分项净和 + 尾注差 = 总差，逐分闭合**；seg1 File offs
+#   `0x00234338`（gen26.2 为 0x00234308，+0x30=48B 顺移——DROM 段增长），
+#   paddr = 0x00234338 + 8(段头) + 0x10000(ota_0 基址) = `0x00244340`（预测）；
+#   seg1 Load `0x3fc9c700` 世代不变锚不动、len `0x08a8c` 与 gen26.2 持平——双锚再守。
+#   sha256 `6728fbaa…`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#   与 gen26.2 逐字节一致；bootloader `40396978…`（同 21,232 B，时间戳差异 vs
+#   gen26.2 的 `36c0a5e3…`）。
+#   本代干跑 zip 不 push、不打 tag（门禁全绿后的既定纪律）；APK 侧 M1.1（v1.3）
+#   随后单独提交，zip 重打（RELEASE_NOTES gen22 残留修正 + 内嵌 v1.3）随真机一轮
+#   复测通过后进行。真机复测面（待验）：① 命中词串口无 0x17；② 未收词出 AI 卡；
+#   ③ 监听态开 push.txt 不弹回；④ 推送后自动恢复点词全链；⑤ 回归面。
+# Gen26.3 (roots out the three M1 live-test findings - user ruling A1 local-first
+#   + B2 stop-listen/auto-restore, decided once and for all; M1's main chain
+#   already closed and pushed at gen26.2, this generation only fixes the three
+#   findings):
+#   Background (M1 live report "functions green" + three findings, gen26.2ai-log
+#   double evidence): (1) listening and sending are mutually exclusive and
+#   push.txt will not open; (2) a word the dictionary holds shows the dictionary
+#   text, differing from the APK's answer; (3) only dictionary misses return AI
+#   results (12 of 14 taps burned LLM for nothing).
+#   Root causes (code reading + log double evidence): (2)(3) share one root - the
+#   ride-along sends 0x17 for every tap while app_book_ai_def_ready's panel gate
+#   (drops when s_reader_panel != NONE) discards the AI definition whenever the
+#   dictionary card is open: two answers per tap plus wasted LLM calls; (1)'s two
+#   halves have different roots - APK-side doPush's resetState leaves listenMode
+#   alone (fixed in M1.1), and device-side gen18 18-a bounces at CONNECTED, which
+#   collides with gen25's background keep-alive parking the listening session
+#   (fixed here as item 2).
+#   Changes (gen26.3, three items, minimal): (1) app_book.c start_dict_lookup:
+#   push_sink_ai_tap_word moves after dict_popup_open and fires only on
+#   hit && english && !found (including the dictionary being unavailable) - AI is
+#   the dictionary's supplement (fills uncollected words), not a replacement; the
+#   M2 scenarios never pass through this entry, so the protocol stays put;
+#   (2) app_book.c on_tick 18-a: the bounce condition {CONNECTED,RECEIVING,
+#   PROCESSING} tightens to {RECEIVING,PROCESSING} - only data actually in flight
+#   bounces; a parked CONNECTED never does, and neither does M1.1's post-push
+#   listen-restore path; (3) push_sink.c: notify_status now returns bool
+#   (delivery confirmation) and ai_flush_queue moves to dequeue-on-success -
+#   dequeue only after notify confirms success; on failure (unsubscribed / mbuf
+#   shortage / rc!=0) the word stays queued with its frame already scheduled for
+#   the existing 100 ms retry, ending the gen26.2-noted "dropped frame, eaten
+#   word".
+#   M1 leftover closed in passing: the AI definition poll branch (added by M1)
+#   missed its host stubs (app_content_open.h stub lacks the ai_def_ready
+#   declaration + push_sink_take_ai_def definition), so the app_loop and
+#   book_management runners stayed compile-red for a generation - the third
+#   incident of the same shape as the gen21 cancel_why stub. This round backfills
+#   the stubs and adds app_loop_host_test's three-branch cases (card present +
+#   word/def passthrough + dropped press / refusal never steals / empty slot has
+#   zero side effects), with three consecutive mutation kills (drop the ready
+#   gate, drop the continue, plus an equivalence-control).
+#   Gate: host 14/14 runners green (push_sink 248 checks, 0 red; app_loop 55
+#   scenarios plus the new AI three-branch cases); fullclean (build dir removed,
+#   a true full run) exit 0, C 1244 / CXX 28 / ASM 26 = 1,298 compilation units
+#   all compiled (flat vs the gen26.2 baseline - this round adds and removes no
+#   unit); 8 warnings line-identical to the §33 original baseline (app_book.c 7 +
+#   ui_pinpad.c 1, neither in the change surface); mutation teeth 3/3.
+#   Anchors: Read_Pico.bin 4,070,144 B (**+96 B** vs gen26.2's 4,070,048; both
+#   operands 4,070,144-4,070,048=+96); segment-level sum seg0(DROM)+48
+#   (0x2342e8->0x234318, the app_book.c bilingual-comment growth) + seg3(IROM)+48
+#   (0x18c59c->0x18c5cc, the three logic edits) + footer delta 0 - **sum of parts
+#   + footer delta = total, closed to the byte**; seg1 File offs `0x00234338`
+#   (gen26.2 was 0x00234308, +0x30=48B shifted - the DROM segment grew), paddr =
+#   0x00234338 + 8 (segment header) + 0x10000 (ota_0 base) = `0x00244340`
+#   (predicted); seg1 Load `0x3fc9c700` generation-invariant anchor unmoved, len
+#   `0x08a8c` flat vs gen26.2 - the double anchor holds again.
+#   sha256 `6728fbaa…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to gen26.2; bootloader `40396978…` (same 21,232 B,
+#   timestamp difference vs gen26.2's `36c0a5e3…`).
+#   This generation's dry-run zip is not pushed and no tag is cut (the standing
+#   discipline after an all-green gate); APK-side M1.1 (v1.3) commits separately
+#   afterwards, and the zip rebuild (RELEASE_NOTES gen22-residue fix + embedding
+#   v1.3) follows one green hardware re-test round. Live re-test surface
+#   (pending): (1) a dictionary hit sends no 0x17 on the serial log; (2) an
+#   uncollected word surfaces the AI card; (3) push.txt opens without bouncing
+#   while listening; (4) the full word chain works again after a push's automatic
+#   listen restore; (5) the regression surface.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="5a97ef4ac28ddc66b8463c721acefb1d3f32a1e24e8a8111b1ca03e2ea287984"
+EXPECTED="6728fbaaf66df76f829e34a5d0515e20f63d8a27c9d752bdd18e0ca88f3f3a00"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

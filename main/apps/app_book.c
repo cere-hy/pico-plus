@@ -5465,16 +5465,22 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     // not extend the time the lock is held. No page has turned, so s_text is still the
     // chapter the hit came from.
     if (hit && english) vocab_log_capture(s_path, s_text, hit_start, hit_end);
-    // gen26 AI 查词搭车：每个英文点词都喂给 push_sink——命中预取缓存秒出卡、连上
-    // 发 0x17 请手机算、离线入搭车队列待下次连接回流。开关/NVS/缓存/加锁语义全在
-    // 组件内，这里只负责「点了什么词」，与本地词典弹窗互为补充、互不阻塞。
-    // gen26 AI ride-along: every English tap feeds push_sink - a prefetch-cache
-    // hit surfaces the card instantly, a live link sends 0x17 for the phone to
-    // compute, and an offline tap queues for the next connection to flush. The
-    // switch/NVS/cache/locking semantics all live inside the component; this
-    // only says which word was tapped, complementing (never blocking) the local
-    // dictionary popup.
-    if (hit && english) push_sink_ai_tap_word(word);
+    // gen26.3 A①：AI 查词是本地词典的补充，不是替代——只有本地词典没有收录（或词典
+    // 整体不可用）的英文点词才喂给 push_sink：命中预取缓存秒出卡、连上发 0x17 请手机
+    // 算、离线入搭车队列待下次连接回流。词典命中的词绝不再走 LLM：一词一答，杜绝
+    // 「词典有释义却显示词典内容、与 APK 返回不一致」与「一词两答」；M1 联测实证
+    // 14 次点词仅 2 次真 miss，其余全是白烧。M2 场景（ai 查句/翻译段落/联系上下文）
+    // 不经本入口，协议不动。
+    // gen26.3 A①: AI lookup supplements the local dictionary, it does not
+    // replace it - only English taps the dictionary does NOT hold (or when the
+    // dictionary is entirely unavailable) feed push_sink: a prefetch-cache hit
+    // surfaces the card instantly, a live link sends 0x17 for the phone to
+    // compute, and an offline tap queues for the next connection. A word the
+    // dictionary holds never reaches the LLM - one tap, one answer, ending the
+    // "dict shows its own entry while the APK answer differs" split and the
+    // wasted LLM calls (M1 live test: 14 taps, only 2 real misses). The M2
+    // scenarios (sentence lookup / paragraph translation / context) never pass
+    // through this entry point, so the protocol stays put.
     const int64_t t_hit = esp_timer_get_time();
     // 弹窗避让锚点：按点词 x 选弹出侧——tap 分界与 gutter 中心重合，单栏横屏下同一谓词
     // 成立（与 v2 §5.1 判栏同一谓词）；分半几何随双栏生效，当前单栏横屏维持铺满
@@ -5493,6 +5499,16 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
              word, (int)hit, (int)english, (long long)((t_hit - t_start) / 1000),
              (long long)((esp_timer_get_time() - t_hit) / 1000),
              (long long)((esp_timer_get_time() - t_start) / 1000));
+    // 词典 miss（含词典整体不可用）才请 AI 补位；命中时一词一答，0x17 不再发出。
+    // 此时 miss 分支的 s_reader_panel 必为 NONE，AI 释义卡不再被面板门丢弃。
+    // Only a dictionary miss (including the dictionary being entirely
+    // unavailable) asks AI to fill in; on a hit there is one tap one answer
+    // and 0x17 is never sent. The miss branch leaves s_reader_panel at NONE,
+    // so the AI definition card is no longer dropped by the panel gate.
+    if (hit && english && !found) {
+        push_sink_ai_tap_word(word);
+        ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
+    }
     if (found) {
         s_reader_panel = READER_PANEL_DICT;
     } else {
@@ -7433,20 +7449,32 @@ static int book_remote_direction(void) {
     return direction;
 }
 static app_redraw_t on_tick(app_ctx_t* ctx) {
-    // gen18（18-a 自动切回）：读手机推来的虚拟书时，sink 在后台保活；手机回连
-    // （WINDOW→CONNECTED）或宽限内直接再发（COOLDOWN→RECEIVING）时，自动切回
-    // 传书页接客——它的泵现成，进度/状态/开书全走既有路径。用户零手动操作。
+    // gen18（18-a 自动切回）：读手机推来的虚拟书时，sink 在后台保活；手机宽限内
+    // 直接再发（COOLDOWN→RECEIVING）时，自动切回传书页接客——它的泵现成，进度/状态/
+    // 开书全走既有路径。用户零手动操作。
     // gen18 (18-a auto-switch-back): while reading the phone-pushed virtual
-    // book the sink is background-alive; when the phone returns (WINDOW->
-    // CONNECTED) or pushes again inside the grace (COOLDOWN->RECEIVING), bounce
-    // back to the transfer page to receive - its pump is ready and progress,
-    // status and book-opening all follow existing paths. Zero manual steps.
+    // book the sink is background-alive; when the phone pushes again inside the
+    // grace (COOLDOWN->RECEIVING), bounce back to the transfer page to receive -
+    // its pump is ready and progress, status and book-opening all follow
+    // existing paths. Zero manual steps.
+    // gen26.3② 收紧（M1 联测根因）：原条件把 CONNECTED 也算「推送在飞」，但 gen25
+    // 后台保活让 APK 监听会话长驻 CONNECTED（链路就绪≠数据在飞），用户开 push.txt
+    // 阅读时每次 tick 都被弹回传书页（联测三次 ~590ms 全弹）。现仅
+    // RECEIVING/PROCESSING——数据真正在飞——才弹；CONNECTED 长驻不弹，
+    // M1.1（B②）推完恢复监听的流程同样不弹。
+    // gen26.3 scope-2 tightening (M1 live-test root cause): the old condition
+    // counted CONNECTED as "a push in flight", but the gen25 background keep-alive
+    // parks an APK listening session in CONNECTED (link up != data flying), so
+    // every tick bounced the user out of push.txt back to the transfer page (all
+    // three live-test opens bounced at ~590ms). Now only RECEIVING/PROCESSING -
+    // data actually in flight - bounce; a parked CONNECTED never does, and
+    // neither does M1.1's (B2) post-push listen-restore path.
     // COOLDOWN 不触发：刚开书那两秒手机还在，别把用户弹回去。
     // COOLDOWN does not trigger: the phone is still around for a couple of
     // seconds right after the book opens - do not bounce the user back then.
     if (s_view == READING && s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0 && push_sink_armed()) {
         const push_state_t st = push_sink_state();
-        if (st == PUSH_STATE_CONNECTED || st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
+        if (st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
             s_push_handoff = true;
             extern const app_desc_t app_transfer;
             ctx->request_app = &app_transfer;

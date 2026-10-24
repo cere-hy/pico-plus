@@ -466,7 +466,7 @@ static void status_remember(const uint8_t *frame, size_t n) {
 // deadlock); fire sends under the lock, then deletes after unlocking (the one-shot
 // has already fired and ESP-IDF allows deleting it from inside its callback).
 static void notify_retry_fire(void *arg);
-static void notify_status(const uint8_t *frame, size_t n);
+static bool notify_status(const uint8_t *frame, size_t n);
 
 static void notify_retry_schedule(void) {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
@@ -515,12 +515,21 @@ static void notify_retry_cancel(void) {
 // subscription flag is for logging only. A phone that never subscribed should
 // ignore notifications per spec, and read-only clients use the read fallback on
 // PUSH_STATUS, which serves s_last_status.
-static void notify_status(const uint8_t *frame, size_t n) {
+//
+// gen26.3③ 返回值语义：true=帧已交付（或已排入重投的同一帧之外的真正成功），
+// false=未交付（无连接/未订阅/mbuf 失败/rc≠0，均已排重投或本就无从投）。
+// 调用方据此决定是否消费发送物——搭车队列 dequeue-on-success 靠它。
+// gen26.3 item-3 return semantics: true means delivered; false means not
+// delivered (no connection / not subscribed / mbuf failure / rc!=0 - each
+// already schedules a retry or had nothing to deliver). Callers use it to
+// decide whether to consume what they sent - the ride-along queue's
+// dequeue-on-success relies on it.
+static bool notify_status(const uint8_t *frame, size_t n) {
     status_remember(frame, n);
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
     if (!s_status_subscribed) {
         ESP_LOGD(TAG, "status 0x%02x dropped: peer not subscribed", frame[0]);
-        return;
+        return false;
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(frame, (uint16_t)n);
     if (!om) {
@@ -529,13 +538,15 @@ static void notify_status(const uint8_t *frame, size_t n) {
         // that is exactly "processed but never notified".
         ESP_LOGW(TAG, "notify 0x%02x: mbuf alloc failed, retry scheduled", frame[0]);
         notify_retry_schedule();
-        return;
+        return false;
     }
     const int rc = ble_gatts_notify_custom(s_conn_handle, s_status_handle, om);
     if (rc != 0) {
         ESP_LOGW(TAG, "notify 0x%02x rc=%d, retry scheduled", frame[0], rc);
         notify_retry_schedule();
+        return false;
     }
+    return true;
 }
 
 static void reply_ready(void) {
@@ -1195,15 +1206,26 @@ static void ai_send_caps(void) {
 
 // 把离线队列里的待查词逐个回流（STATUS 0x17），出队保持紧凑。
 // Flush the offline queue word by word (STATUS 0x17), staying compact.
+//
+// gen26.3③ dequeue-on-success（从 M2 提前）：notify 确认成功才出队；失败
+// （未订阅/mbuf 不足/rc≠0）时队首词留队，帧本身已由 notify_retry_schedule
+// 排入 100ms 重投，下次订阅事件或重连后继续 flush——杜绝 gen26.2 注释挂账的
+// 「帧丢词被吃、离线队列被静默清空」。
+// gen26.3 item-3 dequeue-on-success (pulled forward from M2): dequeue only
+// after notify confirms success; on failure (unsubscribed / mbuf shortage /
+// rc!=0) the head word stays queued, its frame is already scheduled for a
+// 100 ms retry by notify_retry_schedule, and the next subscribe event or
+// reconnect resumes the flush - ending the gen26.2-noted "dropped frame,
+// eaten word, offline queue silently emptied".
 static void ai_flush_queue(void) {
     if (!s_ai_ready) return;
     char w[PUSH_AI_WORD_MAX + 1];
     for (uint16_t guard = 0; ai_raloc_count(s_ai_buf) > 0 && guard <= s_ai_cap; ++guard) {
         if (!ai_raloc_peek(s_ai_buf, w, sizeof(w))) break;
         uint8_t frame[2u + PUSH_AI_WORD_MAX];
-        const size_t n = push_st_ai_query_encode(w, frame, sizeof(frame));
+        const size_t n = push_st_ai_query_encode(w, frame, sizeof(w));
         if (!n) break;
-        notify_status(frame, n);
+        if (!notify_status(frame, n)) break; // 未交付：词留队 / not delivered: word stays
         if (!ai_raloc_dequeue(s_ai_buf, w, sizeof(w))) break;
     }
 }
@@ -1215,19 +1237,22 @@ static void ai_flush_queue(void) {
 // gen26.2 根因修复：这两件事**不能**在 BLE CONNECT 事件里做。手机的 CCCD 订阅
 // 比连接建立晚 ~470ms（日志两会话实证），而 notify_status() 对未订阅的 peer
 // 直接丢帧（LOGD，release 不可见）；本函数若在 connect 时跑，CAPS 与全部
-// 回流帧都会被丢，且 ai_flush_queue() 不论投递成败逐个 dequeue——帧丢词也被
-// 吃，离线搭车队列每次重连被静默清空。订阅事件是 peer 可收帧的首个时刻，
-// 故 CAPS/回流/订阅窗口内积压的点词全部在此交付。
+// 回流帧都会被丢，且彼时 ai_flush_queue() 不论投递成败逐个 dequeue——帧丢词
+// 也被吃，离线搭车队列每次重连被静默清空（该出队语义已由 gen26.3③
+// dequeue-on-success 修正：notify 确认成功才出队，失败留队）。订阅事件是
+// peer 可收帧的首个时刻，故 CAPS/回流/订阅窗口内积压的点词全部在此交付。
 // gen26.2 root-cause fix: these two things must NOT run in the BLE CONNECT
 // event. The phone's CCCD subscription lands ~470 ms after the connection is
 // established (measured in two sessions on hardware), and notify_status()
 // drops frames for a peer that has not subscribed (LOGD, invisible in
 // release); if this ran at connect time, CAPS and every flushed frame would
-// be dropped, and ai_flush_queue() dequeues each word regardless of delivery
-// - frames dropped AND words eaten, silently emptying the offline queue on
-// every reconnect. The subscribe event is the first moment the peer can
-// receive, so CAPS, the flush, and any taps queued inside the pre-subscribe
-// window are all delivered here.
+// be dropped, and back then ai_flush_queue() dequeued each word regardless of
+// delivery - frames dropped AND words eaten, silently emptying the offline
+// queue on every reconnect (that dequeue semantics is now fixed by gen26.3
+// item-3 dequeue-on-success: dequeue only after notify confirms success, the
+// word stays queued on failure). The subscribe event is the first moment the
+// peer can receive, so CAPS, the flush, and any taps queued inside the
+// pre-subscribe window are all delivered here.
 static void ai_on_subscribed(void) {
     if (!s_ai_enabled) return;
     ai_send_caps();
