@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# 交付物家族五件对表（第五道固定检查，2026-10-24 gen26.3 基装轮立）。
-# The deliverable-family five-item reconciliation (the fifth fixed check,
-# established in the 2026-10-24 gen26.3 base-install round).
+# 交付物家族六件对表（第五道固定检查，2026-10-24 gen26.3 基装轮立；第六件 gen26.4.1 收官轮补）。
+# The deliverable-family six-item reconciliation (the fifth fixed check,
+# established in the 2026-10-24 gen26.3 base-install round; item 6 added in
+# the 2026-10-24 gen26.4.1 closing round).
 #
 # 存在的理由 / Why this exists:
 #   gen26.3 基装轮一次抓出三处仓库侧陈旧（firmware/ 旧 bin、flash.bat 锚停在
@@ -12,7 +13,7 @@
 #   artifacts (firmware/ old bins, flash.bat's anchor frozen at gen22,
 #   RELEASE_NOTES gen22 residue) plus one missed sync (manifest.json) - not a
 #   coincidence: every generation owes the deliverable family a sync, but no
-#   checklist existed. Any packaging or re-anchoring action must run all five:
+#   checklist existed. Any packaging or re-anchoring action must run all six:
 #
 #   1. firmware/flash.sh   EXPECTED == sha256(firmware/Read_Pico.bin)
 #   2. firmware/flash.bat  EXPECTED == 同上（Windows 路径，曾三代没动）
@@ -21,6 +22,13 @@
 #   4. RELEASE_NOTES.md    头部版本 == PROJECT_VER；bin 尺码/哈希前缀、APK
 #                          哈希前缀与实物一致
 #   5. apk/README.md       所述 APK 尺码与实物一致（KB 取整口径）
+#   6. apk/ReadPicoPush.apk  发布副本与构建产物逐字节一致——gen26.4.1 收官轮
+#                          实测分叉：web-flasher 下载链接指向远端 main 的 apk/，
+#                          而该副本停在 v1.4.1（e9fb1704…），tools 产物已是
+#                          v1.4.2（a6877152…），新用户经网页装到旧 APK；
+#                          此前五件不覆盖该副本，故分叉两代无人红。
+#                          (release copy must be byte-identical to the build
+#                          output - it drifted two generations unnoticed)
 #
 # 单一真相源：版本串取 CMakeLists.txt 的 PROJECT_VER，哈希/尺码取实物文件。
 # Single source of truth: the version string comes from CMakeLists.txt's
@@ -80,8 +88,15 @@ KB=$(( (APKSIZE + 1023) / 1024 ))
 grep -q "${KB} KB" tools/android/apk/README.md || bad "apk/README.md does not state ${KB} KB (actual ${APKSIZE}B)"
 note "  5/5 apk README: ${KB} KB"
 
+# --- 6. apk 发布副本 / apk release copy ---
+if [ -f apk/ReadPicoPush.apk ] && cmp -s "$APK" apk/ReadPicoPush.apk; then
+  note "  6/6 apk release copy: identical to build output"
+else
+  bad "apk/ReadPicoPush.apk missing or differs from build output $APK (release copy stale)"
+fi
+
 if [ "$fail" -eq 0 ]; then
-  note "deliverable family check: PASS (5/5 in sync)"
+  note "deliverable family check: PASS (6/6 in sync)"
 else
   note "deliverable family check: FAIL (see above) - 出包/重锚前必须全绿 / must be all green before packaging or re-anchoring"
 fi
