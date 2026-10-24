@@ -371,6 +371,56 @@ static void test_reset_clears_pending(void) {
     CHECK(g_text_count == 0);
 }
 
+static void test_ai_entry(void) {
+    // gen26.4：词典命中卡上的「AI」入口。/ gen26.4: the "AI" entry on a dict-hit card.
+    g_dict_ready = true;
+    g_dict_hit = true;
+    snprintf(g_dict_def, sizeof(g_dict_def), "偶然发现珍宝的运气");
+    CHECK(dict_popup_open("serendipity"));
+    // 默认（AI 开关未置）：无 AI chip，AI 区点击不吞（MISSED）。/ Default (AI switch
+    // unset): no AI chip; a tap on the AI zone does not swallow (MISSED).
+    EpdRect ai = dict_popup_ai_rect();
+    EpdRect save = dict_popup_save_rect();
+    draw_card();
+    CHECK(!drew_text("AI"));
+    CHECK(dict_popup_tap((uint16_t)(ai.x + ai.width / 2), (uint16_t)(ai.y + ai.height / 2))
+          == DICT_POPUP_TAP_MISSED);
+    // AI chip 与保存 chip 同在头部一行且不重叠（保存 chip 不被 AI chip 抢占）。
+    // The AI and save chips share the header row and do not overlap (the save chip
+    // is not shadowed by the AI chip).
+    CHECK(ai.y == save.y && ai.height == save.height);
+    CHECK(ai.x + ai.width <= save.x);
+    // 开 AI：chip 显示 + 命中返回 TAP_AI。/ AI on: the chip draws and a hit returns TAP_AI.
+    dict_popup_set_ai_enabled(true);
+    draw_card();
+    CHECK(drew_text("AI"));
+    CHECK(dict_popup_tap((uint16_t)(ai.x + ai.width / 2), (uint16_t)(ai.y + ai.height / 2))
+          == DICT_POPUP_TAP_AI);
+    // force_ai：切查询态 + 标记 over_dict（超时回退词典）。/ force_ai: enter the query
+    // state + mark over_dict (fall back to the dict on timeout).
+    CHECK(dict_popup_force_ai("serendipity"));
+    CHECK(dict_popup_is_pending("serendipity"));
+    CHECK(dict_popup_ai_over_dict());
+    // 查询态卡不显示 AI chip。/ The querying card shows no AI chip.
+    draw_card();
+    CHECK(!drew_text("AI"));
+    CHECK(drew_text("AI 查询中…"));
+    // miss 路径的查询态不带 over_dict（超时应走失败提示而非回退词典）。/ The miss-path
+    // query state carries no over_dict (a timeout should fail, not fall back to the dict).
+    CHECK(dict_popup_show_pending("otherword"));
+    CHECK(dict_popup_is_pending("otherword"));
+    CHECK(!dict_popup_ai_over_dict());
+    // 释义落定后 over_dict 清零（查询态清）。/ Once the def lands, over_dict clears.
+    CHECK(dict_popup_show_def("otherword", "别的释义"));
+    CHECK(!dict_popup_ai_over_dict());
+    // word getter 回当前词头；reset 后清空。/ The word getter returns the current head;
+    // reset clears it.
+    CHECK(strcmp(dict_popup_word(), "otherword") == 0);
+    dict_popup_reset();
+    CHECK(dict_popup_word()[0] == 0);
+    dict_popup_set_ai_enabled(false); // 复位开关，避免影响后续用例 / reset the switch for later cases
+}
+
 int main(void) {
     test_open_miss_contract();
     test_pending_card();
@@ -380,10 +430,11 @@ int main(void) {
     test_wrap_bounds();
     test_pending_timeout();
     test_reset_clears_pending();
+    test_ai_entry();
     if (g_failures) {
         printf("dict_popup: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 200/400 + wrap bounds + timeout)");
+    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 200/400 + wrap bounds + timeout + AI entry)");
     return 0;
 }

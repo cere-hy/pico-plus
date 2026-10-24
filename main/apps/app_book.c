@@ -5528,6 +5528,12 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     EpdRect lookup_body = body_rect();
     dict_popup_set_anchor(x < lookup_body.x + lookup_body.width / 2 ? 0 : 1, false);
     bool found = hit && english && dict_popup_open(word);
+    // gen26.4：词典命中卡按 AI 开关显示「AI」入口 chip——点击可强制发起 AI 查询
+    // （绕过 found 门，复用查询卡状态机）。miss/pending 卡不显示（查询态自带状态行）。
+    // gen26.4: the dict-hit card shows the "AI" entry chip per the AI switch - a tap
+    // forces an AI query (bypassing the found gate, reusing the querying state
+    // machine). Miss/pending cards never show it (the querying state has its own line).
+    if (found) dict_popup_set_ai_enabled(push_sink_ai_enabled());
     ESP_LOGI(TAG, "dict tap word=\"%s\" hit=%d english=%d hittest=%lldms card=%lldms total=%lldms",
              word, (int)hit, (int)english, (long long)((t_hit - t_start) / 1000),
              (long long)((esp_timer_get_time() - t_hit) / 1000),
@@ -6052,6 +6058,25 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
         // chip 上切换生词本并保留卡片；点其它地方照旧关闭。
         // The chip toggles the vocabulary book and keeps the card; anywhere else closes.
         dict_popup_tap_t tap = dict_popup_tap(x, y);
+        // gen26.4：命中词典卡上的「AI」入口——强制发起 AI 查询（绕过 found 门），卡切
+        // 「AI 查询中…」查询态；0x07 到达原地更新为释义，超时回退词典释义。AI 关着则
+        // 如实提示、卡片不动。/ gen26.4: the "AI" entry on a dict-hit card forces an
+        // AI query (bypassing the found gate), switching the card to "AI querying...";
+        // 0x07 updates it in place, a timeout falls back to the dict definition. When
+        // AI is off, say so and leave the card untouched.
+        if (tap == DICT_POPUP_TAP_AI) {
+            if (!push_sink_ai_enabled()) {
+                copy_text(s_reader_notice, sizeof(s_reader_notice), "AI 释义未开启");
+                s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+                return APP_REDRAW_PAGE;
+            }
+            const char* w = dict_popup_word();
+            push_sink_ai_tap_word(w);   // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
+            dict_popup_force_ai(w);     // 卡切查询态并标记 over_dict（超时回退词典）
+            ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", w);
+            invalidate_prep();
+            return APP_REDRAW_PAGE;
+        }
         // gen26.3 查询态卡：chip 点击忽略（存进去会是状态行），零变化不 redraw。
         // gen26.3 querying card: chip tap ignored (a save would store the
         // status line); zero state change, so no redraw.
@@ -7537,6 +7562,20 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         dict_popup_pending_expired(DICT_AI_PENDING_TIMEOUT_US)) {
         ESP_LOGW(TAG, "ai pending card timed out after %llds",
                  (long long)(DICT_AI_PENDING_TIMEOUT_US / 1000000));
+        // gen26.4：查询态由词典命中卡的「AI」入口强制触发时——失败不丢词典内容，
+        // 回退重开词典释义卡（该词此前命中，必再命中），面板保持 DICT。
+        // gen26.4: when the querying state was forced from the dict card's AI entry,
+        // a failure must not lose the dictionary content - fall back by re-opening
+        // the dictionary definition card (the word hit before, so it hits again),
+        // panel stays DICT.
+        if (dict_popup_ai_over_dict()) {
+            char w[64];
+            copy_text(w, sizeof(w), dict_popup_word());
+            dict_popup_open(w);
+            dict_popup_set_ai_enabled(push_sink_ai_enabled()); // open 的 reset 清了它，重置
+            invalidate_prep();
+            return APP_REDRAW_PAGE;
+        }
         dict_popup_reset();
         s_reader_panel = READER_PANEL_NONE;
         copy_text(s_reader_notice, sizeof(s_reader_notice), "AI 查询失败");

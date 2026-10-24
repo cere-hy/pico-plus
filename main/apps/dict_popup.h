@@ -80,6 +80,15 @@ void dict_popup_reset(void);
 void dict_popup_draw(uint8_t* fb);
 /// 「保存」chip 的区域（绘制与命中共用）。/ Rectangle of the save chip, shared by draw and hit-test.
 EpdRect dict_popup_save_rect(void);
+/// gen26.4「AI」入口 chip 的区域（绘制与命中共用）——只在词典释义卡上可点。
+/// gen26.4: the "AI" entry chip rect (shared by draw and hit-test) - tappable only
+/// on a dictionary definition card.
+EpdRect dict_popup_ai_rect(void);
+/// gen26.4：设置「AI」入口是否可点（app_book 按 push_sink_ai_enabled 设置）——控制
+/// 词典卡上 AI chip 的显示与命中。/ gen26.4: set whether the "AI" entry is tappable
+/// (app_book sets it from push_sink_ai_enabled) - controls the AI chip's visibility
+/// and hit-testing on the dictionary card.
+void dict_popup_set_ai_enabled(bool on);
 
 /// chip 点击的结果。调用方据此决定「关卡片」「留着」还是「删完要重开视图」。
 /// What a chip tap did; the caller decides whether to close the card, keep it, or
@@ -91,12 +100,29 @@ typedef enum {
     DICT_POPUP_TAP_NOT_READY, ///< gen26.3 查询态卡：释义没到，chip 点击忽略、卡片保持打开
                               ///< gen26.3 querying card: the def has not landed, the chip tap is
                               ///< ignored and the card stays open
+    DICT_POPUP_TAP_AI,        ///< gen26.4 命中词典卡上的「AI」入口：调用方据此强制发起 AI 查询
+                              ///< gen26.4 the "AI" entry on a dict card: the caller forces an AI query
 } dict_popup_tap_t;
 
 /// 点击落在 chip 上时切换生词本保存状态。未命中由调用方关卡片。
 /// Toggle the vocabulary-book entry when the tap lands on the chip; a miss is the
 /// caller's job to close.
 dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y);
+/// gen26.4：词典命中卡上的「AI」入口——强制发起 AI 查询，卡切「AI 查询中…」查询态
+/// （与 show_pending 同一状态机），并标记 over_dict：查询失败超时回退词典释义。
+/// word 为空或暂存失败返回 false。/ gen26.4: the "AI" entry on a dict-hit card
+/// forces an AI query, switching the card to the "AI querying..." querying state
+/// (same state machine as show_pending) and marking over_dict so a timeout falls
+/// back to the dictionary definition. False on an empty word or a staging failure.
+bool dict_popup_force_ai(const char* word);
+/// gen26.4 谓词：查询态是否由词典命中卡的「AI」入口强制触发——超时时据此回退词典
+/// 释义而非失败提示。/ gen26.4 predicate: whether the querying state was forced
+/// from the dict card's AI entry - on timeout this decides the fall-back to the
+/// dictionary definition instead of a failure notice.
+bool dict_popup_ai_over_dict(void);
+/// 当前卡片的词头（可能被截断到词头缓冲上限）。供调用方回填 / 重查 / 回退。
+/// The current card's word head (possibly truncated). For the caller to reuse.
+const char* dict_popup_word(void);
 
 #ifdef __cplusplus
 }

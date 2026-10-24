@@ -44,6 +44,13 @@ static const char* TAG = "dict";
 // gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
 // query-state text: a one-line real status, not a placeholder fake card.
 #define DICT_POPUP_PENDING_TEXT "AI 查询中…"
+// gen26.4「AI」入口 chip：放在保存 chip 左侧（同在卡片头部右侧），只在词典释义卡
+// 上可点。/ gen26.4 "AI" entry chip: left of the save chip, both in the card
+// header; tappable only on a dictionary definition card.
+#define DICT_POPUP_AI_W 96
+#define DICT_POPUP_AI_H 52
+#define DICT_POPUP_AI_PX 26
+#define DICT_POPUP_AI_LABEL "AI"
 
 static char s_word[DICT_POPUP_WORD_MAX];
 static char* s_lines[DICT_POPUP_LINES];
@@ -60,6 +67,12 @@ static bool s_anchor_split; ///< 分半几何开关：双栏生效，单栏横�
 // both clear it.
 static bool s_pending;
 static int64_t s_pending_since_us; ///< 进入查询态的时刻（esp_timer 微秒）/ when the query state began
+// gen26.4：AI 入口可点性（app_book 按 push_sink_ai_enabled 设置）与「查询态由词典
+// 命中卡强制触发」标记（超时回退词典释义）。/ gen26.4: the AI entry's tappability
+// (set by app_book from push_sink_ai_enabled) and the "querying forced from a
+// dict-hit card" mark (fall back to the dict definition on timeout).
+static bool s_ai_on;
+static bool s_ai_over_dict;
 
 // 避让锚点：按点词 x 选弹出侧（tap 分界与 gutter 中心重合，单栏横屏同一谓词成立）。
 // Avoidance anchor: pick the popup side by the tap x (the tap boundary coincides with
@@ -103,6 +116,21 @@ EpdRect dict_popup_save_rect(void) {
                      DICT_POPUP_SAVE_W, DICT_POPUP_SAVE_H};
 }
 
+// gen26.4：「AI」入口 chip 贴保存 chip 左侧、同高同在头部一行。/ gen26.4: the "AI"
+// entry chip hugs the save chip's left edge, same height, same header row.
+EpdRect dict_popup_ai_rect(void) {
+    EpdRect card = dict_popup_rect();
+    EpdRect save = dict_popup_save_rect();
+    return (EpdRect){save.x - 12 - DICT_POPUP_AI_W, card.y + 22,
+                     DICT_POPUP_AI_W, DICT_POPUP_AI_H};
+}
+
+void dict_popup_set_ai_enabled(bool on) { s_ai_on = on; }
+
+const char* dict_popup_word(void) { return s_word; }
+
+bool dict_popup_ai_over_dict(void) { return s_pending && s_ai_over_dict; }
+
 void dict_popup_reset(void) {
     for (int i = 0; i < s_line_count; ++i) {
         free(s_lines[i]);
@@ -113,6 +141,8 @@ void dict_popup_reset(void) {
     s_saved = false;
     s_pending = false;
     s_pending_since_us = 0;
+    s_ai_over_dict = false;
+    s_ai_on = false;
     s_word[0] = 0;
 }
 
@@ -133,7 +163,16 @@ static void summary_text(char* out, size_t cap) {
 }
 
 dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y) {
-    if (!s_word[0] || !ui_rect_hit(dict_popup_save_rect(), x, y)) return DICT_POPUP_TAP_MISSED;
+    if (!s_word[0]) return DICT_POPUP_TAP_MISSED;
+    // gen26.4：词典释义卡上的「AI」入口——优先于保存 chip 判定。查询态卡不显示 AI
+    // chip（s_pending 时不命中），故只在「AI 开着且非查询态」时抢占。
+    // gen26.4: the "AI" entry on a dict definition card - judged before the save
+    // chip. The querying card shows no AI chip (never hits while s_pending), so it
+    // only takes the tap when AI is on and the card is not querying.
+    if (s_ai_on && !s_pending && ui_rect_hit(dict_popup_ai_rect(), x, y)) {
+        return DICT_POPUP_TAP_AI;
+    }
+    if (!ui_rect_hit(dict_popup_save_rect(), x, y)) return DICT_POPUP_TAP_MISSED;
     // gen26.3 ④ 查询态卡的 chip 尚未就绪：释义没到，此刻存进去的摘要是状态行而
     // 不是释义——忽略 chip 点击、卡片保持打开，等 0x07 落地后再存。chip 之外的
     // 点击照旧走 MISSED 关闭卡片（与词典卡同口径，查询窗口不吞页面点击）。
@@ -284,6 +323,23 @@ bool dict_popup_show_pending(const char* word) {
     return true;
 }
 
+// gen26.4：词典命中卡上的「AI」入口——强制发起 AI 查询。复用 show_pending 的查询态
+// 状态机（词头 + 状态行 + 保存 chip 初值），唯一区别是置位 s_ai_over_dict：查询失败
+// 超时时调用方据此回退重开词典释义卡，不把词典内容弄丢。/ gen26.4: the "AI" entry
+// on a dict-hit card forces an AI query. Reuses show_pending's querying state
+// machine (head + status line + save chip initial value); the only difference is
+// setting s_ai_over_dict so a timeout falls back to re-opening the dictionary
+// definition card instead of losing it.
+bool dict_popup_force_ai(const char* word) {
+    if (!dict_popup_show_pending(word)) return false;
+    // show_pending 的入口 reset 已清 s_ai_over_dict；此处置位标记「词典命中卡强制触发」。
+    // show_pending's entry reset cleared s_ai_over_dict; set the "forced from a
+    // dict-hit card" mark here.
+    s_ai_over_dict = true;
+    ESP_LOGI(TAG, "ai force over dict \"%s\"", s_word);
+    return true;
+}
+
 // gen26.3 ④ 谓词：查询态且查的是本词——app_book 双门判定的核心。word=NULL 只问
 // 查询态；词长超过词头缓冲时按截断词头匹配（卡面显示的就是这个词的截断形）。
 // gen26.3 predicate: the query state for THIS word - the core of app_book's
@@ -387,9 +443,13 @@ void dict_popup_draw(uint8_t* fb) {
     ui_draw_round_rect(fb, card, 24, 0x30);
     const int inner_x = card.x + DICT_POPUP_PAD;
     const int inner_w = card.width - 2 * DICT_POPUP_PAD;
-    // 词头可能超出卡片宽，按宽度从左截短；可用宽度要扣掉右侧的保存 chip。
-    // Trim overlong heads from the left; the usable width excludes the save chip.
-    const int head_w = inner_w - DICT_POPUP_SAVE_W - 12;
+    // gen26.4：「AI」入口 chip 只在词典释义卡上显示（AI 开着且非查询态）。
+    // gen26.4: the "AI" entry chip shows only on a dictionary card (AI on, not querying).
+    const bool ai_chip = s_ai_on && !s_pending;
+    // 词头可能超出卡片宽，按宽度从左截短；可用宽度要扣掉右侧的保存 chip（以及 AI 入口 chip）。
+    // Trim overlong heads from the left; the usable width excludes the save chip (and the AI chip).
+    const int head_w = ai_chip ? (inner_w - DICT_POPUP_SAVE_W - DICT_POPUP_AI_W - 24)
+                               : (inner_w - DICT_POPUP_SAVE_W - 12);
     char head[DICT_POPUP_WORD_MAX];
     snprintf(head, sizeof(head), "%s", s_word);
     while (head[0] && ui_text_fixed_width_px(DICT_POPUP_WORD_PX, head) > head_w) {
@@ -397,6 +457,18 @@ void dict_popup_draw(uint8_t* fb) {
         head[len - 1] = 0; // ASCII 词头逐字节收缩 / ASCII heads shrink byte by byte
     }
     ui_text_fixed(fb, inner_x, card.y + 26, DICT_POPUP_WORD_PX, head, EPD_DRAW_ALIGN_LEFT, false);
+    // gen26.4：「AI」入口 chip（词典释义卡专属）——填充深色 + 反白「AI」，与保存 chip 的
+    // 描边形态区分，示意这是一个动作入口而非状态。/ gen26.4: the "AI" entry chip
+    // (dictionary card only) - filled dark with an inverted "AI", visually distinct
+    // from the outlined save chip so it reads as an action, not a state.
+    if (ai_chip) {
+        EpdRect ai = dict_popup_ai_rect();
+        ui_fill_round_rect(fb, ai, 12, UI_GRAY_BLACK);
+        ui_draw_round_rect(fb, ai, 12, UI_GRAY_BLACK);
+        int ai_w = ui_text_fixed_width_px(DICT_POPUP_AI_PX, DICT_POPUP_AI_LABEL);
+        ui_text_fixed(fb, ai.x + (ai.width - ai_w) / 2, ai.y + 12, DICT_POPUP_AI_PX,
+                      DICT_POPUP_AI_LABEL, EPD_DRAW_ALIGN_LEFT, true);
+    }
     // 保存 chip：未保存是描边，已保存是选中态。
     // Save chip: outlined when unsaved, selected when saved.
     EpdRect chip = dict_popup_save_rect();

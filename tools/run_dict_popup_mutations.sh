@@ -76,4 +76,16 @@ p.write_text(s)
 EOF
 run_mutation "M5 clamp cuts a multibyte sequence"
 
+# M6：AI 入口门禁失效（命中判定忽略 s_ai_on）——AI 关时点 AI 区也会触发查询。
+# M6: the AI entry gate dies (hit test ignores s_ai_on) - tapping AI with AI off would query.
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+s = s.replace('    if (s_ai_on && !s_pending && ui_rect_hit(dict_popup_ai_rect(), x, y)) {',
+              '    if (!s_pending && ui_rect_hit(dict_popup_ai_rect(), x, y)) { /* MUTATION M6 */')
+p.write_text(s)
+EOF
+run_mutation "M6 AI entry gate ignores s_ai_on"
+
 echo "---- mutation sweep done ----"

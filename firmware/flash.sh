@@ -145,47 +145,55 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
-# 版本串 / Version string: 0.3.3-pico26.3（gen26.2 修回流时序；本代 M1 联测三项
-# 反馈根治：AI 查词改词典补充非替代、18-a 收紧、搭车出队改确认成功）。沿用旧串会让
-# TF 卡升级判「版本相同」而拒绝，故每代 fork 专属可区分串。
-# Version string: 0.3.3-pico26.3 (gen26.2 fixed the reflux timing; this
-# generation roots out the three M1 live-test findings: AI lookup becomes a
-# supplement to the dictionary rather than a replacement, 18-a tightens, the
-# ride-along dequeue moves to confirmed-success). Reusing an older tag makes
-# the TF-card upgrade path reject the package as "same version", so each
-# generation gets its own fork-specific distinguishable tag).
+# 版本串 / Version string: 0.3.3-pico26.4（gen26.3 收官后的 M1.2.1 配套轮：词典卡加
+# 「AI」入口——词典命中仍弹词典卡，卡上加可点「AI」chip，点击强制发 0x17 绕过 found
+# 走查询卡状态机，15s 超时回退词典释义；协议零变）。沿用旧串会让 TF 卡升级判
+# 「版本相同」而拒绝，故每代 fork 专属可区分串。
+# Version string: 0.3.3-pico26.4 (the M1.2.1 companion round after gen26.3: the
+# dictionary card gains an "AI" entry - a dictionary hit still pops the
+# dictionary card, a tappable "AI" chip now forces a 0x17 query bypassing
+# "found" through the querying-card state machine, and a 15 s timeout falls
+# back to the dictionary definition; the protocol is unchanged). Reusing an
+# older tag makes the TF-card upgrade path reject the package as "same
+# version", so each generation gets its own fork-specific distinguishable tag).
 #
-# 段表锚（esptool image-info，与 gen17 对照）：
-#   seg1 DRAM  Load addr(vaddr)=0x3fc9c700 十代完全相同（世代不变锚）；
-#   seg1 len=0x08a8c（与 gen17 持平）；File offs=0x002336e8（gen17 为 0x00233448，
-#   差 +0x2a0=672B）—— 仅因 seg0(DROM) 增长顺移，vaddr 不动。
-#   真机 boot 日志预测锚：seg1 paddr = 0x002336e8 + 8(段头) + 0x10000(ota_0 基址) = 0x002436f0
+# 段表锚（esptool image-info，与 gen26.3 对照）：
+#   seg1 DRAM  Load addr(vaddr)=0x3fc9c700 世代不变锚（与 gen26.3 逐代相同）；
+#   seg1 len=0x08a8c（与 gen26.3 持平）；File offs=0x00234418（gen26.3 为 0x002343a8，
+#   差 +0x70=112B）—— 仅因 seg0(DROM) 增长顺移，vaddr 不动。
+#   真机 boot 日志预测锚：seg1 paddr = 0x00234418 + 8(段头) + 0x10000(ota_0 基址) = 0x00244420
 #   （该公式由 gen5/6/10 三轮真机日志实证：gen10 实测 paddr=0x00242040 ✓；
 #   gen14 实测 paddr=0x00243250 与预测 0x00243250 逐字吻合 ✓）。
-#   体积：4,053,392 B，相对 gen17（4,051,072 B）**+2,320 B**（双操作数：
-#   4,053,392 − 4,051,072 = 2320），来自 push_sink 取消原因链、首页推流状态卡
-#   与自动切回导航三处新增代码，以及审计逐行复查补的 quick_toggle_wifi 武装期豁免守卫（+64B）。
-#   bootloader 21,232 B（哈希 eecf08fb…，gen17 为 bf176b86…；bootloader 带构建
+#   体积：4,071,616 B，相对 gen26.3（4,070,704 B）**+912 B**（双操作数：
+#   4,071,616 − 4,070,704 = 912），段级闭合：seg0(DROM)+112（0x234388→0x2343f8，
+#   AI chip 文案/几何常量）+ seg3(IROM)+796（0x18c78c→0x18caa8，AI chip 绘制 /
+#   tap 门禁 / force_ai / ai_over_dict / app_book AI 分支与超时回退）+
+#   seg3 对齐垫 +4（0x18c790→0x18cab0）—— 分项净和 + 尾注差 = 总差，逐分闭合。
+#   bootloader 21,232 B（哈希 e7ab5130…，gen26.3 为 79b992dd…；bootloader 带构建
 #   时间戳，哈希每代必变，零行为变化——该结论由 gen12→gen13 逐字节 diff 实证：
 #   0x54 处时间串 6B + 0x52cf-0x52ef 摘要 33B）；
-#   partition-table / ota_data_initial 与 gen17 同尺寸同内容（sha256 逐字节一致：
+#   partition-table / ota_data_initial 与 gen26.3 同尺寸同内容（sha256 逐字节一致：
 #   9d5d890b… / 7d2c7ac4…）。
-# Segment anchor (esptool image-info, vs gen16): seg1 DRAM Load addr (vaddr) =
-# 0x3fc9c700 identical across ten generations (generation-invariant); seg1
-# len = 0x08a8c (flat vs gen16); File offs = 0x00233448 (gen16 0x00233308, +0x140
-# = 320B) - a shift from seg0 (DROM) growth, vaddr unmoved. Predicted hardware
-# boot-log anchor: seg1 paddr = 0x00233448 + 8 (segment header) + 0x10000 (ota_0
-# base) = 0x00243450; that formula is empirically confirmed by gen5/gen6/gen10
+# Segment anchor (esptool image-info, vs gen26.3): seg1 DRAM Load addr (vaddr) =
+# 0x3fc9c700 generation-invariant (identical to gen26.3); seg1
+# len = 0x08a8c (flat vs gen26.3); File offs = 0x00234418 (gen26.3 0x002343a8, +0x70
+# = 112B) - a shift from seg0 (DROM) growth, vaddr unmoved. Predicted hardware
+# boot-log anchor: seg1 paddr = 0x00234418 + 8 (segment header) + 0x10000 (ota_0
+# base) = 0x00244420; that formula is empirically confirmed by gen5/gen6/gen10
 # device logs (gen10 measured paddr = 0x00242040) and again by gen14, whose
 # measured paddr=0x00243250 matched its prediction character for character.
-# Size: 4,051,072 B, **+640 B** vs gen16 (4,050,432 B) - both operands:
-# 4,051,072 − 4,050,432 = 640 - from the dictionary-open diagnostic strings and
-# the probe-semantics comments.
-# bootloader 21,232 B (hash bf176b86…, gen16 was 852da709…; the bootloader embeds a
+# Size: 4,071,616 B, **+912 B** vs gen26.3 (4,070,704 B) - both operands:
+# 4,071,616 − 4,070,704 = 912 - closed segment by segment: seg0 (DROM) +112
+# (0x234388->0x2343f8, the AI chip label/geometry constants) + seg3 (IROM) +796
+# (0x18c78c->0x18caa8, the AI chip draw / tap gate / force_ai / ai_over_dict /
+# app_book AI branch and timeout fallback) + seg3 alignment pad +4
+# (0x18c790->0x18cab0) - the per-item net plus the tail-note delta equals the
+# total delta, closed item by item.
+# bootloader 21,232 B (hash e7ab5130…, gen26.3 was 79b992dd…; the bootloader embeds a
 # build timestamp so its hash changes every generation with zero behavior change -
 # proven by the gen12->gen13 byte diff: a 6B time string at 0x54 + a 33B digest
 # at 0x52cf-0x52ef); partition-table / ota_data_initial same size and content as
-# gen16.
+# gen26.3 (sha256 byte-identical: 9d5d890b… / 7d2c7ac4…).
 #
 # 重锚记录（2026-10-22，gen24.4：推送/传书界面渲染发灰根治——跨页进入武装页与
 #   推送收官开书强制一次整屏 GC16 擦旧底，gen24.3 真机验收全绿后报的观感缺陷，
@@ -1898,9 +1906,102 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   listening; (4) the full word chain works again after a push's automatic
 #   listen restore; (5) the 40-character prompt shows no half-line truncation;
 #   (6) the regression surface.
+# 重锚记录（2026-10-24，gen26.4：词典卡「AI」入口——M1.2.1 配套设备侧轮，与 APK
+#   侧 M1.2.1（模板库三处状态同步热修 v1.4.1/code6）并行；版本串换代 26.3→26.4）：
+#   ① dict_popup.c/h：新增 DICT_POPUP_TAP_AI；dict_popup_ai_rect()（保存 chip
+#     左侧同头部行，96x52，x=save.x-12-AI_W）；dict_popup_tap 优先判定 AI chip
+#     （仅 s_ai_on && !s_pending 命中，查询态点击忽略）；draw 加 AI chip（深底反白）
+#     并让位头部行宽；force_ai()（show_pending 后置 s_ai_over_dict）/
+#     ai_over_dict()（回退判据）/ set_ai_enabled() / word() getter。
+#   ② app_book.c：点词命中路径 dict_popup_set_ai_enabled(push_sink_ai_enabled())；
+#     reader_panel_action 的 DICT_POPUP_TAP_AI → push_sink_ai_tap_word(本词)
+#     （命中缓存秒出/连上发 0x17/离线入队）+ dict_popup_force_ai() 切查询态；
+#     on_tick 15s 超时分流——ai_over_dict() 为真则 dict_popup_open(本词) 回退
+#     重开词典卡（不丢词典内容），否则原「AI 查询失败」notice。协议零变（0x17 照发）。
+#   ③ tools/dict_popup_host_test.c：test_ai_entry()——AI chip 显隐（默认无/开后有）、
+#     AI 区点击 MISSED（关）/TAP_AI（开）、AI 与 save chip 不重叠、force_ai 后
+#     is_pending+ai_over_dict 真、查询态卡不画 AI、miss 路径 show_pending 不带
+#     over_dict、show_def 后 over_dict 清零、word() getter。
+#   门禁：16/16 runner 全绿（dict_popup 第 15 runner 含 AI entry 断言，变异 6/6
+#     全擒——新增 M6「AI 入口门禁忽略 s_ai_on」）；fullclean（删 build 真全量）
+#     exit 0；8 警告逐条同基线（app_book.c 7 + ui_pinpad.c 1，均不在改动面）；
+#     seg1 双锚再守；段级算术闭合。
+#   锚：Read_Pico.bin 4,071,616 B（相对 gen26.3 的 4,070,704 为 **+912 B**，双操作数
+#   4,071,616-4,070,704=+912）；段级闭合：seg0(DROM)+112（0x234388→0x2343f8，
+#   AI chip 文案/几何常量）+ seg3(IROM)+796（0x18c78c→0x18caa8，AI chip 绘制 /
+#   tap 门禁 / force_ai / ai_over_dict / app_book AI 分支与超时回退）+
+#   seg3 对齐垫 +4（0x18c790→0x18cab0）—— 分项净和 + 尾注差 = 总差，逐分闭合；
+#   seg1 File offs `0x00234418`（gen26.3 为 0x002343a8，+0x70=112B 顺移——
+#   DROM 段增长），paddr = 0x00234418 + 8(段头) + 0x10000(ota_0 基址)
+#   = `0x00244420`（预测）；seg1 Load `0x3fc9c700` 世代不变锚不动、len `0x08a8c`
+#   与 gen26.3 持平——双锚再守。
+#   sha256 `bb9c3963…`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#   与 gen26.3 逐字节一致；bootloader `e7ab5130…`（同 21,232 B，时间戳差异 vs
+#   gen26.3 的 `79b992dd…`）。
+#   本代干跑 zip 不 push、不打 tag（既定纪律：真机一轮收官后统一推 origin）。
+#   真机复测面（待验）：① 词典命中词弹词典卡 + 卡上有可点「AI」；② 点「AI」→
+#   「AI 查询中」卡→2-5s 释义原地更新；③ 离线/失败点「AI」→入队或 15s 回退
+#   词典释义（不丢词典内容）；④ 模板库四操作（切换/删除/恢复默认/编辑保存）后
+#   主编辑框与激活模板名与存储一致（M1.2.1 APK 侧）；⑤ 回归面。
+# Gen26.4 re-anchor (2026-10-24, the dictionary card's "AI" entry - the
+#   device-side M1.2.1 companion round, parallel to the APK-side M1.2.1
+#   template-library three-point state-sync hotfix v1.4.1/code6; the version
+#   tag steps 26.3->26.4):
+#   (1) dict_popup.c/h: new DICT_POPUP_TAP_AI; dict_popup_ai_rect() (left of
+#   the save chip on the same header row, 96x52, x=save.x-12-AI_W);
+#   dict_popup_tap judges the AI chip first (hit only when s_ai_on &&
+#   !s_pending; a querying card's tap is ignored); draw adds the AI chip (dark
+#   fill, inverted text) and narrows the header row; force_ai() (after
+#   show_pending sets s_ai_over_dict) / ai_over_dict() (the fallback predicate)
+#   / set_ai_enabled() / word() getter.
+#   (2) app_book.c: the word-hit path calls
+#   dict_popup_set_ai_enabled(push_sink_ai_enabled()); reader_panel_action's
+#   DICT_POPUP_TAP_AI calls push_sink_ai_tap_word(this word) (cache hit =
+#   instant / connected = send 0x17 / offline = enqueue) plus
+#   dict_popup_force_ai() to switch to the querying card; on_tick's 15 s
+#   timeout splits - when ai_over_dict() is true, dict_popup_open(this word)
+#   falls back to reopening the dictionary card (dictionary content preserved),
+#   otherwise the old "AI 查询失败" notice. The protocol is unchanged (0x17
+#   still goes out).
+#   (3) tools/dict_popup_host_test.c: test_ai_entry() - AI chip show/hide
+#   (absent by default / present when enabled), tapping the AI area MISSED
+#   (off) / TAP_AI (on), AI and save chips never overlap, force_ai makes
+#   is_pending + ai_over_dict true, a querying card draws no AI chip, the miss
+#   path's show_pending carries no over_dict, show_def clears over_dict, the
+#   word() getter.
+#   Gating: 16/16 runners green (the dict_popup runner-15 includes the AI entry
+#   assertions; mutation sweep 6/6 all caught - new M6 "AI entry gate ignores
+#   s_ai_on"); fullclean (build dir removed, a true full rebuild) exit 0; the
+#   8 warnings match the baseline item for item (app_book.c 7 + ui_pinpad.c 1,
+#   neither in the change surface); the seg1 double anchor holds; section
+#   arithmetic closes.
+#   Anchors: Read_Pico.bin 4,071,616 B (**+912 B** vs gen26.3's 4,070,704; both
+#   operands 4,071,616-4,070,704=+912); closed segment by segment: seg0(DROM)
+#   +112 (0x234388->0x2343f8, the AI chip label/geometry constants) +
+#   seg3(IROM) +796 (0x18c78c->0x18caa8, the AI chip draw / tap gate /
+#   force_ai / ai_over_dict / app_book AI branch and timeout fallback) +
+#   seg3 alignment pad +4 (0x18c790->0x18cab0) - **sum of parts + tail-note
+#   delta = total, closed to the byte**; seg1 File offs `0x00234418` (gen26.3
+#   was 0x002343a8, +0x70=112B shifted - the DROM segment grew), paddr =
+#   0x00234418 + 8 (segment header) + 0x10000 (ota_0 base) = `0x00244420`
+#   (predicted); seg1 Load `0x3fc9c700` generation-invariant anchor unmoved,
+#   len `0x08a8c` flat vs gen26.3 - the double anchor holds again.
+#   sha256 `bb9c3963…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to gen26.3; bootloader `e7ab5130…` (same 21,232
+#   B, timestamp difference vs gen26.3's `79b992dd…`).
+#   This generation's dry-run zip is not pushed and no tag is cut (standing
+#   discipline: push to origin in one wave after the hardware round closes).
+#   Live re-test surface (pending): (1) a dictionary hit pops the dictionary
+#   card with a tappable "AI"; (2) tapping "AI" gives the "AI 查询中" card, then
+#   the definition in place within 2-5 s; (3) an offline/failed "AI" tap
+#   enqueues or falls back to the dictionary definition after 15 s (dictionary
+#   content preserved); (4) after the four template-library operations
+#   (switch / delete / restore defaults / edit-save) the main editor and the
+#   active template name match storage (APK-side M1.2.1); (5) the regression
+#   surface.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="d441107b6d6c0fddf1ae56cf5be5474922ae81d4e3db5b5649540a21907f04cc"
+EXPECTED="bb9c39632c3ba70e6029c3203088098b5a621f23fcb0a18c502331f36c43de39"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
