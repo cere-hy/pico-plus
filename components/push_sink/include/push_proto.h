@@ -100,7 +100,7 @@ extern "C" {
 ///                      · Registered and frozen: this line is the registry; the frame
 ///                        layout lives in push_proto.c's ai codec. Java/Python
 ///                        references sync this generation. 0x08..0x0F stay reserved.
-///   gen26.5 0x08        AI 语境释义 + 多帧（M2 收官轮，三端登记即冻结）：
+///   gen26.5 0x08/0x09   AI 语境释义 + 多帧 + 能力使能（M2 收官轮，三端登记即冻结）：
 ///                      · 0x17/0x06 扩上下文：word[64] + book_id(u32 LE) + pos(u32 LE)
 ///                        （书标识 = TF 卡书名 FNV-1a 哈希，pos = 章内字节偏移）；
 ///                        旧 66B 帧按 len 分流继续受理（向后兼容，见 ai 编解码注释）。
@@ -111,6 +111,12 @@ extern "C" {
 ///                      · 0x07 保留不删（老 APK 单帧路）；新 APK 优先 0x08。
 ///                      · 能力位：PUSH_CAP_AI_CONTEXT(1<<1) / PUSH_CAP_AI_MULTI(1<<2)，
 ///                        经 0x18 上报；老 APK 不置位 → 设备逐字节走 M1 老路。
+///                      · 0x09 PUSH_OP_AI_CAPS_ENABLE（手机→设备，8B = 头4 + bits
+///                        u32 LE）：APK 订阅 STATUS 后发一次，声明手机侧支持位。
+///                        双向协商闭环——设备收使能前 0x17 一律 66B 旧帧；收到且
+///                        CONTEXT 置位才发 74B 上下文档；旧 APK 永远不发 0x09 →
+///                        永远收旧帧，零感知兼容；断连清零重发；与 0x05 同模型，
+///                        连上即可（不受「必须武装」闸门限制）。
 ///                      · 0x07 不加上下文回显（241B 帧帽零余量）：设备侧「最近查询
 ///                        上下文」缓存匹配关连。
 ///                      · 登记即冻结：本行即登记；帧布局见 push_proto.c 的 ai 编解码
@@ -128,6 +134,16 @@ extern "C" {
 ///                      · Caps: PUSH_CAP_AI_CONTEXT(1<<1) / PUSH_CAP_AI_MULTI(1<<2)
 ///                        reported via 0x18; an old APK without them keeps the
 ///                        byte-identical M1 path.
+///                      · 0x09 PUSH_OP_AI_CAPS_ENABLE (phone to device, 8 B = 4-byte
+///                        header + bits u32 LE): sent once after the APK subscribes
+///                        to STATUS, declaring the phone-side supported bits. This
+///                        closes the negotiation loop - before the enable arrives
+///                        the device only ever emits the 66 B legacy 0x17; only with
+///                        CONTEXT set does it emit the 74 B contextual frame. An old
+///                        APK never sends 0x09, so it always gets legacy frames:
+///                        zero-perception compatibility. The enable state clears on
+///                        disconnect (re-sent on reconnect) and, like 0x05, works
+///                        without an armed window.
 ///                      · 0x07 carries no context echo (241 B frame is exactly full):
 ///                        the device correlates via its last-query context cache.
 ///                      · Registered and frozen: this line is the registry; layouts
@@ -144,8 +160,10 @@ enum {
     PUSH_OP_AI_RESULT = 0x07,      ///< gen26：AI 释义回传（手机→设备：单词 + 释义文本 / AI definition result)
     PUSH_OP_AI_RESULT_SEG = 0x08,  ///< gen26.5：AI 释义分帧回传（手机→设备；seg_total==1 等价 0x07）/
                                   ///< gen26.5: segmented AI definition (seg_total==1 == 0x07)
-    PUSH_OP_RESERVED_FIRST = 0x09, ///< gen25 预留区续（0x08 已由 gen26.5 启用）/
-                                  ///< gen25 reservation continues (0x08 taken by gen26.5)
+    PUSH_OP_AI_CAPS_ENABLE = 0x09, ///< gen26.5：手机→设备 AI 能力使能（bits u32 LE；收前 0x17 一律旧帧）/
+                                  ///< gen26.5: phone-to-device AI capability enable (legacy 0x17 until seen)
+    PUSH_OP_RESERVED_FIRST = 0x0A, ///< gen25 预留区续（0x08/0x09 已由 gen26.5 启用）/
+                                  ///< gen25 reservation continues (0x08/0x09 taken by gen26.5)
     PUSH_OP_RESERVED_LAST = 0x0F,  ///< gen25 预留区终点（STATUS 从 0x10 起，零重叠）/
                                    ///< gen25 reservation end (STATUS starts at 0x10, no overlap)
 };
@@ -274,6 +292,9 @@ typedef struct {
 
 /// AI 分帧字节上限（含 4 字节 CTRL 头；零填充定长）。/ Segmented frame cap (CTRL header included; zero-padded).
 #define PUSH_AI_SEG_FRAME_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + 2u + 2u + PUSH_AI_SEG_MAX) ///< = 241
+
+/// AI_CAPS_ENABLE（0x09）帧字节数：头(4) + bits(u32 LE)。/ AI_CAPS_ENABLE (0x09) frame size: header + bits.
+#define PUSH_AI_CAPS_ENABLE_LEN (PUSH_CTRL_HDR_LEN + 4u) ///< = 8
 
 /* ---- 能力位图（gen26 能力协商）---- */
 /* Capability bitmap (gen26 capability negotiation). */

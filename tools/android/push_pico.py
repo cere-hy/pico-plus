@@ -83,6 +83,11 @@ PUSH_OP_AI_RESULT = 0x07  # 手机 -> 设备：单词 + 释义 / phone to device
 # gen26.5（M2）：AI 释义分帧回传；seg_total==1 语义等价 0x07，0x07 保留不删。
 # gen26.5 (M2): segmented AI definition; seg_total==1 == 0x07, 0x07 stays.
 PUSH_OP_AI_RESULT_SEG = 0x08
+# gen26.5（M2）：AI 能力使能（手机→设备，bits u32 LE）。APK 订阅 STATUS 后发一次；
+# 设备收前 0x17 一律 legacy 66B——旧 APK 不发，零感知兼容。断连清零重发。
+# gen26.5 (M2): AI capability enable (phone to device, bits u32 LE). Sent once
+# after STATUS subscribe; legacy 66B 0x17 until it arrives. Cleared on disconnect.
+PUSH_OP_AI_CAPS_ENABLE = 0x09
 PUSH_ST_AI_QUERY = 0x17   # 设备 -> 手机：用户点词，请算释义 / device to phone: define this word
 PUSH_ST_CAPS = 0x18       # 设备 -> 手机：能力位图上报 / device to phone: capability bitmap
 PUSH_AI_WORD_MAX = 64

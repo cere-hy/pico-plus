@@ -53,6 +53,13 @@ public final class PushProto {
     // gen26.5 (M2): segmented AI definition. seg_total==1 is equivalent to 0x07;
     // 0x07 stays for the old path, new APKs prefer 0x08 when CAP_AI_MULTI is set.
     public static final int OP_AI_RESULT_SEG = 0x08;
+    // gen26.5（M2）：AI 能力使能（手机→设备）。APK 订阅 STATUS 后发一次；设备收前
+    // 0x17 一律 legacy 66B，收到且 CAP_AI_CONTEXT 置位才发 74B 上下文档——旧 APK
+    // 永远不发，零感知兼容。断连清零重发。
+    // gen26.5 (M2): AI capability enable (phone to device). Sent once after STATUS
+    // subscribe; the device stays on legacy 66B 0x17 until it arrives. An old APK
+    // never sends it -> zero-perception compatibility. Cleared on disconnect.
+    public static final int OP_AI_CAPS_ENABLE = 0x09;
 
     public static final int ST_READY = 0x10;
     public static final int ST_RESUME = 0x11;
@@ -85,6 +92,7 @@ public final class PushProto {
     public static final int AI_STATUS_CTX_QUERY_LEN = 1 + 1 + AI_WORD_MAX + 4 + 4; // 0x17 带上下文体 = 74
     public static final int AI_SEG_MAX = 166;                               // 分帧释义槽：241 - 头4 - wlen1 - word64 - idx2 - total2 - dlen2
     public static final int AI_SEG_FRAME_MAX = 4 + 1 + AI_WORD_MAX + 2 + 2 + 2 + AI_SEG_MAX; // 0x08 = 241
+    public static final int AI_CAPS_ENABLE_MAX = 4 + 4;                    // 0x09 = 8（头4 + bits u32）
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MARKDOWN = 1;
