@@ -61,6 +61,17 @@ public final class PushProtoTest {
         return (int) Long.parseLong(v.get(key).trim());
     }
 
+    /**
+     * 无符号 32 位向量（书标识 / CRC32 / FNV 都可能 ≥ 2^31，经 int 会静默变负——
+     * 正是「跨端契约静默失效」的同族坑，比较必须用 long）。
+     * Unsigned 32-bit vectors (book ids / CRC32 / FNV can exceed 2^31; going through
+     * int silently flips the sign - the same family as a silently broken cross-end
+     * contract, so compare as long).
+     */
+    private static long vecLong(Map<String, String> v, String key) {
+        return Long.parseLong(v.get(key).trim());
+    }
+
     private static String buildLongTitle() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 40; i++) {
@@ -334,6 +345,32 @@ public final class PushProtoTest {
                 == vecInt(v, "caps_ai_ctx_multi_bits"), "0x18 解出 bits == 7");
         check(vecInt(v, "caps_ai_only_bits") == PushProto.CAP_AI_QUERY,
                 "旧对照位图仅 CAP_AI_QUERY（未使能时的基线）");
+
+        // 13) 书标识（跨端契约）：Java 必须与 Python 参考**逐值一致**
+        //     口径不一致的表现是设备算 A、手机算 B → 语境查询静默失效、真机才现形。
+        check(PushProto.fnv1a32(new byte[0]) == vecLong(v, "fnv_empty"), "FNV-1a32(empty) 与参考一致");
+        check(PushProto.fnv1a32("a".getBytes(UTF8)) == vecLong(v, "fnv_a"), "FNV-1a32('a') 与参考一致");
+        check(PushProto.fnv1a32("foobar".getBytes(UTF8)) == vecLong(v, "fnv_foobar"),
+                "FNV-1a32('foobar') 与参考一致");
+        String[][] bookCases = {
+            {"/books/Hold On to Your Kids.epub", "book_id_hold", "带空格书名"},
+            {"/books/战争与和平.txt", "book_id_cjk", "中文书名"},
+            {"/books/The.Great.Gatsby.epub", "book_id_gatsby", "多点文件名"},
+            {"/books/note.tar.gz", "book_id_targz", "多扩展名"},
+            {"/books/README", "book_id_readme", "无扩展名"},
+            {"/books/UPPER.EPUB", "book_id_upper", "大写书名"},
+            {"/books/upper.epub", "book_id_lower", "小写书名"},
+            {"/books/.hidden", "book_id_hidden", "隐藏文件"},
+            {"/sd/books/中文 书名.epub", "book_id_cjk_space", "中文+空格+深层目录"},
+        };
+        for (String[] c : bookCases) {
+            check(PushProto.bookIdFromPath(c[0]) == vecLong(v, c[1]), "书标识对表：" + c[2]);
+        }
+        check(PushProto.bookIdFromPath("") == 0L, "空路径 == 0（无书上下文）");
+        check(PushProto.bookIdFromPath("/x/y/name.epub") == PushProto.bookIdFromPath("name.epub"),
+                "同名 basename 与目录无关");
+        check(PushProto.bookIdFromPath("UPPER.EPUB") != PushProto.bookIdFromPath("upper.epub"),
+                "大小写不折叠（UPPER != upper）");
 
         // 12) gen26.5 TTS 页文本（STATUS 0x19，241B 定长，设备主动 notify）
         //     与 0x08 不同方向、不同语义：0x08 是手机→设备的释义分帧，不复用。

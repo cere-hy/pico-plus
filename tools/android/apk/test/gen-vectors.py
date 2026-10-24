@@ -162,6 +162,26 @@ def main() -> int:
     # 旧 APK 不使能时的对照位图（仅 AI_QUERY）
     v["caps_ai_only_bits"] = pp.PUSH_CAP_AI_QUERY
 
+    # ---- 书标识（跨端契约）：典型文件名 → FNV-1a32（设备/手机必须同值）----
+    # Book id (cross-end contract): typical file names -> FNV-1a32 (must match on device).
+    book_samples = {
+        "book_id_hold": "/books/Hold On to Your Kids.epub",      # 带空格 / spaces
+        "book_id_cjk": "/books/战争与和平.txt",                   # 中文书名 / CJK title
+        "book_id_gatsby": "/books/The.Great.Gatsby.epub",        # 多点名 / many dots
+        "book_id_targz": "/books/note.tar.gz",                   # 多扩展名 / double extension
+        "book_id_readme": "/books/README",                       # 无扩展名 / no extension
+        "book_id_upper": "/books/UPPER.EPUB",                    # 大写 / upper case
+        "book_id_lower": "/books/upper.epub",                    # 小写（须与大写不同）
+        "book_id_hidden": "/books/.hidden",                      # 隐藏文件 / hidden file
+        "book_id_cjk_space": "/sd/books/中文 书名.epub",           # 中文 + 空格 / CJK + space
+    }
+    for k, p in book_samples.items():
+        v[k] = pp.book_id_from_path(p)
+    # 算法标准向量（三端同源自证）/ standard algorithm vectors (self-proof, shared)
+    v["fnv_empty"] = pp.fnv1a32(b"")
+    v["fnv_a"] = pp.fnv1a32(b"a")
+    v["fnv_foobar"] = pp.fnv1a32(b"foobar")
+
     # ---- gen26.5 TTS 页文本（STATUS 0x19，241B 定长）----
     v["tts_frame_len"] = pp.PUSH_ST_TTS_TEXT_FRAME_MAX          # 241
     v["tts_slot"] = pp.PUSH_TTS_TEXT_MAX                        # 234

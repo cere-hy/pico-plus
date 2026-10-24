@@ -114,6 +114,7 @@
 #include "app_registry.h"
 #include "ble_page_turner.h"
 #include "book_layout.h"
+#include "book_id.h"
 #include "book_cover.h"
 #include "book_cover_jobs.h"
 #include "book_lock_collage.h"
@@ -3019,37 +3020,13 @@ static void reader_logical_pages(size_t visual, size_t* left, size_t* right) {
 
 /* ---- gen26.5 Step6：阅读上下文锚点（book_id / pos）----
  * Reading context anchors (book_id / pos) carried by the contextual 0x17 frame.
- */
-
-/**
- * 书标识 = 文件名 basename（去扩展名）的 FNV-1a32 哈希。
- * Book id = FNV-1a32 of the file's basename (extension stripped).
  *
- * 取 basename 而非全路径：跨会话/跨目录稳定、不把用户的目录结构送出去；同名书
- * 哈希冲突可接受——哈希只作**不透明锚点**，设备侧另有 s_path 精确记录（与
- * vocab_log_capture(s_path, …) 的既有惯例一致）。0 保留为「无书上下文」。
- * Basename over full path: stable across sessions and directories, and it keeps the
- * user's directory layout private; a same-name collision is acceptable because the
- * hash is only an opaque anchor while s_path stays the precise record (matching the
- * existing vocab_log_capture(s_path, …) convention). 0 means "no book context".
+ * book_id 是**跨端契约**：算法与口径收在 main/book/book_id.c（纯逻辑、宿主可测），
+ * 手机侧（Python/Java 参考实现）同口径重算才能把查询对回书本——这里不再内联一份，
+ * 避免两处算法漂移。book_id is a **cross-end contract**: the algorithm and its rules
+ * live in main/book/book_id.c (pure logic, host-testable) and the phone side
+ * recomputes it with the same rules; no second copy here, so the two cannot drift.
  */
-static uint32_t reader_book_id(void) {
-    const char *base = s_path;
-    for (const char *p = s_path; *p; ++p) {
-        if (*p == '/') base = p + 1; // 最后一个 '/' 之后 / after the last slash
-    }
-    const char *dot = NULL;
-    for (const char *p = base; *p; ++p) {
-        if (*p == '.') dot = p;      // 最后一个 '.' / the last dot
-    }
-    const size_t n = (dot && dot > base) ? (size_t)(dot - base) : strlen(base);
-    uint32_t h = 2166136261u;        // FNV-1a 偏移基 / FNV offset basis
-    for (size_t i = 0; i < n; ++i) {
-        h ^= (uint8_t)base[i];
-        h *= 16777619u;              // FNV 质数 / FNV prime
-    }
-    return h ? h : 1u;
-}
 
 /**
  * 当前视觉页在章内的起始字节偏移（双栏取左栏）；不可得返回 0。
@@ -5610,7 +5587,7 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         // gen26.5 Step6: carry the book anchor and the hit word's byte offset in the
         // chapter (hit_start, same coordinate space as vocab_log_capture). The frame
         // format follows the negotiation (legacy 66B until enabled).
-        push_sink_ai_tap_word_ctx(word, reader_book_id(), hit_start);
+        push_sink_ai_tap_word_ctx(word, book_id_from_path(s_path), hit_start);
         ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
         if (push_sink_ai_enabled()) pending = dict_popup_show_pending(word);
     }
@@ -6146,7 +6123,7 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             // （比 0 有用，仍属「有书上下文」）。/ The dict-card entry has no hit span,
             // so pos falls back to the current visual page's start offset (better than
             // 0, still "has book context").
-            push_sink_ai_tap_word_ctx(wbuf, reader_book_id(), reader_page_start_offset());
+            push_sink_ai_tap_word_ctx(wbuf, book_id_from_path(s_path), reader_page_start_offset());
             // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
             dict_popup_force_ai(wbuf);     // 卡切查询态并标记 over_dict（超时回退词典）
             ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);

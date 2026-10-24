@@ -480,6 +480,47 @@ public final class PushProto {
         return getU32(frame, 4) & 0xFFFFFFFFL;
     }
 
+    /* ---- 书标识（跨端契约）----
+     * 设备把 book_id 放进 0x17/0x06 上下文档，手机侧必须按**同一口径**再算一遍才能
+     * 把查询对回书本。口径与 main/book/book_id.c、push_pico.py 同源：basename（最后
+     * 一个 '/' 之后）去最后一个扩展名（'.' 为首字符时不切）→ 对 **UTF-8 原始字节**
+     * 做 FNV-1a32；不做大小写折叠、不做 Unicode 归一化；空路径 0，哈希为 0 时返回 1。
+     * 期望值由 gen-vectors.py 从 Python 参考实现生成，PushProtoTest 逐值对表。
+     * The device puts book_id in the contextual 0x17/0x06 frame; the phone must
+     * recompute it with the identical rules to match the query back to the book.
+     * Same rules as main/book/book_id.c and push_pico.py; expectations come from
+     * gen-vectors.py (Python reference) and are table-checked in PushProtoTest.
+     */
+
+    /** FNV-1a32（原始字节）：basis 0x811C9DC5 / prime 0x01000193。 */
+    public static long fnv1a32(byte[] data) {
+        long h = 0x811C9DC5L;
+        if (data == null) return h;
+        for (int i = 0; i < data.length; i++) {
+            h ^= (data[i] & 0xFFL);
+            h = (h * 0x01000193L) & 0xFFFFFFFFL;
+        }
+        return h;
+    }
+
+    /** 路径 → 书标识；空路径返回 0（无书上下文）。 */
+    public static long bookIdFromPath(String path) {
+        if (path == null || path.isEmpty()) {
+            return 0L; // 0 = 无书上下文 / no book context
+        }
+        String base = path;
+        int slash = path.lastIndexOf('/');
+        if (slash >= 0) {
+            base = path.substring(slash + 1); // 只认 '/' / only '/'
+        }
+        int dot = base.lastIndexOf('.');
+        if (dot > 0) {
+            base = base.substring(0, dot); // 首字符为 '.' 的隐藏文件不切 / hidden files keep it
+        }
+        long id = fnv1a32(base.getBytes(UTF8));
+        return id != 0L ? id : 1L; // 0 保留 / 0 is reserved
+    }
+
     /* ---- gen26.5 TTS 页文本（STATUS 0x19，241 B 定长）----
      * op + seq(u16 LE) + total(u16 LE) + len(u16 LE) + text[234]；与 push_proto.c
      * 的 push_st_tts_text_encode、push_pico.py 的 encode_tts_text 逐字节一致。

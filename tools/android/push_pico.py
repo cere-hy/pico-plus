@@ -216,6 +216,33 @@ def encode_set_time(unix_seconds: int) -> bytes:
 # gen26 AI lookup frames (BLE proxy + ride-along); byte-identical to push_sink.
 # --------------------------------------------------------------------------
 
+def fnv1a32(data: bytes) -> int:
+    """FNV-1a32（原始字节）：offset basis 0x811C9DC5 / prime 0x01000193。
+    FNV-1a32 over raw bytes."""
+    h = 0x811C9DC5
+    for b in data:
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def book_id_from_path(path: str) -> int:
+    """书标识（**跨端契约**，与 main/book/book_id.c 同口径）：
+    basename（最后一个 '/' 之后）去最后一个扩展名（'.' 为首字符时不切）→
+    对 **UTF-8 原始字节**做 FNV-1a32；不做大小写折叠、不做 Unicode 归一化。
+    空路径返回 0；哈希为 0 时返回 1（0 保留为「无书上下文」）。
+
+    Book id (a **cross-end contract**, same rules as main/book/book_id.c)."""
+    if not path:
+        return 0
+    base = path.rsplit("/", 1)[-1]
+    dot = base.rfind(".")
+    if dot > 0:
+        base = base[:dot]
+    h = fnv1a32(base.encode("utf-8"))
+    return h if h else 1
+
+
 def encode_ai_query(word: str) -> bytes:
     """gen26 AI_QUERY (0x06): 4-byte header + 1-byte wlen + word，零填充到
     PUSH_AI_WORD_MAX。与 push_proto.c push_ai_query_encode 逐字节一致。"""
@@ -709,7 +736,23 @@ def _selftest() -> int:
         except ValueError:
             check(True, f"使能帧 {bad_len}B 抛 ValueError（严格 8B）")
 
-    # 8) gen26.5 TTS 页文本（STATUS 0x19，241B 定长）
+    # 8) 书标识（跨端契约）：FNV-1a32 标准向量自证 + 口径用例
+    check(fnv1a32(b"") == 0x811C9DC5, "fnv1a32(empty) == 0x811C9DC5")
+    check(fnv1a32(b"a") == 0xE40C292C, "fnv1a32('a') == 0xE40C292C")
+    check(fnv1a32(b"foobar") == 0xBF9CF968, "fnv1a32('foobar') == 0xBF9CF968")
+    # 口径：basename / 扩展名 / 大小写不折叠 / UTF-8 原始字节
+    check(book_id_from_path("/books/a/b/name.epub") == fnv1a32(b"name"), "路径取 basename 去扩展名")
+    check(book_id_from_path("name.epub") == book_id_from_path("/x/y/name.epub"), "与目录无关")
+    check(book_id_from_path("The.Great.Gatsby.epub") == fnv1a32(b"The.Great.Gatsby"), "多点名只去最后扩展名")
+    check(book_id_from_path("note.tar.gz") == fnv1a32(b"note.tar"), "多扩展名只去最后一个")
+    check(book_id_from_path("README") == fnv1a32(b"README"), "无扩展名原样")
+    check(book_id_from_path("/.hidden") == fnv1a32(b".hidden"), "隐藏文件不切扩展名")
+    check(book_id_from_path("UPPER.EPUB") != book_id_from_path("upper.epub"), "大小写不折叠")
+    check(book_id_from_path("/books/战争与和平.txt") == fnv1a32("战争与和平".encode("utf-8")),
+          "中文书名按 UTF-8 原始字节")
+    check(book_id_from_path("") == 0, "空路径 == 0（无书上下文）")
+
+    # 9) gen26.5 TTS 页文本（STATUS 0x19，241B 定长）
     #    帧长断言先行：0x08 那次 243>241 就是靠这道断言在登记期擒住的。
     check(PUSH_ST_TTS_TEXT_FRAME_MAX == 241, f"TTS_TEXT 帧长 == 241（实际 {PUSH_ST_TTS_TEXT_FRAME_MAX}）")
     check(PUSH_ST_TTS_TEXT_FRAME_MAX <= 244, "TTS_TEXT 帧长 <= STATUS notify 帽 244")

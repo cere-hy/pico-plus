@@ -114,6 +114,7 @@ idf_component_register(
         "book/zip_reader.c"
         "book/html_text.c"
         "book/book_layout.c"
+        "book/book_id.c"
         "book/gbk.c"
         "dict/dict_lookup.c"
         "dict/vocab_log.c"
