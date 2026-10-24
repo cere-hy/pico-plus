@@ -41,6 +41,9 @@ static const char* TAG = "dict";
 // NUL) and segments split on \n, so 192 holds any single segment without
 // depending on the push component.
 #define DICT_POPUP_AI_SEG 192
+// gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
+// query-state text: a one-line real status, not a placeholder fake card.
+#define DICT_POPUP_PENDING_TEXT "AI 查询中…"
 
 static char s_word[DICT_POPUP_WORD_MAX];
 static char* s_lines[DICT_POPUP_LINES];
@@ -49,6 +52,14 @@ static bool s_truncated;
 static bool s_saved; ///< 词是否已在生词本 / whether the word is in the vocabulary book
 static int s_anchor_col;  ///< 点词所在侧：0=左半，1=右半 / tapped side: 0=left half, 1=right half
 static bool s_anchor_split; ///< 分半几何开关：双栏生效，单栏横屏维持铺满 / split geometry: two-column only
+// gen26.3 ④ 查询态：卡面停在「AI 查询中…」等 0x07 的状态。s_pending 是双门判定的
+// 唯一依据（app_book 据此区分「本词的查询卡」与「用户手开的词典卡」），reset 与
+// show_def 都会清掉它。/ gen26.3 query state: the card waits on "AI querying..."
+// for 0x07. s_pending is the sole basis of the double gate (app_book tells this
+// word's querying card from a user-opened dict card by it); reset and show_def
+// both clear it.
+static bool s_pending;
+static int64_t s_pending_since_us; ///< 进入查询态的时刻（esp_timer 微秒）/ when the query state began
 
 // 避让锚点：按点词 x 选弹出侧（tap 分界与 gutter 中心重合，单栏横屏同一谓词成立）。
 // Avoidance anchor: pick the popup side by the tap x (the tap boundary coincides with
@@ -100,6 +111,8 @@ void dict_popup_reset(void) {
     s_line_count = 0;
     s_truncated = false;
     s_saved = false;
+    s_pending = false;
+    s_pending_since_us = 0;
     s_word[0] = 0;
 }
 
@@ -121,6 +134,15 @@ static void summary_text(char* out, size_t cap) {
 
 dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y) {
     if (!s_word[0] || !ui_rect_hit(dict_popup_save_rect(), x, y)) return DICT_POPUP_TAP_MISSED;
+    // gen26.3 ④ 查询态卡的 chip 尚未就绪：释义没到，此刻存进去的摘要是状态行而
+    // 不是释义——忽略 chip 点击、卡片保持打开，等 0x07 落地后再存。chip 之外的
+    // 点击照旧走 MISSED 关闭卡片（与词典卡同口径，查询窗口不吞页面点击）。
+    // gen26.3: the querying card's chip is not ready yet - the def has not landed
+    // and the summary would be the status line, not a definition. Ignore the chip
+    // tap and keep the card open until 0x07 lands. Taps off the chip still close
+    // the card as usual (same stance as the dict card; the query window must not
+    // swallow page taps).
+    if (s_pending) return DICT_POPUP_TAP_NOT_READY;
     char summary[288];
     summary_text(summary, sizeof(summary));
     // 移除失败就保持「已存」，保存失败就保持「保存」：chip 永远反映真实落盘结果。
@@ -236,12 +258,91 @@ bool dict_popup_open(const char* word) {
     return ok;
 }
 
+// gen26.3 ④ 「AI 查询中…」卡：词典 miss 且 AI 开着时立即进入查询态。卡面是真实
+// 状态（状态行 + 保存 chip 初值），0x07 到达后由 dict_popup_show_def 原地更新
+// 为释义。词为空或暂存失败返回 false 且不留半张卡，调用方照旧走提示路径。
+// gen26.3 "AI querying..." card: enter the query state at once on a dictionary
+// miss with AI on. The card is a real state (status line plus the save chip's
+// initial value); dict_popup_show_def updates it in place when 0x07 lands.
+// False on an empty word or a staging failure, leaving no half card, so the
+// caller takes its notice path as before.
+bool dict_popup_show_pending(const char* word) {
+    dict_popup_reset();
+    if (!word || !*word) return false;
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    if (!store_line(DICT_POPUP_PENDING_TEXT, strlen(DICT_POPUP_PENDING_TEXT))) {
+        dict_popup_reset(); // 不留半张卡 / leave no half card
+        return false;
+    }
+    s_pending = true;
+    s_pending_since_us = esp_timer_get_time();
+    // 保存 chip 初值与另两条开卡路径同一谓词：反映生词本真实落盘状态。/ The chip's
+    // initial value uses the same predicate as the other two open paths: the real
+    // vocabulary-book state.
+    s_saved = vocab_log_contains(s_word);
+    ESP_LOGI(TAG, "ai pending \"%s\"", s_word);
+    return true;
+}
+
+// gen26.3 ④ 谓词：查询态且查的是本词——app_book 双门判定的核心。word=NULL 只问
+// 查询态；词长超过词头缓冲时按截断词头匹配（卡面显示的就是这个词的截断形）。
+// gen26.3 predicate: the query state for THIS word - the core of app_book's
+// double gate. A NULL word asks only about the state; an overlong word matches
+// on its truncated head (the card shows that word's truncated form anyway).
+bool dict_popup_is_pending(const char* word) {
+    if (!s_pending) return false;
+    if (!word) return true;
+    return strncmp(s_word, word, DICT_POPUP_WORD_MAX - 1) == 0;
+}
+
+// gen26.3 ④ 查询态超时：非查询态恒假；查询态按 esp_timer 时钟判 timeout_us。
+// 手机迟迟不回帧（查询失败/链路断）时调用方把卡片降级为失败提示。/ gen26.3
+// query-state timeout: always false outside the query state; inside it the
+// esp_timer clock decides. The caller degrades the card to a failure notice
+// when the phone never answers (query failed / link down).
+bool dict_popup_pending_expired(int64_t timeout_us) {
+    return s_pending && esp_timer_get_time() - s_pending_since_us >= timeout_us;
+}
+
+// gen26.3 ⑤ AI 释义显示容量（全角字符数）：按当前方向的卡片布局实算。行数用与
+// dict_popup_draw 收行条件完全相同的谓词（行顶+字号 ≤ 卡底-20），每行字数为正文
+// 宽整除 27px 全角字宽。竖屏推导：卡面 {24,540,636,528}（UI_LOCK_WIDTH=684），
+// 正文宽 text_w=636-2*36=564px；头部 26+46+18=90px，底留 20px，行高 42：
+// 42*i ≤ 528-20-27-90=391 → i≤9.30 → 10 行；564/27=20.9 → 20 字/行；
+// 容量 = 10 行 x 20 字 = 200 全角字符。横屏同公式：text_w=1216-48-72=1096 →
+// 40 字/行，10 行 → 400。40 字释义预算占 2 行，竖屏 200 也放得下——匹配，
+// prompt 无需再砍。/ gen26.3 item-5 AI definition capacity in full-width chars,
+// computed from the card layout in the current rotation. The line count uses
+// the exact predicate dict_popup_draw's stop uses (line top + font size <= card
+// bottom - 20) and the per-line count is the text width divided by the 27px
+// full-width advance. Portrait: card {24,540,636,528} (UI_LOCK_WIDTH=684),
+// text_w=636-2*36=564px; header 26+46+18=90px, 20px bottom margin, line height
+// 42: 42*i <= 528-20-27-90=391 -> i<=9.30 -> 10 lines; 564/27=20.9 -> 20 chars
+// per line; capacity = 10 x 20 = 200 full-width chars. Landscape, same formula:
+// text_w=1216-48-72=1096 -> 40 chars per line, 10 lines -> 400. A 40-char
+// budget takes 2 lines and fits even the portrait 200 - it matches, no prompt
+// trim needed.
+int dict_popup_ai_capacity_chars(void) {
+    const EpdRect card = dict_popup_rect();
+    const int text_w = card.width - 2 * DICT_POPUP_PAD;
+    int lines = 0;
+    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) {
+        ++lines;
+    }
+    return lines * (text_w / DICT_POPUP_TEXT_PX);
+}
+
 // gen26 AI 释义开卡：外部释义（手机 0x07 回流 / 预取缓存命中）直接暂存。与
 // dict_popup_open 共用 reset/wrap/store 链路与保存 chip 谓词，唯一区别是不做
-// 本地词典查找。/ gen26 AI definition staging: an external definition (phone
-// 0x07 return / prefetch-cache hit) is staged directly. It shares the
-// reset/wrap/store chain and the save-chip predicate with dict_popup_open; the
-// only difference is that no local dictionary lookup happens.
+// 本地词典查找。gen26.3 ④：查询态卡到达时走的正是原地更新——入口的 reset 已清
+// 掉查询态标志，落定的就是释义态（差分局部刷新，不二次全刷打底）。
+// gen26 AI definition staging: an external definition (phone 0x07 return /
+// prefetch-cache hit) is staged directly. It shares the reset/wrap/store chain
+// and the save-chip predicate with dict_popup_open; the only difference is that
+// no local dictionary lookup happens. gen26.3: a querying card's arrival is
+// exactly this in-place update - the entry reset already cleared the query
+// state, so what lands is the definition state (a differential local refresh,
+// no second full repaint).
 bool dict_popup_show_def(const char* word, const char* def) {
     const int64_t t0 = esp_timer_get_time();
     dict_popup_reset();
@@ -253,10 +354,16 @@ bool dict_popup_show_def(const char* word, const char* def) {
     while (*p && !s_truncated) {
         const char* nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        // 协议上限保证单段必小于 seg；此处钳制纯防御，永不触发。/ The protocol cap
-        // guarantees every segment fits in seg; the clamp is pure defence.
+        // 协议上限保证单段必小于 seg；此处钳制纯防御，永不触发。但钳位必须落在
+        // 字符边界上：从中间砍断一个多字节序列，折行器的 utf8_step 会信引导字节
+        // 踩着 NUL 走过去（ASan 在 300 字段用例上实证过这个越界）。
+        // The protocol cap guarantees every segment fits in seg; the clamp is pure
+        // defence. But the clamp must land on a character boundary: cutting a
+        // multibyte sequence in half makes the wrapper's utf8_step step over the
+        // NUL (ASan proved this overflow on a 300-char segment).
         if (len > sizeof(seg) - 1) len = sizeof(seg) - 1;
         memcpy(seg, p, len);
+        while (len > 0 && ((unsigned char)p[len] & 0xC0) == 0x80) --len; // 续字节回退 / back off continuation bytes
         seg[len] = 0;
         if (len) wrap_text(seg, DICT_POPUP_TEXT_PX, text_w);
         if (s_truncated || !nl) break;

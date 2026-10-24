@@ -105,7 +105,20 @@ def main() -> int:
         if dict_branch < 0:
             failures.append('reader_panel_action(): no READER_PANEL_DICT branch')
         else:
-            branch = action[dict_branch:dict_branch + 400]
+            # 分支窗口：从 READER_PANEL_DICT 到下一个面板判断（或函数尾）。
+            # 曾经这里是 400 字符的魔法数——gen26.3 给 chip 守门加了一段注释，
+            # 把 dict_popup_reset() 挤出窗口，find() 返回 -1，被误判成
+            # "reset 先于 tap" 而假红。窗口只许随代码变大，检测只会更强。
+            # Branch window: from READER_PANEL_DICT to the next panel test (or
+            # the end of the function). This used to be a 400-char magic
+            # number: a gen26.3 comment pushed dict_popup_reset() out of the
+            # window, find() returned -1, and the guard false-flagged
+            # reset-before-tap. The window may only grow with the code, which
+            # can only strengthen the check.
+            tail = re.search(r'\n\s*(?:else )?if \(s_reader_panel',
+                             action[dict_branch + 10:])
+            end = len(action) if not tail else dict_branch + 10 + tail.start()
+            branch = action[dict_branch:end]
             if 'dict_popup_tap(' not in branch:
                 failures.append('reader_panel_action(): the dictionary branch never '
                                 'calls dict_popup_tap()')

@@ -91,6 +91,9 @@ gcc "${flags[@]}" -Itools/transfer_ui_stubs -Icomponents/read_pico_transfer/incl
 python3 tools/test_usb_storage.py
 build/book-tests/transfer-ui
 bash tools/run_app_loop_host_tests.sh
+# gen26.3 词卡查询态 + AI 释义容量（第 15 runner）。
+# gen26.3 querying card + AI definition capacity (runner 15).
+bash tools/run_dict_popup_host_tests.sh
 bash tools/run_display_host_test.sh
 bash tools/run_display_navigation_tests.sh
 bash tools/run_water_turn_host_test.sh

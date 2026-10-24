@@ -183,6 +183,11 @@
 #define BOOK_FONT_PAGE 9
 #define BOOKMARK_MAX 24
 #define BOOKMARK_ROWS 6
+// gen26.3 ④ 「AI 查询中…」卡超时：miss 点词后手机 15s 不回帧即降级为失败提示。
+// 查询卡显示的是真实状态，不能无限期假活。/ gen26.3 "AI querying..." card
+// timeout: 15s without a phone answer degrades the card to a failure notice.
+// The card shows a real state and must never fake forever.
+#define DICT_AI_PENDING_TIMEOUT_US 15000000
 
 typedef enum { SHELF, READING, TOC, MANAGE, BULK, IMPORT, SEARCH, EDIT } book_view_t;
 typedef enum {
@@ -845,21 +850,49 @@ static void prepare_fast_covers(void) {
 }
 void app_book_cover_mode_changed(void) { invalidate_covers(); }
 
-// gen26 AI 释义卡：阅读态且无面板开着时，接住手机回流（0x07）或预取缓存命中的
-// 释义，暂存后直接走 READER_PANEL_DICT 同一绘制/命中/保存链路。有面板开着不抢
-// 焦点——释义已在预取缓存，下次点同一词秒出。返回是否真的开了卡（主循环据此
-// 决定是否呈现）。/ gen26 AI definition card: while reading with no panel open,
-// take the phone-returned (0x07) or prefetch-cache-hit definition and ride the
-// same READER_PANEL_DICT draw/tap/save chain. Never steals focus from an open
-// panel - the definition stays in the prefetch cache and the next tap on the
-// same word shows it instantly. Returns whether a card was actually staged (the
-// main loop uses it to decide whether to present).
+// gen26 AI 释义卡：阅读态接住手机回流（0x07）或预取缓存命中的释义，暂存后直接
+// 走 READER_PANEL_DICT 同一绘制/命中/保存链路。返回是否真的改了卡面（主循环据此
+// 决定是否呈现）。/ gen26 AI definition card: while reading, take the
+// phone-returned (0x07) or prefetch-cache-hit definition and ride the same
+// READER_PANEL_DICT draw/tap/save chain. Returns whether the card actually
+// changed (the main loop uses it to decide whether to present).
+//
+// gen26.3 ④ 双门（本轮最需小心的交互，两个门按词比对、语义分开）：
+// 门 A（原语义保留）：无面板 —— 直接开卡；有**其他**面板（用户手开的词典卡、
+//   设置页等）—— 不抢焦点，释义丢弃（它已在预取缓存里，下次点同一词秒出）。
+// 门 B（新）：开着的正是**本词的「AI 查询中…」卡** —— 原地更新为释义，面板不变，
+//   差分局部刷新，不二次全刷打底。不同词不更新（卡片已翻到别的词，门 A 照旧）。
+// gen26.3 double gate (the round's most delicate interaction - two gates, both
+// compare by word, semantics kept apart):
+// gate A (original semantics kept): no panel - open the card; any OTHER panel
+//   (a user-opened dict card, a settings page, ...) - never steal focus, the
+//   def is dropped (it is already in the prefetch cache; the next tap on the
+//   same word shows it instantly).
+// gate B (new): the open card is THIS word's "AI querying..." card - update it
+//   in place with the panel unchanged: a differential local refresh, no second
+//   full repaint. A different word never updates (the card moved on to another
+//   word; gate A still applies).
 bool app_book_ai_def_ready(const char* word, const char* def) {
     if (s_view != READING || !s_text) return false;
-    if (s_reader_panel != READER_PANEL_NONE) return false;
-    if (!dict_popup_show_def(word, def)) return false;
-    s_reader_panel = READER_PANEL_DICT;
-    return true;
+    if (s_reader_panel == READER_PANEL_NONE) {
+        if (!dict_popup_show_def(word, def)) return false;
+        s_reader_panel = READER_PANEL_DICT;
+        return true;
+    }
+    if (s_reader_panel == READER_PANEL_DICT && dict_popup_is_pending(word)) {
+        // 门 B：原地更新。staging 失败（空释义等）不留一张空白卡假活跃——
+        // 关卡并如实提示，主循环照旧呈现（状态确实变了）。/ Gate B: in-place
+        // update. A staging failure (empty def, ...) leaves no blank card
+        // faking activity - close the card and say so; the main loop still
+        // presents (the state really changed).
+        if (dict_popup_show_def(word, def)) return true;
+        dict_popup_reset();
+        s_reader_panel = READER_PANEL_NONE;
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "AI 查询失败");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        return true;
+    }
+    return false; // 门 A：其他面板开着，释义丢弃进预取缓存 / gate A: another panel, drop into the cache
 }
 static uint8_t* load_cover_gray(const char* source, const char* title, const char* author,
                                 bool decode, bool* pending) {
@@ -5500,16 +5533,25 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
              (long long)((esp_timer_get_time() - t_hit) / 1000),
              (long long)((esp_timer_get_time() - t_start) / 1000));
     // 词典 miss（含词典整体不可用）才请 AI 补位；命中时一词一答，0x17 不再发出。
-    // 此时 miss 分支的 s_reader_panel 必为 NONE，AI 释义卡不再被面板门丢弃。
     // Only a dictionary miss (including the dictionary being entirely
     // unavailable) asks AI to fill in; on a hit there is one tap one answer
-    // and 0x17 is never sent. The miss branch leaves s_reader_panel at NONE,
-    // so the AI definition card is no longer dropped by the panel gate.
+    // and 0x17 is never sent.
+    //
+    // gen26.3 ④：AI 开着就地弹「AI 查询中…」卡——真实状态，不是假卡；0x07 到达
+    // 由 app_book_ai_def_ready 的门 B 原地更新为释义（预取缓存命中时释义已在 UI
+    // 槽，下一个轮询 tick ≤500ms 完成更新）。AI 关着才走「词典未收录」提示。
+    // gen26.3: with AI on, open the "AI querying..." card in place - a real
+    // state, not a fake card; when 0x07 lands, app_book_ai_def_ready's gate B
+    // updates it in place (on a prefetch-cache hit the def is already in the UI
+    // slot and the next poll tick, <=500ms, completes the update). The "not
+    // collected" notice only fires when AI is off.
+    bool pending = false;
     if (hit && english && !found) {
         push_sink_ai_tap_word(word);
         ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
+        if (push_sink_ai_enabled()) pending = dict_popup_show_pending(word);
     }
-    if (found) {
+    if (found || pending) {
         s_reader_panel = READER_PANEL_DICT;
     } else {
         dict_popup_reset();
@@ -6010,6 +6052,10 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
         // chip 上切换生词本并保留卡片；点其它地方照旧关闭。
         // The chip toggles the vocabulary book and keeps the card; anywhere else closes.
         dict_popup_tap_t tap = dict_popup_tap(x, y);
+        // gen26.3 查询态卡：chip 点击忽略（存进去会是状态行），零变化不 redraw。
+        // gen26.3 querying card: chip tap ignored (a save would store the
+        // status line); zero state change, so no redraw.
+        if (tap == DICT_POPUP_TAP_NOT_READY) return APP_REDRAW_NONE;
         if (tap == DICT_POPUP_TAP_MISSED) {
             dict_popup_reset();
             s_reader_panel = READER_PANEL_NONE;
@@ -7480,6 +7526,23 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             ctx->request_app = &app_transfer;
             return APP_REDRAW_NONE;
         }
+    }
+    // gen26.3 ④ 查询卡超时降级：miss 点词弹了「AI 查询中…」卡，手机 15s 不回帧
+    // （查询失败/链路断）就不能让卡片永远假活着——关卡 + 失败提示，与「真实状态
+    // 非假卡」同口径。/ gen26.3 querying-card timeout: after a miss tap opened
+    // the "AI querying..." card, a phone that never answers within 15s (query
+    // failed / link down) must not leave the card faking forever - close the
+    // card and show the failure, the same "real state, not a fake card" stance.
+    if (s_view == READING && s_reader_panel == READER_PANEL_DICT &&
+        dict_popup_pending_expired(DICT_AI_PENDING_TIMEOUT_US)) {
+        ESP_LOGW(TAG, "ai pending card timed out after %llds",
+                 (long long)(DICT_AI_PENDING_TIMEOUT_US / 1000000));
+        dict_popup_reset();
+        s_reader_panel = READER_PANEL_NONE;
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "AI 查询失败");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        invalidate_prep();
+        return APP_REDRAW_PAGE;
     }
     // 字体开关留下的重排在这里做：触摸回调的栈太深，一章排下来会把主任务栈顶穿（实测溢出过）。
     // The font switch's re-typeset happens here: the touch callback runs too deep, and laying out a

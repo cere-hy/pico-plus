@@ -192,16 +192,24 @@ public final class AiClient {
     }
 
     /**
-     * 系统提示：约束输出形态，让释义短到能塞进 169 字节的帧（设备侧单帧上限）。
-     * 这层「让模型自己说短」是第一道防线，fitUtf8 是第二道。
+     * 系统提示（M1.1 ③ 40 字硬约束）：把输出形态钉死——「释义不超过 40 字，
+     * 一句核心词义 + 一个短语示例」，且强制纯文本。这是第一道防线（让模型自己
+     * 就范），fitUtf8 的 169 字节帧帽是第二道。40 个汉字 x 3 字节 = 120 字节，
+     * 帧帽（169）与设备词卡容量（竖屏 200 全角字符，gen26.3 ⑤ 实算）都放得下
+     * ——预算与两端容量自洽，无需再砍。
      *
-     * Keep the model terse so the answer fits one 169-byte frame. This is the
-     * first line of defense; fitUtf8 is the second.
+     * System prompt (M1.1 item-3 40-character hard constraint): pin the output
+     * shape - the definition stays within 40 characters, one core meaning plus
+     * one phrase example, plain text only. First line of defence (the model
+     * behaves); fitUtf8's 169-byte frame cap is the second. 40 chars x 3 bytes
+     * = 120 bytes fits both the frame cap and the device card capacity (200
+     * full-width chars in portrait, gen26.3 item-5) - the budget is consistent
+     * with both ends, no further trim needed.
      */
     static String systemPrompt() {
         return "你是电子墨水屏阅读器的词典助手。用户给出英文单词，你只返回该词在语境中最常用的"
-                + "中文释义，格式为「词性. 中文释义」。不要例句、不要音标、不要解释、不要换行，"
-                + "总长不超过 50 个汉字。";
+                + "中文释义：释义不超过 40 字，一句核心词义 + 一个短语示例。"
+                + "只输出纯文本：不要 Markdown、不要音标、不要解释、不要换行。";
     }
 
     /** 模型输出清洗：去首尾空白、压掉换行与 Markdown 标记。/ Tidy up the model output. */

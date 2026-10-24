@@ -128,6 +128,24 @@ public final class AiClientTest {
         check(AiClient.DEFAULT_MODEL.equals("deepseek-chat"), "默认 model = deepseek-chat");
         check(AiClient.DEF_MAX_BYTES == 169, "释义上限 169 字节（设备侧 170 留 NUL）");
 
+        // 14) M1.1 ③ Prompt 40 字硬约束：一句核心词义 + 一个短语示例 + 纯文本。
+        // 与 gen26.3 ⑤ 容量实算联动：40 汉字 x 3 字节 = 120 <= 169 帧帽，
+        // 且 <= 设备竖屏词卡容量 200 全角字符——预算与两端容量自洽。
+        // M1.1 item-3: the 40-character hard constraint (one core meaning plus
+        // one phrase example, plain text). Linked to gen26.3 item-5: 40 chars x
+        // 3 bytes = 120 <= the 169-byte frame cap and <= the device's 200-char
+        // portrait capacity - the budget is consistent with both ends.
+        String prompt = AiClient.systemPrompt();
+        check(prompt.contains("40 字"), "系统提示钉死「40 字」硬约束");
+        check(prompt.contains("短语示例"), "系统提示要求一个短语示例");
+        check(prompt.contains("纯文本"), "系统提示强制纯文本");
+        check(prompt.contains("Markdown"), "系统提示排除 Markdown");
+        check(!prompt.contains("50 个汉字"), "旧的 50 字约束已移除（不是并存两个数）");
+        check(40 * 3 <= AiClient.DEF_MAX_BYTES,
+                "40 字 x 3 字节 = 120 <= 169 帧帽（预算与帧帽自洽）");
+        check(AiClient.buildRequest(cfg, "serendipity").contains("40 字"),
+                "请求体真的带着 40 字约束（prompt 进了 system 消息）");
+
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));
         System.exit(fail == 0 ? 0 : 1);

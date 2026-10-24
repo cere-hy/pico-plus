@@ -1804,9 +1804,103 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   uncollected word surfaces the AI card; (3) push.txt opens without bouncing
 #   while listening; (4) the full word chain works again after a push's automatic
 #   listen restore; (5) the regression surface.
+#
+# 重锚记录（gen26.3 五项终版——上述三项之外，用户修订令新增 ④ 查询态卡 + 双门、
+#   ⑤ 词卡容量确认，M1.1 新增 ③ Prompt 40 字硬约束；版本串仍为 0.3.3-pico26.3
+#   不换代，产物重锚）：
+#   ④ app_book.c/dict_popup.c：miss 分支在发 0x17 前先弹「AI 查询中…」卡
+#     （dict_popup_show_pending 暂存词 + 状态行 + chip 初值）；app_book_ai_def_ready
+#     双门重写——门 A（保留）：无面板直接开卡 / 有他人面板不抢焦点、释义丢弃
+#     （已在预取缓存，下次点同词秒出）；门 B（新）：开着的正是本词查询卡才
+#     dict_popup_show_def 原地更新（差分局部刷新不二次打底），不同词不更新。
+#     谓词按截断头前缀匹配（s_word 截 47 字 vs 0x07 槽词可达 63 字）。on_tick
+#     15s 超时降级「AI 查询失败」notice（真实状态非假卡）。查询态 chip 点击忽略
+#     （DICT_POPUP_TAP_NOT_READY，零变化不 redraw；卡外点击照旧 MISSED 关闭）。
+#     顺手修真 bug：show_def 钳位落字符边界（ASan 实证的栈溢出读）。
+#   ⑤ dict_popup_ai_capacity_chars 与 draw 收行条件同口径实算：竖屏 10 行 ×
+#     20 字 = 200 全角字符（横屏 400）；40 字 ×3 字节 =120 ≤169 帧帽 ≤200 容量，
+#     预算自洽无需微调。
+#   M1.1③ AiClient.java：systemPrompt 改「释义不超过 40 字，一句核心词义 + 一个
+#     短语示例」+ 强制纯文本（旧文 50 字 + 词性格式移除）；AiClientTest 补 7 断言。
+#   门禁：宿主 15/15 runner 全绿（push_sink 248 checks, 0 red；dict_popup 第 15
+#     runner 含双门谓词/容量 200/400/折行边界/超时/reset，变异 5/5 全擒）；
+#     fullclean（删 build 真全量）exit 0，C 1244 / CXX 28 / ASM 26 = 1,298 编译
+#     单元与 gen26.2 基线持平；8 警告逐条同基线（app_book.c 7 + ui_pinpad.c 1，
+#     均不在改动面）；seg1 双锚再守；段级算术闭合。
+#   锚：Read_Pico.bin 4,070,704 B（相对 gen26.2 的 4,070,048 为 **+656 B**，双操作数
+#   4,070,704-4,070,048=+656）；段级净和 seg0(DROM)+160（0x2342e8→0x234388，
+#   本轮注释与容量函数）+ seg3(IROM)+496（0x18c59c→0x18c78c，双门/超时/
+#   NOT_READY 逻辑）+ 尾注差 0——**分项净和 + 尾注差 = 总差，逐分闭合**；
+#   seg1 File offs `0x002343a8`（gen26.2 为 0x00234308，+0xa0=160B 顺移——
+#   DROM 段增长），paddr = 0x002343a8 + 8(段头) + 0x10000(ota_0 基址)
+#   = `0x002443b0`（预测）；seg1 Load `0x3fc9c700` 世代不变锚不动、len `0x08a8c`
+#   与 gen26.2 持平——双锚再守。
+#   sha256 `d441107b…`；partition-table `9d5d890b…`、ota_data_initial `7d2c7ac4…`
+#   与 gen26.2 逐字节一致；bootloader `79b992dd…`（同 21,232 B，时间戳差异 vs
+#   gen26.2 的 `36c0a5e3…`）。
+#   本代干跑 zip 不 push、不打 tag；zip 重打（RELEASE_NOTES gen22 残留修正 +
+#   内嵌 v1.3 APK）随真机六验收通过后进行（既定纪律）。真机复测面（待验）：
+#   ① 命中词串口无 0x17；② miss 卡立即出现→2-5s 原地变释义无二次打底；③ 监听态
+#   开 push.txt 不弹回；④ 推送后自动恢复点词全链；⑤ 40 字实证无半行截断；
+#   ⑥ 回归面。
+# Gen26.3 five-item final (beyond the three items above, the user's revised order
+#   adds 4 the querying card + double gate and 5 the word-card capacity check,
+#   and M1.1 adds 3 the 40-character prompt constraint; the version tag stays
+#   0.3.3-pico26.3 - no new fork - and the artifacts are re-anchored):
+#   (4) app_book.c/dict_popup.c: the miss branch now pops the "AI 查询中…" card
+#   before sending 0x17 (dict_popup_show_pending stashes the word + status line +
+#   chip seed); app_book_ai_def_ready is rewritten as a double gate - gate A
+#   (keep): no panel opens the card directly / another panel never steals focus
+#   and the definition is dropped (already in the prefetch cache, the next tap on
+#   the same word is instant); gate B (new): only when the open card is THIS
+#   word's querying card does dict_popup_show_def update in place (partial
+#   refresh, no second underpaint), a different word never updates. The predicate
+#   matches on the truncated head prefix (s_word truncated to 47 chars vs the
+#   0x07 slot word's up to 63). on_tick degrades to an "AI 查询失败" notice after
+#   15 s (a real state, not a fake card). A querying card's chip tap is ignored
+#   (DICT_POPUP_TAP_NOT_READY, zero change so no redraw; taps outside the card
+#   still close via MISSED). Real bug fixed in passing: show_def's clamp now
+#   lands on a character boundary (an ASan-proven stack overread).
+#   (5) dict_popup_ai_capacity_chars computes at the same yardstick as the
+#   draw's line cutoff: portrait 10 lines x 20 chars = 200 full-width characters
+#   (landscape 400); 40 chars x 3 bytes = 120 <= 169 frame cap <= 200 capacity,
+#   the budget is self-consistent, no tuning needed.
+#   M1.1(3) AiClient.java: the system prompt becomes "definition at most 40
+#   characters, one core sense + one phrase example" and enforces plain text (the
+#   old 50-character + part-of-speech format is removed); AiClientTest gains 7
+#   assertions.
+#   Gate: host 15/15 runners green (push_sink 248 checks, 0 red; dict_popup is
+#   runner 15 covering the double-gate predicate / capacity 200/400 / wrap
+#   bounds / timeout / reset, mutations 5/5 all caught); fullclean (build dir
+#   removed, a true full run) exit 0, C 1244 / CXX 28 / ASM 26 = 1,298 units
+#   flat vs the gen26.2 baseline; 8 warnings line-identical to baseline
+#   (app_book.c 7 + ui_pinpad.c 1, neither in the change surface); the seg1
+#   double anchor holds; section arithmetic closes.
+#   Anchors: Read_Pico.bin 4,070,704 B (**+656 B** vs gen26.2's 4,070,048; both
+#   operands 4,070,704-4,070,048=+656); segment-level sum seg0(DROM)+160
+#   (0x2342e8->0x234388, this round's comments and the capacity function) +
+#   seg3(IROM)+496 (0x18c59c->0x18c78c, the double gate / timeout / NOT_READY
+#   logic) + footer delta 0 - **sum of parts + footer delta = total, closed to
+#   the byte**; seg1 File offs `0x002343a8` (gen26.2 was 0x00234308, +0xa0=160B
+#   shifted - the DROM segment grew), paddr = 0x002343a8 + 8 (segment header) +
+#   0x10000 (ota_0 base) = `0x002443b0` (predicted); seg1 Load `0x3fc9c700`
+#   generation-invariant anchor unmoved, len `0x08a8c` flat vs gen26.2 - the
+#   double anchor holds again.
+#   sha256 `d441107b…`; partition-table `9d5d890b…` and ota_data_initial
+#   `7d2c7ac4…` byte-identical to gen26.2; bootloader `79b992dd…` (same 21,232 B,
+#   timestamp difference vs gen26.2's `36c0a5e3…`).
+#   This generation's dry-run zip is not pushed and no tag is cut; the zip
+#   rebuild (RELEASE_NOTES gen22-residue fix + embedding the v1.3 APK) follows a
+#   green six-point hardware acceptance (standing discipline). Live re-test
+#   surface (pending): (1) a dictionary hit sends no 0x17 on the serial log;
+#   (2) a miss card appears at once, then becomes the definition in place within
+#   2-5 s with no second underpaint; (3) push.txt opens without bouncing while
+#   listening; (4) the full word chain works again after a push's automatic
+#   listen restore; (5) the 40-character prompt shows no half-line truncation;
+#   (6) the regression surface.
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="6728fbaaf66df76f829e34a5d0515e20f63d8a27c9d752bdd18e0ca88f3f3a00"
+EXPECTED="d441107b6d6c0fddf1ae56cf5be5474922ae81d4e3db5b5649540a21907f04cc"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
