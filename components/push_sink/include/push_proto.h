@@ -100,6 +100,39 @@ extern "C" {
 ///                      · Registered and frozen: this line is the registry; the frame
 ///                        layout lives in push_proto.c's ai codec. Java/Python
 ///                        references sync this generation. 0x08..0x0F stay reserved.
+///   gen26.5 0x08        AI 语境释义 + 多帧（M2 收官轮，三端登记即冻结）：
+///                      · 0x17/0x06 扩上下文：word[64] + book_id(u32 LE) + pos(u32 LE)
+///                        （书标识 = TF 卡书名 FNV-1a 哈希，pos = 章内字节偏移）；
+///                        旧 66B 帧按 len 分流继续受理（向后兼容，见 ai 编解码注释）。
+///                      · 0x08 PUSH_OP_AI_RESULT_SEG：手机→设备，AI 释义分帧回传。
+///                        布局：头(4)+wlen(1)+word[64]+seg_idx(u16 LE)+seg_total(u16 LE)
+///                        +dlen(u16 LE)+seg[166]，零填充定长 241B（帧帽恰尽）；
+///                        UTF-8 字符边界切分；seg_total==1 时语义等价 0x07。
+///                      · 0x07 保留不删（老 APK 单帧路）；新 APK 优先 0x08。
+///                      · 能力位：PUSH_CAP_AI_CONTEXT(1<<1) / PUSH_CAP_AI_MULTI(1<<2)，
+///                        经 0x18 上报；老 APK 不置位 → 设备逐字节走 M1 老路。
+///                      · 0x07 不加上下文回显（241B 帧帽零余量）：设备侧「最近查询
+///                        上下文」缓存匹配关连。
+///                      · 登记即冻结：本行即登记；帧布局见 push_proto.c 的 ai 编解码
+///                        （gen26.5 节）。Java/Python 参考实现同代同步。
+///   gen26.5 0x08        AI contextual definitions + multi-frame (M2 closing round,
+///                      registered and frozen across all three ends):
+///                      · 0x17/0x06 gain context: word[64] + book_id(u32 LE) +
+///                        pos(u32 LE) (book id = FNV-1a of the TF-card book name,
+///                        pos = byte offset within the chapter); the old 66 B frame
+///                        stays accepted by length dispatch (see the ai codec notes).
+///                      · 0x08 PUSH_OP_AI_RESULT_SEG: phone to device, segmented
+///                        definition. seg_idx/seg_total (u16 LE) + a ≤170 B slice cut
+///                        on UTF-8 boundaries; seg_total==1 is equivalent to 0x07.
+///                      · 0x07 stays (old single-frame path); new APKs prefer 0x08.
+///                      · Caps: PUSH_CAP_AI_CONTEXT(1<<1) / PUSH_CAP_AI_MULTI(1<<2)
+///                        reported via 0x18; an old APK without them keeps the
+///                        byte-identical M1 path.
+///                      · 0x07 carries no context echo (241 B frame is exactly full):
+///                        the device correlates via its last-query context cache.
+///                      · Registered and frozen: this line is the registry; layouts
+///                        live in push_proto.c's ai codec (gen26.5 section). Java and
+///                        Python references sync this generation.
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
@@ -107,10 +140,12 @@ enum {
     PUSH_OP_ABORT = 0x04,         ///< 放弃本次会话 / abandon the session
     PUSH_OP_SET_TIME = 0x05,      ///< gen22：手机下发 UTC 秒（4 字节小端）校准设备时钟 /
                                   ///< phone pushes a UTC second count (4 bytes LE) to set the clock
-    PUSH_OP_AI_QUERY = 0x06,       ///< gen26：AI 查词请求（手机→设备：触发离线队列回流 / AI word-query request）
-    PUSH_OP_AI_RESULT = 0x07,      ///< gen26：AI 释义回传（手机→设备：单词 + 释义文本 / AI definition result）
-    PUSH_OP_RESERVED_FIRST = 0x08, ///< gen25 预留区续（未实现，收到即 ERR(2)）/
-                                   ///< gen25 reservation continues (unimplemented; ERR(2) on receipt)
+    PUSH_OP_AI_QUERY = 0x06,       ///< gen26：AI 查词请求（手机→设备：触发离线队列回流 / AI word-query request)
+    PUSH_OP_AI_RESULT = 0x07,      ///< gen26：AI 释义回传（手机→设备：单词 + 释义文本 / AI definition result)
+    PUSH_OP_AI_RESULT_SEG = 0x08,  ///< gen26.5：AI 释义分帧回传（手机→设备；seg_total==1 等价 0x07）/
+                                  ///< gen26.5: segmented AI definition (seg_total==1 == 0x07)
+    PUSH_OP_RESERVED_FIRST = 0x09, ///< gen25 预留区续（0x08 已由 gen26.5 启用）/
+                                  ///< gen25 reservation continues (0x08 taken by gen26.5)
     PUSH_OP_RESERVED_LAST = 0x0F,  ///< gen25 预留区终点（STATUS 从 0x10 起，零重叠）/
                                    ///< gen25 reservation end (STATUS starts at 0x10, no overlap)
 };
@@ -206,6 +241,40 @@ size_t push_st_ai_query_encode(const char *word, uint8_t *out, size_t cap);
 #define PUSH_AI_QUERY_MAX  (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX)
 #define PUSH_AI_RESULT_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + PUSH_AI_DEF_MAX)
 
+/* ---- AI 语境帧（gen26.5，0x17/0x06 扩上下文）---- */
+/* AI contextual frames (gen26.5, 0x17/0x06 with context). */
+
+/// 上下文查询（STATUS 0x17 / CTRL 0x06 扩展负载）：词 + 书标识 + 章内位置。
+/// Contextual query payload (STATUS 0x17 / CTRL 0x06 extended): word + book id + position.
+typedef struct {
+    char word[PUSH_AI_WORD_MAX]; ///< 待查单词 / the word
+    uint32_t book_id;            ///< TF 卡书名 FNV-1a 哈希；0 = 无书上下文 / FNV-1a of the book name; 0 = none
+    uint32_t pos;                ///< 章内字节偏移；0 = 未知 / byte offset in the chapter; 0 = unknown
+} push_ai_query_ctx_t;
+
+/// AI 帧字节上限（gen26.5 带上下文版本，含 4 字节 CTRL 头 / 含 1 字节 op 的 STATUS）。
+/// Frame caps for the gen26.5 contextual versions (CTRL header / STATUS op included).
+#define PUSH_AI_CTX_QUERY_MAX   (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 4u + 4u) ///< = 77
+#define PUSH_ST_AI_CTX_QUERY_LEN (1u + 1u + PUSH_AI_WORD_MAX + 4u + 4u)              ///< = 74（STATUS 0x17 帧全长：op+wlen+word+ctx）
+#define PUSH_ST_AI_LEGACY_QUERY_LEN (1u + 1u + PUSH_AI_WORD_MAX)                     ///< = 66（旧 0x17 帧全长；len 分流：66→旧路，74→新路）
+
+/* ---- AI 释义分帧（gen26.5，0x08）---- */
+/* AI definition segments (gen26.5, 0x08). */
+
+#define PUSH_AI_SEG_MAX 166u ///< 分帧释义槽（UTF-8 字节）：241 帧帽 - 头4 - wlen1 - word64 - idx2 - total2 - dlen2 / segment slot cap
+
+/// AI_RESULT_SEG（0x08）CTRL 载荷：分帧回传释义。/ AI_RESULT_SEG (0x08) payload: segmented definition.
+typedef struct {
+    char word[PUSH_AI_WORD_MAX]; ///< 单词（每帧都带，重组端按词关连）/ the word (every frame; correlation key)
+    uint16_t seg_idx;            ///< 本帧序号，从 0 起 / this frame's index, 0-based
+    uint16_t seg_total;          ///< 总帧数；==1 时语义等价 0x07 / total frames; 1 == plain 0x07
+    uint16_t dlen;               ///< 本帧 seg 有效字节数（≤ PUSH_AI_SEG_MAX）/ valid bytes in seg this frame
+    char seg[PUSH_AI_SEG_MAX];   ///< 本帧释义片段（UTF-8，边界由编码方保证）/ this frame's slice
+} push_ai_seg_t;
+
+/// AI 分帧字节上限（含 4 字节 CTRL 头；零填充定长）。/ Segmented frame cap (CTRL header included; zero-padded).
+#define PUSH_AI_SEG_FRAME_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + 2u + 2u + PUSH_AI_SEG_MAX) ///< = 241
+
 /* ---- 能力位图（gen26 能力协商）---- */
 /* Capability bitmap (gen26 capability negotiation). */
 
@@ -213,7 +282,9 @@ typedef struct {
     uint32_t bits; ///< 能力位掩码 / capability bitmask
 } push_caps_t;
 
-#define PUSH_CAP_AI_QUERY (1u << 0) ///< 设备支持 AI 查词（0x06/0x07 + 0x17）/ device supports AI lookup
+#define PUSH_CAP_AI_QUERY  (1u << 0) ///< 设备支持 AI 查词（0x06/0x07 + 0x17）/ device supports AI lookup
+#define PUSH_CAP_AI_CONTEXT (1u << 1) ///< gen26.5：0x17/0x06 带书标识+位置上下文 / gen26.5: contextual 0x17/0x06
+#define PUSH_CAP_AI_MULTI   (1u << 2) ///< gen26.5：0x08 释义分帧 / gen26.5: segmented definitions (0x08)
 
 /// 编能力位图 STATUS 帧（op 0x18 + 4 字节小端位掩码）。/ Encode a capability bitmap STATUS frame.
 size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap);

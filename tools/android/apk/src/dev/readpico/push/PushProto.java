@@ -48,6 +48,11 @@ public final class PushProto {
     // responder chain - registration freezes, changing breaks shipped firmware.
     public static final int OP_AI_QUERY = 0x06;  // 手机→设备：触发回流 / 即时查询
     public static final int OP_AI_RESULT = 0x07; // 手机→设备：单词 + 释义回传
+    // gen26.5（M2）：AI 释义分帧回传。seg_total==1 时语义等价 0x07（首帧即终帧）；
+    // 0x07 保留不删（老 APK 单帧路），新 APK 在设备上报 CAP_AI_MULTI 时优先 0x08。
+    // gen26.5 (M2): segmented AI definition. seg_total==1 is equivalent to 0x07;
+    // 0x07 stays for the old path, new APKs prefer 0x08 when CAP_AI_MULTI is set.
+    public static final int OP_AI_RESULT_SEG = 0x08;
 
     public static final int ST_READY = 0x10;
     public static final int ST_RESUME = 0x11;
@@ -70,6 +75,16 @@ public final class PushProto {
     public static final int AI_STATUS_QUERY_MAX = 1 + 1 + AI_WORD_MAX;       // 0x17 = 66
     /** 设备支持 AI 查词（0x06/0x07 + 0x17）的能力位。/ Device supports AI lookup. */
     public static final int CAP_AI_QUERY = 1 << 0;
+    // gen26.5（M2）：0x17/0x06 带书标识+位置上下文；0x08 释义分帧。老 APK 不置位 →
+    // 设备逐字节走 M1 老路（向后兼容枢轴）。gen26.5 (M2): contextual 0x17/0x06 and
+    // segmented 0x08; an old APK without these keeps the byte-identical M1 path.
+    public static final int CAP_AI_CONTEXT = 1 << 1;
+    public static final int CAP_AI_MULTI = 1 << 2;
+    // gen26.5（M2）帧长：带上下文的查询与分帧。gen26.5 (M2) frame sizes.
+    public static final int AI_CTX_QUERY_MAX = 4 + 1 + AI_WORD_MAX + 4 + 4;  // 0x06 带上下文 = 77
+    public static final int AI_STATUS_CTX_QUERY_LEN = 1 + 1 + AI_WORD_MAX + 4 + 4; // 0x17 带上下文体 = 74
+    public static final int AI_SEG_MAX = 166;                               // 分帧释义槽：241 - 头4 - wlen1 - word64 - idx2 - total2 - dlen2
+    public static final int AI_SEG_FRAME_MAX = 4 + 1 + AI_WORD_MAX + 2 + 2 + 2 + AI_SEG_MAX; // 0x08 = 241
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MARKDOWN = 1;

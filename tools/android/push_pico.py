@@ -80,11 +80,19 @@ PUSH_ST_PROGRESS = 0x16
 # gen26 AI lookup opcodes (BLE proxy + ride-along); byte-identical to push_proto.h.
 PUSH_OP_AI_QUERY = 0x06   # 手机 -> 设备：触发离线队列回流 / phone to device: flush queue
 PUSH_OP_AI_RESULT = 0x07  # 手机 -> 设备：单词 + 释义 / phone to device: word + definition
+# gen26.5（M2）：AI 释义分帧回传；seg_total==1 语义等价 0x07，0x07 保留不删。
+# gen26.5 (M2): segmented AI definition; seg_total==1 == 0x07, 0x07 stays.
+PUSH_OP_AI_RESULT_SEG = 0x08
 PUSH_ST_AI_QUERY = 0x17   # 设备 -> 手机：用户点词，请算释义 / device to phone: define this word
 PUSH_ST_CAPS = 0x18       # 设备 -> 手机：能力位图上报 / device to phone: capability bitmap
 PUSH_AI_WORD_MAX = 64
 PUSH_AI_DEF_MAX = 170
-PUSH_CAP_AI_QUERY = 1 << 0  # 设备支持 AI 查词 / device supports AI lookup
+PUSH_CAP_AI_QUERY = 1 << 0   # 设备支持 AI 查词 / device supports AI lookup
+# gen26.5（M2）：0x17/0x06 带上下文（book_id u32 + pos u32）；0x08 分帧。老端不置位 →
+# 设备走 M1 老路。gen26.5 (M2): contextual 0x17/0x06 and segmented 0x08.
+PUSH_CAP_AI_CONTEXT = 1 << 1
+PUSH_CAP_AI_MULTI = 1 << 2
+PUSH_AI_SEG_MAX = 166        # 分帧释义槽：241 - 头4 - wlen1 - word64 - idx2 - total2 - dlen2 / segment slot
 
 # 正文类型
 PUSH_TYPE_TEXT = 0
