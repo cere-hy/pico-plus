@@ -160,7 +160,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # button; the D1 serial queue is cancelled by ruling).
 # 体积：4,087,984 B（相对 gen26.5 的 4,085,040 B **+2,944 B**，归因 = 词卡字号/段缓冲
 # 与 D3 槽加宽、D2 空页帧路径；段级闭合待真机 boot 日志 seg1 双锚对表确认）；
-# sha256 713c82b7…；重锚 2026-10-25。
+# sha256 bf7e80f6…；重锚 2026-10-25。
 #
 # 版本串 / Version string: 0.3.3-pico26.5（gen26.5 M2 Step10 TTS 听书：设备侧页文本 +
 # 0x19 STATUS 帧 + 面板朗读进度 + NVS 落盘 / APK 重组朗读流 + FGS 跟随 + AI 联动；
@@ -2113,7 +2113,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="713c82b7c47024b8042ffb6b3ca49fd986ba3faf7673c338813d11a01f9397c6"
+EXPECTED="bf7e80f638c24517320bddb3459a48380c532c3a18272eaee387130de96f68fe"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

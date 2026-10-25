@@ -31,6 +31,7 @@
 
 #include "dict_popup.h"
 #include "dict_lookup.h"
+#include "push_proto.h" // 长度上限链：容量字节 vs 协议槽 / length chain: capacity bytes vs the protocol slot
 #include "vocab_log.h"
 
 /* ---- 可控时钟与旋转 / controllable clock and rotation ---- */
@@ -313,6 +314,12 @@ static void test_capacity(void) {
     CHECK(dict_popup_ai_capacity_chars() == 270);
     g_rotation = EPD_ROT_PORTRAIT;
     CHECK(dict_popup_ai_capacity_chars() == 135);
+    // 长度上限链的运行时腿：竖屏卡容（135 全角 = 405B）必须能被一份协议上限的释义
+    // 填满——否则「装不下」不是卡小，而是链断在 DEF_MAX 一侧（协议给得比卡少）。
+    // The runtime leg of the length chain: the portrait capacity (135 chars = 405B)
+    // must be fillable by a protocol-max definition - otherwise "does not fit" is the
+    // chain breaking at DEF_MAX (the protocol shortchanging the card), not a small card.
+    CHECK(dict_popup_ai_capacity_chars() * 3 <= (int)PUSH_AI_DEF_MAX);
 }
 
 static void test_wrap_bounds(void) {

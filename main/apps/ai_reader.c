@@ -14,8 +14,19 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "push_proto.h" // 释义长度上限链：详解缓冲必须容下协议槽 / length chain: detail buffer >= protocol slot
 #include "ui_kit.h"
 #include "ui_nav.h"
+
+// 长度上限链（gen26.6）：详解视图要承接词卡装不下的长释义，缓冲不得窄于协议槽，
+// 否则同一段释义在详解里也会被截断。与 dict_popup 的 SEG > DEF_MAX、
+// vocab_log 的 VOCAB_AI_DEF_MAX >= DEF_MAX 共同构成一条编译期钉死的链。
+// Length chain (gen26.6): the detail view takes definitions the card cannot hold,
+// so its buffer must not be narrower than the protocol slot, or the same text is
+// truncated there too. Together with dict_popup's SEG > DEF_MAX and vocab_log's
+// VOCAB_AI_DEF_MAX >= DEF_MAX this forms one compile-time chain.
+_Static_assert(AI_READER_DEF_MAX >= PUSH_AI_DEF_MAX,
+               "gen26.6 length chain: the detail buffer must hold any protocol-sized definition");
 
 /* ---------- 会话状态 / The session state ---------- */
 

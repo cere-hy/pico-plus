@@ -9,6 +9,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build/book-tests
 cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer \
-   -Itools/dict_popup_stubs -Imain/apps -Imain/dict \
+   -Itools/dict_popup_stubs -Imain/apps -Imain/dict -Icomponents/push_sink/include \
    tools/dict_popup_host_test.c main/apps/dict_popup.c -o build/book-tests/dict_popup
 build/book-tests/dict_popup

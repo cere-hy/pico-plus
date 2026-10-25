@@ -17,6 +17,24 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# 门禁可信度 = 脚本自身可信度（gen26.6 元测试）：干净树起点 + 每条还原断言。
+# Gate credibility = the script's own credibility (gen26.6 meta-test): a clean-tree
+# start plus a restore assertion after every mutation.
+MUT_FILES=(main/tts/tts_page.c components/push_sink/src/push_tts.c main/apps/app_book.c
+           components/push_sink/include/push_sink.h main/tts/tts_page.h main/CMakeLists.txt)
+require_clean_tree() {
+    if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
+        echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        return
+    fi
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "REFUSE: working tree is dirty before the sweep." >&2
+        echo "  Commit or stash first (or set MUTATION_ALLOW_DIRTY=1 for a dev loop)." >&2
+        exit 2
+    fi
+}
+require_clean_tree
+
 cp main/tts/tts_page.c /tmp/tts_mut_page.c
 cp components/push_sink/src/push_tts.c /tmp/tts_mut_plan.c
 cp main/apps/app_book.c /tmp/tts_mut_book.c
@@ -30,6 +48,10 @@ restore_all() {
     cp /tmp/tts_mut_sink_h.h components/push_sink/include/push_sink.h
     cp /tmp/tts_mut_tts_h.h main/tts/tts_page.h
     cp /tmp/tts_mut_main_cmake.txt main/CMakeLists.txt
+    git diff --quiet -- "${MUT_FILES[@]}" || {
+        echo "FATAL: a mutated file did not return to HEAD" >&2
+        exit 3
+    }
 }
 trap restore_all EXIT
 

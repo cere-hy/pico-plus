@@ -7,8 +7,33 @@
 # assertions have a hole.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# 门禁可信度 = 脚本自身可信度（gen26.6 元测试）：起点必须干净树，否则「未还原」与
+# 「本来就有改动」无法区分；每条变异后断言目标文件已回到 HEAD，让「不还原」从纪律
+# 问题变成脚本会红的问题。开发回路可显式 MUTATION_ALLOW_DIRTY=1 跳过起点检查。
+# Gate credibility = the script's own credibility (gen26.6 meta-test): start from a
+# clean tree (otherwise an unrecovered edit is indistinguishable from a pre-existing
+# one) and assert the target is back at HEAD after every mutation, so a missed
+# restore turns red instead of lying. A dev loop may set MUTATION_ALLOW_DIRTY=1.
+require_clean_tree() {
+    if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
+        echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        return
+    fi
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "REFUSE: working tree is dirty before the sweep." >&2
+        echo "  Commit or stash first (or set MUTATION_ALLOW_DIRTY=1 for a dev loop)." >&2
+        exit 2
+    fi
+}
+require_clean_tree
 cp main/apps/dict_popup.c /tmp/dict_popup_orig.c
-restore() { cp /tmp/dict_popup_orig.c main/apps/dict_popup.c; }
+restore() {
+    cp /tmp/dict_popup_orig.c main/apps/dict_popup.c
+    git diff --quiet -- main/apps/dict_popup.c || {
+        echo "FATAL: dict_popup.c did not return to HEAD after a mutation" >&2
+        exit 3
+    }
+}
 trap restore EXIT
 
 run_mutation() {

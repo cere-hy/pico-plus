@@ -22,6 +22,7 @@ python3 tools/book_layout_twin_host_test.py
 # Vocabulary log writes: escaping, sentence bounds, de-duplication, index degradation, file cap.
 rm -rf /tmp/rp-vocab-test
 gcc "${flags[@]}" -Imain/dict -Imain/book -Itools/vocab_log_stubs -Itools/dict_hit_stubs \
+    -Icomponents/push_sink/include \
     tools/vocab_log_host_test.c -o build/book-tests/vocab_log
 build/book-tests/vocab_log
 

@@ -10,6 +10,7 @@ design point, and the gatekeeper must catch each one (non-zero exit), or the
 gate is a slogan. Mutations run on copies and every file is restored byte for
 byte afterwards - the working tree is never touched.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GATE = ROOT / 'tools' / 'ai_detail_wiring_host_test.py'
+
+
+def _git(*args: str) -> int:
+    return subprocess.run(['git', *args], cwd=str(ROOT)).returncode
+
+
+def _require_clean_tree() -> None:
+    # 门禁可信度 = 脚本自身可信度（gen26.6 元测试）：干净树起点，否则「未还原」与
+    # 「本来就有改动」无法区分。开发回路可 MUTATION_ALLOW_DIRTY=1 跳过。
+    # Gate credibility = the script's own credibility (gen26.6 meta-test): start
+    # from a clean tree, or an unrecovered edit is indistinguishable from a
+    # pre-existing one. A dev loop may set MUTATION_ALLOW_DIRTY=1.
+    if os.environ.get('MUTATION_ALLOW_DIRTY') == '1':
+        print('WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)',
+              file=sys.stderr)
+        return
+    if _git('diff', '--quiet') != 0 or _git('diff', '--cached', '--quiet') != 0:
+        print('REFUSE: working tree is dirty before the sweep.', file=sys.stderr)
+        print('  Commit or stash first (or set MUTATION_ALLOW_DIRTY=1 for a dev loop).',
+              file=sys.stderr)
+        raise SystemExit(2)
 
 # (设计点, 文件, 原串, 变异串, 预期守门台词关键词)
 MUTATIONS = [
@@ -60,6 +82,7 @@ MUTATIONS = [
 
 
 def main() -> int:
+    _require_clean_tree()
     failures = []
     for name, rel, old, new, expect in MUTATIONS:
         path = ROOT / rel
@@ -81,6 +104,12 @@ def main() -> int:
                 failures.append(name)
         finally:
             path.write_bytes(backup)
+            # 每条变异后断言目标已回 HEAD：漏还原必须红，不能悄悄污染下一条。
+            # Assert the target is back at HEAD after every mutation: a missed
+            # restore must go red instead of quietly poisoning the next one.
+            if _git('diff', '--quiet', '--', rel) != 0:
+                print(f'FATAL: {rel} did not return to HEAD after a mutation')
+                raise SystemExit(3)
     if failures:
         print(f'mutation demo: {len(failures)}/{len(MUTATIONS)} mutations survived '
               '(the gate has no teeth for these)')

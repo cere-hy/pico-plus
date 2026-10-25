@@ -12,7 +12,7 @@
 
 | 文件 | SHA-256 | 说明 |
 |---|---|---|
-| `Read_Pico.bin`（4,087,984 B） | `713c82b7…` | 主固件，烧到 `0x10000` |
+| `Read_Pico.bin`（4,087,984 B） | `bf7e80f6…` | 主固件，烧到 `0x10000` |
 | `bootloader.bin` | `c8069ead…`（与 gen26.4.1 逐字节一致，未重编） | 烧到 `0x0` |
 | `partition-table.bin` | `9d5d890b…` | 烧到 `0x8000`（与 gen20/21 起逐字节一致） |
 | `ota_data_initial.bin` | `7d2c7ac4…` | 烧到 `0xb10000`（与 gen20/21 起逐字节一致） |

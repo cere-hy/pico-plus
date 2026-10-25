@@ -17,11 +17,32 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# 门禁可信度 = 脚本自身可信度（gen26.6 元测试）：干净树起点 + 每条还原断言。
+# Gate credibility = the script's own credibility (gen26.6 meta-test): a clean-tree
+# start plus a restore assertion after every mutation.
+MUT_FILES=(components/push_sink/include/push_proto.h main/dict/vocab_log.c)
+require_clean_tree() {
+    if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
+        echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        return
+    fi
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "REFUSE: working tree is dirty before the sweep." >&2
+        echo "  Commit or stash first (or set MUTATION_ALLOW_DIRTY=1 for a dev loop)." >&2
+        exit 2
+    fi
+}
+require_clean_tree
+
 cp components/push_sink/include/push_proto.h /tmp/d3_proto.h
 cp main/dict/vocab_log.c /tmp/d3_vocab.c
 restore_all() {
     cp /tmp/d3_proto.h components/push_sink/include/push_proto.h
     cp /tmp/d3_vocab.c main/dict/vocab_log.c
+    git diff --quiet -- "${MUT_FILES[@]}" || {
+        echo "FATAL: a mutated file did not return to HEAD" >&2
+        exit 3
+    }
 }
 trap restore_all EXIT
 

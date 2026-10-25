@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "push_proto.h" // 释义长度上限链：段缓冲由协议槽派生 / length chain: seg derives from the protocol slot
 #include "ui_kit.h"
 #include "vocab_log.h"
 
@@ -52,19 +53,22 @@ static const char* TAG = "dict";
 #define DICT_POPUP_SAVE_H 52
 #define DICT_POPUP_SAVE_PX 26
 #define DICT_POPUP_SUMMARY_LINES 3
-// gen26 AI 释义段缓冲：设备侧协议上限 PUSH_AI_DEF_MAX=768（D3 放宽后的卡容量）。
-// 段间按 \n 切分后任何单段都短于它，769 字节兜住整段。**gen26.6 D3 联动修正**：
-// 旧值 192 只够 40 字时代（≤169B），D3 释义可达 540B——单段超 191B 会被静默
-// 截断（旧代码 clamp 后 !nl 直接 break，尾部丢失且不置截断位），必须同步放宽。
+// gen26 AI 释义段缓冲：**由协议槽派生**（PUSH_AI_DEF_MAX + 1）。段间按 \n 切分后
+// 任何单段都短于协议槽，故本缓冲必容得下整段——不是「凑一个够大的数」，而是
+// 长度上限链的一环（SEG > DEF_MAX）。gen26.6 D3 把 DEF_MAX 从 170 放宽到 768 时，
+// 旧的硬编码 192 没有跟着动，导致 >191B 的单段被静默截断；改成派生后这类漂移
+// 不再可能发生。
 // 缓冲放 PSRAM（show_def 内分配），不占 8KB 主栈。
-// gen26 AI def segment buffer: the device-side protocol cap is PUSH_AI_DEF_MAX=768
-// (the card capacity after D3). Segments split on \n are shorter than it, so 769
-// bytes holds any single segment. **gen26.6 D3 linkage fix**: the old 192 only
-// served the 40-char era (<=169B); under D3 a definition reaches 540B, and a
-// segment over 191B was silently truncated (the old clamp then broke on !nl,
-// losing the tail without setting the truncation flag) - it must widen in step.
+// gen26 AI def segment buffer: **derived from the protocol slot** (PUSH_AI_DEF_MAX
+// + 1). Any \n-separated segment is shorter than the protocol slot, so this buffer
+// always holds a whole segment - not "a number big enough", but one link of the
+// length chain (SEG > DEF_MAX). When gen26.6 D3 widened DEF_MAX from 170 to 768,
+// the hard-coded 192 did not follow, silently truncating segments over 191B;
+// deriving it makes that drift impossible.
 // The buffer lives in PSRAM (allocated inside show_def), off the 8KB main stack.
-#define DICT_POPUP_AI_SEG 769
+#define DICT_POPUP_AI_SEG (PUSH_AI_DEF_MAX + 1u)
+_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
+               "gen26.6 length chain: the segment buffer must hold any protocol-sized definition");
 // gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
 // query-state text: a one-line real status, not a placeholder fake card.
 #define DICT_POPUP_PENDING_TEXT "AI 查询中…"
