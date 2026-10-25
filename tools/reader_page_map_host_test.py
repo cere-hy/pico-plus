@@ -54,7 +54,14 @@ MAP_TAIL = 'static void draw_reader_stats(uint8_t* fb) {'
 EXPECT_FUNCTIONS = ['reader_page_is_joint', 'reader_rebuild_page_map', 'reader_map_check_sync',
                     'reader_visual_count_checked', 'reader_visual_entry', 'reader_visual_count',
                     'reader_visual_index', 'reader_visual_start', 'reader_visual_mode',
-                    'reader_logical_pages', 'reader_visual_for_offset', 'reader_clamp_visual_page']
+                    'reader_logical_pages', 'reader_visual_for_offset', 'reader_clamp_visual_page',
+                    # gen26.5 Step6 起 reader_page_start_offset 也住在地图区块内（视觉页 →
+                    # 起始字节偏移，供 AI 点词 pos 回退）。它依赖 s_page 与页表起始偏移，
+                    # 两者由 PRELUDE/MAIN 的桩提供。/ Since gen26.5 Step6 it also lives in
+                    # the map block (visual page -> start byte offset, the AI-tap pos
+                    # fallback). Its s_page and page-start dependencies come from the
+                    # PRELUDE/MAIN stubs.
+                    'reader_page_start_offset']
 
 MODE_COLUMNS2 = 0
 MODE_JOINT = 1
@@ -105,6 +112,16 @@ int book_layout_page_image(size_t page);
 int book_layout_page_image_count(size_t page);
 uint32_t book_layout_generation(void);
 size_t book_layout_page_for_offset(size_t off);
+/* gen26.5 Step6：reader_page_start_offset 的第二个依赖——逻辑页的章内起始字节偏移。
+   gen26.5 Step6: reader_page_start_offset's other dependency - a logical page's
+   start byte offset in the chapter. */
+size_t book_layout_page_start_offset(size_t page);
+
+/* gen26.5 Step6：reader_page_start_offset 读的「当前逻辑页」。地图区块自身不引用它，
+   只有这个 Step6 新增的入口用。/ gen26.5 Step6: the "current logical page"
+   reader_page_start_offset reads. The map block itself never references it; only
+   this Step6 entry does. */
+static size_t s_page;
 '''
 
 MAIN = r'''
@@ -126,6 +143,9 @@ size_t book_layout_page_for_offset(size_t off) {
     size_t page = off / 100;
     return page < test_page_count ? page : test_page_count - 1;
 }
+/* gen26.5 Step6 桩：页 k 的起始字节偏移 = k*100（与页表桩口径一致）。
+   gen26.5 Step6 stub: page k's start byte offset is k*100, matching the page-table stub. */
+size_t book_layout_page_start_offset(size_t page) { return page * 100; }
 
 /* 页型：'.' 纯文字；'i' 页内混排插图（image>=0 且 slots>0，普通页）；'I' 整页插图（JOINT）。
    Page kinds: '.' plain text; 'i' inline images (image>=0 with slots>0, an ordinary
@@ -228,6 +248,42 @@ static void big_case(void) {
     emit("== big col1\n");
     emit("count=%zu\n", reader_visual_count());
     emit("tile=%d\n", check_tiling(READER_PAGE_MAX));
+}
+
+/* gen26.5 Step6：视觉页 → 起始字节偏移的自校验。两条判据都不经过参考模型：
+   (a) 恒等口径：对任意逻辑页 p，reader_page_start_offset 必须等于
+       book_layout_page_start_offset(reader_logical_pages(p).left)——即它必须真的
+       经由地图把视觉页折回左逻辑页，而不是抄近路；
+   (b) 单栏恒等：columns=1 时视觉页即逻辑页，偏移必须就是 p*100。
+   输出走 printf 不进摘要：digest 是地图寻址的冻结值，本组是后加的命名防线。
+   gen26.5 Step6: self-checks for visual page -> start byte offset. Neither
+   criterion goes through the reference model:
+   (a) identity: for any logical page p the result must equal
+       book_layout_page_start_offset(reader_logical_pages(p).left) - it must really
+       fold through the map back to the left logical page, not take a shortcut;
+   (b) single-column identity: with columns=1 a visual page IS a logical page, so the
+       offset must be exactly p*100.
+   Printed, not emitted: the digest stays the frozen map-addressing value; these are
+   a named guard added afterwards. */
+static int check_start_offset(void) {
+    fixture_load("....I...");
+    bool ok = true;
+    for (int columns = 1; columns <= 2; ++columns) {
+        reader_rebuild_page_map(columns);
+        for (size_t p = 0; p < test_page_count; ++p) {
+            s_page = p;
+            size_t got = reader_page_start_offset();
+            size_t left = 0, right = 0;
+            reader_logical_pages(p, &left, &right);
+            size_t want = book_layout_page_start_offset(left);
+            if (got != want) ok = false;
+            if (columns == 1 && got != p * 100) ok = false;
+            printf("start_offset col%d logical=%zu -> %zu (left=%zu) %s\n", columns, p, got,
+                   left, got == want ? "ok" : "MISMATCH");
+        }
+    }
+    printf("start_offset identity %s\n", ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 static int run_fixture(const char* spec, int columns) {
@@ -367,6 +423,7 @@ static int run_all(void) {
     for (size_t i = 0; i < sizeof(FIXTURES) / sizeof(FIXTURES[0]); ++i)
         if (check_onform(FIXTURES[i])) return 1;
     if (stale_case()) return 1;
+    if (check_start_offset()) return 1;
     big_case();
     return 0;
 }

@@ -4454,7 +4454,15 @@ static void prepare_inline_image(void) {
                 pixels_left -= pixels;
                 ++decoded;
             } else {
-                ESP_LOGW(TAG, "inline %d: grayscale decode failed", i);
+                // 现场三件套（gen26 真机观察项「JPEG 单图降级」销项）：图片名（URL）、
+                // 字节数、格式；SOF 类型与走的库由 book_cover.c 内的 jpeg_gray/png_gray_input
+                // 各自打（那里才拿得到解码器内部状态）。
+                // The three-part scene (closing the gen26 device observation "a lone
+                // JPEG degrades"): image name (URL), byte count, format; the SOF type
+                // and the library that ran come from jpeg_gray/png_gray_input inside
+                // book_cover.c, the only place that can see decoder-internal state.
+                ESP_LOGW(TAG, "inline %d %s: grayscale decode failed (%u bytes, png=%d)",
+                         i, s_images[index], (unsigned)size, (int)png);
                 free(gray);
             }
         } else {

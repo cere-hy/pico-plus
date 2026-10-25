@@ -200,6 +200,13 @@ static size_t reader_visual_count(void){return book_layout_page_count();}
 static size_t reader_visual_index(size_t logical){return logical;}
 static size_t reader_visual_start(size_t visual){return visual;}
 static size_t reader_visual_for_offset(size_t off){return book_layout_page_for_offset(off);}
+/* gen26.5 Step6：load_chapter_at 挂/卸 AI 书上下文。宿主 harness 不测 push_sink，
+   给个记录调用的桩（次数可见，防接线被悄悄删掉）。/ gen26.5 Step6: load_chapter_at
+   attaches/detaches the AI book context. The host harness does not test push_sink, so
+   this stub records the calls (the count is visible, so the wiring cannot quietly
+   disappear). */
+static int ai_ctx_calls;
+static void push_sink_ai_set_context_ready(bool ready){(void)ready;++ai_ctx_calls;}
 static void release_page_images(void);
 static void free_book(void){
  release_page_images();free(s_text);free(s_blocks);free(s_runs);for(size_t i=0;i<s_image_count;++i)free(s_images[i]);free(s_images);

@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "jpeg_decoder.h"
 #include "JPEGDEC.h"
 #include "png.h"
@@ -34,6 +35,8 @@ static void decode_yield(unsigned at) {
     (void)at;
 #endif
 }
+
+static const char* COVER_TAG = "cover";
 
 static void *cover_alloc(size_t n) {
     return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -222,11 +225,29 @@ static bool jpegdec_gray(const uint8_t *data, size_t size, unsigned frame_width,
 
 static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
                       unsigned out_height, uint8_t *out) {
-    if (size > UINT32_MAX) return false;
+    // 失败现场必须留全（gen26 真机观察项「JPEG 单图降级」销项）：字节数、SOF 类型、
+    // 帧尺寸、走的哪条库、目标尺寸。SOF=0xC2（progressive）走 JPEGDEC 软解，
+    // 其余走 esp_jpeg 硬解循环——两条路径的失败原因完全不同，日志必须能区分。
+    // A failure must leave its full scene (closing the gen26 device observation
+    // "a lone JPEG degrades"): byte count, SOF type, frame size, which library
+    // ran, and the target size. SOF=0xC2 (progressive) takes the JPEGDEC software
+    // path, everything else the esp_jpeg hardware loop - the two fail for entirely
+    // different reasons, so the log has to tell them apart.
+    if (size > UINT32_MAX) {
+        ESP_LOGW(COVER_TAG, "jpeg: %u bytes over the u32 API cap", (unsigned)size);
+        return false;
+    }
     uint8_t sof = 0;
     unsigned frame_width = 0, frame_height = 0;
-    if (book_jpeg_frame(data, size, &sof, &frame_width, &frame_height) && sof == 0xC2)
-        return jpegdec_gray(data, size, frame_width, frame_height, out_width, out_height, out);
+    if (book_jpeg_frame(data, size, &sof, &frame_width, &frame_height) && sof == 0xC2) {
+        if (!jpegdec_gray(data, size, frame_width, frame_height, out_width, out_height, out)) {
+            ESP_LOGW(COVER_TAG, "jpeg: JPEGDEC software path failed (%u bytes, sof=0x%02x, "
+                     "frame %ux%u, out %ux%u)", (unsigned)size, sof, frame_width, frame_height,
+                     out_width, out_height);
+            return false;
+        }
+        return true;
+    }
     esp_jpeg_image_cfg_t cfg = { .indata = (uint8_t *)data, .indata_size = (uint32_t)size,
                                  .out_format = JPEG_IMAGE_FORMAT_RGB565 };
     esp_jpeg_image_output_t info = {0};
@@ -235,7 +256,11 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
     bool decoded = false;
     for (int scale = JPEG_IMAGE_SCALE_0; scale <= JPEG_IMAGE_SCALE_1_8; ++scale) {
         cfg.out_scale = scale;
-        if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK) return false;
+        if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK) {
+            ESP_LOGW(COVER_TAG, "jpeg: esp_jpeg info probe failed (%u bytes, scale=%d, sof=0x%02x)",
+                     (unsigned)size, (int)scale, sof);
+            return false;
+        }
         if (!info.width || !info.height || !info.output_len || info.output_len > limit) continue;
         uint8_t *pixels = cover_alloc(info.output_len);
         if (!pixels) continue;
@@ -271,6 +296,15 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
         free(pixels);
         if (decoded) break;
     }
+    if (!decoded) {
+        // 八个 scale 档全试过仍失败：把最后一站的 info 与 frame 探测一起留下。
+        // All eight scales failed: leave the last station's info together with the
+        // frame probe (sof=0 means the probe itself could not even read a header).
+        ESP_LOGW(COVER_TAG, "jpeg: esp_jpeg loop exhausted (%u bytes, sof=0x%02x, frame %ux%u, "
+                 "out %ux%u, last info %ux%u len=%u)", (unsigned)size, sof, frame_width,
+                 frame_height, out_width, out_height, (unsigned)info.width, (unsigned)info.height,
+                 (unsigned)info.output_len);
+    }
     return decoded;
 }
 
@@ -298,14 +332,23 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
     // freeing an uninitialised pointer there would crash.
     scale_step_t *volatile xmap = NULL, *volatile ymap = NULL;
     uint8_t *volatile rows[2] = {NULL, NULL};
+    // PNG 自报的四个头字段同样提升 + 预初始化：done 处的失败日志要读它们，
+    // 而 goto done 会跳过 setjmp 之后的初始化（与上面三个指针同一理由）。
+    // The four header fields are lifted and pre-initialised for the same reason:
+    // the failure log at done reads them, and goto done skips the initialisers
+    // after setjmp.
+    png_uint_32 volatile width = 0, height = 0;
+    int volatile color = 0, depth = 0;
     png_input_t input = {data, size, 0, file};
     bool ok = false;
     if (setjmp(png_jmpbuf(png))) goto done;
     png_set_read_fn(png, &input, png_read_mem);
     png_read_info(png, info);
-    png_uint_32 width = png_get_image_width(png, info), height = png_get_image_height(png, info);
+    width = png_get_image_width(png, info);
+    height = png_get_image_height(png, info);
     if (!width || !height || width > 8192 || height > 8192) goto done;
-    int color = png_get_color_type(png, info), depth = png_get_bit_depth(png, info);
+    color = png_get_color_type(png, info);
+    depth = png_get_bit_depth(png, info);
     if (depth == 16) png_set_strip_16(png);
     if (color == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
     if (color == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
@@ -360,6 +403,16 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
     }
     ok = next_y == out_height;
 done:
+    // 失败现场（与 jpeg_gray 同口径）：字节数、目标尺寸、PNG 自报的宽高/位深/色彩类型。
+    // 头都没读到时后三个是 0，如实打——那本身就是「不是合法 PNG」的证据。
+    // The failure scene (same shape as jpeg_gray): byte count, target size, and the
+    // PNG's own width/height/depth/color type. When even the header failed the last
+    // three read 0 - which is itself the evidence of "not a valid PNG".
+    if (!ok) {
+        ESP_LOGW(COVER_TAG, "png: decode failed (%u bytes, png %ux%u depth=%d color=%d, out %ux%u)",
+                 (unsigned)size, (unsigned)width, (unsigned)height, depth, color,
+                 out_width, out_height);
+    }
     free(xmap);
     free(ymap);
     free(rows[0]);
@@ -481,7 +534,15 @@ static bool book_cover_load_gray_impl(const char *path, const char *title, const
         size_t free_bytes=heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
         size_t budget=free_bytes>2u*1024u*1024u?free_bytes-2u*1024u*1024u:0;
         esp_err_t err = budget ? book_epub_cover_bounded(path,&data,&size,&png,budget) : ESP_ERR_NO_MEM;
-        if (err == ESP_OK) good = book_cover_thumbnail(data, size, png, out);
+        if (err == ESP_OK) {
+            good = book_cover_thumbnail(data, size, png, out);
+            // 失败现场（与正文插图同口径）：书路径、字节数、格式；SOF/库在 jpeg_gray 内。
+            // The failure scene (same shape as the inline path): book path, byte count,
+            // format; the SOF type and library come from jpeg_gray.
+            if (!good)
+                ESP_LOGW(COVER_TAG, "epub cover thumbnail failed (%s, %u bytes, png=%d)",
+                         path, (unsigned)size, (int)png);
+        }
         free(data);
         if (err == ESP_ERR_NO_MEM) cache_result = false;
     }
@@ -537,6 +598,11 @@ static bool book_cover_load_list_gray_impl(const char *path, const char *title, 
             if (!*width) *width = 1;
             if (!*height) *height = 1;
             good = book_image_grayscale(data, size, png, *width, *height, out);
+            // 失败现场（同封面口径）：书路径、字节数、格式。/ The failure scene (same as
+            // the cover path): book path, byte count, format.
+            if (!good)
+                ESP_LOGW(COVER_TAG, "epub list thumbnail failed (%s, %u bytes, png=%d)",
+                         path, (unsigned)size, (int)png);
         }
         free(data);
         if ((error != ESP_OK && error != ESP_ERR_NOT_FOUND) || (error == ESP_OK && !good)) cacheable = false;

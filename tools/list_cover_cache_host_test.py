@@ -30,6 +30,14 @@ unit = r'''
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
 typedef int esp_err_t;
+/* gen26.5 JPEG ticket：失败现场日志的宿主桩。计数而不是打印——「解码失败必须
+   留现场」因此成为可断言的行为（见 main 里 decode_fail 用例）。
+   gen26.5 JPEG ticket: host stub for the failure-scene log. It counts instead of
+   printing, so "a failed decode must leave its scene" becomes assertable (see the
+   decode_fail case in main). */
+static const char* COVER_TAG="cover";
+static int logw_calls;
+#define ESP_LOGW(tag,fmt,...) (void)(tag),(void)(fmt),++logw_calls
 typedef struct {uint32_t magic,schema,template_version,width,height;uint64_t file_size;int64_t modified;uint64_t path_hash,text_hash;} cover_cache_header_t;
 static unsigned source_w=300,source_h=600,requests,decoded;
 static size_t available=8u*1024u*1024u;
@@ -59,7 +67,7 @@ int main(int argc,char **argv){
  source_w=500;source_h=500;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h)&&w==176&&h==176);assert(!remove(cache));
  available=1536u*1024u;unsigned before=requests;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h)&&w==176&&h==240&&requests==before);assert(stat(cache,&(struct stat){0})!=0);
  available=8u*1024u*1024u;error=ESP_ERR_NO_MEM;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h));assert(stat(cache,&(struct stat){0})!=0);
- error=ESP_OK;decode_fail=true;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h));assert(stat(cache,&(struct stat){0})!=0);
+ error=ESP_OK;decode_fail=true;int scene_logs=logw_calls;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h));assert(stat(cache,&(struct stat){0})!=0);assert(logw_calls==scene_logs+1);
  decode_fail=false;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h));assert(!remove(cache));
  error=ESP_ERR_NOT_FOUND;assert(book_cover_load_list_gray(path,"title","author",out,true,&pending,&w,&h)&&w==176&&h==240);assert(book_cover_load_list_gray(path,"title","author",out,false,&pending,&w,&h));
  for(unsigned i=176*240;i<sizeof(out);++i)assert(out[i]==0xab);
