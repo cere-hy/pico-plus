@@ -17,7 +17,12 @@
   8. gen26.5 M2 Step8：app_loop 里 take_ai_def 成功后先 set_def 再 def_ready
      （落库与弹卡解耦），flush 落在 500ms 网络轮询块内；app_main 在
      app_settings_init() 之后调 vocab_log_autosave_init()；.c/.h 双冻结声明
-     同步（rp_vocab / autosave / 5s 攒批关键词对表）。
+     同步（rp_vocab / autosave / 5s 攒批关键词对表）；
+  9. gen26.5 M2 Step10：TTS 听书三个新声明点的头同步 + CMake 登记——
+     app_book.c 点到的 push_sink_*/tts_(switch|page)_* 必须落在各自头文件里，
+     push_sink.c 点到的 push_tts_* 必须落在 push_tts.h 里，两个新 .c 必须进
+     各自 CMake 清单（ai_detail P7 同型网：宿测看不见的漏声明只有固件
+     fullclean 抓，那是最后一道也是最贵的一道网）。
 
 只做静态检查，不编译。
 
@@ -42,7 +47,13 @@ user only finds out later. This test pins the wiring:
   8. gen26.5 M2 Step8: in app_loop, set_def runs between take_ai_def and def_ready
      (logging decoupled from the card), flush lands inside the 500ms network poll
      block; app_main calls vocab_log_autosave_init() after app_settings_init(); the
-     .c/.h frozen declarations stay in sync (rp_vocab / autosave / 5s batching).
+     .c/.h frozen declarations stay in sync (rp_vocab / autosave / 5s batching);
+  9. gen26.5 M2 Step10: header sync plus CMake registration for the three new TTS
+     declaration points - every push_sink_*/tts_(switch|page)_* symbol app_book.c
+     uses must live in its module header, every push_tts_* symbol push_sink.c uses
+     must live in push_tts.h, and both new .c files must sit in their CMake source
+     lists (the same net as ai_detail P7: a missing declaration the host builds
+     cannot see only surfaces in a firmware fullclean - the last and priciest net).
 
 Static only, nothing is compiled.
 """
@@ -57,6 +68,12 @@ VOCAB = ROOT / 'main' / 'dict' / 'vocab_log.c'
 VOCAB_H = ROOT / 'main' / 'dict' / 'vocab_log.h'
 LOOP = ROOT / 'main' / 'app' / 'app_loop.c'
 MAIN = ROOT / 'main' / 'app_main.c'
+SINK_C = ROOT / 'components' / 'push_sink' / 'src' / 'push_sink.c'
+SINK_H = ROOT / 'components' / 'push_sink' / 'include' / 'push_sink.h'
+PLAN_H = ROOT / 'components' / 'push_sink' / 'include' / 'push_tts.h'
+TTS_PAGE_H = ROOT / 'main' / 'tts' / 'tts_page.h'
+MAIN_CMAKE = ROOT / 'main' / 'CMakeLists.txt'
+SINK_CMAKE = ROOT / 'components' / 'push_sink' / 'CMakeLists.txt'
 
 
 def function_body(text: str, signature: str) -> str:
@@ -361,13 +378,72 @@ def main() -> int:
                 failures.append(f'{label}: the frozen declaration no longer mentions '
                                 f'{what} ({needle!r})')
 
+    # 9. gen26.5 M2 Step10：TTS 三个新声明点的头同步 + CMake 登记（P7 同型网）。
+    #    ai_detail_wiring_host_test.py 的 P7 段立过规矩：宿测直接 #include .c
+    #    （tts_page 独册就是这么编的，静态定义全可见）或压根不编调用方（本守门
+    #    只读文本）时，头文件漏声明只有固件 fullclean 抓得到——那是最后一道、
+    #    也是最贵的一道网。这里照同式结一张静态网：调用方点到的每个模块符号都
+    #    必须落在模块头的声明里；两个新 .c 必须进各自 CMake 清单（漏登记 =
+    #    固件链接期 undefined，宿主测试一声不吭）。
+    #    gen26.5 M2 Step10: header sync plus CMake registration for the three new
+    #    TTS declaration points (the same net as P7). The tts_page booklet
+    #    #includes the .c directly and this guard only reads text, so a missing
+    #    header declaration would only surface in a firmware fullclean - the last
+    #    and priciest net. Same pattern here: every module symbol the callers use
+    #    must be declared in the module header, and both new .c files must sit in
+    #    their CMake source lists (a missing entry = firmware link-time undefined,
+    #    which the host tests never notice).
+    tts_h = TTS_PAGE_H.read_text(encoding='utf-8') if TTS_PAGE_H.exists() else ''
+    sink_h_text = SINK_H.read_text(encoding='utf-8') if SINK_H.exists() else ''
+    plan_h_text = PLAN_H.read_text(encoding='utf-8') if PLAN_H.exists() else ''
+    sink_c = SINK_C.read_text(encoding='utf-8') if SINK_C.exists() else ''
+    main_c = MAIN.read_text(encoding='utf-8') if MAIN.exists() else ''
+    for path, label in ((TTS_PAGE_H, 'tts_page.h'), (SINK_H, 'push_sink.h'),
+                        (PLAN_H, 'push_tts.h'), (SINK_C, 'push_sink.c')):
+        if not path.exists():
+            failures.append(f'{label}: missing')
+    # tts_page_range 是 app_book.c 自己的静态 helper（算当前视觉页的字节区间），
+    # 不是 tts_page 模块 API，不进头文件——同 ai_detail P7 的
+    # ai_reader_close_full，显式排除。
+    # tts_page_range is app_book.c's own static helper (the current visual
+    # page's byte range), not a tts_page module API - exclude it explicitly,
+    # exactly like ai_detail P7's ai_reader_close_full.
+    local_helpers = {'tts_page_range'}
+    step10_pairs = (
+        # 调用方文本, 模块头文本, 符号模式, 头文件名
+        # caller text, module header text, symbol pattern, header name
+        (book, sink_h_text, r'\bpush_sink_[a-z_0-9]+\(', 'push_sink.h'),
+        (book + '\n' + main_c, tts_h, r'\btts_(?:switch|page)_[a-z_]+\(',
+         'tts_page.h'),
+        (sink_c, plan_h_text, r'\bpush_tts_[a-z_]+\(', 'push_tts.h'),
+    )
+    for caller_text, header_text, pattern, header_name in step10_pairs:
+        if not caller_text or not header_text:
+            continue  # 缺文件已在上面记过 / missing files already reported
+        used = sorted({m[:-1] for m in re.findall(pattern, caller_text)}
+                      - local_helpers)
+        for name in used:  # used 已去括号 / names already have the paren stripped
+            if not re.search(rf'\b{re.escape(name)}\s*\(', header_text):
+                failures.append(f'{header_name}: the caller uses {name}() but the '
+                                'header never declares it (a firmware fullclean '
+                                'would fail on an implicit declaration)')
+    for cmake, needle, label in ((MAIN_CMAKE, '"tts/tts_page.c"', 'main/CMakeLists.txt'),
+                                 (SINK_CMAKE, '"src/push_tts.c"',
+                                  'components/push_sink/CMakeLists.txt')):
+        if not cmake.exists():
+            failures.append(f'{label}: missing')
+        elif needle not in cmake.read_text(encoding='utf-8'):
+            failures.append(f'{label}: {needle} is not in the source list '
+                            '(the firmware link would fail on undefined symbols)')
+
     if failures:
         for line in failures:
             print('  FAIL ' + line)
         print('vocab_wiring_host_test: FAIL')
         return 1
     print('PASS: vocabulary book wiring intact (capture after unlock, 3 lifecycle hooks, '
-          'view guard matched by contents, 6 asserted tools, chip tap + re-open, chip drawn)')
+          'view guard matched by contents, 7 asserted tools, chip tap + re-open, chip '
+          'drawn, TTS panel wiring, Step10 header sync + CMake registration)')
     return 0
 
 if __name__ == '__main__':

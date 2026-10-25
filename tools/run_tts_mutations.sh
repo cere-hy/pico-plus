@@ -8,20 +8,28 @@
 # surviving mutation means the assertions have a hole - fill the hole, never
 # drop the mutation.
 #
-# 覆盖三层：
+# 覆盖四层：
 #   纯逻辑  main/tts/tts_page.c      -> run_tts_host_tests.sh
 #   纯逻辑  push_sink/src/push_tts.c -> run_push_sink_host_tests.sh
 #   接线    main/apps/app_book.c      -> run_dict_hit_host_tests.sh（vocab_wiring 静态守门）
+#   声明/构建 push_sink.h / tts_page.h / main/CMakeLists.txt
+#           -> run_dict_hit_host_tests.sh（Step10-5 补的 P7 同型头同步网 + CMake 登记网）
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 cp main/tts/tts_page.c /tmp/tts_mut_page.c
 cp components/push_sink/src/push_tts.c /tmp/tts_mut_plan.c
 cp main/apps/app_book.c /tmp/tts_mut_book.c
+cp components/push_sink/include/push_sink.h /tmp/tts_mut_sink_h.h
+cp main/tts/tts_page.h /tmp/tts_mut_tts_h.h
+cp main/CMakeLists.txt /tmp/tts_mut_main_cmake.txt
 restore_all() {
     cp /tmp/tts_mut_page.c main/tts/tts_page.c
     cp /tmp/tts_mut_plan.c components/push_sink/src/push_tts.c
     cp /tmp/tts_mut_book.c main/apps/app_book.c
+    cp /tmp/tts_mut_sink_h.h components/push_sink/include/push_sink.h
+    cp /tmp/tts_mut_tts_h.h main/tts/tts_page.h
+    cp /tmp/tts_mut_main_cmake.txt main/CMakeLists.txt
 }
 trap restore_all EXIT
 
@@ -143,10 +151,64 @@ p.write_text(s.replace(old, '', 1))
 EOF
 run_mutation "M8 app_book: follow poll link_up gate removed" tools/run_dict_hit_host_tests.sh
 
+# ---- M9：push_sink.h 漏 push_sink_tts_send_page 声明 ----
+# M9: push_sink.h loses the push_sink_tts_send_page declaration. P7 同型缺口：
+# 宿测不编 push_sink.c（定义在，编译不需要声明），vocab 守门只读文本——
+# 只有 Step10-5 补的头同步网看得见，固件 fullclean 也会炸（隐式声明）。
+# M9: push_sink.h loses the push_sink_tts_send_page declaration. The P7 gap
+# class: the host build never compiles push_sink.c (the definition needs no
+# declaration) and the wiring guard only reads text - only the Step10-5
+# header-sync net sees it; a firmware fullclean would also fail.
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('components/push_sink/include/push_sink.h')
+s = p.read_text()
+old = 'bool push_sink_tts_send_page(const char *text, size_t len);\n'
+assert old in s, 'M9 anchor missing'
+p.write_text(s.replace(old, '', 1))
+EOF
+run_mutation "M9 push_sink.h: tts_send_page declaration removed" tools/run_dict_hit_host_tests.sh
+
+# ---- M10：tts_page.h 漏 tts_switch_on 声明 ----
+# M10: tts_page.h loses the tts_switch_on declaration. tts_page 独册直接
+# #include "tts_page.c"，静态定义全可见，编译一声不吭——同 P7，只有头同步
+# 网擒得住。
+# M10: tts_page.h loses the tts_switch_on declaration. The tts_page booklet
+# #includes the .c directly so every static definition is visible and the
+# compile stays silent - same P7 class, only the header-sync net catches it.
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/tts/tts_page.h')
+s = p.read_text()
+old = 'bool tts_switch_on(void);\n'
+assert old in s, 'M10 anchor missing'
+p.write_text(s.replace(old, '', 1))
+EOF
+run_mutation "M10 tts_page.h: switch_on declaration removed" tools/run_dict_hit_host_tests.sh
+
+# ---- M11：main/CMakeLists.txt 漏登记 tts/tts_page.c ----
+# M11: main/CMakeLists.txt loses the tts/tts_page.c entry. 宿主测试不读
+# CMake，链接期才炸——CMake 登记网（Step10-5 同批补）擒。
+# M11: main/CMakeLists.txt loses the tts/tts_page.c entry. The host tests
+# never read CMake; the failure would only surface at link time - caught by
+# the CMake registration net (added in the same Step10-5 batch).
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/CMakeLists.txt')
+s = p.read_text()
+old = '        "tts/tts_page.c"\n'
+assert old in s, 'M11 anchor missing'
+p.write_text(s.replace(old, '        /* MUTATION M11 */\n', 1))
+EOF
+run_mutation "M11 CMake: tts/tts_page.c dropped from the source list" tools/run_dict_hit_host_tests.sh
+
 echo "----"
 if [ "$survived" -gt 0 ]; then
     echo "TTS MUTATIONS: $survived SURVIVED (BAD) - assertions have holes"
     exit 1
 fi
-echo "TTS MUTATIONS: all 8 caught (M1-M3 tts_page, M4-M6 push_tts, M7-M8 app_book wiring)"
+echo "TTS MUTATIONS: all 11 caught (M1-M3 tts_page, M4-M6 push_tts, M7-M8 app_book wiring, M9-M10 header sync, M11 CMake)"
 exit 0
