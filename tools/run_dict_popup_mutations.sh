@@ -110,8 +110,9 @@ python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
-assert '#define DICT_POPUP_AI_SEG 769' in s, 'M5 target not found'
-s = s.replace('#define DICT_POPUP_AI_SEG 769', '#define DICT_POPUP_AI_SEG 192 /* MUTATION M5 */')
+old = '#define DICT_POPUP_AI_SEG (PUSH_AI_DEF_MAX + 1u)'
+assert old in s, 'M5 target not found'
+s = s.replace(old, '#define DICT_POPUP_AI_SEG 192 /* MUTATION M5 */')
 p.write_text(s)
 EOF
 run_mutation "M5 AI segment buffer shrinks back to 192"
