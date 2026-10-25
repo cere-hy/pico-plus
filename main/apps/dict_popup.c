@@ -409,6 +409,15 @@ int dict_popup_ai_capacity_chars(void) {
     return lines * (text_w / DICT_POPUP_TEXT_PX);
 }
 
+// M2 Step9：释义截断标记的只读出口。s_truncated 由 wrap_text/store_line 在
+// 行数触顶（或行缓冲分配失败）时置位——正是「卡片装不下」的事实本身。
+// reset 清零，故只在一次暂存成功后到下一次开卡/reset 之间有意义。
+// M2 Step9: the read-only outlet of the truncation flag. s_truncated is set by
+// wrap_text/store_line when the lines fill up (or a line buffer fails) - the
+// very fact of "the card cannot hold it". reset clears it, so it is meaningful
+// only between a successful staging and the next open/reset.
+bool dict_popup_ai_truncated(void) { return s_truncated; }
+
 // gen26 AI 释义开卡：外部释义（手机 0x07 回流 / 预取缓存命中）直接暂存。与
 // dict_popup_open 共用 reset/wrap/store 链路与保存 chip 谓词，唯一区别是不做
 // 本地词典查找。gen26.3 ④：查询态卡到达时走的正是原地更新——入口的 reset 已清

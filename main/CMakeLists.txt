@@ -88,6 +88,7 @@ idf_component_register(
         "ui/ui_reader_background.c"
         "apps/app_book.c"
         "apps/dict_popup.c"
+        "apps/ai_reader.c"
         "apps/book_toc.c"
         "apps/app_dashboard.c"
         "apps/app_files.c"

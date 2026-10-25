@@ -74,6 +74,16 @@ bool dict_popup_pending_expired(int64_t timeout_us);
 /// portrait value is the conservative one for prompt calibration). The
 /// derivation is pinned in the function comment in dict_popup.c.
 int dict_popup_ai_capacity_chars(void);
+/// M2 Step9 谓词：当前卡片（词典释义卡或 AI 释义卡）的释义是否在暂存折行时
+/// 被容量截断——行数触顶后仍有文本剩。调用方（app_book）据此把超容量长文
+/// 交给 ai_reader 详解会话承载：词卡管快、阅读视图管全。查询态（AI 查询中…）
+/// 与非 AI 词典卡恒 false（词典条目本就为卡面容量编写）。
+/// M2 Step9 predicate: whether the staged definition was truncated by the
+/// card's line capacity (text left over after the lines filled up). The caller
+/// (app_book) routes oversized long text to the ai_reader detail session: the
+/// card is quick, the view is complete. Always false in the querying state and
+/// on a plain dictionary card (dictionary entries are written to fit the card).
+bool dict_popup_ai_truncated(void);
 /// 释放内容与词头。/ Release staged content.
 void dict_popup_reset(void);
 /// 在阅读页内容之上绘制卡片。/ Paint the card over the reader content.

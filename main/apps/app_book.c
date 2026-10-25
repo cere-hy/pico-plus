@@ -117,6 +117,7 @@
 #include "book_id.h"
 #include "book_cover.h"
 #include "book_cover_jobs.h"
+#include "ai_reader.h"
 #include "book_lock_collage.h"
 #include "book_epub.h"
 #include "book_policy.h"
@@ -224,6 +225,15 @@ typedef struct {
 } shelf_entry_t;
 
 static const char* TAG = "book";
+// M2 Step9：AI 释义超容量时改用 ai_reader 详解会话承载（覆盖层，不开书）。
+// 本标志是「本次卡面改动需要 FULL 重刷」的信号——开/关详解各一次 GC16
+// （双 GC16 设计点），词卡原地更新则为 PAGE。app_loop 回流点据此选档位。
+// M2 Step9: when an AI definition overflows the card, the ai_reader detail
+// session (an overlay, no book opened) carries it. This flag signals "this
+// card change needs a FULL repaint" - one GC16 each for open and close (the
+// double-GC16 design point); an in-place card update stays PAGE. The app_loop
+// return path picks the tier from it.
+static bool s_ai_def_full;
 static book_view_t s_view;
 static int s_presented_view = -1;
 static bool s_reader_image_refresh_pending;
@@ -470,6 +480,10 @@ static UBaseType_t s_prep_hwm_words;
 static void render(app_ctx_t* ctx, uint8_t* fb);
 static void draw_reader_panel(uint8_t* fb);
 static EpdRect reader_slider_rect(int slider);
+// M2 Step9：app_book_ai_def_ready 的页脚快照要用视觉页号，声明提前到使用点
+// 之前（定义在后部）。/ M2 Step9: the footer snapshot in app_book_ai_def_ready
+// needs the visual page number; declared ahead of its use (defined later).
+static size_t reader_visual_index(size_t logical);
 static void scan_shelf(app_ctx_t* ctx);
 static void copy_text(char* dst, size_t cap, const char* src);
 static void fit_text(char* text, int px, int width);
@@ -876,7 +890,46 @@ void app_book_cover_mode_changed(void) { invalidate_covers(); }
 bool app_book_ai_def_ready(const char* word, const char* def) {
     if (s_view != READING || !s_text) return false;
     if (s_reader_panel == READER_PANEL_NONE) {
+        // M2 Step9：新释义到达时旧详解会话让位——新词接管，无论本次落卡还是
+        // 再开详解。详解页→卡面的版面切换同样要 GC16 打底（双 GC16 语义：
+        // 详解会话的每次「进出」都是 FULL）。/ M2 Step9: a new definition
+        // evicts an older detail session (the new word takes over, whether it
+        // lands on a card or opens a fresh session). A detail-page-to-card
+        // layout switch also needs a GC16 base - every enter/exit of the
+        // session is FULL under the double-GC16 rule.
+        if (ai_reader_active()) {
+            ai_reader_close();
+            s_ai_def_full = true;
+        }
         if (!dict_popup_show_def(word, def)) return false;
+        // M2 Step9：卡面装不下（折行触顶仍有剩文）→ 不开卡，改开详解阅读会话
+        // ——词卡管快、阅读视图管全。原书章节缓冲不动，关闭即回原书当前页。
+        // M2 Step9: when the card cannot hold it (the wrap hit the line cap
+        // with text left over), open the detail session instead of the card.
+        // The source chapter buffer stays put; closing re-presents the source
+        // page in place.
+        if (dict_popup_ai_truncated()) {
+            dict_popup_reset();
+            s_reader_panel = READER_PANEL_NONE;
+            ai_reader_source_t src;
+            memset(&src, 0, sizeof(src));
+            src.chapter = s_chapter;
+            src.page = reader_visual_index(s_page);           // 视觉页号（页脚展示）
+            src.page_start_offset = s_page;                   // 逻辑页索引（锚点兜底）
+            copy_text(src.title, sizeof(src.title),
+                      s_book_title[0] ? s_book_title : s_title);
+            if (ai_reader_open(word, def, &src)) {
+                s_ai_def_full = true; // 双 GC16 的 open 侧 / open side of the double GC16
+                ESP_LOGI(TAG, "ai detail session opened for \"%s\" (card truncated)", word);
+                return true;
+            }
+            // 开会话失败（空词/空释义——上游已校验，纯防御）：卡面重开，至少
+            // 用户看到（可能截断的）卡而不是什么都没有。/ Session-open failure
+            // (empty word/def - already validated upstream, pure defence):
+            // re-stage the card so the user at least sees the card.
+            if (dict_popup_show_def(word, def)) s_reader_panel = READER_PANEL_DICT;
+            return s_reader_panel == READER_PANEL_DICT;
+        }
         s_reader_panel = READER_PANEL_DICT;
         return true;
     }
@@ -894,6 +947,35 @@ bool app_book_ai_def_ready(const char* word, const char* def) {
         return true;
     }
     return false; // 门 A：其他面板开着，释义丢弃进预取缓存 / gate A: another panel, drop into the cache
+}
+
+// M2 Step9：present 档位查询——app_book_ai_def_ready 刚开（或关过）详解会话
+// 时为 true（主循环用 FULL 呈现，双 GC16 的 open 侧）。一次性消费。
+// M2 Step9: the present-tier query - true when app_book_ai_def_ready just
+// opened (or closed) a detail session (the main loop presents FULL: the open
+// side of the double GC16). One-shot consumption.
+bool app_book_ai_def_full(void) {
+    const bool full = s_ai_def_full;
+    s_ai_def_full = false;
+    return full;
+}
+
+// M2 Step9：详解会话活跃谓词（app_loop 的 KEY_2 豁免判定用）。
+// M2 Step9: the detail-session-active predicate (app_loop's KEY_2 exemption).
+bool app_book_ai_detail_active(void) {
+    return ai_reader_active();
+}
+
+// M2 Step9：关闭详解会话并请求 FULL 重呈现（双 GC16 的 close 侧）。原书章节
+// 缓冲从未卸载，render 随即走原阅读路径画回原书当前页——阅读位置零丢失。
+// M2 Step9: close the session and ask for a FULL re-present (the close side of
+// the double GC16). The source chapter buffer was never unloaded, so render
+// walks the plain reader path straight back to the source page - zero
+// reading-position loss.
+static app_redraw_t ai_reader_close_full(void) {
+    ai_reader_close();
+    s_ai_def_full = false;
+    return APP_REDRAW_FULL;
 }
 static uint8_t* load_cover_gray(const char* source, const char* title, const char* author,
                                 bool decode, bool* pending) {
@@ -3977,6 +4059,22 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
                         book_navigation_count(), current_toc_position(), ctx->leaf, s_message);
         if (s_toc_jump_open)
             book_toc_render_jump(fb, book_navigation_count(), s_toc_jump_percent);
+        unlock_draw();
+        return;
+    }
+    // M2 Step9：AI 详解覆盖会话优先于阅读正文——它是 READING 视图上的一层，
+    // 方向沿用阅读设置（横屏阅读者看横屏详解；ai_reader_render 内部按实际
+    // 版面实算每行字数/每页行数，分页与所见一致）。原书正文不画、章节缓冲
+    // 不动（铁律②）；render 只绘图，会话状态由输入链管理。
+    // M2 Step9: the AI detail overlay takes precedence over the reader body -
+    // it is a layer on the READING view and inherits the reading rotation (a
+    // landscape reader sees a landscape detail; metrics are computed from the
+    // measured layout inside ai_reader_render so pagination matches the view).
+    // The source body is not painted and its chapter buffer is untouched (law
+    // 2); render only draws, the input chain owns the session state.
+    if (s_view == READING && ai_reader_active()) {
+        lock_draw();
+        ai_reader_render(fb);
         unlock_draw();
         return;
     }
@@ -7299,6 +7397,23 @@ static int reader_swipe_direction(ui_gesture_type_t type, bool vertical) {
 }
 
 static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
+    // M2 Step9 铁律①：详解态手势语义隔离——沿用阅读翻页方向映射（左右/上下
+    // 滑按设置）翻详解页，首/末页停滞不退出；点击/长按/其他手势不穿透到原书
+    // （点词、工具栏、导航、设置滑杆在覆盖层下全部不可达）。
+    // M2 Step9 law 1: gesture semantics are isolated in a detail session - the
+    // reader's turn mapping (swipes per settings) turns detail pages, stalling
+    // at both ends; taps, long-presses and other gestures never fall through
+    // to the source (word lookup, toolbar, nav and sliders are all unreachable
+    // under the overlay).
+    if (s_view == READING && ai_reader_active()) {
+        const int direction = reader_swipe_direction(ev->type,
+                                                     app_settings_reader_vertical_turn());
+        if (direction) {
+            ctx->user_activity = true;
+            return ai_reader_turn(direction);
+        }
+        return APP_REDRAW_NONE;
+    }
     if (s_view==SHELF && (s_category_menu || ui_rect_hit((EpdRect){24,79,388,74},ev->x0,ev->y0)))
         return shelf_category_gesture(ctx,ev);
     if (s_view == READING && (s_reader_panel == READER_PANEL_BACKGROUND ||
@@ -7487,6 +7602,20 @@ static app_redraw_t reader_key_action(app_ctx_t *ctx, app_reader_key_action_t ac
 static app_redraw_t on_key(app_ctx_t* ctx, int key) {
     s_reader_tap.pending = false;
     s_pressed_control = -1;
+    // M2 Step9 铁律①：详解会话期按键语义全隔离——KEY1/3 翻详解页（首/末页
+    // 停滞，不自动退出），KEY2 = 关闭并回原书当前页，其余键忽略。覆盖层下
+    // 原书 turn_page / 工具栏 / 设置面板永不可达。/ M2 Step9 law 1: key
+    // semantics are fully isolated in a detail session - KEY1/3 turn detail
+    // pages (stalling at both ends, never auto-exiting), KEY2 closes back to
+    // the source page, other keys are ignored. The source turn_page, toolbar
+    // and settings panels are unreachable under the overlay.
+    if (s_view == READING && ai_reader_active()) {
+        if (key == UI_KEY_1 || key == UI_KEY_3) {
+            return ai_reader_turn(key == UI_KEY_1 ? -1 : 1);
+        }
+        if (key == UI_KEY_2) return ai_reader_close_full();
+        return APP_REDRAW_NONE;
+    }
     if (s_view == TOC && s_toc_jump_open) {
         if (key == UI_KEY_2) s_toc_jump_open = s_toc_jump_drag = false;
         else if (key == UI_KEY_1 || key == UI_KEY_3) {
@@ -7536,6 +7665,16 @@ static app_redraw_t on_key(app_ctx_t* ctx, int key) {
 }
 static app_redraw_t on_power_short(app_ctx_t* ctx) {
     s_reader_tap.pending = false;
+    // M2 Step9 铁律①：详解态电源键 = 翻详解页（沿用用户的电源翻页设置；
+    // 末页停滞回 APP_REDRAW_DONE，与原书路径同口径——按了不退出）。
+    // M2 Step9 law 1: the power key turns detail pages (honouring the user's
+    // power-turn setting; a stall answers APP_REDRAW_DONE, same as the source
+    // path - pressed means pressed, never an exit).
+    if (s_view == READING && ai_reader_active()) {
+        if (!app_settings_reader_power_turn()) return APP_REDRAW_NONE;
+        app_redraw_t result = ai_reader_turn(1);
+        return result == APP_REDRAW_NONE ? APP_REDRAW_DONE : result;
+    }
     if (s_view != READING || !s_text || s_clear_confirm ||
         !app_settings_reader_power_turn()) return APP_REDRAW_NONE;
     s_stats_activity_ms = ctx->now_ms;
@@ -7544,6 +7683,14 @@ static app_redraw_t on_power_short(app_ctx_t* ctx) {
 }
 static app_redraw_t on_key_long(app_ctx_t* ctx, int key) {
     s_reader_tap.pending = false;
+    // M2 Step9 铁律①：详解态长按 KEY2 = 关闭详解回原书（不开工具栏、不返回
+    // 主页——覆盖层只有一个出口）。其余长按忽略。/ M2 Step9 law 1: in a
+    // detail session a KEY2 long-press closes back to the source (no toolbar,
+    // no home - the overlay has exactly one exit). Other long-presses ignore.
+    if (s_view == READING && ai_reader_active()) {
+        if (key == UI_KEY_2) return ai_reader_close_full();
+        return APP_REDRAW_NONE;
+    }
     if (key != UI_KEY_2) return APP_REDRAW_NONE;
     if (s_view == TOC && s_toc_jump_open) {
         s_toc_jump_open = s_toc_jump_drag = false;
@@ -7626,6 +7773,13 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     if (s_view == READING && s_path[0] && strcmp(s_path, PUSH_TEXT_PATH) == 0 && push_sink_armed()) {
         const push_state_t st = push_sink_state();
         if (st == PUSH_STATE_RECEIVING || st == PUSH_STATE_PROCESSING) {
+            // M2 Step9：推送在飞要弹回传书页——详解会话先关（状态卫生：不回
+            // 到一个「详解还开着」的传书页）。原书位置由 app_transfer 链路保管。
+            // M2 Step9: a push in flight bounces to the transfer page - close
+            // any detail session first (state hygiene: never land on the
+            // transfer page with a session still open). The source position is
+            // kept by the app_transfer chain.
+            if (ai_reader_active()) ai_reader_close();
             s_push_handoff = true;
             extern const app_desc_t app_transfer;
             ctx->request_app = &app_transfer;
@@ -7672,7 +7826,12 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             (void)load_chapter(ctx, s_chapter, book_layout_page_start_offset(s_page), false);
         return APP_REDRAW_PAGE;
     }
-    if (s_view != READING || (s_toolbar && s_reader_panel != READER_PANEL_TOOLS) || s_clear_confirm || ctx->consumed) s_reader_tap.pending = false;
+    // M2 Step9：详解态不清原书双击翻页判定——覆盖层下单击/双击不产生任何
+    // 原书语义（防御性清理：pending 只可能由会话前的输入留下）。
+    // M2 Step9: a detail session never feeds the source double-tap turn - under
+    // the overlay a tap produces no source semantics at all (defensive clear:
+    // a pending can only be left by pre-session input).
+    if (s_view != READING || ai_reader_active() || (s_toolbar && s_reader_panel != READER_PANEL_TOOLS) || s_clear_confirm || ctx->consumed) s_reader_tap.pending = false;
     else {
         int tap = book_reader_tap_tick(&s_reader_tap, ctx->now_ms, ctx->touch && ctx->touch->touched);
         if (tap) return turn_page(ctx, tap);
@@ -7696,6 +7855,10 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             if (redraw != APP_REDRAW_NONE) return redraw;
         } else if (ble_dir && s_view == READING) {
             s_stats_activity_ms = ctx->now_ms;
+            // M2 Step9 铁律①：BLE 遥控器翻页在详解态同样隔离——翻详解页，
+            // 不到原书。/ M2 Step9 law 1: BLE remote turns are isolated too -
+            // they turn detail pages, never the source book.
+            if (ai_reader_active()) return ai_reader_turn(ble_dir);
             return turn_page(ctx, ble_dir);
         }
     }

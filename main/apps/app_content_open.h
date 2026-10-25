@@ -54,6 +54,23 @@ void app_book_cover_mode_changed(void);
 /// stays in the prefetch cache and the next tap on the same word shows it
 /// instantly).
 bool app_book_ai_def_ready(const char* word, const char* def);
+/// M2 Step9：app_book_ai_def_ready 刚开了一次详解会话（超容量长文改由
+/// ai_reader 覆盖层承载）——主循环据此把呈现档位从 PAGE 提到 FULL（双 GC16
+/// 的 open 侧）。一次性消费：读过即清零，陈旧的 FULL 请求不会滞留。
+/// M2 Step9: app_book_ai_def_ready just opened a detail session (an oversized
+/// long definition routed to the ai_reader overlay) - the main loop lifts the
+/// present tier from PAGE to FULL for it (the open side of the double GC16).
+/// One-shot: read-and-clear, so a stale FULL request never lingers.
+bool app_book_ai_def_full(void);
+/// M2 Step9 谓词：详解会话正活跃（READING 视图上的覆盖层）。主循环用它把
+/// KEY_2 短按从「中键菜单」豁免成「直达 app 关详解」——defer_middle_short
+/// 此时必须让位，否则菜单会盖住详解页。输入隔离主体在 app_book 各入口。
+/// M2 Step9 predicate: a detail session is active (the overlay on READING).
+/// The main loop uses it to exempt KEY_2 short-press from the middle-key menu
+/// so it reaches the app to close the view - defer_middle_short must yield
+/// here, or the menu would cover the detail page. The input isolation itself
+/// lives in app_book's entry points.
+bool app_book_ai_detail_active(void);
 void app_home_cover_mode_changed(void);
 /// 开书前释放可重建的表盘底图，让解析器使用这部分 PSRAM。/ Release rebuildable clock bases before opening a book so parsing can use that PSRAM.
 void app_home_release_clock_cache(void);

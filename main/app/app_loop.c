@@ -665,7 +665,19 @@ void app_loop_run(const app_loop_config_t* config) {
                 vocab_log_ai_set_def(ai_word, ai_def);
                 if (app_book_ai_def_ready(ai_word, ai_def)) {
                     was_touched = touch.touched;
-                    app_present(&ctx, current, APP_REDRAW_PAGE);
+                    // M2 Step9：本轮回流若是开详解视图（门 A 放行 + 折行触顶），走一次
+                    // GC16 全刷打底；词面→详解页的版面跨度大，局部刷新会留残影。
+                    // 其余回流（卡面刷新）维持局部刷新档位不变。app_book_ai_def_full
+                    // 是一次性查询：开详解时置位、此处消费，下一轮回流自动回落 PAGE。
+                    // M2 Step9: if this return flow opens the detail view (gate A
+                    // passed + wrapped text hit the cap), take one GC16 FULL refresh
+                    // to lay the base; the word-card -> detail-page layout jump is
+                    // wide enough that a partial update would ghost. Every other
+                    // return flow (card refresh) keeps its partial-update gear.
+                    // app_book_ai_def_full is a one-shot query: set when the detail
+                    // view opens, consumed here, so the next flow falls back to PAGE.
+                    app_present(&ctx, current,
+                                app_book_ai_def_full() ? APP_REDRAW_FULL : APP_REDRAW_PAGE);
                     vTaskDelay(pdMS_TO_TICKS(LOOP_TICK_MS));
                     continue;
                 }
@@ -855,10 +867,40 @@ void app_loop_run(const app_loop_config_t* config) {
                 menu_pressed = UI_MENU_HIT_NONE;
             }
             if (key >= 0 && current->owns_keys && !menu_open) {
-                app_redraw_t redraw = current->on_key && !(key == UI_KEY_2 && current->defer_middle_short)
+                // M2 Step9：详解会话活跃时，KEY_2 短按豁免 defer_middle_short——直达
+                // app_book 的 on_key 关闭详解页。否则短按会被中键菜单吞掉，菜单盖住
+                // 详解页且失去关闭入口。豁免只查 app_book 的 detail_active 谓词；
+                // 非详解态（含其他 app）条件与原来逐字等价，延迟菜单行为不变。
+                // 详解态的输入隔离（app_book 五处入口）保证会话期内切不出 app_book，
+                // 故谓词为真时 current 必为 app_book，豁免不会误伤别的 app。
+                // M2 Step9: while a detail session is live, a short KEY_2 press is
+                // exempt from defer_middle_short - it goes straight to app_book's
+                // on_key to close the detail page. Otherwise the middle-key menu
+                // would swallow the press, covering the detail page and losing the
+                // close affordance. The exemption consults only app_book's
+                // detail_active predicate; outside a detail session (including for
+                // other apps) the condition is byte-for-byte the old one, so
+                // deferred-menu behavior is unchanged. The detail session's input
+                // isolation (app_book's five entry points) keeps the user inside
+                // app_book for its lifetime, so a true predicate implies
+                // current == app_book and the exemption cannot misfire elsewhere.
+                const bool ai_detail = app_book_ai_detail_active();
+                app_redraw_t redraw = current->on_key &&
+                    !(key == UI_KEY_2 && current->defer_middle_short && !ai_detail)
                     ? current->on_key(&ctx, key) : APP_REDRAW_NONE;
                 present_page(&ctx, current, &gesture, redraw);
-                if (current->on_key_long && touch.count == 1) {
+                // M2 Step9：豁免过的 KEY_2 短按不再挂 held_key。压下时 on_key 已直达
+                // 关闭详解；若照旧挂键，抬手时下面的 defer 释放块会二次调用 on_key——
+                // 那一刻详解已关，KEY_2 会落到原书路径（工具面板/按键设置），多弹一个
+                // 面板。详解态 KEY_2 长按语义=关闭，由压路直达已经满足，无需挂键。
+                // M2 Step9: an exempted KEY_2 short press no longer arms held_key.
+                // on_key already ran straight to close the detail view on press;
+                // arming anyway would make the deferred release block below call
+                // on_key a second time - by then the detail view is closed and
+                // KEY_2 would land on the source path (tools panel / key action),
+                // popping an extra panel. Long-press KEY_2 in a detail session
+                // means "close" too, which the press path already satisfies.
+                if (current->on_key_long && touch.count == 1 && !(key == UI_KEY_2 && ai_detail)) {
                     held_key = key;
                     held_since_ms = ctx.now_ms;
                 }

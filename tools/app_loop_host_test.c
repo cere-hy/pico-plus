@@ -81,7 +81,17 @@ static char push_cancel_why[64];
 // of the same shape as the gen21 cancel_why stub; see the note there.
 static bool ai_take_hit, ai_ready_ok = true;
 static int ai_presents, ai_ready_calls;
+static int ai_full_presents;
 static char ai_seen_word[PUSH_AI_WORD_MAX + 1], ai_seen_def[PUSH_AI_DEF_MAX + 1];
+// M2 Step9 接线桩：双 GC16 档位查询与详解活跃谓词。ai_def_full_ok 的一次性
+// 消费语义与真实 app_book_ai_def_full() 逐字一致（取一次即清），守门用例因此
+// 能验「开详解当轮回流走 FULL、下一轮回流自动回落」而不必真跑 app_book。
+// M2 Step9 wiring shims: the double-GC16 gear query and the detail-active
+// predicate. ai_def_full_ok consumes itself exactly like the real
+// app_book_ai_def_full(), so the gatekeeper can assert "the opening flow takes
+// FULL and the next one falls back to PAGE" without running app_book itself.
+static bool ai_def_full_ok;
+static bool ai_detail_active;
 // 出卡观测点：挂到 current->present 上，只数 PAGE 呈现（AI 分支专用参数；
 // 首帧 FULL 与 tick 尾部 NONE 不计）。返回 false 让 app_present 继续走常规
 // 呈现路径，不改变被测行为。
@@ -89,7 +99,23 @@ static char ai_seen_word[PUSH_AI_WORD_MAX + 1], ai_seen_def[PUSH_AI_DEF_MAX + 1]
 // presents (the AI branch's argument; the startup FULL and tick-tail NONE are
 // not counted). Returning false lets app_present continue down its normal
 // path, changing nothing.
-static bool ai_present(app_ctx_t *c, app_redraw_t r) { (void)c; if (r == APP_REDRAW_PAGE) ++ai_presents; return false; }
+static bool ai_present(app_ctx_t *c, app_redraw_t r) {
+    (void)c;
+    if (r == APP_REDRAW_PAGE) ++ai_presents;
+    // M2 Step9：FULL 单独计数——开详解的回流必须整屏打底（双 GC16 的 open 侧），
+    // 与首帧 FULL 混在一起就分不清「谁触发的全刷」。
+    // M2 Step9: count FULL separately - the detail-opening flow must lay a full
+    // base (the open side of the double GC16); mixing it with the startup FULL
+    // would hide who triggered the refresh.
+    else if (r == APP_REDRAW_FULL) ++ai_full_presents;
+    return false;
+}
+// M2 Step9：按键调用步记录。豁免守门要分辨「压下即调」与「抬手才调」——只数
+// 次数两者都是 1，步号才能把 defer 语义与豁免语义分开。
+// M2 Step9: record the loop step of each key call. The exemption gatekeeper
+// must tell "called on press" from "called on release" - both count 1, so only
+// the step number separates the deferred semantics from the exempted one.
+static int key_steps[3];
 
 static app_redraw_t long_key(app_ctx_t* c, int k) { assert(k==UI_KEY_2); ++long_keys; c->request_menu=true; return APP_REDRAW_NONE; }
 static app_redraw_t response;
@@ -226,7 +252,7 @@ static app_redraw_t gesture(app_ctx_t*c,const ui_gesture_event_t*e) {
     if(e->type==UI_GESTURE_PRESS&&home_on_touch)c->request_return=true;
     return response;
 }
-static app_redraw_t key(app_ctx_t*c,int k) {keys[k]++;if(home_on_key)c->request_return=true;return APP_REDRAW_NONE;}
+static app_redraw_t key(app_ctx_t*c,int k) {keys[k]++;key_steps[k]=step;if(home_on_key)c->request_return=true;return APP_REDRAW_NONE;}
 // 记录 TAP 的逻辑坐标，供横屏旋转公式做端到端断言。
 // Record TAP logical coords for end-to-end landscape rotation assertions.
 static int tap_x0, tap_y0, tap_x, tap_y;
@@ -251,7 +277,8 @@ static void reset(void) {
     transfer_status=(read_pico_transfer_status_t){0};
     quick_draws=quick_gl=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
     push_armed=false;push_cancel_calls=0;push_cancel_why[0]='\0';
-    ai_take_hit=false;ai_ready_ok=true;ai_presents=ai_ready_calls=0;
+    ai_take_hit=false;ai_ready_ok=true;ai_presents=ai_ready_calls=ai_full_presents=0;
+    ai_def_full_ok=false;ai_detail_active=false;
     ai_seen_word[0]=ai_seen_def[0]='\0';
     main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
@@ -263,7 +290,7 @@ static void reset(void) {
     home_on_touch=home_on_tick=home_on_key=start_second=false;
     home_enters=home_renders=0;rendered_leaf=-1;last_menu_leaf=-1;menu_background=NULL;
     full_tick=lock_due=font_due=shake_activity=false;time_offset=0;time_step=10000;du_areas=gl_areas=0;
-    memset(samples,0,sizeof(samples));memset(keys,0,sizeof(keys));memset(events,0,sizeof(events));memset(tick_consumed,0,sizeof(tick_consumed));
+    memset(samples,0,sizeof(samples));memset(keys,0,sizeof(keys));memset(key_steps,0,sizeof(key_steps));memset(events,0,sizeof(events));memset(tick_consumed,0,sizeof(tick_consumed));
     sample_count=step=ticks=enters=exits=touch_calls=menus=highlights=restores=fulls=mode=0;
     request_on_touch=request_on_tick=menu_on_tick=menu_on_touch=cancel_clobber=false;response=APP_REDRAW_NONE;
     first=(app_desc_t){.title="first",.render=render,.on_enter=enter,.on_exit=leave,.on_touch=touch,.on_tick=tick,.on_key=key};
@@ -684,6 +711,49 @@ int main(void) {
     reset();first.present=ai_present;ai_take_hit=false;time_step=600000;
     add(100,400,1,0);add(0,0,0,0);run();
     assert(ai_ready_calls==0&&ai_presents==0&&touch_calls==1); // 槽空：零副作用
+    // 守门用例四（M2 Step9 接线）：双 GC16 档位 + KEY_2 豁免五断言——
+    // ①开详解（ai_def_full_ok=true）：回流呈现走 FULL，首帧 FULL + 回流 FULL = 2、
+    //   零 PAGE——词面→详解页的版面跨度大，局部刷新会留残影，必须整屏 GC16 打底；
+    // ②普通回流（ai_def_full_ok=false）：维持 PAGE 档位（首帧 FULL = 1 + 卡 PAGE = 1），
+    //   与守门用例三①同口径——档位查询不波及非详解回流；
+    // ③KEY_2 豁免关（defer_middle_short + 非详解态）：短按压无动作，on_key 在抬手
+    //   步才调（key_steps[1]==1）——延迟菜单语义原样，豁免没有偷改常态路径；
+    // ④KEY_2 豁免开（详解态）：压下即调 on_key 关闭（key_steps[1]==0）且不挂
+    //   held_key——抬手不补刀（否则详解已关，KEY_2 会落到原书工具面板多弹一层）；
+    // ⑤豁免开 + 长按（超 UI_LONG_PRESS_MS）：照样只关一次（long_keys==0）——
+    //   「长按也=关闭」由压路直达满足，无需挂键等抬手。
+    // Gatekeeper 4 (M2 Step9 wiring): the double GC16 gear + the KEY_2 exemption,
+    // five assertions - (1) detail opening (ai_def_full_ok=true): the return flow
+    // presents FULL, startup FULL + return FULL = 2 with zero PAGE - the word-card
+    // -> detail-page layout jump is wide enough that a partial update would ghost,
+    // so a full GC16 base is mandatory; (2) an ordinary flow (flag false): keeps
+    // the PAGE gear (startup FULL = 1 + card PAGE = 1), same as gatekeeper 3 case 1
+    // - the gear query leaves non-detail flows untouched; (3) exemption off
+    // (defer_middle_short, no detail session): the press does nothing and on_key
+    // fires on the release step (key_steps[1]==1) - deferred-menu semantics are
+    // unchanged, the exemption does not quietly rewrite the normal path; (4)
+    // exemption on (detail session live): on_key fires on the press step
+    // (key_steps[1]==0) and held_key is not armed - no second call on release
+    // (the detail view would already be closed and KEY_2 would land on the
+    // source tools panel, popping an extra layer); (5) exemption on with a long
+    // press (past UI_LONG_PRESS_MS): still closes exactly once (long_keys==0) -
+    // "long press also means close" is satisfied by the press path directly.
+    reset();first.present=ai_present;ai_take_hit=true;ai_def_full_ok=true;time_step=600000;
+    add(100,400,1,0);add(0,0,0,0);run();
+    assert(ai_ready_calls==1&&ai_presents==0&&ai_full_presents==2);
+    reset();first.present=ai_present;ai_take_hit=true;ai_def_full_ok=false;time_step=600000;
+    add(100,400,1,0);add(0,0,0,0);run();
+    assert(ai_full_presents==1&&ai_presents==1); // 普通回流维持 PAGE 档位
+    reset();first.owns_keys=true;first.defer_middle_short=true;first.on_key_long=long_key;time_step=100000;
+    add(240,1500,1,0);add(0,0,0,0);run();
+    assert(keys[1]==1&&key_steps[1]==1&&!long_keys&&!menus); // 豁免关：抬手才执行
+    reset();first.owns_keys=true;first.defer_middle_short=true;first.on_key_long=long_key;ai_detail_active=true;time_step=100000;
+    add(240,1500,1,0);add(0,0,0,0);run();
+    assert(keys[1]==1&&key_steps[1]==0&&!long_keys&&!menus); // 豁免开：压下即关，抬手不补刀
+    reset();first.owns_keys=true;first.defer_middle_short=true;first.on_key_long=long_key;ai_detail_active=true;time_step=1000000;
+    add(240,1500,1,0);add(0,0,0,0);run();
+    assert(keys[1]==1&&key_steps[1]==0&&!long_keys); // 长按也只关一次
+    puts("PASS: M2 Step9 wiring: detail-opening return flow takes the FULL gear, ordinary flows keep PAGE; the KEY_2 exemption fires on press without arming held_key, while deferred-menu semantics stay intact outside a detail session");
     puts("PASS: gen26 AI definition poll: filled+accepted presents the card and drops the tick's press, refused keeps normal dispatch, empty slot has zero side effects");
     puts("PASS: real loop and power recognizer: DU-only contact, release commits off/staged sleep/restart once, cancel restores full navigation, touch/multitouch errors and entry-held suppression");
     puts("PASS: shutdown dialog gatekeepers: landscape long-press resets the dialog branch to portrait, and cancel repaints through render() to restore landscape");
@@ -722,6 +792,26 @@ bool app_book_ai_def_ready(const char *word, const char *def) {
     snprintf(ai_seen_def, sizeof(ai_seen_def), "%s", def);
     return ai_ready_ok;
 }
+// M2 Step9：双 GC16 档位查询桩。一次性消费语义与 app_book.c 的真实 getter
+// 一致——app_loop 的回流点每轮回流只查一次，查完即清，故守门可以用两次
+// 回流验证「开详解 FULL、随后回落 PAGE」。非消费式会让第二轮回流错误地
+// 再吃一次 FULL，守门立刻红。
+// M2 Step9: the double-GC16 gear query stub. Its one-shot consumption mirrors
+// the real getter in app_book.c - app_loop's return flow queries it once per
+// flow and it clears on read, so the gatekeeper can drive two flows and see
+// "detail-opening takes FULL, the next falls back to PAGE". A non-consuming
+// stub would wrongly feed the second flow another FULL and turn the gate red.
+bool app_book_ai_def_full(void) {
+    const bool full = ai_def_full_ok;
+    ai_def_full_ok = false;
+    return full;
+}
+// M2 Step9：详解活跃谓词桩（app_loop 的 KEY_2 豁免查询）。非一次性——豁免
+// 判定发生在每次 owns_keys 按键分发，会话期内每次查询都须如实作答。
+// M2 Step9: the detail-active predicate stub (app_loop's KEY_2 exemption
+// query). Not one-shot - the exemption is evaluated on every owns_keys key
+// dispatch, so every query during a session must answer truthfully.
+bool app_book_ai_detail_active(void) { return ai_detail_active; }
 // gen21：手动息屏经 prepare_lock(manual=true) 调 cancel_why("manual sleep")。
 // 记录调用次数与 why 文本，供守门用例断言「武装期手动息屏静默取消武装」。
 // 此桩自 gen21（2ea51cb）起漏同步补定义，宿主链接失败躺了三代——教训同
