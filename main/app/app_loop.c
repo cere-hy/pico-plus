@@ -48,6 +48,7 @@
 #include "push_sink.h"
 #include "ota_online.h"
 #include "continuous_du.h"
+#include "dict/vocab_log.h"
 #include "display.h"
 #include "e0470_epaper_waveform.h"
 #include "esp_log.h"
@@ -649,13 +650,31 @@ void app_loop_run(const app_loop_config_t* config) {
             // discard (same treatment as card-removal events).
             char ai_word[PUSH_AI_WORD_MAX + 1];
             char ai_def[PUSH_AI_DEF_MAX + 1];
-            if (push_sink_take_ai_def(ai_word, sizeof(ai_word), ai_def, sizeof(ai_def)) &&
-                app_book_ai_def_ready(ai_word, ai_def)) {
-                was_touched = touch.touched;
-                app_present(&ctx, current, APP_REDRAW_PAGE);
-                vTaskDelay(pdMS_TO_TICKS(LOOP_TICK_MS));
-                continue;
+            if (push_sink_take_ai_def(ai_word, sizeof(ai_word), ai_def, sizeof(ai_def))) {
+                // gen26.5 M2 Step8：释义回流先进 AI 生词批，再走弹卡。两个动作解耦——
+                // 弹卡被门 A 丢弃（其他面板开着）时，落库照旧：交互已经发生，
+                // 「与 AI 交互过的词全落」不因 UI 状态而改变。批里没这个词
+                // （早已落盘或从未入批）时 set_def 静默忽略，释义留在预取缓存。
+                // gen26.5 M2 Step8: the returning definition feeds the AI vocabulary
+                // batch BEFORE the card. The two are decoupled - when gate A drops
+                // the card (another panel is open), logging still happens: the
+                // interaction occurred, and "every AI-interacted word logs" does not
+                // bend to UI state. A word not in the batch (already flushed or
+                // never queued) is silently ignored; the definition stays in the
+                // prefetch cache.
+                vocab_log_ai_set_def(ai_word, ai_def);
+                if (app_book_ai_def_ready(ai_word, ai_def)) {
+                    was_touched = touch.touched;
+                    app_present(&ctx, current, APP_REDRAW_PAGE);
+                    vTaskDelay(pdMS_TO_TICKS(LOOP_TICK_MS));
+                    continue;
+                }
             }
+            // gen26.5 M2 Step8：AI 生词批合批驱动。首次入队满 5s 才真正写卡，
+            // 没到点或没批都是零开销的两次比较。/ gen26.5 M2 Step8: drive the AI
+            // vocabulary batch. Writes only once 5s after the first queued word;
+            // with no batch or before the deadline it is two comparisons, free.
+            vocab_log_ai_flush();
         }
         ctx.pressed = pressed;
         ctx.released = released;

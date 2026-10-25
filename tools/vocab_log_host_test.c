@@ -30,8 +30,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 int vocab_test_alloc_fail = -1; /* -1 = 不注入失败 / no injected failures */
+int64_t vocab_test_now_us = 0;   /* AI 批时钟，测试推进它 / the AI batch clock */
+int vocab_test_nvs_autosave = -1; /* -1 = NVS 无此键 / key absent */
 
 #include "vocab_log.h"
 #include "vocab_log.c"
@@ -416,8 +419,164 @@ static void test_view_guard(void) {
     CHECK(!s_sentence[0], "an upper-case copy is guarded too, got '%s'", s_sentence);
 }
 
-int main(void) {
+/* ---------- 8. AI 交互词攒批（gen26.5 M2 Step8） ---------- */
+
+// 取出某词那一行（小写比词头，与批内口径一致）。/ Fetch one word's row (lower-cased
+// head, same as inside the batch). 返回静态缓冲，仅供即时断言。
+static const char* row_of(const char* word) {
+    static char out[VOCAB_LINE_MAX];
+    char lower[VOCAB_WORD_MAX];
+    lower_copy(lower, sizeof(lower), word);
+    FILE* f = fopen(VOCAB_PATH, "r");
+    if (!f) return NULL;
+    char line[VOCAB_LINE_MAX];
+    const char* ret = NULL;
+    while (fgets(line, sizeof(line), f)) {
+        char head[VOCAB_WORD_MAX];
+        size_t n = strcspn(line, "\t");
+        if (n >= sizeof(head)) n = sizeof(head) - 1;
+        memcpy(head, line, n);
+        head[n] = 0;
+        if (head[0] && !strcmp(head, lower)) {
+            snprintf(out, sizeof(out), "%s", line);
+            ret = out;
+            break;
+        }
+    }
+    fclose(f);
+    return ret;
+}
+
+static void test_ai_batch(void) {
+    reset_book();
+    // NVS 三态：键不存在 / 怪值 → 缺省开；明确 0 → 关；明确 1 → 开。
+    // Three NVS states: absent / odd -> default on; explicit 0 -> off; 1 -> on.
+    vocab_test_nvs_autosave = -1;
+    vocab_log_autosave_init();
+    CHECK(vocab_log_autosave_enabled(), "a missing NVS key defaults to on");
+    vocab_test_nvs_autosave = 2;
+    vocab_log_autosave_init();
+    CHECK(vocab_log_autosave_enabled(), "an odd value counts as the default on");
+    vocab_test_nvs_autosave = 0;
+    vocab_log_autosave_init();
+    CHECK(!vocab_log_autosave_enabled(), "an explicit 0 turns the switch off");
+    // 关着：入队即丢，时钟走多久都不落盘。/ Off: dropped at queue time, never lands.
+    vocab_log_capture("/sdcard/books/atomic.epub", "Hello apple pie.", 6, 11);
+    vocab_log_ai_queue("apple");
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(access(VOCAB_PATH, F_OK) != 0, "a disabled switch writes nothing");
+
+    vocab_test_nvs_autosave = 1;
+    vocab_log_autosave_init();
+    CHECK(vocab_log_autosave_enabled(), "an explicit 1 turns the switch on");
+
+    // 5s 窗口：未到不写，到期一次写全部积压。/ The 5s window: nothing before the
+    // deadline, everything in one write after it.
+    vocab_log_capture("/sdcard/books/atomic.epub", "Hello apple pie.", 6, 11);
+    vocab_log_ai_queue("apple");
+    vocab_log_ai_queue("Apple"); // 同词不同大小写：批内只留一条 / one row per word
+    vocab_log_capture("/sdcard/books/atomic.epub", "The banana split was nice.", 4, 10);
+    vocab_log_ai_queue("banana");
+    CHECK(count_lines() == 0, "nothing is written while the batch waits");
+    vocab_test_now_us += 4 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 0, "still nothing at 4s (deadline is 5s from the first word)");
+    vocab_test_now_us += 2 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 3, "one header + two rows in a single write, got %d", count_lines());
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 3, "a second flush writes nothing (the batch is gone)");
+
+    // 行内容：词头、时间、书名、原句、释义（此时释义未回，写 "-"）。
+    // Row contents: word, timestamp, book, sentence, definition ("-" until it lands).
+    const char* apple = row_of("apple");
+    CHECK(apple != NULL, "the apple row exists");
+    if (apple) {
+        CHECK(fields_of(apple) == 5, "the row still has five fields, got %d", fields_of(apple));
+        CHECK(strstr(apple, "Hello apple pie.") != NULL, "the sentence is snapshotted");
+        CHECK(strstr(apple, "atomic") != NULL, "the book name is carried");
+        CHECK(strstr(apple, "\t-\n") != NULL, "an empty definition column reads '-'");
+    }
+
+    // 原句快照：入队后抓新句子，各词落盘的还是各自那一句。
+    // Sentence snapshot: a later capture must not rewrite an already-queued row.
+    const char* banana = row_of("banana");
+    CHECK(banana != NULL && strstr(banana, "The banana split was nice.") != NULL,
+          "banana keeps its own sentence");
+
+    // 释义后补：0x07 回来时补进批，随行落盘。/ A late definition rides with the row.
+    vocab_log_capture("/sdcard/books/atomic.epub", "A cherry on top.", 2, 8);
+    vocab_log_ai_queue("cherry");
+    vocab_log_ai_set_def("cherry", "n. 樱桃");
+    vocab_log_ai_set_def("durian", "n. 榴莲"); // 批外词：静默忽略 / not batched: ignored
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    const char* cherry = row_of("cherry");
+    CHECK(cherry != NULL && strstr(cherry, "n. 樱桃") != NULL,
+          "a definition that landed before the flush is written");
+    CHECK(row_of("durian") == NULL, "a word outside the batch is never written");
+    CHECK(count_lines() == 4, "only cherry was appended, got %d", count_lines());
+
+    // 与手动保存去重：卡上已有的词，批 flush 不重复写。
+    // De-dup against the manual save: a word already on the card is not re-written.
+    vocab_log_capture("/sdcard/books/atomic.epub", "An elderberry bush.", 3, 13);
+    vocab_log_save("elderberry", "n. 接骨木");
+    vocab_log_ai_queue("elderberry"); // 模拟同一词走了 AI 又入批 / same word, AI too
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 5, "an already-saved word adds no second row, got %d", count_lines());
+
+    // 批满：第 65 个词被丢（日志可见），前 64 个照常落盘。/ Full batch: the 65th
+    // word is dropped (visible in the log), the first 64 land as usual.
+    reset_book();
+    vocab_test_nvs_autosave = 1;
+    vocab_log_autosave_init();
+    for (int i = 0; i < VOCAB_AI_BATCH_MAX + 1; ++i) {
+        char w[32];
+        snprintf(w, sizeof(w), "w%02d", i);
+        vocab_log_ai_queue(w);
+    }
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 1 + VOCAB_AI_BATCH_MAX,
+          "a full batch writes 64 rows, got %d", count_lines());
+
+    // 写失败保留批次：VOCAB_DIR 被一个文件占着（dir_ready 的 EEXIST 宽进放行它），
+    // open 失败 → 批留着；恢复目录后重试成功。
+    // A failed write keeps the batch: with VOCAB_DIR shadowed by a plain file
+    // (dir_ready's EEXIST leniency lets it through), open fails and the batch
+    // waits; once the directory is back the retry lands it.
+    reset_book();
+    vocab_test_nvs_autosave = 1;
+    vocab_log_autosave_init();
+    vocab_log_ai_queue("fig");
+    remove(VOCAB_DIR);
+    FILE* shadow = fopen(VOCAB_DIR, "w");
+    assert(shadow);
+    fclose(shadow);
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(access(VOCAB_PATH, F_OK) != 0, "a failed open writes nothing");
+    remove(VOCAB_DIR);
     mkdir(VOCAB_DIR, 0777);
+    vocab_log_ai_flush();
+    CHECK(count_lines() == 2, "the retry lands the batch once the card is back, got %d",
+          count_lines());
+
+    // invalidate 丢批：书上下文没了，≤5s 的积压静默作废。
+    // invalidate drops the batch: the book context is gone, at most 5s lost silently.
+    reset_book();
+    vocab_test_nvs_autosave = 1;
+    vocab_log_autosave_init();
+    vocab_log_ai_queue("grape");
+    vocab_log_invalidate();
+    vocab_test_now_us += 10 * 1000 * 1000;
+    vocab_log_ai_flush();
+    CHECK(access(VOCAB_PATH, F_OK) != 0, "invalidate discards the batch");
+}
+
+int main(void) {
     test_escape();
     test_sentence();
     test_save_remove();
@@ -430,6 +589,7 @@ int main(void) {
     test_render_malformed();
     test_undo();
     test_view_guard();
+    test_ai_batch();
     reset_book();
     if (failures) {
         printf("FAILURES: %d\n", failures);

@@ -5,9 +5,21 @@
  * English: Vocabulary builder. After a long-press lookup the reader taps a chip on the
  * card to save; entries land on the TF card as TSV, ready for Anki.
  *
- * 冻结：绝不自动记录——保存只由用户点击触发；写失败必须静默，绝不得阻塞 UI。
- * Frozen: never automatic — saving only happens on an explicit tap, and a failed
- * write stays silent instead of blocking the UI.
+ * gen26.5 契约修订（M2 Step8，用户裁定）：在 chip 手动保存之外新增
+ * **AI 交互词自动落库**——「与 AI 交互过的词」即落：① 词典 miss 词 0x17 发出即落；
+ * ② 词典命中后用户主动点「AI」chip 即落；③ **纯词典命中（没要 AI）不落**（避免噪音）。
+ * 自动落库受 NVS 开关控制（`rp_vocab` namespace、`autosave` u8、**缺省开**），
+ * 且走**攒批写**：词只进内存批，5s 后合批单次写 TF 卡（防 Flash 磨损）。
+ * gen26.5 contract revision (M2 Step8, user-adjudicated): on top of the manual chip
+ * save, words that interacted with AI are logged automatically - a dictionary-miss
+ * word logs the moment 0x17 goes out; a dict-hit word logs when the user taps the
+ * "AI" chip; a pure dictionary hit (AI never asked) never logs (noise). Automatic
+ * logging honors an NVS switch (namespace "rp_vocab", key "autosave", **on by
+ * default**) and is **batched**: words wait in memory and land in one write 5s
+ * later (guards the card against wear).
+ *
+ * 保留的冻结语义：写失败必须静默，绝不得阻塞 UI。
+ * Kept frozen semantics: a failed write stays silent and never blocks the UI.
  */
 #pragma once
 #include <stdbool.h>
@@ -18,6 +30,35 @@ extern "C" {
 #endif
 
 #define VOCAB_WORD_MAX 64
+
+/// AI 交互词入批（不写卡）。与 AI 交互过 = 词典 miss 时 0x17 发出、或词典命中卡上
+/// 主动点「AI」chip——两者都只入内存批，由 vocab_log_ai_flush() 5s 后合批落盘。
+/// autosave 开关关着时直接丢弃（静默）。原句取当前抓取上下文（点词时已抓好）。
+/// Queue an AI-interacted word (no card write). AI interaction = a dictionary miss
+/// whose 0x17 went out, or a deliberate "AI" chip tap on a dict-hit card. Both only
+/// enter the memory batch; vocab_log_ai_flush() lands it 5s later in one write.
+/// Discarded silently when the autosave switch is off. The sentence comes from the
+/// context captured at tap time.
+void vocab_log_ai_queue(const char* word);
+/// 释义回流补进批（0x07 到达时调）。批里没有这个词就忽略——它可能已经落盘了，
+/// 那时释义走预取缓存，下次手动保存会带上。/ Feed a returning definition (0x07)
+/// into the batch. A word not in the batch is ignored: it may already be on the
+/// card, and the definition stays in the prefetch cache for the next manual save.
+void vocab_log_ai_set_def(const char* word, const char* def);
+/// 合批落盘。由主循环 tick 驱动（≤500ms 一遍）：首次入队满 5s 才写，一次写全部
+/// 积压；写失败保留批次等下次重试（防磨损的合批语义不变，也不丢词）。
+/// Flush the batch. Driven by a main-loop tick (every <=500ms): writes once 5s
+/// after the first queued word, everything pending in one go; a failure keeps the
+/// batch for the next attempt (batching semantics intact, no word lost).
+void vocab_log_ai_flush(void);
+/// 自动落库开关是否开着（缺省开）。读 NVS `rp_vocab`/`autosave`：读不到或读失败
+/// 都按缺省开，只有明确读到 0 才是关。/ Whether automatic logging is on (default
+/// on). NVS "rp_vocab"/"autosave": a missing or failed read defaults to on, and
+/// only an explicit 0 turns it off.
+bool vocab_log_autosave_enabled(void);
+/// 读一次 NVS 开关（开机时调）。重复调用会重读。/ Read the NVS switch once (at
+/// boot). Calling it again re-reads.
+void vocab_log_autosave_init(void);
 
 /// 抓取长按上下文（书名路径、章节原文、词区间）。必须在原文仍有效时调用，
 /// 且不要在绘制锁内做——扫描是有界的字符串操作，不该拉长持锁时间。
@@ -57,8 +98,12 @@ bool vocab_log_is_view_path(const char* path);
 /// Build the index up front; call next to dict_warm() to keep the card read off
 /// the lookup path.
 void vocab_log_warm(void);
-/// 拔卡/退出时释放索引。与 dict_close() 同处调用。
-/// Drop the index when the card goes away; call next to dict_close().
+/// 拔卡/退出时释放索引。与 dict_close() 同处调用。**同时丢弃未落盘的 AI 批**——
+/// 书上下文已失效，批内词的原句/书名不再可靠；损失 ≤5s 的批，静默（契约保留）。
+/// Drop the index when the card goes away; call next to dict_close(). **Also drops
+/// the unflushed AI batch**: with the book context gone, a batched word's sentence
+/// and book name are no longer trustworthy; at most 5s of batch is lost, silently
+/// (the contract is kept).
 void vocab_log_invalidate(void);
 
 #ifdef __cplusplus

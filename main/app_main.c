@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include "app_registry.h"
 #include "display.h"
+#include "dict/vocab_log.h"
 #include "epd_highlevel.h"
 #include "epdiy.h"
 #include "esp_heap_caps.h"
@@ -120,6 +121,12 @@ void app_main(void) {
     const esp_reset_reason_t reset = esp_reset_reason();
     ESP_LOGI(TAG, "startup reset=%d stack=%u", (int)reset, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     app_settings_init();
+    // gen26.5 M2 Step8：生词本 AI 自动落库的 NVS 开关（rp_vocab/autosave，缺省开）。
+    // 紧随 settings_init：NVS 已就绪，且开机读一次即缓存。
+    // gen26.5 M2 Step8: the vocabulary book's AI auto-logging NVS switch
+    // (rp_vocab/autosave, on by default). Right after settings_init: NVS is up
+    // and one boot-time read is all it takes.
+    vocab_log_autosave_init();
     pico_boot_init(reset == ESP_RST_PANIC || reset == ESP_RST_INT_WDT ||
                    reset == ESP_RST_TASK_WDT || reset == ESP_RST_WDT);
 

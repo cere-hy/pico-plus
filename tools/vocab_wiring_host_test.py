@@ -10,7 +10,14 @@
   3. 词典面板的点击必须先交给 dict_popup_tap()，命中 chip 时不关闭卡片；
   4. 弹层必须真的画出 chip，并且头部宽度要为它让位；
   5. 工具条第 6 项必须真的打开视图，且视图内删掉一条后要重渲染 + 重开；
-  6. 视图路径必须**按内容**比较（不许指针比较，也不许 strstr 子串包含）。
+  6. 视图路径必须**按内容**比较（不许指针比较，也不许 strstr 子串包含）；
+  7. gen26.5 M2 Step8：AI 交互词落库的三处接线——miss 路径与 AI chip 路径各调一次
+     vocab_log_ai_queue()（恰好两次，且都在 push_sink_ai_tap_word_ctx() 之后），
+     纯词典命中路径（dict_popup_open 到 found 判定之间）**不得**出现 queue；
+  8. gen26.5 M2 Step8：app_loop 里 take_ai_def 成功后先 set_def 再 def_ready
+     （落库与弹卡解耦），flush 落在 500ms 网络轮询块内；app_main 在
+     app_settings_init() 之后调 vocab_log_autosave_init()；.c/.h 双冻结声明
+     同步（rp_vocab / autosave / 5s 攒批关键词对表）。
 
 只做静态检查，不编译。
 
@@ -27,7 +34,15 @@ user only finds out later. This test pins the wiring:
   4. the popup must actually draw the chip and the header width must yield to it;
   5. toolbar item 6 must really open the view, and a removal inside the view must
      re-render and re-open it;
-  6. the view path must be matched by contents, never by pointer or substring.
+  6. the view path must be matched by contents, never by pointer or substring;
+  7. gen26.5 M2 Step8: the three AI-logging wirings - the miss path and the AI-chip
+     path each call vocab_log_ai_queue() exactly once (twice in total, each after
+     push_sink_ai_tap_word_ctx()), and the pure dictionary-hit path (from
+     dict_popup_open to the found decision) must NOT queue;
+  8. gen26.5 M2 Step8: in app_loop, set_def runs between take_ai_def and def_ready
+     (logging decoupled from the card), flush lands inside the 500ms network poll
+     block; app_main calls vocab_log_autosave_init() after app_settings_init(); the
+     .c/.h frozen declarations stay in sync (rp_vocab / autosave / 5s batching).
 
 Static only, nothing is compiled.
 """
@@ -39,6 +54,9 @@ ROOT = Path(__file__).resolve().parent.parent
 BOOK = ROOT / 'main' / 'apps' / 'app_book.c'
 POPUP = ROOT / 'main' / 'apps' / 'dict_popup.c'
 VOCAB = ROOT / 'main' / 'dict' / 'vocab_log.c'
+VOCAB_H = ROOT / 'main' / 'dict' / 'vocab_log.h'
+LOOP = ROOT / 'main' / 'app' / 'app_loop.c'
+MAIN = ROOT / 'main' / 'app_main.c'
 
 
 def function_body(text: str, signature: str) -> str:
@@ -208,6 +226,99 @@ def main() -> int:
     if 'inner_w - DICT_POPUP_SAVE_W' not in popup:
         failures.append('dict_popup.c: the header width does not reserve room for the chip')
 
+    # 7. gen26.5 M2 Step8：AI 交互词落库接线。/ AI-word logging wiring.
+    #    判据一：queue 恰好两次（miss + AI chip），且每次都在 tap_word_ctx 之后。
+    #    Criterion 1: exactly two queue calls (miss + AI chip), each after a
+    #    push_sink_ai_tap_word_ctx().
+    #    判据二：纯词典命中路径不落——dict_popup_open() 到 found 判定之间没有 queue。
+    #    Criterion 2: the pure dictionary-hit path never queues - no queue call
+    #    between dict_popup_open() and the found decision.
+    lookup_body = function_body(book, 'static app_redraw_t start_dict_lookup(')
+    panel_body = function_body(book, 'static app_redraw_t reader_panel_action(')
+    if not lookup_body or not panel_body:
+        failures.append('start_dict_lookup()/reader_panel_action(): not found '
+                        '(cannot check the AI logging wiring)')
+    else:
+        if book.count('vocab_log_ai_queue(') != 2:
+            failures.append('app_book.c: expected exactly 2 vocab_log_ai_queue() calls '
+                            '(miss path + AI chip), got %d' % book.count('vocab_log_ai_queue('))
+        for name, body in (('start_dict_lookup', lookup_body),
+                           ('reader_panel_action', panel_body)):
+            tap_at = body.find('push_sink_ai_tap_word_ctx(')
+            queue_at = body.find('vocab_log_ai_queue(')
+            if tap_at < 0 or queue_at < 0:
+                failures.append('%s(): the AI path is missing tap_word_ctx or queue' % name)
+            elif queue_at < tap_at:
+                failures.append('%s(): queues the word before the query goes out' % name)
+        # 纯词典命中不落：found 判定窗口。/ The pure dictionary-hit path never queues.
+        # 窗口右界是 miss 分支本身——那里的 queue 是**正确**的（miss 词要落），
+        # 所以判据只看 dict_popup_open() 到 miss 分支之间。
+        # The window's right edge is the miss branch itself - a queue in there is
+        # CORRECT (a miss word must log), so the check only covers the span from
+        # dict_popup_open() to the miss branch.
+        open_at = lookup_body.find('dict_popup_open(')
+        found_at = lookup_body.find('if (hit && english && !found)')
+        if open_at < 0 or found_at < 0:
+            failures.append('start_dict_lookup(): cannot locate the dict-hit window '
+                            '(dict_popup_open / the miss branch)')
+        elif 'vocab_log_ai_queue(' in lookup_body[open_at:found_at]:
+            failures.append('start_dict_lookup(): queues a word on a pure dictionary hit '
+                            '(adjudicated: only AI-interacted words log)')
+
+    # 8. gen26.5 M2 Step8：app_loop 的 flush 驱动与解耦顺序、app_main 的开关读取、
+    #    .c/.h 双冻结声明同步。/ The flush driver and decoupling order in app_loop,
+    #    the switch read in app_main, and the .c/.h frozen declarations in sync.
+    if not LOOP.exists() or not MAIN.exists():
+        failures.append('app_loop.c / app_main.c: missing')
+    else:
+        loop = LOOP.read_text(encoding='utf-8')
+        take_at = loop.find('push_sink_take_ai_def(')
+        set_at = loop.find('vocab_log_ai_set_def(')
+        ready_at = loop.find('app_book_ai_def_ready(')
+        flush_at = loop.find('vocab_log_ai_flush(')
+        poll_at = loop.find('read_pico_transfer_service_poll()')
+        if take_at < 0:
+            failures.append('app_loop.c: push_sink_take_ai_def() not found')
+        else:
+            if set_at < 0:
+                failures.append('app_loop.c: does not call vocab_log_ai_set_def() '
+                                '(a returned definition never feeds the batch)')
+            elif not take_at < set_at:
+                failures.append('app_loop.c: set_def before take_ai_def (nothing to feed)')
+            elif ready_at >= 0 and set_at > ready_at:
+                failures.append('app_loop.c: set_def after def_ready - logging stays '
+                                'coupled to the card and gate A would drop it')
+            if flush_at < 0:
+                failures.append('app_loop.c: does not call vocab_log_ai_flush() '
+                                '(the batch would never land)')
+            elif poll_at >= 0 and flush_at < poll_at:
+                failures.append('app_loop.c: flush sits outside the network poll block '
+                                '(it must ride the <=500ms tick)')
+        main_text = MAIN.read_text(encoding='utf-8')
+        settings_at = main_text.find('app_settings_init();')
+        auto_at = main_text.find('vocab_log_autosave_init();')
+        if settings_at < 0 or auto_at < 0:
+            failures.append('app_main.c: missing app_settings_init() or '
+                            'vocab_log_autosave_init()')
+        elif auto_at < settings_at:
+            failures.append('app_main.c: reads the autosave switch before NVS is up')
+
+    # 冻结声明同步：.c/.h 顶部都登记同一份契约（立项令门禁项）。
+    # Frozen declarations in sync: both the .c and .h headers register the same
+    # contract (a gate from the charter).
+    for path, label in ((VOCAB, 'vocab_log.c'), (VOCAB_H, 'vocab_log.h')):
+        if not path.exists():
+            failures.append(f'{label}: missing')
+            continue
+        head = path.read_text(encoding='utf-8')[:2500]
+        for needle, what in (('rp_vocab', 'the NVS namespace'),
+                             ('autosave', 'the NVS key'),
+                             ('5s', 'the batch delay'),
+                             ('攒批', 'the batching itself')):
+            if needle not in head:
+                failures.append(f'{label}: the frozen declaration no longer mentions '
+                                f'{what} ({needle!r})')
+
     if failures:
         for line in failures:
             print('  FAIL ' + line)
@@ -216,7 +327,6 @@ def main() -> int:
     print('PASS: vocabulary book wiring intact (capture after unlock, 3 lifecycle hooks, '
           'view guard matched by contents, 6 asserted tools, chip tap + re-open, chip drawn)')
     return 0
-
 
 if __name__ == '__main__':
     sys.exit(main())

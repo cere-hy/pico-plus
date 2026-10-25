@@ -5588,6 +5588,17 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
         // chapter (hit_start, same coordinate space as vocab_log_capture). The frame
         // format follows the negotiation (legacy 66B until enabled).
         push_sink_ai_tap_word_ctx(word, book_id_from_path(s_path), hit_start);
+        // gen26.5 M2 Step8：miss 词 0x17 发出即入 AI 生词批（用户裁定语义：与 AI
+        // 交互过的词全落，纯词典命中不落）。只在 AI 真使能时入批——tap_word_ctx
+        // 内部对未使能是静默丢弃，那边没交互，这边就不该有记录。攒批写由
+        // vocab_log_ai_flush() 5s 后合批落盘（app_loop tick 驱动）。
+        // gen26.5 M2 Step8: a dictionary-miss word joins the AI vocabulary batch the
+        // moment its 0x17 goes out (adjudicated: every AI-interacted word logs, a
+        // pure dictionary hit never). Queued only when AI is really enabled -
+        // tap_word_ctx silently drops the word when it is not, and with no
+        // interaction there must be no record. vocab_log_ai_flush() lands the
+        // batch 5s later (driven by the app_loop tick).
+        if (push_sink_ai_enabled()) vocab_log_ai_queue(word);
         ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
         if (push_sink_ai_enabled()) pending = dict_popup_show_pending(word);
     }
@@ -6124,6 +6135,14 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             // so pos falls back to the current visual page's start offset (better than
             // 0, still "has book context").
             push_sink_ai_tap_word_ctx(wbuf, book_id_from_path(s_path), reader_page_start_offset());
+            // gen26.5 M2 Step8：词典命中卡上主动点「AI」chip 即入 AI 生词批（用户
+            // 裁定语义第二条）。上方已判 push_sink_ai_enabled()——不到这里 AI 就是
+            // 关着的，所以无需再判。攒批写由 vocab_log_ai_flush() 5s 后合批落盘。
+            // gen26.5 M2 Step8: a deliberate "AI" chip tap on a dict-hit card joins
+            // the AI vocabulary batch (adjudicated rule 2). push_sink_ai_enabled()
+            // was already checked above - a disabled AI never reaches here - so no
+            // second check. vocab_log_ai_flush() lands the batch 5s later.
+            vocab_log_ai_queue(wbuf);
             // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
             dict_popup_force_ai(wbuf);     // 卡切查询态并标记 over_dict（超时回退词典）
             ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);

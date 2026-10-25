@@ -5,10 +5,21 @@
  * English: Vocabulary-book storage. One TSV row per entry:
  * word / timestamp / book / sentence / definition.
  *
- * 用户修订：只由 chip 手动保存，绝不自动记录；索引分配失败退化为扫文件，
- * 绝不因为生词本而卡住界面。
- * User revision: saving is manual only, never automatic; if the index allocation
- * fails we degrade to a file scan rather than ever stalling the UI.
+ * gen26.5 契约修订（M2 Step8，用户裁定）：chip 手动保存之外，**AI 交互词自动落库**——
+ * miss 词 0x17 发出即落、词典命中卡上点「AI」chip 即落、纯词典命中不落。自动落库受
+ * NVS 开关 `rp_vocab`/`autosave`（缺省开）控制，走攒批写：入内存批、5s 合批单次写
+ * TF 卡（防 Flash 磨损）；写失败静默且保留批次重试。
+ * gen26.5 contract revision (M2 Step8, user-adjudicated): on top of the manual chip
+ * save, AI-interacted words log automatically - a dictionary-miss word the moment
+ * its 0x17 goes out, a dict-hit word when the "AI" chip is tapped, a pure dictionary
+ * hit never. Automatic logging honors the NVS switch "rp_vocab"/"autosave" (on by
+ * default) and is batched: words wait in memory and land in one write 5s later
+ * (guards the card against wear); a failed write stays silent and keeps the batch
+ * for a retry.
+ *
+ * 保留的冻结语义：绝不因为生词本而卡住界面（索引分配失败退化为扫文件；批写失败静默）。
+ * Kept frozen semantics: the vocabulary book must never stall the UI (index
+ * allocation failure degrades to a file scan; a failed batch write stays silent).
  */
 #include "vocab_log.h"
 
@@ -23,6 +34,8 @@
 #include "book_title.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "nvs_flash.h"
 
 static const char* TAG = "vocab";
 
@@ -52,6 +65,33 @@ static const char* TAG = "vocab";
 #define VOCAB_CHUNK 50
 #endif
 
+// AI 交互词自动落库的 NVS 开关：namespace "rp_vocab"、键 "autosave"、u8、
+// **缺省开**（读不到/读失败/怪值都按开；只有明确 0 才是关）。
+// NVS switch for automatic AI-word logging: namespace "rp_vocab", key
+// "autosave", u8, **on by default** (missing read / failure / odd value all count
+// as on; only an explicit 0 is off).
+#ifndef VOCAB_NVS_NS
+#define VOCAB_NVS_NS "rp_vocab"
+#endif
+#ifndef VOCAB_NVS_KEY_AUTOSAVE
+#define VOCAB_NVS_KEY_AUTOSAVE "autosave"
+#endif
+
+// AI 批：5s 合批单次写 TF 卡（防 Flash 磨损）。上限 64 词——5 秒内不可能真点这么多，
+// 满了丢新的（日志可见），绝不为了攒批阻塞查词路径。
+// AI batch: one write 5s later (guards the card against wear). Cap 64 words - no
+// one taps that many in 5s; when full new words are dropped (visible in the log),
+// never blocking the lookup path to grow a batch.
+#ifndef VOCAB_AI_BATCH_DELAY_US
+#define VOCAB_AI_BATCH_DELAY_US (5 * 1000 * 1000)
+#endif
+#ifndef VOCAB_AI_BATCH_MAX
+#define VOCAB_AI_BATCH_MAX 64
+#endif
+#ifndef VOCAB_AI_DEF_MAX
+#define VOCAB_AI_DEF_MAX 288
+#endif
+
 #define VOCAB_HEADER "# read-pico vocab.txt — 列：word<TAB>时间<TAB>书名<TAB>原句<TAB>释义"
 #define VOCAB_INDEX_MAX 4096u
 #ifndef VOCAB_FILE_MAX // 宿主测试会把它缩小，好把「写满」也测到 / the host test shrinks it to exercise the cap
@@ -77,6 +117,23 @@ static char s_sentence[VOCAB_SENTENCE_MAX];
  * accidental removal is undoable — and a removed-then-re-saved entry can never
  * be polluted by a sentence captured inside the vocabulary view itself. */
 static char s_undo[VOCAB_LINE_MAX];
+
+/* AI 批：入队时快照词、释义（可后补）、原句。定长、PSRAM，无失败分支之外的抖动。
+ * 释义列后补：0x17 发出时释义还没回来，入批只记词；0x07 到达经 set_def 补上。
+ * The AI batch: word, definition (may arrive later) and sentence, snapshotted at
+ * queue time. Fixed size, PSRAM. The definition is filled in later: when 0x17 goes
+ * out the answer has not returned yet, so only the word is queued; 0x07 feeds it
+ * through set_def. */
+typedef struct {
+    char word[VOCAB_WORD_MAX];   // 已小写化（与索引同口径）/ already lower-cased
+    char def[VOCAB_AI_DEF_MAX];  // 释义，空 = 未回 / empty until the answer lands
+    char sentence[VOCAB_SENTENCE_MAX]; // 入队时的原句快照 / the sentence at queue time
+} ai_batch_entry_t;
+
+static ai_batch_entry_t* s_batch;      // PSRAM，惰性分配 / lazily allocated
+static size_t s_batch_count;
+static int64_t s_batch_deadline_us;    // 首次入队 + 5s；0 = 无批 / first queue + 5s
+static bool s_autosave = true;         // 缺省开，init 时读 NVS / on until NVS says no
 
 /* 去重索引：PSRAM 里的有序 char* 数组。分配失败就保持 NULL，
  * 由 save() 退化成逐行扫文件；contains() 只读它，绝不读卡。
@@ -346,6 +403,26 @@ static void split_phonetic(const char* def, char* phon, size_t phon_cap, const c
 
 /* ---------- 对外接口 ---------- */
 
+// 追加一行 TSV（调用方负责 open/close、header 与去重）。手动保存与 AI 批共用——
+// 行格式只有这一份，杜绝「批落盘的行和手点保存的行不一样」。
+// Append one TSV row (the caller opens/closes, writes the header and
+// de-duplicates). The manual save and the AI batch share this: the row format
+// exists exactly once, so a batch write can never drift from a chip save.
+static void append_row(FILE* f, const char* lower, const char* def, const char* sentence) {
+    char when[32];
+    char title[sizeof(s_book)];
+    if (!book_title_get(s_book, title, sizeof(title)) &&
+        !book_title_from_path(s_book, title, sizeof(title)))
+        snprintf(title, sizeof(title), "%s", s_book[0] ? s_book : "-");
+    char book[160], def_esc[VOCAB_AI_DEF_MAX];
+    field_escape(book, sizeof(book), title);
+    field_escape(def_esc, sizeof(def_esc), def ? def : "");
+    fprintf(f, "%s\t%s\t%s\t%s\t%s\n", lower, stamp(when, sizeof(when)),
+            book[0] ? book : "-",
+            (sentence && sentence[0]) ? sentence : (s_sentence[0] ? s_sentence : "-"),
+            def_esc[0] ? def_esc : "-");
+}
+
 void vocab_log_capture(const char* book_path, const char* text, size_t start, size_t end) {
     // 在生词本视图里长按查词时，抓到的「书名」是视图文件、「原句」是视图里的一行——
     // 那是垃圾上下文。宁可清空也不覆盖：留着上一次真书的上下文同样会写错行。
@@ -411,19 +488,9 @@ bool vocab_log_save(const char* word, const char* definition) {
 
     FILE* f = fopen(VOCAB_PATH, "a");
     if (!f) { ESP_LOGW(TAG, "open failed: %s", strerror(errno)); return false; }
-    char when[32];
-    char title[sizeof(s_book)];
-    if (!book_title_get(s_book, title, sizeof(title)) &&
-        !book_title_from_path(s_book, title, sizeof(title)))
-        snprintf(title, sizeof(title), "%s", s_book[0] ? s_book : "-");
-    char book[160], def[288];
-    field_escape(book, sizeof(book), title);
-    field_escape(def, sizeof(def), definition ? definition : "");
     bool ok = true;
     if (!exists || st.st_size == 0) ok = fprintf(f, "%s\n", VOCAB_HEADER) >= 0;
-    if (ok) ok = fprintf(f, "%s\t%s\t%s\t%s\t%s\n", lower, stamp(when, sizeof(when)),
-                         book[0] ? book : "-", s_sentence[0] ? s_sentence : "-",
-                         def[0] ? def : "-") >= 0;
+    if (ok) append_row(f, lower, definition, s_sentence);
     if (fclose(f) != 0) ok = false;
     if (!ok) { ESP_LOGW(TAG, "write failed"); return false; }
     index_add(lower);
@@ -592,13 +659,139 @@ bool vocab_log_render(size_t* out_count) {
     return true;
 }
 
+/* ---------- AI 交互词攒批（gen26.5 M2 Step8） ---------- */
+
+// 批惰性分配：查词路径上零开销，直到真有一个 AI 交互词入队。
+// Lazily allocate the batch: zero cost on the lookup path until a word queues.
+static bool batch_ensure(void) {
+    if (s_batch) return true;
+    s_batch = heap_caps_calloc(VOCAB_AI_BATCH_MAX, sizeof(ai_batch_entry_t),
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_batch) { ESP_LOGW(TAG, "ai batch alloc failed"); return false; }
+    s_batch_count = 0;
+    return true;
+}
+
+static void batch_clear(void) {
+    if (s_batch) { heap_caps_free(s_batch); s_batch = NULL; }
+    s_batch_count = 0;
+    s_batch_deadline_us = 0;
+}
+
+static ai_batch_entry_t* batch_find(const char* lower) {
+    for (size_t i = 0; i < s_batch_count; ++i)
+        if (!strcmp(s_batch[i].word, lower)) return &s_batch[i];
+    return NULL;
+}
+
+void vocab_log_ai_queue(const char* word) {
+    if (!s_autosave) return; // 开关关着：静默丢弃 / switch off: dropped silently
+    if (!word) return;
+    char lower[VOCAB_WORD_MAX];
+    lower_copy(lower, sizeof(lower), word);
+    if (!lower[0]) return;
+    if (s_batch && batch_find(lower)) return; // 批内已有，首次为准 / first wins
+    if (s_batch_count >= VOCAB_AI_BATCH_MAX) {
+        ESP_LOGW(TAG, "ai batch full (%u), dropping \"%s\"", (unsigned)VOCAB_AI_BATCH_MAX, lower);
+        return;
+    }
+    if (!batch_ensure()) return; // 分配失败：静默，不阻塞查词 / silent, never blocks lookup
+    ai_batch_entry_t* e = &s_batch[s_batch_count];
+    snprintf(e->word, sizeof(e->word), "%s", lower);
+    e->def[0] = 0;
+    // 原句必须快照：之后每点一个词都会覆盖 s_sentence，落盘时早不是这一句了。
+    // Snapshot the sentence: every later tap overwrites s_sentence, so by flush
+    // time it would no longer belong to this word.
+    snprintf(e->sentence, sizeof(e->sentence), "%s", s_sentence);
+    ++s_batch_count;
+    // deadline 取**首次**入队时刻：连续点词只会并入同批，不会把落盘一推再推。
+    // The deadline is the FIRST queue: later taps join the same batch instead of
+    // pushing the write back forever.
+    if (!s_batch_deadline_us)
+        s_batch_deadline_us = esp_timer_get_time() + VOCAB_AI_BATCH_DELAY_US;
+}
+
+void vocab_log_ai_set_def(const char* word, const char* def) {
+    if (!s_batch || !s_batch_count || !word || !def) return;
+    char lower[VOCAB_WORD_MAX];
+    lower_copy(lower, sizeof(lower), word);
+    ai_batch_entry_t* e = batch_find(lower);
+    // 批里没有 = 已落盘或从未入批。释义走预取缓存，下次手动保存会带上。
+    // Not in the batch = already on the card or never queued; the definition
+    // stays in the prefetch cache for the next manual save.
+    if (!e) return;
+    snprintf(e->def, sizeof(e->def), "%s", def);
+}
+
+void vocab_log_ai_flush(void) {
+    if (!s_batch_count) { s_batch_deadline_us = 0; return; }
+    if (!s_autosave) { batch_clear(); return; } // 关开关：积压丢弃，不落 / off: drop, don't log
+    if (esp_timer_get_time() < s_batch_deadline_us) return; // 5s 窗口未到 / not yet
+    if (!dir_ready()) { ESP_LOGW(TAG, "no vocab dir, ai batch kept"); return; }
+    struct stat st;
+    bool exists = stat(VOCAB_PATH, &st) == 0;
+    if (exists && (uint64_t)st.st_size >= VOCAB_FILE_MAX) {
+        ESP_LOGW(TAG, "vocab.txt reached %u bytes, dropping ai batch", (unsigned)VOCAB_FILE_MAX);
+        batch_clear();
+        return;
+    }
+    FILE* f = fopen(VOCAB_PATH, "a");
+    if (!f) { ESP_LOGW(TAG, "ai batch open failed: %s", strerror(errno)); return; } // 保留重试
+    bool ok = true;
+    if (!exists || st.st_size == 0) ok = fprintf(f, "%s\n", VOCAB_HEADER) >= 0;
+    // 一次 open 循环写全部——这就是「攒批」省下来的写次数。去重与手动保存同口径：
+    // 索引优先，没索引扫文件。半途失败时已写出的行靠去重挡住，不会重复。
+    // One open, every row in a loop - the writes the batch saves. De-duplication
+    // matches the manual save (index first, file scan otherwise). Rows written
+    // before a mid-way failure are de-duplicated on retry, never doubled.
+    for (size_t i = 0; ok && i < s_batch_count; ++i) {
+        const char* lower = s_batch[i].word;
+        if (s_words) {
+            size_t pos = 0;
+            if (index_find(lower, &pos)) continue;
+        } else if (file_contains(lower)) {
+            index_add(lower);
+            continue;
+        }
+        append_row(f, lower, s_batch[i].def, s_batch[i].sentence);
+        index_add(lower);
+    }
+    if (fclose(f) != 0) ok = false;
+    if (!ok) {
+        // 保留批次等下次 tick 重试：防磨损的合批语义不变，词也不丢。
+        // Keep the batch for the next tick: batching semantics intact, no word lost.
+        ESP_LOGW(TAG, "ai batch write failed, kept for retry");
+        return;
+    }
+    batch_clear();
+}
+
+void vocab_log_autosave_init(void) {
+    s_autosave = true; // 缺省开：读不到、读失败、怪值都按开 / default on
+    nvs_handle_t h;
+    if (nvs_open(VOCAB_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t v = 1;
+    // 只有明确读到 0 才是关。/ Only an explicit 0 turns it off.
+    if (nvs_get_u8(h, VOCAB_NVS_KEY_AUTOSAVE, &v) == ESP_OK && v == 0) s_autosave = false;
+    nvs_close(h);
+}
+
+bool vocab_log_autosave_enabled(void) { return s_autosave; }
+
 void vocab_log_warm(void) {
     if (s_words) return;
     (void)index_load();
 }
 
 void vocab_log_invalidate(void) {
-    if (!s_words) { s_count = 0; return; }
+    if (!s_words) {
+        s_count = 0;
+        // AI 批照清：书上下文失效语义不因「索引没建起来」而变（≤5s 的批，静默）。
+        // Drop the AI batch all the same: "the book context is gone" does not
+        // change just because the index failed to build (at most 5s, silently).
+        batch_clear();
+        return;
+    }
     for (size_t i = 0; i < s_count; ++i) heap_caps_free(s_words[i]);
     heap_caps_free(s_words);
     s_words = NULL;
@@ -606,4 +799,5 @@ void vocab_log_invalidate(void) {
     s_book[0] = 0;
     s_sentence[0] = 0;
     s_undo[0] = 0; // 卡都没了，撤销缓冲指向的行也一起没了 / the card is gone, so is the stashed row
+    batch_clear();
 }

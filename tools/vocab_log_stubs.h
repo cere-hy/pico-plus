@@ -44,4 +44,14 @@ static inline bool vocab_log_is_view_path(const char* path) { (void)path; return
 static inline void vocab_log_warm(void) {}
 static inline void vocab_log_invalidate(void) {}
 
+/* gen26.5 M2 Step8 新增：AI 交互词攒批与 NVS 开关的宿主空实现。
+ * gen26.5 M2 Step8 additions: host no-ops for the AI batch and the NVS switch. */
+static inline void vocab_log_ai_queue(const char* word) { (void)word; }
+static inline void vocab_log_ai_set_def(const char* word, const char* def) {
+    (void)word; (void)def;
+}
+static inline void vocab_log_ai_flush(void) {}
+static inline bool vocab_log_autosave_enabled(void) { return true; }
+static inline void vocab_log_autosave_init(void) {}
+
 #endif /* TOOLS_VOCAB_LOG_STUBS_H */
