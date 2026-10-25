@@ -54,6 +54,7 @@
 
 #include "ai_ridealong.h"
 #include "ai_segasm.h"
+#include "push_tts.h"
 
 static const char *TAG = "push_sink";
 
@@ -2208,4 +2209,55 @@ void push_sink_notify_battery(void) {
     const size_t n = push_status_encode(PUSH_ST_BATT, body, 1, frame, sizeof(frame));
     if (n) notify_status(frame, n);
     unlock();
+}
+
+/* ---- gen26.5 TTS 听书（STATUS 0x19 页文本）---- */
+/* gen26.5 TTS read-aloud (STATUS 0x19 page text). */
+
+bool push_sink_link_up(void) {
+    ensure_init();
+    // 链路可用 = 有连接 && 对端已订阅 STATUS（未订阅时 notify 全丢，发了也白发）。
+    // Link up = connected AND the peer subscribed to STATUS (notifying an
+    // unsubscribed peer just burns mbufs).
+    lock();
+    const bool up = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
+    unlock();
+    return up;
+}
+
+bool push_sink_tts_send_page(const char *text, size_t len) {
+    ensure_init();
+    if (!text && len) return false;
+    lock();
+    const size_t total = push_tts_frame_count(text, len);
+    bool ok = true;
+    for (size_t i = 0; i < total && ok; ++i) {
+        const char *slice = NULL;
+        size_t slice_len = 0;
+        if (!push_tts_frame_at(text, len, i, &slice, &slice_len)) {
+            ok = false; // 计划器自相矛盾：防御性失败，调用方下轮重发
+            break;
+        }
+        push_tts_text_t t;
+        memset(&t, 0, sizeof(t));
+        t.seq = (uint16_t)i;
+        t.total = (uint16_t)total;
+        t.len = (uint16_t)slice_len;
+        memcpy(t.text, slice, slice_len); // 切分器保证 slice_len ≤ 233 < 槽
+        t.text[slice_len] = 0;
+        uint8_t frame[PUSH_ST_TTS_TEXT_FRAME_MAX];
+        const size_t n = push_st_tts_text_encode(&t, frame, sizeof(frame));
+        if (!n || !notify_status(frame, n)) {
+            // 任一帧未交付即整页失败：不投「缺帧的页」——对端重组器靠
+            // seq/total 对账，缺帧页本就该整页作废；下轮从头（seq==0）重发，
+            // 对端在 seq==0 处自然重置，无半页残留。/ Any undelivered frame fails
+            // the whole page: never air a gapped page - the peer's reassembler
+            // reconciles by seq/total and a gapped page must be dropped whole;
+            // the next round resends from seq==0, where the peer resets anyway.
+            ESP_LOGW(TAG, "tts page frame %u/%u not delivered", (unsigned)i, (unsigned)total);
+            ok = false;
+        }
+    }
+    unlock();
+    return ok;
 }

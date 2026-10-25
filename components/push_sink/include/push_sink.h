@@ -269,6 +269,28 @@ uint32_t push_sink_apk_caps(void);
 /// by the UI, true means one was available.
 bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap);
 
+/* ---- gen26.5 TTS 听书（STATUS 0x19 页文本）---- */
+/* gen26.5 TTS read-aloud (STATUS 0x19 page text). */
+
+/// 链路可用 = 有连接 && 对端已订阅 STATUS。TTS 跟随轮询与朗读面板的元信息行
+/// 共用这一个判据（未订阅时 notify 全丢，判据必须诚实）。
+/// Link up = connected AND the peer subscribed to STATUS. The TTS follow poll
+/// and the read-aloud panel's meta row share this one predicate (notifying an
+/// unsubscribed peer just burns mbufs, so the predicate must be honest).
+bool push_sink_link_up(void);
+
+/// 把一页纯文本切成 0x19 帧序列推给手机（跟随模式的核心动作）。返回是否全部
+/// 帧交付：任一帧未交付（未连接/未订阅/mbuf/rc≠0）即整页失败——不投缺帧页，
+/// 对端在 seq==0 处自然重置，调用方下轮从头重发即可。文本须已由调用方完成域内
+/// 清洗（图片占位等）；切分只保证 UTF-8 字符边界（push_tts.c）。
+/// Split one page of plain text into a 0x19 frame sequence for the phone (the
+/// core act of follow mode). Returns whether every frame was delivered: any
+/// undelivered frame fails the whole page - a gapped page is never aired, the
+/// peer resets at seq==0 and the caller simply resends from the top next round.
+/// The text must already be domain-cleaned by the caller (image placeholders
+/// etc.); the splitter only guarantees UTF-8 boundaries (push_tts.c).
+bool push_sink_tts_send_page(const char *text, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

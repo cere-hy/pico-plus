@@ -189,10 +189,13 @@ def main() -> int:
     # 5. 工具条：两张表必须等长，且有 _Static_assert 兜着。
     # Toolbar: both tables must be the same length and asserted.
     for needle, label in (
-        ('#define BOOK_TOOL_COUNT 6', 'six tools'),
+        ('#define BOOK_TOOL_COUNT 7', 'seven tools'),
         ('k_tool_labels[BOOK_TOOL_COUNT]', 'a label table sized by the count'),
         ('k_tool_icons[BOOK_TOOL_COUNT]', 'an icon table sized by the count'),
         ('"生词本"', 'the vocabulary-book label'),
+        ('"听书"', 'the TTS read-aloud label'),
+        ('UI_ICON_VOLUME_2', 'the TTS read-aloud icon'),
+        ('READER_PANEL_TTS', 'the TTS reader panel'),
     ):
         if needle not in book:
             failures.append(f'app_book.c: missing {label} ({needle!r})')
@@ -210,6 +213,45 @@ def main() -> int:
     tools = function_body(book, 'static app_redraw_t reader_panel_action(')
     if 'open_vocab_view(ctx, false)' not in tools:
         failures.append('reader_panel_action(): the toolbar never opens the vocabulary view')
+    # gen26.5 Step10：听书那一项要真的打开 TTS 面板，且面板里有开关卡接线
+    # （NVS rp_tts）。工具计数从 6 到 7 是本次唯一一次扩容，两条表同长由
+    # _Static_assert 兜着；这里盯「第 7 项点下去有去处」。
+    # gen26.5 Step10: the TTS entry must open the TTS panel, and the panel must
+    # wire the switch card (NVS rp_tts). 6 -> 7 is the only toolbar expansion;
+    # the _Static_asserts guard equal table lengths, this guards "the seventh
+    # tap goes somewhere".
+    if 's_reader_panel = READER_PANEL_TTS' not in tools:
+        failures.append('reader_panel_action(): the toolbar never opens the TTS panel')
+    if 'tts_switch_set(' not in tools:
+        failures.append('reader_panel_action(): the TTS panel never sets the switch')
+    if 'tts_switch_on()' not in book:
+        failures.append('app_book.c: the TTS follow path never reads the switch')
+    if 'push_sink_tts_send_page(' not in book:
+        failures.append('app_book.c: the TTS follow path never pushes page text')
+    # gen26.5 Step10-5：跟随轮询的两条安全线也要有牙——① 页变哨兵去重
+    # （删了它每 tick 重发同一页，手机上把一页读成复读）；② link_up 门
+    # （删了它没连接也调 notify，白耗重投配额）。变异脚本 run_tts_mutations.sh
+    # 逐条植入验证这两行使它 FAIL。**必须在 tts_follow_poll 函数体内查**：
+    # push_sink_link_up() 在 draw_tts 状态卡里也出现，整文件查会被别的调用点
+    # 蒙混过关（M8 变异第一版就是这么存活下来的）。
+    # gen26.5 Step10-5: the follow poll's two safety lines need teeth too - the
+    # page-change sentinel (without it every tick re-sends the same page and the
+    # phone reads it on repeat) and the link_up gate (without it a dead link
+    # still calls notify, burning retry quota for nothing). The mutation script
+    # run_tts_mutations.sh plants each and proves this check FAILs. The lookup
+    # MUST be scoped to tts_follow_poll's body: push_sink_link_up() also appears
+    # in draw_tts's status card, so a whole-file search lets the other call site
+    # mask the deletion (that is exactly how mutation M8 survived revision 1).
+    poll = function_body(book, 'static void tts_follow_poll(void)')
+    if not poll:
+        failures.append('app_book.c: tts_follow_poll() not found')
+    else:
+        if 's_chapter == s_tts_last_chapter && s_page == s_tts_last_page' not in poll:
+            failures.append('tts_follow_poll(): lost its page-change sentinel '
+                            '(every tick would re-send the current page)')
+        if 'push_sink_link_up()' not in poll:
+            failures.append('tts_follow_poll(): lost its link_up gate '
+                            '(a dead link would still call notify)')
     # 在视图里删掉一条后要重开视图 / a removal inside the view must re-open it
     if 'DICT_POPUP_TAP_REMOVED' not in tools or 'open_vocab_view(ctx, true)' not in tools:
         failures.append('reader_panel_action(): removing an entry in the view does not '

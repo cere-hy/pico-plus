@@ -27,6 +27,7 @@
 #include "app_registry.h"
 #include "display.h"
 #include "dict/vocab_log.h"
+#include "tts_page.h"
 #include "epd_highlevel.h"
 #include "epdiy.h"
 #include "esp_heap_caps.h"
@@ -127,6 +128,12 @@ void app_main(void) {
     // (rp_vocab/autosave, on by default). Right after settings_init: NVS is up
     // and one boot-time read is all it takes.
     vocab_log_autosave_init();
+    // gen26.5 M2 Step10：TTS 听书的 NVS 开关（rp_tts/enabled，**缺省关**——听书是
+    // 手机开口发声，不可默认代用户决定）。紧随 autosave：同一时机、同一模式。
+    // gen26.5 M2 Step10: the TTS read-aloud NVS switch (rp_tts/enabled, **off by
+    // default** - read-aloud makes the phone speak and must not decide for the
+    // user). Right after autosave: same timing, same pattern.
+    tts_switch_init();
     pico_boot_init(reset == ESP_RST_PANIC || reset == ESP_RST_INT_WDT ||
                    reset == ESP_RST_TASK_WDT || reset == ESP_RST_WDT);
 

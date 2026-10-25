@@ -17,6 +17,7 @@
 #include "push_session.h"
 #include "ai_ridealong.h"
 #include "ai_segasm.h"
+#include "push_tts.h"
 
 static int s_checks;
 static int s_red;
@@ -1190,6 +1191,101 @@ static void test_ai_ridealong(void) {
     printf("ai ridealong: init/resume/enqueue dedup/peek/dequeue shift/clear/full ok\n");
 }
 
+/* ---- TTS 页文本帧切分计划（gen26.5 Step10，纯逻辑）---- */
+/* TTS page-text frame plan (gen26.5 Step10, pure logic). */
+static void test_tts_plan(void) {
+    // 预算与槽的关系：帧预算 233 = 槽 234 保 NUL。/ Budget vs slot: 233 = 234 minus NUL.
+    CHECK(PUSH_TTS_FRAME_BUDGET == 233u);
+    CHECK(PUSH_TTS_FRAME_BUDGET == PUSH_TTS_TEXT_MAX - 1u);
+
+    // 空文本 = 1 帧 0 字节。/ Empty text = one 0-byte frame.
+    CHECK(push_tts_frame_count("", 0) == 1);
+    const char *slice = NULL;
+    size_t slice_len = 99;
+    CHECK(push_tts_frame_at("", 0, 0, &slice, &slice_len));
+    CHECK(slice_len == 0);
+    CHECK(!push_tts_frame_at("", 0, 1, &slice, &slice_len));
+
+    // UTF-8 安全前进的单元行为。/ Unit behaviour of the UTF-8 advance.
+    CHECK(push_tts_utf8_advance("abc", 3, 2) == 2);           // ASCII 截到预算
+    CHECK(push_tts_utf8_advance("abc", 3, 99) == 3);          // 短文本全收
+    CHECK(push_tts_utf8_advance("\xE4\xB8\xAD\xE6\x96\x87", 6, 1) == 0); // 中=3B，预算1放不下
+    CHECK(push_tts_utf8_advance("\xE4\xB8\xAD\xE6\x96\x87", 6, 3) == 3); // 恰放一个
+    CHECK(push_tts_utf8_advance("\xE4\xB8\xAD\xE6\x96\x87", 6, 4) == 3); // 第2个放不下，收刀
+    CHECK(push_tts_utf8_advance("\xE4\xB8\xAD\xE6\x96\x87", 6, 6) == 6); // 两个都收
+    CHECK(push_tts_utf8_advance("\x80\x80", 2, 2) == 0);      // 首字节即续字节：不前进
+    CHECK(push_tts_utf8_advance("\xF0\x9F\x98\x80z", 5, 4) == 4); // 4B emoji 恰收
+    CHECK(push_tts_utf8_advance("\xF0\x9F\x98\x80z", 5, 3) == 0); // emoji 放不下就整颗不收
+
+    // 短页一帧。/ A short page is one frame.
+    const char *page = "It was a bright cold day in April.";
+    CHECK(push_tts_frame_count(page, strlen(page)) == 1);
+    CHECK(push_tts_frame_at(page, strlen(page), 0, &slice, &slice_len));
+    CHECK(slice_len == strlen(page));
+
+    // 长 ASCII 页：帧数 = ceil(len/233)，切片拼回原文。
+    // A long ASCII page: ceil(len/233) frames, slices reassemble to the original.
+    static char big[1000];
+    for (size_t i = 0; i < sizeof(big) - 1; ++i) big[i] = (char)('a' + (i % 26));
+    const size_t big_len = sizeof(big) - 1;
+    CHECK(push_tts_frame_count(big, big_len) == (big_len + 232) / 233);
+    {
+        char back[sizeof(big)];
+        size_t got = 0;
+        const size_t total = push_tts_frame_count(big, big_len);
+        for (size_t i = 0; i < total; ++i) {
+            CHECK(push_tts_frame_at(big, big_len, i, &slice, &slice_len));
+            CHECK(slice_len > 0 && slice_len <= PUSH_TTS_FRAME_BUDGET);
+            memcpy(back + got, slice, slice_len);
+            got += slice_len;
+        }
+        CHECK(got == big_len);
+        CHECK(memcmp(back, big, big_len) == 0);
+        CHECK(!push_tts_frame_at(big, big_len, total, &slice, &slice_len)); // 越界
+    }
+
+    // 中文页：每颗 3 字节，帧内颗数 = 233/3 = 77 颗余 2；拼回原文且无一颗被劈。
+    // A Chinese page: 3 bytes each, 77 characters plus a 2-byte remainder per
+    // frame; reassembly matches and no character is ever split.
+    static char zh[1000];
+    size_t zh_len = 0;
+    while (zh_len + 3 <= sizeof(zh) - 1) {
+        zh[zh_len++] = (char)0xE4;
+        zh[zh_len++] = (char)0xB8;
+        zh[zh_len++] = (char)0xAD;
+    }
+    CHECK(push_tts_frame_count(zh, zh_len) == (zh_len + 232) / 233);
+    {
+        static char back[sizeof(zh)];
+        size_t got = 0;
+        const size_t total = push_tts_frame_count(zh, zh_len);
+        for (size_t i = 0; i < total; ++i) {
+            CHECK(push_tts_frame_at(zh, zh_len, i, &slice, &slice_len));
+            CHECK(slice_len % 3 == 0); // 帧内恒为整颗 / whole characters only
+            memcpy(back + got, slice, slice_len);
+            got += slice_len;
+        }
+        CHECK(got == zh_len);
+        CHECK(memcmp(back, zh, zh_len) == 0);
+    }
+
+    // 贴脸用例：233 字节整好一帧（不多出一帧 0 字节）。
+    // Exact-fit case: 233 bytes is exactly one frame (no trailing empty frame).
+    static char exact[233];
+    memset(exact, 'x', sizeof(exact));
+    CHECK(push_tts_frame_count(exact, sizeof(exact)) == 1);
+    CHECK(push_tts_frame_at(exact, sizeof(exact), 0, &slice, &slice_len));
+    CHECK(slice_len == 233);
+    // 234 字节：第二帧只有 1 字节。/ 234 bytes: the second frame carries 1 byte.
+    static char exact2[234];
+    memset(exact2, 'y', sizeof(exact2));
+    CHECK(push_tts_frame_count(exact2, sizeof(exact2)) == 2);
+    CHECK(push_tts_frame_at(exact2, sizeof(exact2), 1, &slice, &slice_len));
+    CHECK(slice_len == 1);
+
+    printf("tts plan: budget 233, utf8-safe split, empty=1 frame, exact-fit edges ok\n");
+}
+
 int main(void) {
     test_crc32();
     test_ctrl_header();
@@ -1199,6 +1295,7 @@ int main(void) {
     test_ai_frames();
     test_ai_ridealong();
     test_ai_segasm();
+    test_tts_plan();
     test_happy_path();
     test_word_card();
     test_resume();

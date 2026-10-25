@@ -185,6 +185,38 @@ public class MainActivity extends Activity {
     /** 亮屏/解锁事件接收器（同上）。 */
     private BroadcastReceiver mKeepAliveReceiver = null;
 
+    /* ---- gen26.5 M2 Step10：TTS 听书（0x19 页文本 → 本地朗读）----
+     * 设备侧「听书」面板开启跟随后，每翻页推一页 0x19；本侧重组回整页交
+     * TextToSpeech 朗读。跟随模式 = 打断当前读新页，无本地队列——设备是单一
+     * 真相源，APK 不缓存未读书页。FGS 独立于监听保活（两段会话可同时存在：
+     * 点词监听 + 听书朗读，互不抢占）；10 分钟无新页即停保活（读停了不空耗，
+     * 当前页若仍在读不打断），断连即停 + 重组器复位（半页残留不留）。
+     * With the device's TTS panel in follow mode, every page turn pushes one
+     * 0x19 page; this side folds it back and reads it aloud. Follow mode =
+     * interrupt and read the new page, no local queue (the device is the
+     * single source of truth). The FGS is independent of the listening
+     * keep-alive (both sessions may coexist); 10 minutes without a new page
+     * stops the keep-alive (an in-flight long page is never cut), and a
+     * disconnect stops it and resets the reassembler.
+     */
+    private TextView ttsStatus;
+    private Button btnTtsSettings;
+    /** 0x19 页文本重组器（只由 BLE 回调线程 touch：accept/reset 同线程，无锁）。 */
+    private final TtsReassembler ttsReassembler = new TtsReassembler();
+    /** 朗读引擎封装（异步 init + 档位持久化 + 跟随/查词两个入口）。 */
+    private final TtsSpeaker ttsSpeaker = new TtsSpeaker();
+    /** 最近一页 0x19 收齐的时刻；0 = 本会话还没收到过页文本。 */
+    private volatile long ttsLastPageMs = 0;
+    /** 本会话已收齐并交朗读的页数（状态行展示）。 */
+    private volatile int ttsPagesRead = 0;
+    /** TTS 保活 FGS 运行态（最佳努力记录，与 ListenKeepAliveService 分开记）。 */
+    private volatile boolean mTtsFgsRunning = false;
+    /** 10 分钟无新页 → 停 TTS 保活。也作为「跟随朗读进行中」的判定窗。 */
+    private static final long TTS_IDLE_STOP_MS = 10 * 60 * 1000;
+    /** TTS 空闲停 FGS 的定时（UI 线程；每来新页重排）。 */
+    private final Handler mTtsIdleHandler = new Handler(Looper.getMainLooper());
+    private Runnable mTtsIdleStop = null;
+
     private static final String PREF = "ai";
     private static final String PREF_KEY = "api_key";
     private static final String PREF_BASE = "base_url";
@@ -234,6 +266,26 @@ public class MainActivity extends Activity {
     private final BluetoothGattCallback gattCb = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
+            if (newState == BluetoothGatt.STATE_DISCONNECTED) {
+                // gen26.5 Step10：断连即停 TTS 保活 + 复位重组器（半页残留不留）。
+                // 当前页若仍在本地朗读不打断——BLE 断了不影响 TextToSpeech 把
+                // 这一页读完；设备侧重连后页变哨兵自然续推（推送失败时哨兵
+                // 本就没更新，重连即补推）。
+                // Disconnect: stop the TTS keep-alive and reset the reassembler
+                // (no half-page residue). An in-flight local utterance is NOT
+                // cut (a BLE loss never stops TextToSpeech mid-page), and the
+                // device resumes on the next page change (a push that failed
+                // for want of a link left its sentinel untouched, so a
+                // reconnect re-pushes the current page).
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        stopTtsKeepAlive();
+                        ttsReassembler.reset();
+                        refreshTtsStatus();
+                    }
+                });
+            }
             synchronized (lock) {
                 if (status != BluetoothGatt.GATT_SUCCESS
                         && newState == BluetoothGatt.STATE_DISCONNECTED) {
@@ -495,6 +547,35 @@ public class MainActivity extends Activity {
         root.addView(rowAi, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // ---- gen26.5 M2 Step10：TTS 听书（状态行 + 朗读设置）----
+        // 设备侧工具条第 7 项「听书」打开跟随后，每翻页推一页 0x19 由本 App
+        // 朗读；语速/音调档位与系统引擎入口在「朗读设置」。状态行只反映事实
+        // （未开始 / 朗读中·页数·引擎态 / 已待机），不承诺推不到的声音。
+        // With the device's 7th tool entry (听书) in follow mode, every page
+        // turn arrives as 0x19 and is read aloud here; rate/pitch steps and
+        // the system engine entry live in 朗读设置. The status row only
+        // reports facts (idle / reading·pages·engine / standby).
+        ttsStatus = new TextView(this);
+        ttsStatus.setTextSize(12);
+        ttsStatus.setPadding(0, dp(6), 0, dp(2));
+        root.addView(ttsStatus, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout rowTts = new LinearLayout(this);
+        rowTts.setOrientation(LinearLayout.HORIZONTAL);
+        btnTtsSettings = new Button(this);
+        btnTtsSettings.setText("朗读设置");
+        btnTtsSettings.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showTtsSettings();
+            }
+        });
+        rowTts.addView(btnTtsSettings, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(rowTts, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
         logScroll = new ScrollView(this);
         logView = new TextView(this);
         logView.setTextSize(12);
@@ -517,6 +598,13 @@ public class MainActivity extends Activity {
         uiLog("就绪。在墨水屏上开启「接收推送」后，点「发送到墨水屏」。");
         refreshLocationBanner(); // gen23：进入 App 检测一次定位服务/权限
         refreshAiStatus();       // gen26 M1：AI 状态行（key 是否配置 / 是否在监听）
+        // gen26.5 Step10：异步起朗读引擎（onInit 成功前到达的页暂存，init 成功
+        // 即补读——「开书即推首推」与「引擎刚初始化」竞态不丢页）；随后刷状态行。
+        // Bring up the read-aloud engine asynchronously (a page that arrives
+        // before onInit is stashed and read once init succeeds, so the
+        // device's first push never races engine startup).
+        ttsSpeaker.init(this);
+        refreshTtsStatus();      // gen26.5 Step10：TTS 状态行
     }
 
     @Override
@@ -540,6 +628,11 @@ public class MainActivity extends Activity {
         cancelAiRetry();
         mFgsRunning = false;
         ListenKeepAliveService.stop(this);
+        // gen26.5 Step10：退出即停 TTS 保活 + 关引擎 + 复位重组器（半页不留）。
+        // Exit: stop the TTS keep-alive, shut the engine, reset the reassembler.
+        stopTtsKeepAlive();
+        ttsReassembler.reset();
+        ttsSpeaker.shutdown();
         closeQuietly();
         super.onDestroy();
     }
@@ -1729,7 +1822,7 @@ public class MainActivity extends Activity {
         refreshAiStatus();
     }
 
-    /** 分发设备来的 AI 状态帧：0x18 记能力位，0x17 触发查词。 */
+    /** 分发设备来的状态帧：0x18 记能力位，0x17 触发查词，0x19 听书页文本。 */
     private void dispatchAiStatus(byte[] frame) {
         int op = frame.length > 0 ? (frame[0] & 0xFF) : 0;
         if (op == PushProto.ST_CAPS) {
@@ -1767,6 +1860,187 @@ public class MainActivity extends Activity {
             }
             onAiQuery(word, bookId, pos);
         }
+        if (op == PushProto.ST_TTS_TEXT) {
+            dispatchTtsText(frame);
+        }
+    }
+
+    /**
+     * gen26.5 Step10：0x19 页文本 → 重组 → 朗读。BLE 回调线程只做纯逻辑重组
+     * （快、无锁、不碰 UI），朗读/FGS/状态一律回 UI 线程。半页在途或本页作废
+     * （accept 返回 null）静默等待；空页（""）= 静默——设备侧本不推空页，
+     * 此处是防御性同语义（这页没字可读，不切断上一页的剩余部分也无页可读）。
+     * Fold 0x19 page text and read it aloud: the BLE callback thread only runs
+     * the pure reassembler (fast, lock-free, no UI); speaking, the FGS and the
+     * status row all hop to the UI thread. A half-page or a dropped page
+     * (accept == null) waits in silence; an empty page ("") reads as silence
+     * (the defensive twin of the device rule - nothing to read on this page).
+     */
+    private void dispatchTtsText(byte[] frame) {
+        final String page = ttsReassembler.accept(frame);
+        if (page == null) {
+            return; // 半页在途/缺帧作废：等下一页 seq==0 自然收敛
+        }
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                ttsLastPageMs = System.currentTimeMillis();
+                ++ttsPagesRead;
+                // 跟随模式：打断当前读新页（"" = 静默）。/ Follow: interrupt
+                // and read the new page ("" = silence).
+                ttsSpeaker.speakFollow(page);
+                // 来页即保活：点词监听与听书朗读是两段独立会话，两个 FGS 互不
+                // 抢占；激进 ROM 拒启时服务内降级不崩，状态行如实显示。
+                // A page arrives -> keep-alive. The listening and read-aloud
+                // sessions are independent and their FGS never preempt each
+                // other; a refusing ROM degrades inside the service.
+                if (!mTtsFgsRunning) {
+                    mTtsFgsRunning = true;
+                    TtsKeepAliveService.start(MainActivity.this);
+                }
+                scheduleTtsIdleStop();
+                refreshTtsStatus();
+            }
+        });
+    }
+
+    /** 重排 10 分钟空闲停 FGS（每页到达重排；只停保活，不打断可能仍在读的长页）。 */
+    private void scheduleTtsIdleStop() {
+        if (mTtsIdleStop != null) {
+            mTtsIdleHandler.removeCallbacks(mTtsIdleStop);
+        }
+        mTtsIdleStop = new Runnable() {
+            @Override
+            public void run() {
+                mTtsIdleStop = null;
+                mTtsFgsRunning = false;
+                TtsKeepAliveService.stop(MainActivity.this);
+                refreshTtsStatus(); // 「已待机」如实显示
+            }
+        };
+        mTtsIdleHandler.postDelayed(mTtsIdleStop, TTS_IDLE_STOP_MS);
+    }
+
+    /** 停止 TTS 保活 + 撤销空闲定时（断开/退出时调，幂等）。 */
+    private void stopTtsKeepAlive() {
+        if (mTtsIdleStop != null) {
+            mTtsIdleHandler.removeCallbacks(mTtsIdleStop);
+            mTtsIdleStop = null;
+        }
+        mTtsFgsRunning = false;
+        TtsKeepAliveService.stop(this);
+    }
+
+    /** 跟随朗读是否进行中（最近一页在 10 分钟空闲窗内）——查词发音联动判据。 */
+    private boolean ttsActive() {
+        final long last = ttsLastPageMs;
+        return last != 0 && System.currentTimeMillis() - last < TTS_IDLE_STOP_MS;
+    }
+
+    /** TTS 状态行：未开始 / 朗读中（页数 + 引擎态）/ 已待机。只反映事实。 */
+    private void refreshTtsStatus() {
+        if (ttsStatus == null) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("听书：");
+        if (ttsLastPageMs == 0) {
+            sb.append("未开始（在墨水屏工具条开「听书」并打开跟随开关）");
+        } else if (ttsActive()) {
+            sb.append("朗读中 · 已读 ").append(ttsPagesRead).append(" 页");
+            sb.append(ttsSpeaker.ready() ? " · 引擎就绪" : " · 引擎不可用");
+        } else {
+            sb.append("已待机（10 分钟无新页，翻页自动续读）");
+        }
+        final String text = sb.toString();
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                ttsStatus.setText(text);
+            }
+        });
+    }
+
+    /**
+     * gen26.5 Step10：朗读设置——语速/音调离散档循环 + 系统 TTS 引擎入口 +
+     * 引擎就绪态。引擎选择走系统（本 App 不私存引擎包名：装了什么引擎是用户
+     * 的决定）；档位存 SharedPreferences，init 成功时刷进引擎。
+     * Read-aloud settings: discrete rate/pitch step cycling, the system TTS
+     * engine entry and engine readiness. Engine choice belongs to the system;
+     * the steps persist in SharedPreferences and land in the engine on init.
+     */
+    private void showTtsSettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(16);
+        box.setPadding(p, p, p, p);
+
+        TextView stEngine = new TextView(this);
+        stEngine.setTextSize(13);
+        stEngine.setText(ttsSpeaker.ready()
+                ? "朗读引擎：就绪（档位下面切换，引擎本身在系统设置里选）"
+                : "朗读引擎：未就绪（系统没有可用的 TTS 引擎，或仍在初始化）");
+        box.addView(stEngine);
+
+        final TextView stRate = new TextView(this);
+        stRate.setTextSize(15);
+        stRate.setPadding(0, dp(8), 0, 0);
+        stRate.setText("语速：" + rateLabel(ttsSpeaker.rateIdx(this))
+                + "（点一下换一档，共 " + TtsSpeaker.RATE_STEPS.length + " 档）");
+        box.addView(stRate);
+
+        final TextView stPitch = new TextView(this);
+        stPitch.setTextSize(15);
+        stPitch.setText("音调：" + pitchLabel(ttsSpeaker.pitchIdx(this))
+                + "（点一下换一档，共 " + TtsSpeaker.PITCH_STEPS.length + " 档）");
+        box.addView(stPitch);
+
+        Button btnRate = new Button(this);
+        btnRate.setText("切换语速");
+        btnRate.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                int i = ttsSpeaker.cycleRate(MainActivity.this);
+                stRate.setText("语速：" + rateLabel(i)
+                        + "（点一下换一档，共 " + TtsSpeaker.RATE_STEPS.length + " 档）");
+            }
+        });
+        box.addView(btnRate);
+
+        Button btnPitch = new Button(this);
+        btnPitch.setText("切换音调");
+        btnPitch.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                int i = ttsSpeaker.cyclePitch(MainActivity.this);
+                stPitch.setText("音调：" + pitchLabel(i)
+                        + "（点一下换一档，共 " + TtsSpeaker.PITCH_STEPS.length + " 档）");
+            }
+        });
+        box.addView(btnPitch);
+
+        Button btnEngine = new Button(this);
+        btnEngine.setText("系统 TTS 设置（选引擎 / 装语音数据）");
+        btnEngine.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                TtsSpeaker.openSystemTtsSettings(MainActivity.this);
+            }
+        });
+        box.addView(btnEngine);
+
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("朗读设置")
+                .setView(box)
+                .setNegativeButton("完成", null)
+                .show();
+    }
+
+    private static String rateLabel(int idx) {
+        return TtsSpeaker.RATE_STEPS[idx] + "×";
+    }
+
+    private static String pitchLabel(int idx) {
+        return TtsSpeaker.PITCH_STEPS[idx] + "×";
     }
 
     /** 收到点词：后台调 LLM，拿到释义后回 0x07。 */
@@ -1813,6 +2087,16 @@ public class MainActivity extends Activity {
                         plan.markFinished();
                         uiLog("释义：" + r.text);
                         sendAiResult(plan.word(), r.text);
+                        // gen26.5 Step10「AI 联动」：跟随朗读进行中 → 顺带发音
+                        // （打断当前页读「词 + 释义」——用户的注意力在词上；
+                        // 下一页推送自然续上跟随，无需本地补读）。
+                        // AI linkage: while following, pronounce the word plus
+                        // its definition (the current page is cut on purpose;
+                        // the next page push resumes the follow - no local
+                        // catch-up needed).
+                        if (ttsActive()) {
+                            ttsSpeaker.speakWord(plan.word(), r.text);
+                        }
                         refreshAiStatus();
                     }
                 });

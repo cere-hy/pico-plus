@@ -29,6 +29,9 @@ javac --release 8 -encoding UTF-8 -nowarn \
     "$HERE/src/dev/readpico/push/AiClient.java" \
     "$HERE/src/dev/readpico/push/AiKeepAlive.java" \
     "$HERE/src/dev/readpico/push/ListenKeepAliveService.java" \
+    "$HERE/src/dev/readpico/push/TtsReassembler.java" \
+    "$HERE/src/dev/readpico/push/TtsKeepAliveService.java" \
+    "$HERE/src/dev/readpico/push/TtsSpeaker.java" \
     "$HERE/src/dev/readpico/push/MainActivity.java"
 
 echo "== 2/7 宿主机对表测试（对表 push_pico.py）"
@@ -47,6 +50,11 @@ echo "== 2c/7 AiKeepAlive 宿主测试（保活四态 + 事件驱动重试，纯
 javac --release 8 -encoding UTF-8 -nowarn \
     -cp "$HERE/build/obj" -d "$HERE/build/test" "$HERE/test/AiKeepAliveTest.java"
 java -cp "$HERE/build/test:$HERE/build/obj" dev.readpico.push.AiKeepAliveTest
+
+echo "== 2d/7 TtsReassembler 宿主测试（0x19 页文本重组，纯逻辑，零 android 依赖）"
+javac --release 8 -encoding UTF-8 -nowarn \
+    -cp "$HERE/build/obj" -d "$HERE/build/test" "$HERE/test/TtsReassemblerTest.java"
+java -cp "$HERE/build/test:$HERE/build/obj" dev.readpico.push.TtsReassemblerTest
 
 echo "== 3/7 d8 -> classes.dex"
 "$BT/d8" --release --min-api 26 --lib "$AJ" \

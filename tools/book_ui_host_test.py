@@ -472,6 +472,23 @@ unit += 'static void push_sink_notify_read(void){}\n'
 # derailed; cancel semantics are covered by the push_sink host test.
 unit += 'static bool s_push_handoff;\n'
 unit += 'static void push_sink_cancel_why(const char *why){(void)why;}\n'
+# gen26.5 Step9 详解会话替身：on_key / on_key_long 的 KEY_1/KEY_2 分支与 render
+# 的早退都读 ai_reader_active()，本测试只验证这些输入/退出路径不被会话带偏
+# （KEY_2 豁免、离开不收摊），会话语义（开/关/翻页/重呈现）由 ai_reader 自己的
+# 宿测覆盖。/ Step9 detail-session stand-ins: on_key / on_key_long's KEY_1/KEY_2
+# branches and render's early exit all read ai_reader_active(); this test only
+# pins that those input/exit paths are not derailed by a session (the KEY_2
+# exemption, no teardown on exit); session semantics (open/close/turn/
+# re-present) are covered by ai_reader's own host tests.
+unit += r'''
+typedef struct { size_t chapter, page, page_start_offset; char title[96]; } ai_reader_source_t;
+static bool ai_reader_open(const char* word, const char* def, const ai_reader_source_t* source){(void)word;(void)def;(void)source;return false;}
+static void ai_reader_close(void){}
+static bool ai_reader_active(void){return false;}
+static void ai_reader_render(uint8_t* fb){(void)fb;}
+static app_redraw_t ai_reader_turn(int dir){(void)dir;return APP_REDRAW_NONE;}
+static app_redraw_t ai_reader_close_full(void){return APP_REDRAW_FULL;}
+'''
 for name in ("inline_ink_gray", "reader_margin_width", "reader_margin_levels", "reader_margin_level_for", "reader_margin_for_level", "slider_index", "reader_margin_input", "reader_area", "reader_fullscreen_progress_area", "body_rect_for_tracking", "body_rect", "progress_rect", "copy_text", "reader_footer_strip_number", "favorite_key", "favorite_read_handle", "shelf_hidden_key", "shelf_hidden_read_handle", "shelf_hidden_load", "shelf_hidden_save", "shelf_rows", "row_rect", "shelf_category_add", "shelf_category_init", "shelf_category_matches", "shelf_category_remember", "shelf_category_restore", "shelf_categories_recount", "shelf_matches", "compare_books", "sort_shelf", "shelf_reserve", "delete_retry_find", "delete_retry_reserve", "delete_retry_discard", "scan_shelf_dir", "shelf_backfill_visit", "shelf_backfill_read_books", "scan_shelf", "refresh_cached_progress",             "pending_find", "pending_reserve", "pending_restore", "pending_discard", "pending_mark_latest", "pending_drop_invalidated", "pending_flush", "reader_page_offset", "save_progress", "retry_progress", "layout_name", "manage_panel", "manage_rect", "batch_rect", "manage_back_rect", "bulk_filter_rect", "bulk_nav_rect", "bulk_nav_hit", "leaves", "selected_count", "clear_selection", "toggle_selection", "select_page", "bookmark_compact", "search_begin", "refresh_search_matches", "search_finish", "refresh_capacity", "manage_apply", "manage_action", "batch_apply", "batch_action", "bulk_turn_page", "bulk_finish", "bulk_action", "bulk_control_at", "menu_handle_enabled", "reader_manual_refresh", "apply_reader_option", "reader_return", "reader_key_action", "on_key", "on_key_long", "draw_wrapped_name", "open_requested_book", "on_enter", "book_on_exit"):
     unit += function(name) + "\n"
 for name in ("book_remote_direction", "shelf_turn_page", "shelf_page_arrow_rect", "reader_swipe_direction"):

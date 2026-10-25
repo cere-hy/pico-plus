@@ -82,6 +82,7 @@ ICONS = (
     "cpu",               # BOOT 刷机 / boot flashing
     "book-open",         # 阅读设置 / reading settings
     "timer",             # 自动休眠 / idle lock
+    "volume-2",          # 阅读工具栏·听书（TTS 朗读入口）/ reader toolbar, read-aloud (TTS)
 )
 
 _NUMBER = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")

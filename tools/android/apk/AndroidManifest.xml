@@ -11,8 +11,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.readpico.push"
-    android:versionCode="8"
-    android:versionName="1.4.3">
+    android:versionCode="9"
+    android:versionName="1.5.0">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
@@ -55,6 +55,17 @@
              long as the listening session; explicit connectedDevice type. -->
         <service
             android:name=".ListenKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+        <!-- gen26.5 Step10：听书朗读保活前台服务。与监听保活同型不同生：
+             两段会话（点词监听 + 听书朗读）可同时存在，互不抢占；started-only
+             （不 bind），朗读起停，connectedDevice 类型，静默低优先级渠道。 -->
+        <!-- gen26.5 Step10: the read-aloud keep-alive FGS. Same shape, separate
+             life from the listening one - both sessions may coexist and never
+             preempt each other; started-only, lives exactly as long as the
+             read-aloud session, explicit connectedDevice type, silent channel. -->
+        <service
+            android:name=".TtsKeepAliveService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
         <activity

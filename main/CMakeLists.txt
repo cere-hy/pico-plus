@@ -119,6 +119,7 @@ idf_component_register(
         "book/gbk.c"
         "dict/dict_lookup.c"
         "dict/vocab_log.c"
+        "tts/tts_page.c"
         "font/ttf_font.c"
         "font/app_font_context.c"
         "font/ui_font.c"
@@ -126,7 +127,7 @@ idf_component_register(
         "factory/pmu_selftest.c"
         "factory/vcom_setup.c"
     REQUIRES ${main_requires}
-    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book" "dict"
+    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book" "dict" "tts"
     EMBED_FILES
         "assets/lock_4bpp.bin"
         "assets/loading_4bpp.bin"

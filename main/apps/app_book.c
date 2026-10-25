@@ -133,6 +133,7 @@
 #include "dict_lookup.h"
 #include "dict_popup.h"
 #include "vocab_log.h"
+#include "tts_page.h"
 #include "display.h"
 #include "display_reader_waveform.h"
 #include "e0470_epaper_waveform.h"
@@ -175,13 +176,13 @@
 #define BOOK_PX_MIN 36
 #define BOOK_PX_MAX 72
 #define BOOK_PX_STEP 4
-// 边距取上游 r91 的九档滑杆（0..48）；工具条第 6 项（词典）是我方新增，故计数为 6。
-// Margins follow upstream r91's nine-step slider (0..48); the sixth tool (dictionary) is ours,
-// hence the count of six.
+// 边距取上游 r91 的九档滑杆（0..48）；工具条第 6 项（生词本）与第 7 项（听书）是我方新增，故计数为 7。
+// Margins follow upstream r91's nine-step slider (0..48); the sixth tool (vocabulary book) and the
+// seventh (TTS read-aloud) are ours, hence the count of seven.
 #define BOOK_MARGIN_MIN 0
 #define BOOK_MARGIN_MAX 48
 #define BOOK_MARGIN_CHOICES 9
-#define BOOK_TOOL_COUNT 6
+#define BOOK_TOOL_COUNT 7
 #define BOOK_FONT_PAGE 9
 #define BOOKMARK_MAX 24
 #define BOOKMARK_ROWS 6
@@ -210,6 +211,7 @@ typedef enum {
     READER_PANEL_KEY_SETTINGS,
     READER_PANEL_KEY_PICKER,
     READER_PANEL_DICT, ///< 点词查译卡片 / Tap-to-lookup definition card
+    READER_PANEL_TTS,  ///< 听书面板（开关 + 链路状态）/ TTS panel (switch + link status)
 } reader_panel_t;
 typedef struct {
     char name[256];
@@ -334,6 +336,18 @@ static char s_message[128], s_storage[128], s_path[BOOK_STORE_PATH_MAX], s_title
 // teardown waits for a real reader exit (the ruling: teardown hangs off
 // book_on_exit).
 static bool s_push_handoff;
+// gen26.5 Step10 听书：已推送页哨兵，只记「成功投过 0x19 的 (章, 页)」。
+// 推送失败不更新——下轮原样重发（对端在 seq==0 处自然重置，无半页残留）；
+// 开关打开时重置保首推；关书时清哨兵但不停开关（偏好跨书保持，换书后同
+// (章,页) 不撞车）。开关态本身在 tts_page.c（NVS rp_tts），此处不存第二份。
+// gen26.5 Step10 TTS: the pushed-page sentinel records only (chapter, page)
+// pairs whose 0x19 page text went out. A failed push leaves it untouched - the
+// next round resends as-is (the peer resets at seq==0, no half-page residue);
+// turning the switch on resets it so the current page always gets a first push;
+// closing a book clears it but never stops the switch (the preference survives
+// books and a new book's same (chapter,page) never collides). The switch state
+// itself lives in tts_page.c (NVS rp_tts); no second copy is kept here.
+static size_t s_tts_last_chapter = SIZE_MAX, s_tts_last_page = SIZE_MAX;
 static char s_book_title[128];
 static char s_chapter_heading_title[128], s_chapter_heading_label[32];
 static size_t s_chapter_lead_skip;
@@ -1331,7 +1345,7 @@ static EpdRect tool_rect(int i) {
 // entry would silently shift every tap (tapping the vocabulary book opening the
 // TOC). Both tables are now asserted against the same count.
 static const char* const k_tool_labels[BOOK_TOOL_COUNT] = {
-    "目录", "书签", "阅读统计", "阅读设置", "字体设置", "生词本",
+    "目录", "书签", "阅读统计", "阅读设置", "字体设置", "生词本", "听书",
 };
 static const ui_icon_t k_tool_icons[BOOK_TOOL_COUNT] = {
     UI_ICON_LIST,          // 0 目录 / TOC
@@ -1340,6 +1354,7 @@ static const ui_icon_t k_tool_icons[BOOK_TOOL_COUNT] = {
     UI_ICON_BOOK_OPEN,     // 3 阅读设置 / reading settings
     UI_ICON_TYPE,          // 4 字体设置 / font settings
     UI_ICON_A_LARGE_SMALL, // 5 生词本 / vocabulary book (Lucide "a-large-small")
+    UI_ICON_VOLUME_2,      // 6 听书 / TTS read-aloud (Lucide "volume-2")
 };
 _Static_assert(sizeof(k_tool_labels) / sizeof(k_tool_labels[0]) == BOOK_TOOL_COUNT,
                "every reader tool needs a label");
@@ -2755,6 +2770,65 @@ static void draw_turn_settings(uint8_t *fb) {
     reader_panel_text_vc(fb, 342, 1170, 26, "完成", EPD_DRAW_ALIGN_CENTER, true);
 }
 
+// 听书面板：状态卡（链路 + 跟随态）+ 开关卡 + 完成键。三刻度全对表：
+// sheet top=270、状态卡 {36,370,612,240}、开关卡 {36,650,612,96}、
+// 提示行 y=1051、完成键 {36,1141,612,58}——PAD 36 / 卡间距 40（GAP 24 的同族
+// 圆整值）/ META_LINE_GAP 8 无一处偏离。/ TTS panel: status card (link + follow
+// state) + switch card + done key. All three scales line up: sheet top=270,
+// status card {36,370,612,240}, switch card {36,650,612,96}, hint line y=1051,
+// done key {36,1141,612,58} - PAD 36 / card gap 40 (the rounded sibling of
+// GAP 24) / META_LINE_GAP 8, no deviation anywhere.
+// 状态文案只陈述设备侧可知的事实：链路通不通、开关开不开——「手机是否真的在
+// 发声」设备无从验证，不假报。/ The status lines state only device-side facts:
+// whether the link is up and the switch is on - whether the phone is truly
+// speaking is unknowable here and never faked.
+static void draw_tts(uint8_t *fb) {
+    draw_sheet(fb, 270, "听书");
+    draw_sheet_back(fb, 270);
+    const bool up = push_sink_link_up();
+    const bool on = tts_switch_on();
+    // 状态卡：左图右文，与翻页模式卡同族（圆角 22、双层框）。
+    // Status card: diagram left, text right - the same family as the turn-mode
+    // cards (radius 22, double frame).
+    EpdRect card = {36, 370, 612, 240};
+    ui_fill_round_rect(fb, card, 22, 0xf0);
+    ui_draw_control_frame(fb, card, 22, 0x50);
+    ui_draw_control_frame(fb, (EpdRect){37, 371, 610, 238}, 21, 0x50);
+    EpdRect diagram = {64, 407, 182, 166};
+    ui_fill_round_rect(fb, diagram, 12, UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, diagram, 12, 0x58);
+    ui_draw_icon(fb, diagram.x + diagram.width / 2, diagram.y + diagram.height / 2, 72,
+                 UI_ICON_VOLUME_2, on && up ? 0x00 : 0x40);
+    const char *main_line, *sub_line;
+    if (!up) {
+        main_line = "手机未连接";
+        sub_line = "连接后自动推送当前页文字";
+    } else if (on) {
+        main_line = "跟随朗读 · 已开启";
+        sub_line = "翻到新页自动推送文本";
+    } else {
+        main_line = "跟随朗读 · 已关闭";
+        sub_line = "打开开关，手机会朗读当前页";
+    }
+    ui_text_box(fb, (EpdRect){274, 413, 350, 44}, 30, "听书朗读", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){274, 480, 350, 40}, 23, main_line, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){274, 524, 350, 40}, 21, sub_line, EPD_DRAW_ALIGN_LEFT, false);
+    // 开关卡：整宽槽，标题 + 开/关副标题 + 开关（draw_reading_toggle 的同族版式，
+    // 副标题即开关态）。/ Switch card: full-width slot with title, on/off subtitle
+    // and switch (the same family as draw_reading_toggle; the subtitle is the state).
+    EpdRect toggle = {36, 650, 612, 96};
+    ui_fill_round_rect(fb, toggle, 20, UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, toggle, 20, 0x68);
+    ui_text_box(fb, (EpdRect){toggle.x + 21, toggle.y + 6, toggle.width - 42, toggle.height / 2 - 16},
+                23, "听书开关", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){toggle.x + 21, toggle.y + toggle.height / 2, toggle.width - 108, toggle.height / 2 - 8},
+                19, on ? "开启" : "关闭", EPD_DRAW_ALIGN_LEFT, false);
+    draw_reading_switch(fb, (EpdRect){toggle.x + toggle.width - 88, toggle.y + toggle.height / 2 - 19, 69, 39}, on);
+    reader_panel_text_vc(fb, 342, 1051, 21, "朗读由手机完成 · 翻页自动跟随", EPD_DRAW_ALIGN_CENTER, false);
+    ui_fill_round_rect(fb, (EpdRect){36, 1141, 612, 58}, 20, UI_GRAY_BLACK);
+    reader_panel_text_vc(fb, 342, 1170, 26, "完成", EPD_DRAW_ALIGN_CENTER, true);
+}
+
 static const char *reader_key_label(app_reader_key_action_t action) {
     static const char *const labels[] = {"上一页", "下一页", "阅读工具栏", "切换全屏", "返回主页", "手动全刷", "不操作"};
     return labels[action >= 0 && action < APP_READER_KEY_COUNT ? action : APP_READER_KEY_NONE];
@@ -3415,6 +3489,7 @@ static void draw_reader_panel(uint8_t* fb) {
     else if (s_reader_panel == READER_PANEL_KEY_SETTINGS) draw_key_settings(fb);
     else if (s_reader_panel == READER_PANEL_KEY_PICKER) draw_key_picker(fb);
     else if (s_reader_panel == READER_PANEL_DICT) dict_popup_draw(fb);
+    else if (s_reader_panel == READER_PANEL_TTS) draw_tts(fb);
     // 上游 r91：面板文字跟随系统字号，画完复位；我方词典卡片走同一条 if 链。
     // Upstream r91: panel text follows the system font size and resets afterwards;
     // our dictionary card rides the same if-chain.
@@ -4405,6 +4480,11 @@ static void free_book(void) {
     // gen26.5 Step6：正文卸下 = 上下文源不再就绪（0x18 撤掉 CONTEXT 位，0x17 回 legacy）。
     // Chapter text released = the context source is gone (0x18 drops CONTEXT, 0x17 legacy).
     push_sink_ai_set_context_ready(false);
+    // gen26.5 Step10：听书哨兵随书清（开关不停）。换书后同 (章,页) 不撞车，
+    // 新书当前页保首推。/ Step10: the TTS sentinel clears with the book (the
+    // switch stays on). A new book's same (chapter,page) never collides, so its
+    // current page always gets a first push.
+    s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
     s_selected_toc = SIZE_MAX;
     s_jump_offset = SIZE_MAX;
     // gen25（池化 · 生命周期收口）+ gen26（降栈 12K→6K）：book_prep 的 6K 任务栈随书归还。
@@ -6294,11 +6374,17 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
                 s_line_spacing = app_settings_book_line_spacing();
                 s_reader_slider = -1;
                 s_reader_panel = READER_PANEL_FONT_SETTINGS;
-            } else {
+            } else if (i == 5) {
                 // 5 生词本：渲染虚拟书并打开，原书进度由 open_book_impl 先存好。
                 // Vocabulary book: render the virtual book and open it; the current
                 // book's progress is saved first by open_book_impl().
                 return open_vocab_view(ctx, false);
+            } else {
+                // 6 听书：打开 TTS 面板。开关在面板里（NVS rp_tts 持久化），打开
+                // 面板本身不改变开关态。/ TTS: open the TTS panel. The switch lives
+                // in the panel (persisted in NVS rp_tts); opening the panel alone
+                // never changes the switch.
+                s_reader_panel = READER_PANEL_TTS;
             }
             return APP_REDRAW_PAGE;
         }
@@ -6427,6 +6513,30 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
                 invalidate_prep();
                 return APP_REDRAW_PAGE;
             }
+            return APP_REDRAW_NONE;
+        }
+        invalidate_prep();
+        return APP_REDRAW_PAGE;
+    }
+    if (s_reader_panel == READER_PANEL_TTS) {
+        // 版面：y<270（状态栏）直接收面板；返回键与完成键都回工具条（父面板，
+        // 与翻页模式子面板同构）；开关卡切听书开关。/ Layout: a tap above y=270
+        // (the status bar) closes the panel; the back chevron and the done key
+        // both return to the tools bar (the parent panel, same shape as the
+        // turn-mode sub-panel); the switch card toggles read-aloud.
+        if (y < 270 || ui_rect_hit((EpdRect){36, 1141, 612, 58}, x, y) ||
+            ui_rect_hit((EpdRect){36, 299, 56, 56}, x, y)) {
+            s_reader_panel = READER_PANEL_TOOLS;
+        } else if (ui_rect_hit((EpdRect){36, 650, 612, 96}, x, y)) {
+            const bool on = tts_switch_on();
+            tts_switch_set(!on);
+            // 打开即重置哨兵：当前页无条件首推——哪怕它与上一本书记录的同一
+            // (章,页) 撞了（关书时清过哨兵，这里是双保险）。/ Turning on resets
+            // the sentinel: the current page always gets a first push - even if
+            // it collides with the last book's (chapter,page) (closing the book
+            // clears it; this is the belt-and-braces path).
+            if (!on) s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+        } else {
             return APP_REDRAW_NONE;
         }
         invalidate_prep();
@@ -7746,6 +7856,79 @@ static int book_remote_direction(void) {
     }
     return direction;
 }
+/* ---- gen26.5 Step10：TTS 听书（0x19 页文本 + 跟随轮询）----
+ * gen26.5 Step10: TTS read-aloud (0x19 page text + follow polling).
+ *
+ * 单一轮询源：app_book 的 on_tick。不接 GATT 回调、不挂翻页漏斗——页变了就
+ * 推，没变就不推，哨兵去重。One polling source: app_book's on_tick. No GATT
+ * callback wiring and no turn-page funnel hook - push when the page changed,
+ * stay quiet when it did not, with the sentinel deduplicating.
+ */
+
+// 当前视觉页在章内的字节区间：双栏取「左栏起 → 右栏的下一页止」，JOINT/单栏/
+// 落单左栏取「本页起 → 下一页止」，末页到章尾。s_page 恒为视觉页起始逻辑页
+// （turn/load/跳转全路径保证），故先归视觉页再取左右栏，不把逻辑页当视觉页用。
+// The current visual page's byte range inside the chapter: two-column runs from
+// the left column to the page after the right one; JOINT/single/lone-left runs
+// from this page to the next; the last page runs to the chapter end. s_page is
+// always a visual page's starting logical page (guaranteed on every turn/load/
+// jump path), so fold to the visual page first - never pass a logical page
+// where a visual index is expected.
+static bool tts_page_range(size_t *start, size_t *end) {
+    if (s_view != READING || !s_text || !s_text_len) return false;
+    size_t left = 0, right = SIZE_MAX;
+    reader_logical_pages(reader_visual_index(s_page), &left, &right);
+    const size_t begin = book_layout_page_start_offset(left);
+    const size_t after = (right != SIZE_MAX ? right : left) + 1;
+    size_t stop = after < book_layout_page_count() ? book_layout_page_start_offset(after)
+                                                   : s_text_len;
+    // 布局怪态（after 页起始回退）钳为空区间：推空页即静默页，不卡死轮询。
+    // A layout oddity (a backwards page start) clamps to an empty range: an
+    // empty page reads as silence and never stalls the poll.
+    if (stop < begin) stop = begin;
+    *start = begin;
+    *end = stop;
+    return true;
+}
+
+// 跟随轮询：开关开着 + 阅读中 + 链路就绪 + 页变了 → 抽当前视觉页文本推 0x19。
+// 推送失败不更新哨兵，下轮原样重发；空页（纯插图/纯空白）不推——推了会把手机上
+// 正在朗读的上一页切断，静默即是正确语义。抽取在 draw 锁内做（与点词取句同口径：
+// 有界扫描不拉长持锁时间），发送在锁外做（BLE 通知可能带重投，不能堵渲染）。
+// Follow polling: switch on + reading + link up + page changed -> extract the
+// current visual page's text and push it as 0x19. A failed push leaves the
+// sentinel untouched and the next round resends as-is; an empty page
+// (illustration-only/blank) is never pushed - pushing it would cut off the
+// phone's current utterance, and silence is the correct semantics. Extraction
+// runs under the draw lock (the same rule as tap-to-lookup's sentence capture:
+// a bounded scan must not stretch lock hold time) and the send runs outside it
+// (a BLE notify may carry retries and must never stall rendering).
+static void tts_follow_poll(void) {
+    if (!tts_switch_on() || s_view != READING || !s_text) return;
+    if (!push_sink_link_up()) return;
+    if (s_chapter == s_tts_last_chapter && s_page == s_tts_last_page) return;
+    char text[TTS_PAGE_TEXT_MAX];
+    size_t start = 0, end = 0, n = 0;
+    lock_draw();
+    const bool ranged = tts_page_range(&start, &end);
+    if (ranged) n = tts_page_extract(s_text, s_text_len, start, end, text, sizeof(text));
+    unlock_draw();
+    if (!ranged) return; // 版面未就绪：哨兵不碰，下轮再试 / layout not ready: sentinel untouched
+    if (n == 0) {
+        // 空页：无字可读。记哨兵（这页算推过了），不发帧。/ Empty page: nothing to
+        // read. Record the sentinel (this page counts as done) and air nothing.
+        s_tts_last_chapter = s_chapter;
+        s_tts_last_page = s_page;
+        return;
+    }
+    if (push_sink_tts_send_page(text, n)) {
+        s_tts_last_chapter = s_chapter;
+        s_tts_last_page = s_page;
+        ESP_LOGI(TAG, "tts push chapter=%u page=%u bytes=%u",
+                 (unsigned)s_chapter, (unsigned)s_page, (unsigned)n);
+    }
+}
+
 static app_redraw_t on_tick(app_ctx_t* ctx) {
     // gen18（18-a 自动切回）：读手机推来的虚拟书时，sink 在后台保活；手机宽限内
     // 直接再发（COOLDOWN→RECEIVING）时，自动切回传书页接客——它的泵现成，进度/状态/
@@ -7836,6 +8019,13 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         int tap = book_reader_tap_tick(&s_reader_tap, ctx->now_ms, ctx->touch && ctx->touch->touched);
         if (tap) return turn_page(ctx, tap);
     }
+    // gen26.5 Step10 听书跟随轮询放在翻页判定之后：本轮翻页若改了页，下一 tick
+    // 的轮询自然推到新页（哨兵比对 (章,页)）；此处调用只承担「页没变但链路刚
+    // 通/开关刚开」的首推与失败重发。/ The Step10 TTS follow poll sits after the
+    // turn judgement: a turn that changed the page is picked up by the next
+    // tick's poll (the sentinel compares (chapter,page)); this call only covers
+    // the first push when the link or the switch just came up, plus resends.
+    tts_follow_poll();
     track_ticket_stats(ctx);
     if (s_view == SEARCH || s_view == EDIT) {
         if (ctx->consumed) return APP_REDRAW_NONE;
