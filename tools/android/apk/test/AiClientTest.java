@@ -42,26 +42,26 @@ public final class AiClientTest {
         check(shortDef.equals(AiClient.fitUtf8(shortDef, AiClient.DEF_MAX_BYTES)),
                 "短释义原样返回（不画蛇添足加省略号）");
 
-        // 2) 裁剪：中文按字符边界切，绝不半字（250 汉字 = 750B > 600 帧帽，必截断）
+        // 2) 裁剪：中文按字符边界切，绝不半字（250 汉字 = 750B > 700 帧帽，必截断）
         StringBuilder cjk = new StringBuilder();
         for (int i = 0; i < 250; i++) {
             cjk.append("汉"); // 每个 3 字节
         }
         String cut = AiClient.fitUtf8(cjk.toString(), AiClient.DEF_MAX_BYTES);
         check(bytes(cut) <= AiClient.DEF_MAX_BYTES,
-                "中文裁剪后 <= 600 字节（实测 " + bytes(cut) + "）");
+                "中文裁剪后 <= 700 字节（实测 " + bytes(cut) + "）");
         check(cut.endsWith("…"), "被截断时末尾加「…」");
         // 去掉省略号后必须是完整汉字序列（长度 * 3 == 字节数）
         String body = cut.substring(0, cut.length() - 1);
         check(bytes(body) == body.length() * 3, "裁剪结果全是完整汉字（无半字）");
 
-        // 3) 裁剪：ASCII 长串（700 字节 > 600 帧帽，必截断）
+        // 3) 裁剪：ASCII 长串（800 字节 > 700 帧帽，必截断）
         StringBuilder ascii = new StringBuilder();
-        for (int i = 0; i < 700; i++) {
+        for (int i = 0; i < 800; i++) {
             ascii.append('x');
         }
         String cutA = AiClient.fitUtf8(ascii.toString(), AiClient.DEF_MAX_BYTES);
-        check(bytes(cutA) <= AiClient.DEF_MAX_BYTES, "ASCII 裁剪后 <= 600 字节");
+        check(bytes(cutA) <= AiClient.DEF_MAX_BYTES, "ASCII 裁剪后 <= 700 字节");
         check(cutA.endsWith("…"), "ASCII 截断也加「…」");
 
         // 4) 裁剪：混排（中英混排不越界）
@@ -70,7 +70,7 @@ public final class AiClientTest {
             mix.append("word 释义");
         }
         String cutM = AiClient.fitUtf8(mix.toString(), AiClient.DEF_MAX_BYTES);
-        check(bytes(cutM) <= AiClient.DEF_MAX_BYTES, "中英混排裁剪后 <= 600 字节");
+        check(bytes(cutM) <= AiClient.DEF_MAX_BYTES, "中英混排裁剪后 <= 700 字节");
 
         // 5) JSON 转义
         check(AiClient.jsonString("a\"b").equals("\"a\\\"b\""), "转义双引号");
@@ -126,27 +126,28 @@ public final class AiClientTest {
         // 13) 默认值：服务商可替换
         check(AiClient.DEFAULT_BASE_URL.equals("https://api.deepseek.com"), "默认 base_url = DeepSeek");
         check(AiClient.DEFAULT_MODEL.equals("deepseek-chat"), "默认 model = deepseek-chat");
-        check(AiClient.DEF_MAX_BYTES == 600,
-                "释义上限 600 字节（gen26.6 D3：180字≈540B 吃满卡容量 90%，设备侧 PUSH_AI_DEF_MAX=768 兜住）");
+        check(AiClient.DEF_MAX_BYTES == 700,
+                "释义上限 700 字节（gen26.6.1：真机 600B≈7/9 行欠饱和，230字≈690B，设备侧 PUSH_AI_DEF_MAX=768 兜住）");
 
-        // 14) gen26.6 D3 ③ Prompt 180 字硬约束：一句核心词义 + 一个短语示例 + 纯文本。
-        // 与 D3 容量实算联动：180 汉字 x 3 字节 = 540 <= 600 帧帽，且 <= 设备侧
+        // 14) gen26.6.1 ③ Prompt 230 字硬约束：一句核心词义 + 一个短语示例 + 纯文本。
+        // 与容量实算联动：230 汉字 x 3 字节 = 690 <= 700 帧帽，且 <= 设备侧
         // PUSH_AI_DEF_MAX=768（gen26.6 D3 放宽）——预算与两端容量自洽。
-        // gen26.6 D3 item-3: the 180-character hard constraint (one core meaning
-        // plus one phrase example, plain text). Linked to the D3 budget: 180 chars
-        // x 3 bytes = 540 <= the 600-byte frame cap and <= the device's
+        // gen26.6.1 item-3: the 230-character hard constraint (one core meaning
+        // plus one phrase example, plain text). Linked to the budget: 230 chars
+        // x 3 bytes = 690 <= the 700-byte frame cap and <= the device's
         // PUSH_AI_DEF_MAX=768 (relaxed in gen26.6 D3) - consistent both ends.
         String prompt = AiClient.systemPrompt();
-        check(prompt.contains("180 字"), "系统提示钉死「180 字」硬约束");
+        check(prompt.contains("230 字"), "系统提示钉死「230 字」硬约束");
         check(prompt.contains("短语示例"), "系统提示要求一个短语示例");
         check(prompt.contains("纯文本"), "系统提示强制纯文本");
         check(prompt.contains("Markdown"), "系统提示排除 Markdown");
         check(!prompt.contains("50 个汉字"), "旧的 50 字约束已移除（不是并存两个数）");
-        check(!prompt.contains("40 字"), "旧的 40 字约束已退役（D3 放宽到 180 字）");
-        check(180 * 3 <= AiClient.DEF_MAX_BYTES,
-                "180 字 x 3 字节 = 540 <= 600 帧帽（预算与帧帽自洽）");
-        check(AiClient.buildRequest(cfg, "serendipity").contains("180 字"),
-                "请求体真的带着 180 字约束（prompt 进了 system 消息）");
+        check(!prompt.contains("40 字"), "旧的 40 字约束已退役");
+        check(!prompt.contains("180 字"), "旧的 180 字约束已退役（gen26.6.1 放宽到 230 字）");
+        check(230 * 3 <= AiClient.DEF_MAX_BYTES,
+                "230 字 x 3 字节 = 690 <= 700 帧帽（预算与帧帽自洽）");
+        check(AiClient.buildRequest(cfg, "serendipity").contains("230 字"),
+                "请求体真的带着 230 字约束（prompt 进了 system 消息）");
 
         // 15) M1.2 ① 提示模板渲染 + 分层铁律
         // M1.2 item-1: prompt-template rendering + the layering rule.
@@ -189,7 +190,7 @@ public final class AiClientTest {
         check(tplReq.contains("\"role\":\"user\""), "请求体有 user 角色");
         check(tplReq.contains("用户说：apple"), "自定义模板进了 user 消息");
         check(!tplReq.contains("word: apple"), "user 消息用的是自定义模板而非默认");
-        check(tplReq.contains("180 字"), "系统 180 字约束仍在（模板碰不到 system）");
+        check(tplReq.contains("230 字"), "系统 230 字约束仍在（模板碰不到 system）");
         // 最强一条：system 消息内容恒等于 systemPrompt()——模板不可覆盖
         check(tplReq.contains(AiClient.jsonString(AiClient.systemPrompt())),
                 "system 消息内容恒等于 systemPrompt()（分层铁律：模板不可覆盖）");

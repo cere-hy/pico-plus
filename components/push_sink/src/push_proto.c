@@ -162,16 +162,23 @@ bool push_ai_query_decode(const uint8_t *in, size_t len, push_ai_query_t *q) {
 }
 
 size_t push_ai_result_encode(const push_ai_result_t *r, uint8_t *out, size_t cap) {
-    if (!r || !out || cap < PUSH_AI_RESULT_MAX) return 0;
-    memset(out, 0, PUSH_AI_RESULT_MAX);
+    // 产冻结的 241B 线格式帧：槽位恒 170（不随 PUSH_AI_DEF_MAX 膨胀，见
+    // PUSH_AI_RESULT_WIRE_LEN 注释里的 D-1 事故）。/ Emit the frozen 241B wire
+    // frame: a constant 170-byte slot (it does NOT grow with PUSH_AI_DEF_MAX - see
+    // the D-1 incident in PUSH_AI_RESULT_WIRE_LEN's comment).
+    if (!r || !out || cap < PUSH_AI_RESULT_WIRE_LEN) return 0;
+    memset(out, 0, PUSH_AI_RESULT_WIRE_LEN);
     out[0] = PUSH_MAGIC0;
     out[1] = PUSH_MAGIC1;
     out[2] = PUSH_OP_AI_RESULT;
     out[3] = PUSH_VERSION;
     size_t wn = strnlen(r->word, PUSH_AI_WORD_MAX);
     if (wn >= PUSH_AI_WORD_MAX) wn = PUSH_AI_WORD_MAX - 1;
-    size_t dn = strnlen(r->def, PUSH_AI_DEF_MAX);
-    if (dn >= PUSH_AI_DEF_MAX) dn = PUSH_AI_DEF_MAX - 1;
+    // 释义长度按**线格式槽 170** 钳制：帧只有 241B，按容量 768 取值会写越界。
+    // Clamp to the WIRE slot (170): the frame is only 241B, sizing by the 768-byte
+    // capacity would write out of bounds.
+    size_t dn = strnlen(r->def, PUSH_AI_DEF_WIRE_MAX);
+    if (dn >= PUSH_AI_DEF_WIRE_MAX) dn = PUSH_AI_DEF_WIRE_MAX - 1;
     out[4] = (uint8_t)wn;
     memcpy(out + 5, r->word, wn);
     // word 区固定占 PUSH_AI_WORD_MAX 槽位（填满 0），释义长度(u16 LE)接在后面。
@@ -180,11 +187,16 @@ size_t push_ai_result_encode(const push_ai_result_t *r, uint8_t *out, size_t cap
     const size_t off = 5u + PUSH_AI_WORD_MAX;
     put_u16(out + off, (uint16_t)dn);
     memcpy(out + off + 2u, r->def, dn);
-    return PUSH_AI_RESULT_MAX;
+    return PUSH_AI_RESULT_WIRE_LEN;
 }
 
 bool push_ai_result_decode(const uint8_t *in, size_t len, push_ai_result_t *r) {
-    if (!in || !r || len < PUSH_AI_RESULT_MAX) return false;
+    // 最小长度锚**冻结线格式** 241B（不是随容量膨胀的 PUSH_AI_RESULT_MAX——
+    // 那就是 gen26.6.1 D-1：把最大当最小，短释义全灭）。
+    // The minimum length is pinned to the FROZEN wire frame (241B), not to the
+    // capacity-derived PUSH_AI_RESULT_MAX - that was gen26.6.1 D-1: a maximum used
+    // as a minimum killed every short definition.
+    if (!in || !r || len < PUSH_AI_RESULT_WIRE_LEN) return false;
     if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_RESULT) return false;
     if (in[3] != PUSH_VERSION) return false;
     memset(r, 0, sizeof(*r));
@@ -194,7 +206,10 @@ bool push_ai_result_decode(const uint8_t *in, size_t len, push_ai_result_t *r) {
     r->word[wn] = 0;
     const size_t off = 5u + PUSH_AI_WORD_MAX;
     const size_t dn = get_u16(in + off);
-    if (dn >= PUSH_AI_DEF_MAX) return false;
+    // 0x07 的 def 槽冻结 170：dn=170 装不下 NUL，属协议违规，拒收。
+    // The 0x07 def slot is frozen at 170: dn=170 leaves no room for the NUL, so a
+    // frame claiming it is a protocol violation and is rejected.
+    if (dn >= PUSH_AI_DEF_WIRE_MAX) return false;
     memcpy(r->def, in + off + 2u, dn);
     r->def[dn] = 0;
     return true;

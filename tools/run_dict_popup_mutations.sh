@@ -14,9 +14,11 @@ cd "$(dirname "$0")/.."
 # clean tree (otherwise an unrecovered edit is indistinguishable from a pre-existing
 # one) and assert the target is back at HEAD after every mutation, so a missed
 # restore turns red instead of lying. A dev loop may set MUTATION_ALLOW_DIRTY=1.
+START_CLEAN=1
 require_clean_tree() {
     if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
         echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        START_CLEAN=0
         return
     fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -29,10 +31,19 @@ require_clean_tree
 cp main/apps/dict_popup.c /tmp/dict_popup_orig.c
 restore() {
     cp /tmp/dict_popup_orig.c main/apps/dict_popup.c
-    git diff --quiet -- main/apps/dict_popup.c || {
-        echo "FATAL: dict_popup.c did not return to HEAD after a mutation" >&2
+    # 先与快照比对（脏树起点也成立），干净树起点再叠「相对 HEAD 无差异」。
+    # Compare with the snapshot (valid from a dirty start); when the start was
+    # clean, also assert no diff vs HEAD.
+    cmp -s /tmp/dict_popup_orig.c main/apps/dict_popup.c || {
+        echo "FATAL: dict_popup.c did not return to its pre-mutation snapshot" >&2
         exit 3
     }
+    if [ "$START_CLEAN" = "1" ]; then
+        git diff --quiet -- main/apps/dict_popup.c || {
+            echo "FATAL: dict_popup.c did not return to HEAD after a mutation" >&2
+            exit 3
+        }
+    fi
 }
 trap restore EXIT
 

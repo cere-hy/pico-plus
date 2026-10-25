@@ -162,6 +162,20 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 与 D3 槽加宽、D2 空页帧路径；段级闭合待真机 boot 日志 seg1 双锚对表确认）；
 # sha256 bf7e80f6…；重锚 2026-10-25。
 #
+# 版本串 / Version string: 0.3.3-pico26.6.1（gen26.6.1 D-1 修复轮：修 0x07 短释义全灭——
+# decode 守卫 `len < PUSH_AI_RESULT_MAX` 把帧最大长度当最小长度，D3 后该常量随
+# PUSH_AI_DEF_MAX 膨胀到 839，而 APK 的 0x07 是冻结的 241B 帧→恒拒。修法：线格式常量与
+# 容量常量分家，新增冻结的 PUSH_AI_RESULT_WIRE_LEN=241（跟随 APK PushProto），删除陷阱宏
+# PUSH_AI_RESULT_MAX；宿主 fixture 改由 Java 现产真实帧 + 169/170B 边界 + 4 条线格式变异）。
+# Version string: 0.3.3-pico26.6.1 (gen26.6.1 D-1 fix: the decode guard used the max
+# frame length as a minimum, so after D3 the 839B-derived check rejected the APK's
+# frozen 241B frame and every short definition died. The wire constant is now
+# separated from the capacity constant: PUSH_AI_RESULT_WIRE_LEN=241 tracks the APK's
+# PushProto, the trap macro PUSH_AI_RESULT_MAX is gone; the host fixture is generated
+# by the Java encoder, with 169/170B bounds and 4 wire-format mutations).
+#
+# 体积：4,087,984 B（与 gen26.6 持平——D-1 是守卫与常量修正，无体积变化）；sha256 a7bed55b…；重锚 2026-10-25。
+#
 # 版本串 / Version string: 0.3.3-pico26.5（gen26.5 M2 Step10 TTS 听书：设备侧页文本 +
 # 0x19 STATUS 帧 + 面板朗读进度 + NVS 落盘 / APK 重组朗读流 + FGS 跟随 + AI 联动；
 # 每代 fork 专属可区分串，沿用旧串会让 TF 卡升级判「版本相同」而拒绝）。
@@ -2113,7 +2127,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="bf7e80f638c24517320bddb3459a48380c532c3a18272eaee387130de96f68fe"
+EXPECTED="a7bed55b3182e167181c255b14f3018b726a2d328dc81526c8a7b1468359c2fd"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

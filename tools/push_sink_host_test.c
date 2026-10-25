@@ -18,6 +18,12 @@
 #include "ai_ridealong.h"
 #include "ai_segasm.h"
 #include "push_tts.h"
+// gen26.6.1 D-1：APK 真实线格式帧 fixture（tools/gen_apk_frame_fixture.sh 由
+// Java PushProto 现产；缺失即编译失败——没有 fixture 的协议往返不做数）。
+// gen26.6.1 D-1: the APK's real wire-frame fixture (generated from the Java
+// PushProto by tools/gen_apk_frame_fixture.sh; a missing fixture fails the build -
+// a protocol round-trip without the peer's frame does not count).
+#include "apk_ai_result_frame.h"
 
 static int s_checks;
 static int s_red;
@@ -647,15 +653,18 @@ static void test_ai_frames(void) {
     CHECK(push_ai_query_decode(qf, n, &q2));
     CHECK(strcmp(q2.word, "serendipity") == 0);
 
-    // AI_RESULT（0x07）编解码往返：固定 word 槽 + def 长度(u16 LE)。
-    // AI_RESULT (0x07) round-trip: fixed word slot plus def length (u16 LE).
+    // AI_RESULT（0x07）：编码产**冻结的 241B 线格式帧**（不是随 PUSH_AI_DEF_MAX
+    // 膨胀的 839B——那正是 gen26.6.1 D-1 的陷阱宏 PUSH_AI_RESULT_MAX）。
+    // AI_RESULT (0x07): encoding emits the FROZEN 241B wire frame (not the
+    // PUSH_AI_DEF_MAX-derived 839B - that was the D-1 trap macro).
     push_ai_result_t r;
     memset(&r, 0, sizeof(r));
     snprintf(r.word, sizeof(r.word), "ephemeral");
     snprintf(r.def, sizeof(r.def), "lasting a very short time");
-    uint8_t rf[PUSH_AI_RESULT_MAX];
+    uint8_t rf[PUSH_AI_RESULT_WIRE_LEN];
     size_t rn = push_ai_result_encode(&r, rf, sizeof(rf));
-    CHECK(rn == PUSH_AI_RESULT_MAX);
+    CHECK(rn == PUSH_AI_RESULT_WIRE_LEN);
+    CHECK(rn == 241u);
     CHECK(rf[2] == PUSH_OP_AI_RESULT);
     CHECK(rf[4] == (uint8_t)strlen("ephemeral"));
     const size_t def_off = 5u + PUSH_AI_WORD_MAX;
@@ -666,6 +675,50 @@ static void test_ai_frames(void) {
     CHECK(push_ai_result_decode(rf, rn, &r2));
     CHECK(strcmp(r2.word, "ephemeral") == 0);
     CHECK(strcmp(r2.def, "lasting a very short time") == 0);
+    // 超长释义在 0x07 上按**线格式槽 170** 收敛（不按容量 768，否则写越界）。
+    // A long definition clamps to the WIRE slot (170), not to the 768-byte capacity.
+    push_ai_result_t rl;
+    memset(&rl, 0, sizeof(rl));
+    snprintf(rl.word, sizeof(rl.word), "longdef");
+    memset(rl.def, 'x', 400);
+    rl.def[400] = 0;
+    uint8_t rlf[PUSH_AI_RESULT_WIRE_LEN];
+    CHECK(push_ai_result_encode(&rl, rlf, sizeof(rlf)) == PUSH_AI_RESULT_WIRE_LEN);
+    CHECK(((size_t)rlf[def_off] | ((size_t)rlf[def_off + 1] << 8)) == PUSH_AI_DEF_WIRE_MAX - 1u);
+
+    // ---- gen26.6.1 D-1 回归：解码必须由「APK 真实帧」验证 ----
+    // D-1 regression: decoding must be validated against the APK's REAL frame.
+    // fixture 由 Java 侧 PushProto.encodeAiResult() 现产（tools/gen_apk_frame_fixture.sh），
+    // 手写字节一律作废——过去用 PUSH_AI_RESULT_MAX 缓冲自洽（839B）正是盲区根因。
+    // The fixture is produced by the Java PushProto (tools/gen_apk_frame_fixture.sh);
+    // hand-written bytes are void - the old 839B buffer-sized round-trip was the blind spot.
+    CHECK(sizeof(APK_AI_RESULT_SHORT) == PUSH_AI_RESULT_WIRE_LEN);
+    push_ai_result_t ra;
+    memset(&ra, 0, sizeof(ra));
+    CHECK(push_ai_result_decode(APK_AI_RESULT_SHORT, sizeof(APK_AI_RESULT_SHORT), &ra));
+    CHECK(strcmp(ra.word, APK_AI_RESULT_SHORT_WORD) == 0);
+    CHECK(strcmp(ra.def, APK_AI_RESULT_SHORT_DEF) == 0);
+    // 169B 满载：0x07 单帧帽的满载侧必须接受。/ 169B, the loaded side of the cap.
+    CHECK(sizeof(APK_AI_RESULT_169B) == PUSH_AI_RESULT_WIRE_LEN);
+    push_ai_result_t rb;
+    memset(&rb, 0, sizeof(rb));
+    CHECK(push_ai_result_decode(APK_AI_RESULT_169B, sizeof(APK_AI_RESULT_169B), &rb));
+    CHECK(strcmp(rb.word, APK_AI_RESULT_169B_WORD) == 0);
+    CHECK(strcmp(rb.def, APK_AI_RESULT_169B_DEF) == 0);
+    CHECK(strlen(rb.def) == 169u);
+    // 170B 越界侧：0x07 def 槽无 NUL 容身处，声明 170 的帧必须拒收。
+    // The boundary's other side: a 0x07 frame claiming dn=170 has no room for the
+    // NUL, so it must be rejected.
+    uint8_t bad_frame[PUSH_AI_RESULT_WIRE_LEN];
+    memcpy(bad_frame, APK_AI_RESULT_SHORT, sizeof(bad_frame));
+    bad_frame[def_off] = (uint8_t)(PUSH_AI_DEF_WIRE_MAX & 0xFF);
+    bad_frame[def_off + 1] = (uint8_t)((PUSH_AI_DEF_WIRE_MAX >> 8) & 0xFF);
+    push_ai_result_t rc;
+    memset(&rc, 0, sizeof(rc));
+    CHECK(!push_ai_result_decode(bad_frame, sizeof(bad_frame), &rc));
+    // 短一字节的帧（240B）同样拒收：守卫锚的是冻结线格式长度。
+    // One byte short is rejected too: the guard is pinned to the frozen wire length.
+    CHECK(!push_ai_result_decode(APK_AI_RESULT_SHORT, PUSH_AI_RESULT_WIRE_LEN - 1u, &rc));
 
     // STATUS 0x17（设备→手机，请算释义）编码。
     // STATUS 0x17 (device to phone: please define) encode.

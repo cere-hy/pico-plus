@@ -304,7 +304,41 @@ size_t push_st_ai_query_encode(const char *word, uint8_t *out, size_t cap);
 
 /// AI 帧字节上限（含 4 字节 CTRL 头 / 含 1 字节 op 的 STATUS）。/ AI frame caps (CTRL header / STATUS op included).
 #define PUSH_AI_QUERY_MAX  (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX)
-#define PUSH_AI_RESULT_MAX (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + PUSH_AI_DEF_MAX)
+
+/// **0x07 线格式（冻结）**：def 槽 170 字节（169 + NUL），整帧恒为 241 B。
+/// 它跟随的是 **APK 侧 `PushProto.AI_DEF_MAX` / `AI_RESULT_MAX`**，
+/// **绝不跟随 `PUSH_AI_DEF_MAX`**——后者是设备端缓冲容量（D3 后 768）。
+/// The 0x07 WIRE FORMAT (FROZEN): a 170-byte def slot (169 + NUL), always a 241B
+/// frame. It tracks the APK's `PushProto.AI_DEF_MAX` / `AI_RESULT_MAX`, **never**
+/// `PUSH_AI_DEF_MAX` - the latter is the device-side buffer capacity (768 since D3).
+///
+/// gen26.6.1 D-1（真机自擒）：D3 把 `PUSH_AI_DEF_MAX` 170→768 后，原
+/// `PUSH_AI_RESULT_MAX`（随它膨胀到 839）被 decode 守卫当作**最小长度**——
+/// APK 恒发的 241B 冻结帧于是 `241 < 839` 恒拒，短释义（≤169B，走 0x07 直发）
+/// 全灭、长释义（走 0x08）正常。根因是「容量常量」与「线格式常量」被 DEF_MAX
+/// 同化。自此两链分家：容量链管缓冲（SEG ≥ DEF_MAX ≥ 显示容量），线格式链管协议
+/// （WIRE_LEN = 241，静态断言钉死）。`PUSH_AI_RESULT_MAX` 随之删除——它正是
+/// 那个把最大当最小用的陷阱宏。
+/// gen26.6.1 D-1 (caught on hardware): after D3 widened `PUSH_AI_DEF_MAX` to 768,
+/// `PUSH_AI_RESULT_MAX` (which grew with it to 839) was used by the decode guard as
+/// a MINIMUM length, so the APK's constant 241B frozen frame failed `241 < 839` and
+/// every short definition (<=169B, the 0x07 direct path) was rejected while long
+/// ones (0x08) worked. Root cause: a capacity constant and a wire-format constant
+/// assimilated by DEF_MAX. The two chains are now separate: the capacity chain
+/// governs buffers (SEG >= DEF_MAX >= display capacity), the wire chain governs the
+/// protocol (WIRE_LEN = 241, pinned by static assert). `PUSH_AI_RESULT_MAX` is
+/// deleted - it was the very macro used as a minimum.
+#define PUSH_AI_DEF_WIRE_MAX 170u
+#define PUSH_AI_RESULT_WIRE_LEN \
+    (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + PUSH_AI_DEF_WIRE_MAX) // = 241
+_Static_assert(PUSH_AI_RESULT_WIRE_LEN == 241u,
+               "0x07 wire frame is frozen at 241B (tracks the APK, NOT PUSH_AI_DEF_MAX)");
+_Static_assert(PUSH_AI_DEF_WIRE_MAX == 170u,
+               "0x07 wire def slot is frozen at 170B (169 + NUL)");
+// 容量必须容得下一条线格式释义（两链唯一合法的交汇点：容量 ≥ 线格式）。
+// The only legal contact between the chains: capacity must hold a wire-sized def.
+_Static_assert(PUSH_AI_DEF_MAX >= PUSH_AI_DEF_WIRE_MAX,
+               "gen26.6.1: the buffer slot must hold a wire-sized definition");
 
 /* ---- AI 语境帧（gen26.5，0x17/0x06 扩上下文）---- */
 /* AI contextual frames (gen26.5, 0x17/0x06 with context). */

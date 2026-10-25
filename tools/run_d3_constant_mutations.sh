@@ -20,10 +20,13 @@ cd "$(dirname "$0")/.."
 # 门禁可信度 = 脚本自身可信度（gen26.6 元测试）：干净树起点 + 每条还原断言。
 # Gate credibility = the script's own credibility (gen26.6 meta-test): a clean-tree
 # start plus a restore assertion after every mutation.
-MUT_FILES=(components/push_sink/include/push_proto.h main/dict/vocab_log.c)
+MUT_FILES=(components/push_sink/include/push_proto.h components/push_sink/src/push_proto.c \
+           main/dict/vocab_log.c)
+START_CLEAN=1
 require_clean_tree() {
     if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
         echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        START_CLEAN=0
         return
     fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -35,14 +38,32 @@ require_clean_tree() {
 require_clean_tree
 
 cp components/push_sink/include/push_proto.h /tmp/d3_proto.h
+cp components/push_sink/src/push_proto.c /tmp/d3_proto_c.c
 cp main/dict/vocab_log.c /tmp/d3_vocab.c
+# 还原告终：先与**快照**逐字节比对（脏树起点也成立）；起点是干净树时再叠一条
+# 「相对 HEAD 无差异」断言（更强：连备份本身被写坏都能抓）。
+# Restored-verify: compare byte for byte with the SNAPSHOT (valid even from a dirty
+# start); when the start was clean, also assert "no diff vs HEAD" (stronger: it
+# catches a corrupted backup too).
+RESTORED_PAIRS=("/tmp/d3_proto.h:components/push_sink/include/push_proto.h"
+                "/tmp/d3_proto_c.c:components/push_sink/src/push_proto.c"
+                "/tmp/d3_vocab.c:main/dict/vocab_log.c")
 restore_all() {
-    cp /tmp/d3_proto.h components/push_sink/include/push_proto.h
-    cp /tmp/d3_vocab.c main/dict/vocab_log.c
-    git diff --quiet -- "${MUT_FILES[@]}" || {
-        echo "FATAL: a mutated file did not return to HEAD" >&2
-        exit 3
-    }
+    for pair in "${RESTORED_PAIRS[@]}"; do
+        cp "${pair%%:*}" "${pair#*:}"
+    done
+    for pair in "${RESTORED_PAIRS[@]}"; do
+        cmp -s "${pair%%:*}" "${pair#*:}" || {
+            echo "FATAL: ${pair#*:} did not return to its pre-mutation snapshot" >&2
+            exit 3
+        }
+    done
+    if [ "$START_CLEAN" = "1" ]; then
+        git diff --quiet -- "${MUT_FILES[@]}" || {
+            echo "FATAL: a mutated file did not return to HEAD" >&2
+            exit 3
+        }
+    fi
 }
 trap restore_all EXIT
 
@@ -83,8 +104,71 @@ p.write_text(s.replace(old, '#define VOCAB_AI_DEF_MAX 288 /* MUTATION M2 */', 1)
 EOF
 run_mutation "M2 VOCAB_AI_DEF_MAX shrinks to 288" tools/run_dict_hit_host_tests.sh
 
+# ---- M3：decode 守卫重新被容量拖拽（把最小长度锚回 PUSH_AI_DEF_MAX 派生的 839）
+#      —— 真机 D-1 的原始形态：APK 恒发的 241B 冻结帧被拒，短释义全灭。
+# ---- M3: the decode guard is dragged by the capacity constant again (minimum
+#      length anchored to the PUSH_AI_DEF_MAX-derived 839) - the original shape of
+#      the on-device D-1: every 241B frozen frame is rejected.
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('components/push_sink/src/push_proto.c')
+s = p.read_text()
+old = 'if (!in || !r || len < PUSH_AI_RESULT_WIRE_LEN) return false;'
+assert old in s, 'M3 target not found'
+new = ('if (!in || !r || len < (PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u '
+       '+ PUSH_AI_DEF_MAX)) return false; /* MUTATION M3 */')
+p.write_text(s.replace(old, new, 1))
+EOF
+run_mutation "M3 decode guard dragged back to the capacity-derived minimum" \
+    tools/run_push_sink_host_tests.sh
+
+# ---- M4：encode 重新产出随容量膨胀的帧长（839B，偏离冻结线格式）----
+# ---- M4: encode emits the capacity-derived frame length again (839B).
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('components/push_sink/src/push_proto.c')
+s = p.read_text()
+old = '    memcpy(out + off + 2u, r->def, dn);\n    return PUSH_AI_RESULT_WIRE_LEN;'
+assert old in s, 'M4 target not found'
+new = ('    memcpy(out + off + 2u, r->def, dn);\n'
+       '    return PUSH_CTRL_HDR_LEN + 1u + PUSH_AI_WORD_MAX + 2u + PUSH_AI_DEF_MAX;'
+       ' /* MUTATION M4 */')
+p.write_text(s.replace(old, new, 1))
+EOF
+run_mutation "M4 encode emits the capacity-derived frame length" tools/run_push_sink_host_tests.sh
+
+# ---- M5：冻结线格式槽被容量同化（170 -> 768）——静态断言应擒 ----
+# ---- M5: the frozen wire slot is assimilated by the capacity (170 -> 768).
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('components/push_sink/include/push_proto.h')
+s = p.read_text()
+old = '#define PUSH_AI_DEF_WIRE_MAX 170u'
+assert old in s, 'M5 target not found'
+p.write_text(s.replace(old, '#define PUSH_AI_DEF_WIRE_MAX 768u /* MUTATION M5 */', 1))
+EOF
+run_mutation "M5 frozen wire def slot follows the capacity constant" \
+    tools/run_push_sink_host_tests.sh
+
+# ---- M6：dn 上限守卫被容量放宽（170 -> 768）——170B 越界侧应被拒 ----
+# ---- M6: the dn guard is relaxed to the capacity - the 170B side must be refused.
+restore_all
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('components/push_sink/src/push_proto.c')
+s = p.read_text()
+old = '    if (dn >= PUSH_AI_DEF_WIRE_MAX) return false;'
+assert old in s, 'M6 target not found'
+p.write_text(s.replace(old, '    if (dn >= PUSH_AI_DEF_MAX) return false; /* MUTATION M6 */', 1))
+EOF
+run_mutation "M6 dn guard relaxed to the capacity constant" tools/run_push_sink_host_tests.sh
+
 if [ "$survived" -ne 0 ]; then
     echo "D3 CONSTANT MUTATIONS: $survived SURVIVED (BAD) - assertions have holes"
     exit 1
 fi
-echo "D3 CONSTANT MUTATIONS: all 2 caught (M1 protocol slot, M2 batch slot)"
+echo "D3 CONSTANT MUTATIONS: all 6 caught (M1 protocol slot, M2 batch slot, "
+echo "  M3-M6 gen26.6.1 D-1 wire-format chain: guard/encode/wire slot/dn guard)"

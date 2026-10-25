@@ -110,6 +110,21 @@ public final class PushProtoTest {
         return sb.toString();
     }
 
+    /** 恰好 n 字节的释义（ASCII，一字一字节）。/ A definition of exactly n bytes. */
+    private static String exactDef(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            sb.append('x');
+        }
+        return sb.toString();
+    }
+
+    /** 取 0x07 帧里的 dlen(u16 LE)。/ Read the 0x07 frame's dlen (u16 LE). */
+    private static int dlen(byte[] f) {
+        int off = 5 + PushProto.AI_WORD_MAX;
+        return (f[off] & 0xFF) | ((f[off + 1] & 0xFF) << 8);
+    }
+
     private static byte[] bigBody() {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < 100; i++) {
@@ -219,6 +234,19 @@ public final class PushProtoTest {
                 .equals(v.get("ai_result_long")), "AI_RESULT(0x07) 释义 200B 截断到 169");
         check(hex(PushProto.encodeAiResult("ephemeral", ""))
                 .equals(v.get("ai_result_empty_def")), "AI_RESULT(0x07) 空释义逐字节一致");
+
+        // gen26.6.1：0x07 单帧帽的两侧边界——169B 正好满载不截断，170B 必须截断到 169
+        // （170B 侧无 NUL 容身处，也是 0x08 分流的起点）。设备端 decode 守卫与这里
+        // 同一条冻结线格式（def 槽 170）。
+        // gen26.6.1: both sides of the 0x07 single-frame cap - 169B fits without
+        // truncation, 170B must trim to 169 (no room for the NUL; also where the
+        // 0x08 split starts). The device-side decode guard shares this frozen wire
+        // format (170-byte def slot).
+        byte[] def169 = PushProto.encodeAiResult("boundary", exactDef(169));
+        check(def169.length == 241, "AI_RESULT(0x07) 帧恒长 241B（冻结线格式）");
+        check(dlen(def169) == 169, "AI_RESULT(0x07) 169B 释义满载不截断");
+        byte[] def170 = PushProto.encodeAiResult("boundary", exactDef(170));
+        check(dlen(def170) == 169, "AI_RESULT(0x07) 170B 释义截断到 169");
 
         check(hex(PushProto.encodeStatusAiQuery("serendipity"))
                 .equals(v.get("status_ai_serendipity")), "STATUS 0x17 serendipity 逐字节一致");

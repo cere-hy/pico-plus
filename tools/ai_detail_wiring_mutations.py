@@ -34,12 +34,13 @@ def _require_clean_tree() -> None:
     if os.environ.get('MUTATION_ALLOW_DIRTY') == '1':
         print('WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)',
               file=sys.stderr)
-        return
+        return False
     if _git('diff', '--quiet') != 0 or _git('diff', '--cached', '--quiet') != 0:
         print('REFUSE: working tree is dirty before the sweep.', file=sys.stderr)
         print('  Commit or stash first (or set MUTATION_ALLOW_DIRTY=1 for a dev loop).',
               file=sys.stderr)
         raise SystemExit(2)
+    return True
 
 # (设计点, 文件, 原串, 变异串, 预期守门台词关键词)
 MUTATIONS = [
@@ -82,7 +83,7 @@ MUTATIONS = [
 
 
 def main() -> int:
-    _require_clean_tree()
+    start_clean = _require_clean_tree()
     failures = []
     for name, rel, old, new, expect in MUTATIONS:
         path = ROOT / rel
@@ -104,10 +105,15 @@ def main() -> int:
                 failures.append(name)
         finally:
             path.write_bytes(backup)
-            # 每条变异后断言目标已回 HEAD：漏还原必须红，不能悄悄污染下一条。
-            # Assert the target is back at HEAD after every mutation: a missed
-            # restore must go red instead of quietly poisoning the next one.
-            if _git('diff', '--quiet', '--', rel) != 0:
+            # 每条变异后先与快照逐字节比对（脏树起点也成立）；起点干净时再叠一条
+            # 相对 HEAD 的断言——漏还原必须红，不能悄悄污染下一条。
+            # After every mutation compare byte for byte with the snapshot (valid
+            # from a dirty start); when the start was clean also assert no diff vs
+            # HEAD. A missed restore must go red, not poison the next one.
+            if path.read_bytes() != backup:
+                print(f'FATAL: {rel} did not return to its pre-mutation snapshot')
+                raise SystemExit(3)
+            if start_clean and _git('diff', '--quiet', '--', rel) != 0:
                 print(f'FATAL: {rel} did not return to HEAD after a mutation')
                 raise SystemExit(3)
     if failures:

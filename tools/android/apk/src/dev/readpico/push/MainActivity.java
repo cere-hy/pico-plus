@@ -1495,10 +1495,10 @@ public class MainActivity extends Activity {
         cfg.baseUrl = base.isEmpty() ? AiClient.DEFAULT_BASE_URL : base;
         String model = sp.getString(PREF_MODEL, "");
         cfg.model = model.isEmpty() ? AiClient.DEFAULT_MODEL : model;
-        // M1.2 ①：激活模板注入 user 角色；系统指令（180 字硬约束，gen26.6 D3 放宽）
+        // M1.2 ①：激活模板注入 user 角色；系统指令（230 字硬约束，gen26.6.1 放宽）
         // 仍由 AiClient 恒定钉在 system 角色，模板永远碰不到。
         // M1.2 item-1: inject the active template into the user role; the system
-        // instruction (180-char hard constraint, relaxed in gen26.6 D3) stays pinned in the system role by
+        // instruction (230-char hard constraint, relaxed in gen26.6.1) stays pinned in the system role by
         // AiClient and is never reachable from the template.
         cfg.promptTemplate = getActiveTemplateContent();
         return cfg;
@@ -1577,7 +1577,7 @@ public class MainActivity extends Activity {
         // ---- M1.2 ① 提示模板：多行编辑，{word} 占位符，恢复默认 ----
         // M1.2 item-1 prompt template: multi-line, {word} placeholder, reset-to-default.
         TextView tplHint = new TextView(this);
-        tplHint.setText("提示模板（可用 {word} 占位符，系统 180 字约束始终生效且不可被覆盖）");
+        tplHint.setText("提示模板（可用 {word} 占位符，系统 230 字约束始终生效且不可被覆盖）");
         tplHint.setTextSize(12);
         tplHint.setPadding(0, dp(8), 0, dp(4));
         box.addView(tplHint);
@@ -2392,10 +2392,10 @@ public class MainActivity extends Activity {
 
     /* ================= M1.2 ① 提示模板库 =================
      * 命名模板列表存 SharedPreferences（JSON 数组），激活模板按名字引用。
-     * 系统指令（180 字硬约束，gen26.6 D3 放宽）永远独立于模板、恒定钉在 system 角色——模板只能
+     * 系统指令（230 字硬约束，gen26.6.1 放宽）永远独立于模板、恒定钉在 system 角色——模板只能
      * 改 user 角色的内容/风格，永远碰不到系统约束。这就是「分层铁律」。
      * Named templates live in SharedPreferences (JSON array); the active one is
-     * referenced by name. The system instruction (180-char hard constraint, relaxed in gen26.6 D3) is
+     * referenced by name. The system instruction (230-char hard constraint, relaxed in gen26.6.1) is
      * always pinned in the system role, independent of templates - the "layering
      * rule": a template edits only the user-role content/style.
      */

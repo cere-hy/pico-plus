@@ -22,9 +22,11 @@ cd "$(dirname "$0")/.."
 # start plus a restore assertion after every mutation.
 MUT_FILES=(main/tts/tts_page.c components/push_sink/src/push_tts.c main/apps/app_book.c
            components/push_sink/include/push_sink.h main/tts/tts_page.h main/CMakeLists.txt)
+START_CLEAN=1
 require_clean_tree() {
     if [ "${MUTATION_ALLOW_DIRTY:-0}" = "1" ]; then
         echo "WARN: MUTATION_ALLOW_DIRTY=1 - clean-tree check skipped (dev only)" >&2
+        START_CLEAN=0
         return
     fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -41,17 +43,31 @@ cp main/apps/app_book.c /tmp/tts_mut_book.c
 cp components/push_sink/include/push_sink.h /tmp/tts_mut_sink_h.h
 cp main/tts/tts_page.h /tmp/tts_mut_tts_h.h
 cp main/CMakeLists.txt /tmp/tts_mut_main_cmake.txt
+# 还原告终：先与快照逐字节比对（脏树起点也成立），干净树起点再叠相对 HEAD 断言。
+# Restored-verify: compare with the snapshots (valid from a dirty start); when the
+# start was clean, also assert no diff vs HEAD.
+RESTORED_PAIRS=("/tmp/tts_mut_page.c:main/tts/tts_page.c"
+                "/tmp/tts_mut_plan.c:components/push_sink/src/push_tts.c"
+                "/tmp/tts_mut_book.c:main/apps/app_book.c"
+                "/tmp/tts_mut_sink_h.h:components/push_sink/include/push_sink.h"
+                "/tmp/tts_mut_tts_h.h:main/tts/tts_page.h"
+                "/tmp/tts_mut_main_cmake.txt:main/CMakeLists.txt")
 restore_all() {
-    cp /tmp/tts_mut_page.c main/tts/tts_page.c
-    cp /tmp/tts_mut_plan.c components/push_sink/src/push_tts.c
-    cp /tmp/tts_mut_book.c main/apps/app_book.c
-    cp /tmp/tts_mut_sink_h.h components/push_sink/include/push_sink.h
-    cp /tmp/tts_mut_tts_h.h main/tts/tts_page.h
-    cp /tmp/tts_mut_main_cmake.txt main/CMakeLists.txt
-    git diff --quiet -- "${MUT_FILES[@]}" || {
-        echo "FATAL: a mutated file did not return to HEAD" >&2
-        exit 3
-    }
+    for pair in "${RESTORED_PAIRS[@]}"; do
+        cp "${pair%%:*}" "${pair#*:}"
+    done
+    for pair in "${RESTORED_PAIRS[@]}"; do
+        cmp -s "${pair%%:*}" "${pair#*:}" || {
+            echo "FATAL: ${pair#*:} did not return to its pre-mutation snapshot" >&2
+            exit 3
+        }
+    done
+    if [ "$START_CLEAN" = "1" ]; then
+        git diff --quiet -- "${MUT_FILES[@]}" || {
+            echo "FATAL: a mutated file did not return to HEAD" >&2
+            exit 3
+        }
+    fi
 }
 trap restore_all EXIT
 
