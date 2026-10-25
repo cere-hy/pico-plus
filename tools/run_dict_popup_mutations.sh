@@ -18,6 +18,12 @@ run_mutation() {
     else
         echo "caught: $label"
     fi
+    # 每条变异都从原件重新开始：否则前一条的致命变异会把后一条「顺带」抓掉，
+    # 「caught」就失去意义（gen26.6 发现：原实现只在 EXIT 时还原）。
+    # Restore before the next mutation: otherwise an earlier fatal mutation makes
+    # every later one look "caught" and the sweep stops meaning anything (found in
+    # gen26.6: the original only restored on EXIT).
+    restore
 }
 
 # M1：谓词丢词比对（pending 即真）——门 B 会对别词开卡。/ M1: the predicate drops
@@ -43,13 +49,17 @@ p.write_text(s)
 EOF
 run_mutation "M2 pending_expired never fires"
 
-# M3：容量行数少一行（9 行）——200 的锚漂掉。/ M3: one line fewer in the capacity - the 200 anchor drifts.
+# M3：容量行数少一行——135 的锚漂掉。起行下移一整行，任何几何下都成立（旧的
+# 「条件 +1」在 36px/46 下不再跨行边界，会存活）。/ M3: one line fewer in the
+# capacity - the 135 anchor drifts. Shifting the start down a full line is robust
+# under any geometry (the old "+1 on the condition" no longer crosses a line
+# boundary at 36px/46 and would survive).
 python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
 s = s.replace('    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) {',
-              '    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX + 1 <= card.height - 20; y += DICT_POPUP_LINE_H) { /* MUTATION M3 */')
+              '    for (int y = 26 + DICT_POPUP_WORD_PX + 18 + DICT_POPUP_LINE_H; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) { /* MUTATION M3 */')
 p.write_text(s)
 EOF
 run_mutation "M3 capacity drops a line"
@@ -65,16 +75,21 @@ p.write_text(s)
 EOF
 run_mutation "M4 show_pending drops the flag"
 
-# M5：折行踩 NUL 的旧伤复现（钳位不回退字符边界）——ASan 应擒。/ M5: the old
-# step-over-NUL injury returns (clamp without the boundary back-off) - ASan should catch it.
+# M5：AI 段缓冲回退到 192（D3 联动修正前的值）——180 字（540B）释义会被静默截到
+# 63 字（5 行、无省略号），宿主「9 行 + ……」断言应擒住。gen26.6 起此条专门守
+# 「放宽释义不得回收段缓冲」。/ M5: the AI segment buffer back to 192 (the pre-D3
+# value) - a 180-char (540B) definition is silently cut to 63 chars (5 lines, no
+# ellipsis); the host's "9 lines + ……" assertion should catch it. Since gen26.6
+# this guards "widening the definition must not shrink the segment buffer".
 python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
-s = s.replace('        while (len > 0 && ((unsigned char)p[len] & 0xC0) == 0x80) --len; // 续字节回退 / back off continuation bytes\n', '')
+assert '#define DICT_POPUP_AI_SEG 769' in s, 'M5 target not found'
+s = s.replace('#define DICT_POPUP_AI_SEG 769', '#define DICT_POPUP_AI_SEG 192 /* MUTATION M5 */')
 p.write_text(s)
 EOF
-run_mutation "M5 clamp cuts a multibyte sequence"
+run_mutation "M5 AI segment buffer shrinks back to 192"
 
 # M6：AI 入口门禁失效（命中判定忽略 s_ai_on）——AI 关时点 AI 区也会触发查询。
 # M6: the AI entry gate dies (hit test ignores s_ai_on) - tapping AI with AI off would query.
@@ -111,5 +126,36 @@ s = s.replace(old, new)
 p.write_text(s)
 EOF
 run_mutation "M7 aliasing defense torn out"
+
+# M8：折行宽度只扣左 PAD（右侧不扣）——正文末字贴/越卡右缘（真机「die」贴边被裁
+# 的几何缺陷）。宿主「右缘 ≤ 卡右缘 - PAD」断言应擒住。
+# M8: the wrap width subtracts only the LEFT pad - the body's last glyph sits on
+# or over the right edge (the geometry behind the on-device "die" clipping). The
+# host's "right edge <= card right - PAD" assertion should catch it.
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '    return dict_popup_rect().width - 2 * DICT_POPUP_PAD;'
+assert old in s, 'M8 target not found'
+s = s.replace(old, '    return dict_popup_rect().width - DICT_POPUP_PAD; /* MUTATION M8 */')
+p.write_text(s)
+EOF
+run_mutation "M8 wrap width drops the right pad"
+
+# M9：暂存行帽回退到 14（旧值）——10~14 行的释义被画成 9 行 + 省略号却不置截断位，
+# 不开详解、尾部静默丢失。宿主「136 字必须 truncated」断言应擒住。
+# M9: the staging cap back to 14 (the old value) - a 10-14 line definition paints
+# 9 lines plus an ellipsis without setting the flag, so no detail view and a
+# silently lost tail. The host's "136 chars must be truncated" assertion catches it.
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+assert '#define DICT_POPUP_LINES 9' in s, 'M9 target not found'
+s = s.replace('#define DICT_POPUP_LINES 9', '#define DICT_POPUP_LINES 14 /* MUTATION M9 */')
+p.write_text(s)
+EOF
+run_mutation "M9 staging cap back to 14"
 
 echo "---- mutation sweep done ----"

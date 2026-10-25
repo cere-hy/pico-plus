@@ -22,25 +22,49 @@
 
 static const char* TAG = "dict";
 
-#define DICT_POPUP_LINES 14
+// 暂存行数 = 卡面可显示的正文行数。**gen26.6 36px 起 14→9**：显示循环在 9 行触底，
+// 若暂存仍容 14 行，10~14 行的释义会被画成 9 行 + 省略号却**不置截断位**——不开
+// 详解、尾部静默丢失。让暂存帽与显示帽对齐，store_line 一溢出即 truncated，
+// app_book 的「触顶进详解」门才会真正兜住长释义。
+// Staging lines = the body lines the card can actually show. **14->9 at 36px in
+// gen26.6**: the draw loop bottoms out at 9 lines, so a 14-line staging cap let
+// a 10-14 line definition paint 9 lines plus an ellipsis WITHOUT setting the
+// truncation flag - no detail view, tail silently lost. Aligning the staging cap
+// to the display cap makes store_line's overflow set truncated immediately, so
+// app_book's "overflow -> detail view" gate actually holds long definitions.
+#define DICT_POPUP_LINES 9
 #define DICT_POPUP_PAD 36
 #define DICT_POPUP_WORD_PX 46
-#define DICT_POPUP_TEXT_PX 27
-#define DICT_POPUP_LINE_H 42
+// gen26.6 词卡可读性：释义正文 27→36px（约 1.33×；裁定所指「24→36、1.5×」的
+// 24 是旧固件目测值，源码自 gen10 起即为 27）。词头 46、保存/AI chip 26px 不动。
+// 行高随字号重算：42→46（行距 10px，约为字号的 28%，此前 27px/42 是 55% 的松排）。
+// gen26.6 card legibility: body text 27->36px (~1.33x; the ruling's "24->36,
+// 1.5x" took 24 from an older build - the source has been 27 since gen10). The
+// head (46) and the save/AI chips (26) stay. Line height recomputed: 42->46
+// (10px leading, ~28% of the font; the old 27/42 was a loose 55%).
+#define DICT_POPUP_TEXT_PX 36
+#define DICT_POPUP_LINE_H 46
 #define DICT_POPUP_WORD_MAX 48
-// 保存 chip 放在卡片头部右侧：不占正文行，释义仍是可显示的 10 行。
+// 保存 chip 放在卡片头部右侧：不占正文行，释义仍是可显示的 9 行。
 // The save chip sits in the card header on the right: it costs no body line, so the
-// definition still shows its usual ten lines.
+// definition still shows its usual nine lines.
 #define DICT_POPUP_SAVE_W 120
 #define DICT_POPUP_SAVE_H 52
 #define DICT_POPUP_SAVE_PX 26
 #define DICT_POPUP_SUMMARY_LINES 3
-// gen26 AI 释义段缓冲：手机侧协议上限 PUSH_AI_DEF_MAX=170（含 NUL 169），段间按
-// \n 切分后任何单段都短于它，192 足够且不引入 push 组件依赖。/ gen26 AI def
-// segment buffer: the phone-side protocol cap is PUSH_AI_DEF_MAX=170 (169 with
-// NUL) and segments split on \n, so 192 holds any single segment without
-// depending on the push component.
-#define DICT_POPUP_AI_SEG 192
+// gen26 AI 释义段缓冲：设备侧协议上限 PUSH_AI_DEF_MAX=768（D3 放宽后的卡容量）。
+// 段间按 \n 切分后任何单段都短于它，769 字节兜住整段。**gen26.6 D3 联动修正**：
+// 旧值 192 只够 40 字时代（≤169B），D3 释义可达 540B——单段超 191B 会被静默
+// 截断（旧代码 clamp 后 !nl 直接 break，尾部丢失且不置截断位），必须同步放宽。
+// 缓冲放 PSRAM（show_def 内分配），不占 8KB 主栈。
+// gen26 AI def segment buffer: the device-side protocol cap is PUSH_AI_DEF_MAX=768
+// (the card capacity after D3). Segments split on \n are shorter than it, so 769
+// bytes holds any single segment. **gen26.6 D3 linkage fix**: the old 192 only
+// served the 40-char era (<=169B); under D3 a definition reaches 540B, and a
+// segment over 191B was silently truncated (the old clamp then broke on !nl,
+// losing the tail without setting the truncation flag) - it must widen in step.
+// The buffer lives in PSRAM (allocated inside show_def), off the 8KB main stack.
+#define DICT_POPUP_AI_SEG 769
 // gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
 // query-state text: a one-line real status, not a placeholder fake card.
 #define DICT_POPUP_PENDING_TEXT "AI 查询中…"
@@ -108,6 +132,17 @@ EpdRect dict_popup_rect(void) {
         return (EpdRect){24, ui_h() - 24 - h, ui_w() - 48, h};
     }
     return (EpdRect){24, 540, UI_LOCK_WIDTH - 48, 528};
+}
+
+// 正文可用宽度：卡宽减去左右两侧 PAD（DICT_POPUP_PAD 两边对称）。**右侧必须同
+// 样扣**——只扣左侧会让折行宽度多出 36px，末字贴/越卡右缘（gen26.6 真机
+// 「die」贴边被裁的几何根因）。所有正文折行与容量实算共用此单一真源。
+// Body text width: the card width minus the PAD on BOTH sides. The right PAD must
+// be subtracted too - reserving only the left adds 36px to the wrap width and
+// pushes the last glyph onto/over the right edge (the geometry behind the gen26.6
+// on-device "die" clipping). Every body wrap and the capacity math share this.
+static int body_text_width(void) {
+    return dict_popup_rect().width - 2 * DICT_POPUP_PAD;
 }
 
 EpdRect dict_popup_save_rect(void) {
@@ -216,28 +251,44 @@ static bool store_line(const char* text, size_t len) {
     return true;
 }
 
-// 逐字累加宽度折行；比整串反复测量便宜，与正文排版同一做法。
-// Wrap by per-glyph advance, the same approach the body layout uses.
+// 逐字推进折行，但**每步按「整行候选」量宽**——与 ui_text_fixed 绘制时同一
+// 字符串、同一字体路径判定。逐字相加会在混合行上出错：只要有一个字形不在内置
+// 字体，绘制会整行切到系统 TTF，而逐字量宽仍按各自原字体累加，两套 advance
+// 混算的误差沿行累积，把末字挤出卡右缘（gen26.6「die」贴边）。
+// 候选行缓冲 128 字节：行长受 max_w 约束（36px 全角约 15 字 = 45 字节）。
+// Advance glyph by glyph, but measure each candidate LINE as a whole - the same
+// string and the same font-path decision ui_text_fixed draws with. Per-glyph
+// summing breaks on mixed lines: one glyph missing from the built-in font flips
+// the whole draw to the system TTF while the per-glyph widths still mix both
+// fonts' advances, and the error accumulates along the line, pushing the last
+// glyph past the card's right edge (the gen26.6 "die" clipping).
+// The 128-byte candidate buffer is enough: a line is bounded by max_w (about 15
+// full-width glyphs = 45 bytes at 36px).
 static void wrap_text(const char* text, int px, int max_w) {
     const char* line = text;
-    int width = 0;
     const char* p = text;
+    char probe[128];
     while (*p) {
         int n = utf8_step(p);
-        char glyph[5];
         if (n > 4) n = 4;
-        memcpy(glyph, p, n);
-        glyph[n] = 0;
-        int w = ui_text_fixed_width_px(px, glyph);
-        if (width + w > max_w && p > line) {
+        const size_t len = (size_t)(p - line) + (size_t)n;
+        if (len >= sizeof(probe)) {
+            // 不可达兜底（行长 ≤ max_w）：切一行保进度，绝不空转。
+            // Unreachable backstop (a line is <= max_w): cut a line to make progress.
+            if (!store_line(line, (size_t)(p - line))) { s_truncated = true; return; }
+            line = p;
+            continue;
+        }
+        memcpy(probe, line, len);
+        probe[len] = 0;
+        const int w = ui_text_fixed_width_px(px, probe);
+        if (w > max_w && p > line) {
             // 分配失败也要标记截断，否则卡片少了一段却不显示省略号。
             // Mark truncation on allocation failure too, or the card silently loses the tail.
             if (!store_line(line, p - line)) { s_truncated = true; return; }
             line = p;
-            width = 0;
             continue;
         }
-        width += w;
         p += n;
     }
     if (*line) store_line(line, strlen(line));
@@ -277,7 +328,7 @@ bool dict_popup_open(const char* word) {
         if (found) {
             const int64_t b = esp_timer_get_time();
             snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
-            int text_w = dict_popup_rect().width - 2 * DICT_POPUP_PAD;
+            int text_w = body_text_width();
             char* p = out;
             while (*p) {
                 char* nl = strchr(p, '\n');
@@ -383,25 +434,26 @@ bool dict_popup_pending_expired(int64_t timeout_us) {
 
 // gen26.3 ⑤ AI 释义显示容量（全角字符数）：按当前方向的卡片布局实算。行数用与
 // dict_popup_draw 收行条件完全相同的谓词（行顶+字号 ≤ 卡底-20），每行字数为正文
-// 宽整除 27px 全角字宽。竖屏推导：卡面 {24,540,636,528}（UI_LOCK_WIDTH=684），
-// 正文宽 text_w=636-2*36=564px；头部 26+46+18=90px，底留 20px，行高 42：
-// 42*i ≤ 528-20-27-90=391 → i≤9.30 → 10 行；564/27=20.9 → 20 字/行；
-// 容量 = 10 行 x 20 字 = 200 全角字符。横屏同公式：text_w=1216-48-72=1096 →
-// 40 字/行，10 行 → 400。40 字释义预算占 2 行，竖屏 200 也放得下——匹配，
-// prompt 无需再砍。/ gen26.3 item-5 AI definition capacity in full-width chars,
-// computed from the card layout in the current rotation. The line count uses
-// the exact predicate dict_popup_draw's stop uses (line top + font size <= card
-// bottom - 20) and the per-line count is the text width divided by the 27px
-// full-width advance. Portrait: card {24,540,636,528} (UI_LOCK_WIDTH=684),
-// text_w=636-2*36=564px; header 26+46+18=90px, 20px bottom margin, line height
-// 42: 42*i <= 528-20-27-90=391 -> i<=9.30 -> 10 lines; 564/27=20.9 -> 20 chars
-// per line; capacity = 10 x 20 = 200 full-width chars. Landscape, same formula:
-// text_w=1216-48-72=1096 -> 40 chars per line, 10 lines -> 400. A 40-char
-// budget takes 2 lines and fits even the portrait 200 - it matches, no prompt
-// trim needed.
+// 宽整除 36px 全角字宽。**gen26.6 乘字号 36px/行高 46 重算**（旧 27px/42 的 200/400
+// 作废）：竖屏卡 {24,540,636,528}，正文宽 text_w=636-72=564px；头部 26+46+18=90px，
+// 底留 20px，行高 46：46*i ≤ 528-20-36-90=382 → i≤8.30 → 9 行；564/36=15.67 → 15
+// 字/行；容量 = 9 x 15 = 135 全角字符。横屏同公式：text_w=1216-48-72=1096 →
+// 30 字/行，9 行 → 270。D3 的 180 字释义预算超过词卡容量，溢出部分进详解视图承接
+// （可读性优先的 trade-off，非缺陷）。
+// gen26.3 item-5 AI definition capacity in full-width chars, computed from the
+// card layout in the current rotation. The line count uses the exact predicate
+// dict_popup_draw's stop uses (line top + font size <= card bottom - 20) and the
+// per-line count is the body width divided by the 36px full-width advance.
+// **Recomputed for gen26.6's 36px font / 46px line height** (the old 27/42
+// 200/400 is void): portrait card {24,540,636,528}, text_w=636-72=564px; header
+// 26+46+18=90px, 20px bottom margin, line height 46: 46*i <= 528-20-36-90=382 ->
+// i<=8.30 -> 9 lines; 564/36=15.67 -> 15 chars per line; capacity = 9 x 15 = 135
+// full-width chars. Landscape, same formula: text_w=1216-48-72=1096 -> 30 chars
+// per line, 9 lines -> 270. D3's 180-char budget exceeds the card capacity and
+// the overflow goes to the detail view (a readability-first trade-off, not a bug).
 int dict_popup_ai_capacity_chars(void) {
     const EpdRect card = dict_popup_rect();
-    const int text_w = card.width - 2 * DICT_POPUP_PAD;
+    const int text_w = body_text_width();
     int lines = 0;
     for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) {
         ++lines;
@@ -434,20 +486,24 @@ bool dict_popup_show_def(const char* word, const char* def) {
     dict_popup_reset();
     if (!word || !*word || !*def) return false;
     snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
-    const int text_w = dict_popup_rect().width - 2 * DICT_POPUP_PAD;
-    char seg[DICT_POPUP_AI_SEG];
+    const int text_w = body_text_width();
+    // 段缓冲放 PSRAM：gen26.6 D3 起可容 768B 整段，不能压 8KB 主栈。
+    // The segment buffer lives in PSRAM: since gen26.6 D3 it holds a full 768-byte
+    // segment and must not sit on the 8KB main stack.
+    char* seg = heap_caps_malloc(DICT_POPUP_AI_SEG, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!seg) { dict_popup_reset(); return false; } // 不留半张卡 / leave no half card
     const char* p = def;
     while (*p && !s_truncated) {
         const char* nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        // 协议上限保证单段必小于 seg；此处钳制纯防御，永不触发。但钳位必须落在
-        // 字符边界上：从中间砍断一个多字节序列，折行器的 utf8_step 会信引导字节
-        // 踩着 NUL 走过去（ASan 在 300 字段用例上实证过这个越界）。
-        // The protocol cap guarantees every segment fits in seg; the clamp is pure
-        // defence. But the clamp must land on a character boundary: cutting a
-        // multibyte sequence in half makes the wrapper's utf8_step step over the
-        // NUL (ASan proved this overflow on a 300-char segment).
-        if (len > sizeof(seg) - 1) len = sizeof(seg) - 1;
+        // 协议上限（PUSH_AI_DEF_MAX=768）保证单段必小于 seg；此处钳制纯防御。
+        // 钳位必须落在字符边界上：从中间砍断一个多字节序列，折行器的 utf8_step
+        // 会信引导字节踩着 NUL 走过去（ASan 在 300 字段用例上实证过这个越界）。
+        // The protocol cap (PUSH_AI_DEF_MAX=768) guarantees every segment fits in
+        // seg; the clamp is pure defence. It must land on a character boundary:
+        // cutting a multibyte sequence in half makes the wrapper's utf8_step step
+        // over the NUL (ASan proved this overflow on a 300-char segment).
+        if (len > DICT_POPUP_AI_SEG - 1) len = DICT_POPUP_AI_SEG - 1;
         memcpy(seg, p, len);
         while (len > 0 && ((unsigned char)p[len] & 0xC0) == 0x80) --len; // 续字节回退 / back off continuation bytes
         seg[len] = 0;
@@ -455,6 +511,7 @@ bool dict_popup_show_def(const char* word, const char* def) {
         if (s_truncated || !nl) break;
         p = nl + 1;
     }
+    free(seg);
     const bool ok = s_line_count > 0;
     // 保存 chip 反映生词本真实落盘状态，与本地词典卡同一谓词。/ The save chip
     // reflects the real vocabulary-book state, same predicate as the dict card.

@@ -145,7 +145,7 @@ python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/app_book.c')
 s = p.read_text()
-old = '    if (!push_sink_link_up()) return;\n'
+old = '    if (!up) return;\n'
 assert old in s, 'M8 anchor missing'
 p.write_text(s.replace(old, '', 1))
 EOF

@@ -234,11 +234,16 @@ static bool (*s_dict_probe)(void); // 词典可用性探针 / the dictionary-ava
 /* ---- gen26 AI 查词（蓝牙代理 + 搭车协议）---- */
 /* gen26 AI lookup (BLE proxy + ride-along). */
 
-// 搭车离线队列缓冲（设备侧 PSRAM，由 main 挂接）。点词时若没连手机，单词先
-// 暂存这里，下次连接由 ai_flush_queue 逐个回流（STATUS 0x17）。
-// The ride-along offline buffer (PSRAM on device, attached by main). While the
-// phone is away, tapped words park here and ai_flush_queue streams them back on
-// the next connect (STATUS 0x17).
+// 搭车离线队列缓冲（设备侧 PSRAM，由 main 挂接）。**gen26.6 起退役**：离线
+// miss 词不再入队（见 push_sink_ai_tap_word_ctx 内注释），队列恒空，无回流。
+// 保留原因：0x06 协议位「登记即冻结」、ai_raloc 宿主测试照跑、app_main 挂接
+// 链路不动——死代码面最小化，等下一轮再议整体拆除。
+// The ride-along offline buffer (PSRAM on device, attached by main).
+// **Retired in gen26.6**: offline misses no longer enqueue (see the comment in
+// push_sink_ai_tap_word_ctx), the queue stays empty and nothing reflows. Kept
+// because the 0x06 opcode is frozen, the ai_raloc host tests still run and the
+// app_main attach path stays untouched - minimal dead surface; full removal is
+// a decision for a later round.
 static uint8_t *s_ai_buf;
 static size_t s_ai_buf_len;
 static uint16_t s_ai_cap;
@@ -1234,6 +1239,14 @@ static void ai_send_caps(void) {
 // 把离线队列里的待查词逐个回流（STATUS 0x17），出队保持紧凑。
 // Flush the offline queue word by word (STATUS 0x17), staying compact.
 //
+// **gen26.6 起恒为空转**：入队路径已随裁定移除（push_sink_ai_tap_word_ctx），
+// 队列永无生产者，本函数实际不再回流任何词。保留是为 0x06 冻结协议位与
+// ai_on_subscribed 的调用形状不动；dequeue-on-success 语义随之失去意义。
+// **A permanent no-op since gen26.6**: the enqueue path was removed by ruling
+// (push_sink_ai_tap_word_ctx), so the queue never gets a producer and this
+// flushes nothing. Kept for the frozen 0x06 opcode and ai_on_subscribed's call
+// shape; dequeue-on-success is moot along with it.
+//
 // gen26.3③ dequeue-on-success（从 M2 提前）：notify 确认成功才出队；失败
 // （未订阅/mbuf 不足/rc≠0）时队首词留队，帧本身已由 notify_retry_schedule
 // 排入 100ms 重投，下次订阅事件或重连后继续 flush——杜绝 gen26.2 注释挂账的
@@ -1272,29 +1285,23 @@ static void ai_flush_queue(void) {
     }
 }
 
-// 订阅建立：上报能力 + 回流离线队列。持锁调用（notify 需持锁）。
-// On subscription: report capability and flush the offline queue. Called with
-// the lock held (notify needs the lock held).
+// 订阅建立：上报能力 + 回流离线队列（gen26.6 起回流恒空）。
+// On subscription: report capability and flush the offline queue (the flush is
+// a permanent no-op since gen26.6).
 //
-// gen26.2 根因修复：这两件事**不能**在 BLE CONNECT 事件里做。手机的 CCCD 订阅
-// 比连接建立晚 ~470ms（日志两会话实证），而 notify_status() 对未订阅的 peer
-// 直接丢帧（LOGD，release 不可见）；本函数若在 connect 时跑，CAPS 与全部
-// 回流帧都会被丢，且彼时 ai_flush_queue() 不论投递成败逐个 dequeue——帧丢词
-// 也被吃，离线搭车队列每次重连被静默清空（该出队语义已由 gen26.3③
-// dequeue-on-success 修正：notify 确认成功才出队，失败留队）。订阅事件是
-// peer 可收帧的首个时刻，故 CAPS/回流/订阅窗口内积压的点词全部在此交付。
-// gen26.2 root-cause fix: these two things must NOT run in the BLE CONNECT
-// event. The phone's CCCD subscription lands ~470 ms after the connection is
-// established (measured in two sessions on hardware), and notify_status()
-// drops frames for a peer that has not subscribed (LOGD, invisible in
-// release); if this ran at connect time, CAPS and every flushed frame would
-// be dropped, and back then ai_flush_queue() dequeued each word regardless of
-// delivery - frames dropped AND words eaten, silently emptying the offline
-// queue on every reconnect (that dequeue semantics is now fixed by gen26.3
-// item-3 dequeue-on-success: dequeue only after notify confirms success, the
-// word stays queued on failure). The subscribe event is the first moment the
-// peer can receive, so CAPS, the flush, and any taps queued inside the
-// pre-subscribe window are all delivered here.
+// gen26.2 根因修复：CAPS **不能**在 BLE CONNECT 事件里做。手机的 CCCD 订阅比
+// 连接建立晚 ~470ms（日志两会话实证），而 notify_status() 对未订阅的 peer 直接
+// 丢帧（LOGD，release 不可见）；本函数若在 connect 时跑，CAPS 会被丢。订阅事件
+// 是 peer 可收帧的首个时刻，故 CAPS 在此交付。（ai_flush_queue 已成空转：gen26.6
+// 移除入队后队列无生产者，保留调用只为形状不动。）
+// gen26.2 root-cause fix: CAPS must NOT run in the BLE CONNECT event. The
+// phone's CCCD subscription lands ~470 ms after the connection is established
+// (measured in two sessions on hardware), and notify_status() drops frames for
+// a peer that has not subscribed (LOGD, invisible in release); running at
+// connect time would drop CAPS. The subscribe event is the first moment the
+// peer can receive, so CAPS is delivered here. (ai_flush_queue is now a no-op:
+// the enqueue path was removed in gen26.6, so the queue has no producer; the
+// call is kept only to leave the shape untouched.)
 static void ai_on_subscribed(void) {
     if (!s_ai_enabled) return;
     ai_send_caps();
@@ -1366,9 +1373,22 @@ void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos)
         const size_t n = push_st_ai_query_emit(word, book_id, pos, ai_ctx_enabled(),
                                                frame, sizeof(frame));
         if (n) notify_status(frame, n); // 即时：STATUS 0x17
-    } else if (s_ai_ready) {
-        ai_raloc_enqueue(s_ai_buf, s_ai_buf_len, word); // 离线：入搭车队列
     }
+    // gen26.6 裁定：离线 miss 词**直接丢弃，不再入搭车队列**。FGS 落地后息屏
+    // 也能查词，断线补查的窗口价值归零——「错过的词让它过去」。UI 侧 15s 超时
+    // 回退词典照旧（离线本就发不出 0x17，弹卡超时行为前后一致），重连后零回流
+    // 零打扰。该设计在无 FGS 时代是合理决策，条件变了自然收敛（账本已记）。
+    // 队列基础设施保留（0x06 协议位「登记即冻结」、ai_raloc 宿主测试照跑），
+    // 只是从此没有生产者——ai_flush_queue 恒为空转。
+    // gen26.6 ruling: an offline miss is **dropped outright, no longer queued**
+    // for the ride-along reflow. With the FGS keep-alive landed, screen-off
+    // lookups work, so the offline re-query window is worthless - a missed word
+    // is allowed to pass. The UI still times out after 15s into the dictionary
+    // fallback (offline never sent 0x17 anyway, so the card behavior is
+    // identical), and reconnects stay silent. The design was reasonable in the
+    // pre-FGS era and retires naturally. The queue infrastructure stays (the
+    // frozen 0x06 opcode, the ai_raloc host tests) - just with no producer, so
+    // ai_flush_queue is a permanent no-op.
     unlock();
 }
 
@@ -1422,10 +1442,11 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         return;
     }
     // gen26 AI 查词通道：与 SET_TIME 同属「连上即可用」旁路，不受「必须武装」限制。
-    // 0x06 = 手机→设备触发离线队列回流；0x07 = 手机→设备单词 + 释义回流。
+    // 0x06 = 手机→设备触发离线队列回流（gen26.6 起回流恒空，仅回一个空转）；
+    // 0x07 = 手机→设备单词 + 释义回流。
     // gen26 AI lookup: like SET_TIME, usable on connect, not gated on armed.
-    // 0x06 = phone to device, flush the offline queue; 0x07 = phone to device,
-    // word + definition.
+    // 0x06 = phone to device, flush the offline queue (a no-op since gen26.6 -
+    // the queue has no producer); 0x07 = phone to device, word + definition.
     if (op == PUSH_OP_AI_QUERY) {
         ai_flush_queue();
         return;

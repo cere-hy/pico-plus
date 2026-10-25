@@ -42,13 +42,14 @@ enum EpdRotation epd_get_rotation(void) { return g_rotation; }
 
 /* ---- ui_kit 替身 / ui_kit doubles ---- */
 #define MAX_TEXT_CALLS 48
-static struct { int px; char text[192]; } g_texts[MAX_TEXT_CALLS];
+static struct { int x; int px; char text[192]; } g_texts[MAX_TEXT_CALLS];
 static int g_text_count;
 
 void ui_text_fixed(uint8_t* framebuffer, int x, int y_top, int px, const char* text,
                    enum EpdFontFlags align, bool inverted) {
-    (void)framebuffer; (void)x; (void)y_top; (void)align; (void)inverted;
+    (void)framebuffer; (void)y_top; (void)align; (void)inverted;
     if (g_text_count < MAX_TEXT_CALLS && text) {
+        g_texts[g_text_count].x = x; // gen26.6：右缘断言需要起点 x / the right-edge check needs x
         g_texts[g_text_count].px = px;
         snprintf(g_texts[g_text_count].text, sizeof(g_texts[g_text_count].text), "%s", text);
         ++g_text_count;
@@ -155,19 +156,35 @@ static bool drew_text(const char* text) {
     }
     return false;
 }
-// 正文行 = 27px 字号的绘制（省略号是 21px，词头 46px，chip 标签 26px）。
-// Body lines are the 27px draws (the ellipsis is 21px, the head 46px, the chip label 26px).
+// 正文行 = 36px 字号的绘制（省略号是 21px，词头 46px，chip 标签 26px）。
+// Body lines are the 36px draws (the ellipsis is 21px, the head 46px, the chip label 26px).
 static int body_lines_drawn(void) {
     int n = 0;
     for (int i = 0; i < g_text_count; ++i) {
-        if (g_texts[i].px == 27) ++n;
+        if (g_texts[i].px == 36) ++n;
     }
     return n;
+}
+// gen26.6：正文右缘不得越过「卡右缘 − PAD」——折行宽度必须两侧对称扣 PAD
+// （只扣左侧会让末字贴/越卡右缘，真机「die」贴边被裁）。对每次绘制自动检查。
+// The body's right edge must not pass "card right - PAD": the wrap width must
+// subtract the PAD on both sides (reserving only the left pushes the last glyph
+// onto/over the right edge - the on-device "die" clipping). Checked on every draw.
+#define TEST_CARD_PAD 36 // 与 dict_popup.c 的 DICT_POPUP_PAD 对表 / mirrors DICT_POPUP_PAD
+static void check_body_right_edge(void) {
+    const EpdRect card = dict_popup_rect();
+    const int limit = card.x + card.width - TEST_CARD_PAD;
+    for (int i = 0; i < g_text_count; ++i) {
+        if (g_texts[i].px != 36) continue; // 只看正文行 / body lines only
+        const int right = g_texts[i].x + ui_text_fixed_width_px(g_texts[i].px, g_texts[i].text);
+        CHECK(right <= limit);
+    }
 }
 static void draw_card(void) {
     reset_observers();
     uint8_t fb = 0;
     dict_popup_draw(&fb);
+    check_body_right_edge();
 }
 
 // chip 矩形中心（竖屏卡 {24,540,636,528} → chip {504,562,120,52}）。
@@ -286,25 +303,22 @@ static void test_word_match_edges(void) {
 }
 
 static void test_capacity(void) {
-    // 竖屏：10 行 x 20 全角字 = 200——40 字预算的校准锚。/ Portrait: 10 lines x 20
-    // full-width chars = 200 - the yardstick for the 40-char budget.
+    // 竖屏：9 行 x 15 全角字 = 135——gen26.6 乘 36px/46 重算（旧 27/42 的 200 作废）。
+    // Portrait: 9 lines x 15 full-width chars = 135 - recomputed for gen26.6's
+    // 36px/46 (the old 27/42 200 is void).
     g_rotation = EPD_ROT_PORTRAIT;
-    CHECK(dict_popup_ai_capacity_chars() == 200);
-    // 横屏：同公式 10 行 x 40 字 = 400；预算校准取竖屏的保守值。/ Landscape: the
-    // same formula gives 10 x 40 = 400; calibration keeps the conservative portrait
-    // value.
+    CHECK(dict_popup_ai_capacity_chars() == 135);
+    // 横屏：同公式 9 行 x 30 字 = 270。/ Landscape: the same formula gives 9 x 30 = 270.
     g_rotation = EPD_ROT_LANDSCAPE;
-    CHECK(dict_popup_ai_capacity_chars() == 400);
+    CHECK(dict_popup_ai_capacity_chars() == 270);
     g_rotation = EPD_ROT_PORTRAIT;
-    CHECK(dict_popup_ai_capacity_chars() == 200);
+    CHECK(dict_popup_ai_capacity_chars() == 135);
 }
 
 static void test_wrap_bounds(void) {
-    // AI 路径（show_def）：手机协议帽 PUSH_AI_DEF_MAX=170，单条释义必然放得下——
-    // 60 个全角字 3 行不截断即「40 字预算完整显示」的实证富余量。
-    // AI path (show_def): the phone protocol cap PUSH_AI_DEF_MAX=170 means a def
-    // always fits - 60 full-width chars wrapping to 3 lines with no truncation is
-    // the empirical slack behind "the 40-char budget shows in full".
+    // AI 路径（show_def）：60 个全角字在竖屏 36px 下 15 字/行 → 4 行，不截断。
+    // AI path (show_def): 60 full-width chars at 36px wrap 15 per line -> 4 lines,
+    // no truncation.
     static const char unit[] = "\xE4\xB8\xAD"; // 中 / a full-width glyph
     char full[3 * 300 + 1];
     size_t o = 0;
@@ -312,27 +326,71 @@ static void test_wrap_bounds(void) {
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     draw_card();
-    CHECK(body_lines_drawn() == 3);
+    CHECK(body_lines_drawn() == 4);
     CHECK(!drew_text("……"));
-    // 钳位防御（协议不可达，ASan 曾在此实证越界）：单个超长段被钳到字符边界
-    // （189 字节 = 63 字），折行器不得踩过 NUL；落定 4 行、卡片照常可用。
-    // Clamp defence (unreachable via the protocol; ASan once proved an overflow
-    // here): an overlong single segment clamps to a character boundary (189 bytes
-    // = 63 chars) and the wrapper must not step over the NUL; 4 lines land and the
-    // card stays usable.
+    // 显示/暂存对齐（gen26.6 36px）：135 字正好 9 行放满、不截断；第 136 字开第
+    // 10 行，必须置截断位（app_book 据此开详解），否则尾部静默丢失。这条对
+    // 「暂存帽回退到 14」有牙——那时 136 字仍 10 行暂存、不置位。
+    // Display/staging alignment (gen26.6 36px): 135 chars fill exactly 9 lines
+    // with no truncation; the 136th opens a 10th line and must set the flag
+    // (app_book opens the detail view), else the tail is silently lost. This has
+    // teeth against a "staging cap back to 14" regression (then 136 chars stage 10
+    // lines and never set the flag).
+    o = 0;
+    for (int i = 0; i < 135; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    full[o] = 0;
+    CHECK(dict_popup_show_def("capacity", full));
+    CHECK(!dict_popup_ai_truncated());
+    draw_card();
+    CHECK(body_lines_drawn() == 9);
+    CHECK(!drew_text("……"));
+    dict_popup_reset();
+    o = 0;
+    for (int i = 0; i < 136; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    full[o] = 0;
+    CHECK(dict_popup_show_def("capacity", full));
+    CHECK(dict_popup_ai_truncated());
+    draw_card();
+    CHECK(body_lines_drawn() == 9);
+    CHECK(drew_text("……"));
+    dict_popup_reset();
+    // gen26.6 D3 联动回归：180 字（540B）单段释义必须整段进入折行——旧 AI_SEG=192
+    // 会把它静默截到 63 字（5 行、无省略号）。放宽到 769 后 180/15 = 12 行，
+    // 显示 9 行 + 「……」（其余进详解视图承接）。这条断言对 AI_SEG 回退有牙。
+    // gen26.6 D3 linkage regression: a 180-char (540B) single-segment definition
+    // must wrap in full - the old AI_SEG=192 silently cut it to 63 chars (5 lines,
+    // no ellipsis). Widened to 769, 180/15 = 12 lines, the display shows 9 plus
+    // "……" (the rest goes to the detail view). This assertion has teeth against an
+    // AI_SEG regression.
+    o = 0;
+    for (int i = 0; i < 180; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    full[o] = 0;
+    CHECK(dict_popup_show_def("capacity", full));
+    draw_card();
+    CHECK(body_lines_drawn() == 9);
+    CHECK(drew_text("……"));
+    CHECK(dict_popup_is_pending(NULL) == false);
+    dict_popup_reset();
+    // 钳位防御（协议不可达）：300 字（900B）超过 PUSH_AI_DEF_MAX=768，段缓冲钳到
+    // 字符边界（768B = 256 字）；折行器不得踩过 NUL，暂存 14 行封顶后置截断位。
+    // Clamp defence (unreachable via the protocol): 300 chars (900B) exceed
+    // PUSH_AI_DEF_MAX=768, so the segment buffer clamps to a character boundary
+    // (768B = 256 chars); the wrapper must not step over the NUL, staging caps at
+    // 14 lines and the truncation flag is set.
     o = 0;
     for (int i = 0; i < 300; ++i) { memcpy(full + o, unit, 3); o += 3; }
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     draw_card();
-    CHECK(body_lines_drawn() == 4);
+    CHECK(body_lines_drawn() == 9);
+    CHECK(drew_text("……"));
     CHECK(dict_popup_is_pending(NULL) == false);
     dict_popup_reset();
-    // 本地词典路径（dict_popup_open）：DICT_ENTRY_MAX=1280 的长释义才是 10 行
-    // 显示帽 + 省略号的真实到达路径——300 字 → 暂存 14 行封顶，显示 10 行 + 「……」。
+    // 本地词典路径（dict_popup_open）：DICT_ENTRY_MAX=1280 的长释义才是 9 行显示
+    // 帽 + 省略号的真实到达路径——300 字 → 暂存 14 行封顶，显示 9 行 + 「……」。
     // Local dictionary path (dict_popup_open): a long DICT_ENTRY_MAX=1280 entry is
-    // the real route to the 10-line display cap plus the ellipsis - 300 chars ->
-    // staging caps at 14 lines, the display shows 10 plus the ellipsis.
+    // the real route to the 9-line display cap plus the ellipsis - 300 chars ->
+    // staging caps at 14 lines, the display shows 9 plus the ellipsis.
     g_dict_ready = true;
     g_dict_hit = true;
     o = 0;
@@ -340,7 +398,7 @@ static void test_wrap_bounds(void) {
     g_dict_def[o] = 0;
     CHECK(dict_popup_open("longdef"));
     draw_card();
-    CHECK(body_lines_drawn() == 10);
+    CHECK(body_lines_drawn() == 9);
     CHECK(drew_text("……"));
     dict_popup_reset();
 }
@@ -462,6 +520,6 @@ int main(void) {
         printf("dict_popup: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 200/400 + wrap bounds + timeout + AI entry)");
+    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 135/270 + right-edge bound + wrap bounds + timeout + AI entry)");
     return 0;
 }

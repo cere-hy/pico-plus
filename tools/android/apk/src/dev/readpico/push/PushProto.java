@@ -80,7 +80,7 @@ public final class PushProto {
 
     /* ---- gen26 AI 帧长与上限（与 push_proto.h 逐字一致）---- */
     public static final int AI_WORD_MAX = 64;   // 单词 UTF-8 槽（含结尾 0）
-    public static final int AI_DEF_MAX = 170;   // 单帧释义槽（含结尾 0）
+    public static final int AI_DEF_MAX = 170;   // 0x07 单帧线格式 def 槽（BLE-MTU 受限 ~170）；D3 放宽走 0x08 多帧，不在此槽
     public static final int AI_QUERY_MAX = 4 + 1 + AI_WORD_MAX;              // 0x06 = 69
     public static final int AI_RESULT_MAX = 4 + 1 + AI_WORD_MAX + 2 + AI_DEF_MAX; // 0x07 = 241
     public static final int AI_STATUS_QUERY_MAX = 1 + 1 + AI_WORD_MAX;       // 0x17 = 66

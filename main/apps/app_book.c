@@ -348,6 +348,12 @@ static bool s_push_handoff;
 // books and a new book's same (chapter,page) never collides). The switch state
 // itself lives in tts_page.c (NVS rp_tts); no second copy is kept here.
 static size_t s_tts_last_chapter = SIZE_MAX, s_tts_last_page = SIZE_MAX;
+// 上一 tick 的链接态：用于检测「刚重连」跃迁，触发 D2B 重连补发（断线期间
+// 关开关、重连后设备开关为关 → 补推空页让对端停朗读）。/ Last tick's link
+// state: detects the just-reconnected edge to fire D2B's reconnect resend
+// (switch turned off while disconnected -> on reconnect, re-push an empty
+// page so the peer stops the read-aloud).
+static bool s_tts_link_was_up = false;
 static char s_book_title[128];
 static char s_chapter_heading_title[128], s_chapter_heading_label[32];
 static size_t s_chapter_lead_skip;
@@ -6536,6 +6542,20 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             // it collides with the last book's (chapter,page) (closing the book
             // clears it; this is the belt-and-braces path).
             if (!on) s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+            else {
+                // 关闭：推一帧 len=0 的 0x19 空页帧，对端按「空串=静默」语义
+                // 立即停止朗读。这与 tts_follow_poll 对插画页「不推空页」是两码
+                // 事——那里是版面无字、不该打断在念的句子；这里是用户明确关开关，
+                // 必须主动停。链接断开时跳过（断线期间关开关由 D2B 重连补发兜底）。
+                // Turning off: push a len=0 0x19 empty-page frame so the peer
+                // stops the read-aloud via its empty-string=silence semantics.
+                // Distinct from tts_follow_poll's "never air an empty page" rule
+                // (that one is for illustration-only pages where silence must
+                // not cut the current sentence); here the user explicitly turned
+                // the switch off, so an active stop is required. Skip when the
+                // link is down (D2B resends the empty page on reconnect).
+                if (push_sink_link_up()) push_sink_tts_send_page("", 0);
+            }
         } else {
             return APP_REDRAW_NONE;
         }
@@ -7904,8 +7924,22 @@ static bool tts_page_range(size_t *start, size_t *end) {
 // a bounded scan must not stretch lock hold time) and the send runs outside it
 // (a BLE notify may carry retries and must never stall rendering).
 static void tts_follow_poll(void) {
+    const bool up = push_sink_link_up();
+    // D2B 重连补发：刚建立链接（down→up 跃迁）且开关为关，补推空页让对端停
+    // 朗读。覆盖「断线期间关开关、重连后开关仍为关」的漏洞——此时 D2A 的即时
+    // 空页在断线时发不出去，只能等重连这一刻补。开关为开则交给下方哨兵自然
+    // 续推（重连后当前页首推），无需空页。/ D2B reconnect resend: a down->up
+    // edge with the switch off re-pushes an empty page so the peer stops. This
+    // closes the "switch turned off while disconnected" gap - D2A's immediate
+    // empty page couldn't air during the outage, so it is made up at reconnect.
+    // Switch on falls through to the sentinel re-push below (current page first
+    // push after reconnect), no empty page needed.
+    if (up && !s_tts_link_was_up && !tts_switch_on()) {
+        push_sink_tts_send_page("", 0);
+    }
+    s_tts_link_was_up = up;
     if (!tts_switch_on() || s_view != READING || !s_text) return;
-    if (!push_sink_link_up()) return;
+    if (!up) return;
     if (s_chapter == s_tts_last_chapter && s_page == s_tts_last_page) return;
     char text[TTS_PAGE_TEXT_MAX];
     size_t start = 0, end = 0, n = 0;

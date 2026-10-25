@@ -89,8 +89,15 @@ static const char* TAG = "vocab";
 #define VOCAB_AI_BATCH_MAX 64
 #endif
 #ifndef VOCAB_AI_DEF_MAX
-#define VOCAB_AI_DEF_MAX 288
+#define VOCAB_AI_DEF_MAX 768 ///< gen26.6 D3：批内 def 槽与设备 PUSH_AI_DEF_MAX 同源加宽到卡容量
 #endif
+// 与设备释义槽同源：批内 def 槽不得窄于卡容量，否则同一条释义在落库时被截断
+// （生词本内容与卡面不一致）。缩槽在此编译失败。
+// Shares the device def slot: the batch slot must not be narrower than the card
+// capacity, or the same definition is truncated on the way into the vocabulary
+// book (its content would disagree with the card). A shrink fails here.
+_Static_assert(VOCAB_AI_DEF_MAX >= 768,
+               "gen26.6 D3: VOCAB_AI_DEF_MAX must stay >= 768 (shares the card capacity)");
 
 #define VOCAB_HEADER "# read-pico vocab.txt — 列：word<TAB>时间<TAB>书名<TAB>原句<TAB>释义"
 #define VOCAB_INDEX_MAX 4096u

@@ -24,7 +24,7 @@ rem   3c7892f5…（2026-10-25 重锚，与 firmware/flash.sh 同值；拒烧语
 rem Anchor: the gen26.4.1 device-defect hotfix (the AI entry's self-referential
 rem alias) Read_Pico.bin 4,071,680 B / a13d0b5e... (re-anchored 2026-10-24, same
 rem value as firmware/flash.sh; refusal semantics match flash.sh: exit 1).
-set EXPECTED=3c7892f55b8ebb3d4886d37483bc5d175d6f823627da3c89a07b4ea9d14cb0ed
+set EXPECTED=713c82b7c47024b8042ffb6b3ca49fd986ba3faf7673c338813d11a01f9397c6
 set DIR=%~dp0
 set PORT=%1
 if "%PORT%"=="" set PORT=COM3

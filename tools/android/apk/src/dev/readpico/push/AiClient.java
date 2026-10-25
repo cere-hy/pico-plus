@@ -39,8 +39,8 @@ public final class AiClient {
     public static final String DEFAULT_BASE_URL = "https://api.deepseek.com";
     public static final String DEFAULT_MODEL = "deepseek-chat";
 
-    /** 释义的 UTF-8 字节上限：设备侧 PUSH_AI_DEF_MAX=170 留 1 字节 NUL。 */
-    public static final int DEF_MAX_BYTES = 169;
+    /** 释义的 UTF-8 字节上限：gen26.6 D3 放宽到 600B（180 字 ≈ 540B 吃满卡容量 90%）；设备侧 PUSH_AI_DEF_MAX=768 兜住。 */
+    public static final int DEF_MAX_BYTES = 600;
 
     /** 连接与读取超时（毫秒）：LLM 秒级返回，15s 足够且不让用户干等。 */
     public static final int DEFAULT_TIMEOUT_MS = 15000;
@@ -48,15 +48,16 @@ public final class AiClient {
     /**
      * 默认用户提示模板（M1.2 ① Prompt 自定义）。占位符 {word} 在渲染时被实际
      * 单词替换，语义等价于历史硬编码的 "word: " + word。用户可在 APK 设置页
-     * 编辑自己的模板，但系统指令（systemPrompt，40 字硬约束）永远独立钉在
-     * system 角色、不可被模板覆盖——这就是「分层铁律」。
+     * 编辑自己的模板，但系统指令（systemPrompt，180 字硬约束，gen26.6 D3 放宽）
+     * 永远独立钉在 system 角色、不可被模板覆盖——这就是「分层铁律」。
      *
      * Default user-prompt template (M1.2 item-1 Prompt customization). The
      * {word} placeholder is substituted with the actual word at render time,
      * semantically identical to the old hard-coded "word: " + word. Users may
      * edit their own template in the APK settings, but the system instruction
-     * (systemPrompt, the 40-char hard constraint) is always pinned in the
-     * system role, never overridable by the template - the "layering rule".
+     * (systemPrompt, the 180-char hard constraint, relaxed in gen26.6 D3) is
+     * always pinned in the system role, never overridable by the template - the
+     * "layering rule".
      */
     public static final String DEFAULT_TEMPLATE = "word: {word}";
 
@@ -217,8 +218,8 @@ public final class AiClient {
      * 构造 OpenAI 兼容的 chat/completions 请求体。
      *
      * 分层铁律在这里落地：
-     *   - system 角色恒为 systemPrompt()（40 字硬约束），永远最后追加、不可被
-     *     用户模板覆盖；
+     *   - system 角色恒为 systemPrompt()（180 字硬约束，gen26.6 D3 放宽），
+     *     永远最后追加、不可被用户模板覆盖；
      *   - user 角色为 renderTemplate 渲染后的用户模板（内容/风格由用户掌控）。
      * 两条消息天然分属不同角色，模板再怎么改也碰不到 system 的约束。
      *
@@ -267,23 +268,23 @@ public final class AiClient {
     }
 
     /**
-     * 系统提示（M1.1 ③ 40 字硬约束）：把输出形态钉死——「释义不超过 40 字，
+     * 系统提示（gen26.6 D3 校准：180 字硬约束）：把输出形态钉死——「释义不超过 180 字，
      * 一句核心词义 + 一个短语示例」，且强制纯文本。这是第一道防线（让模型自己
-     * 就范），fitUtf8 的 169 字节帧帽是第二道。40 个汉字 x 3 字节 = 120 字节，
-     * 帧帽（169）与设备词卡容量（竖屏 200 全角字符，gen26.3 ⑤ 实算）都放得下
+     * 就范），fitUtf8 的 600 字节帧帽是第二道。180 个汉字 x 3 字节 = 540 字节，
+     * 帧帽（600）与设备词卡容量（PUSH_AI_DEF_MAX=768，gen26.6 D3 放宽）都放得下
      * ——预算与两端容量自洽，无需再砍。
      *
-     * System prompt (M1.1 item-3 40-character hard constraint): pin the output
-     * shape - the definition stays within 40 characters, one core meaning plus
-     * one phrase example, plain text only. First line of defence (the model
-     * behaves); fitUtf8's 169-byte frame cap is the second. 40 chars x 3 bytes
-     * = 120 bytes fits both the frame cap and the device card capacity (200
-     * full-width chars in portrait, gen26.3 item-5) - the budget is consistent
+     * System prompt (gen26.6 D3 calibration: 180-character hard constraint): pin
+     * the output shape - the definition stays within 180 characters, one core
+     * meaning plus one phrase example, plain text only. First line of defence
+     * (the model behaves); fitUtf8's 600-byte frame cap is the second. 180 chars
+     * x 3 bytes = 540 bytes fits both the frame cap and the device card capacity
+     * (PUSH_AI_DEF_MAX=768, widened in gen26.6 D3) - the budget is consistent
      * with both ends, no further trim needed.
      */
     static String systemPrompt() {
         return "你是电子墨水屏阅读器的词典助手。用户给出英文单词，你只返回该词在语境中最常用的"
-                + "中文释义：释义不超过 40 字，一句核心词义 + 一个短语示例。"
+                + "中文释义：释义不超过 180 字，一句核心词义 + 一个短语示例。"
                 + "只输出纯文本：不要 Markdown、不要音标、不要解释、不要换行。";
     }
 

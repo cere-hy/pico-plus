@@ -267,6 +267,9 @@ def main() -> int:
             failures.append('tts_follow_poll(): lost its page-change sentinel '
                             '(every tick would re-send the current page)')
         if 'push_sink_link_up()' not in poll:
+            failures.append('tts_follow_poll(): lost its link_up read '
+                            '(a dead link would still call notify)')
+        if 'if (!up) return;' not in poll:
             failures.append('tts_follow_poll(): lost its link_up gate '
                             '(a dead link would still call notify)')
     # 在视图里删掉一条后要重开视图 / a removal inside the view must re-open it
@@ -323,6 +326,23 @@ def main() -> int:
         elif 'vocab_log_ai_queue(' in lookup_body[open_at:found_at]:
             failures.append('start_dict_lookup(): queues a word on a pure dictionary hit '
                             '(adjudicated: only AI-interacted words log)')
+
+    # 7b. gen26.6 裁定：补查机制整体移除——设备端断连 miss 词不得再入搭车队列。
+    #     push_sink.c 若重新出现 ai_raloc_enqueue 调用，说明补查回潮（「错过的词
+    #     让它过去」是裁定语义，不是实现细节）。注意 ai_ridealong.c 模块本身仍
+    #     保留（纯逻辑 + 宿主测试），故只查 push_sink.c 这个调用点。
+    #     gen26.6 ruling: the re-query mechanism is gone - an offline miss must
+    #     never re-enter the ride-along queue. If push_sink.c calls
+    #     ai_raloc_enqueue again, the retired mechanism has crept back ("a missed
+    #     word is allowed to pass" is adjudicated semantics, not an impl detail).
+    #     The ai_ridealong.c module itself stays (pure logic + host tests), so
+    #     only push_sink.c's call site is checked.
+    sink_text = SINK_C.read_text(encoding='utf-8') if SINK_C.exists() else ''
+    if not sink_text:
+        failures.append('push_sink.c: missing')
+    elif 'ai_raloc_enqueue(' in sink_text:
+        failures.append('push_sink.c: an offline miss is queued again '
+                        '(ai_raloc_enqueue found - gen26.6 retired the re-query)')
 
     # 8. gen26.5 M2 Step8：app_loop 的 flush 驱动与解耦顺序、app_main 的开关读取、
     #    .c/.h 双冻结声明同步。/ The flush driver and decoupling order in app_loop,

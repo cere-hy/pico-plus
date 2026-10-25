@@ -201,6 +201,7 @@ public class MainActivity extends Activity {
      */
     private TextView ttsStatus;
     private Button btnTtsSettings;
+    private Button btnTtsStop;
     /** 0x19 页文本重组器（只由 BLE 回调线程 touch：accept/reset 同线程，无锁）。 */
     private final TtsReassembler ttsReassembler = new TtsReassembler();
     /** 朗读引擎封装（异步 init + 档位持久化 + 跟随/查词两个入口）。 */
@@ -572,7 +573,25 @@ public class MainActivity extends Activity {
             }
         });
         rowTts.addView(btnTtsSettings, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        // gen26.6 D2B：听书状态行加「停止朗读」按钮——手动即时停掉当前发声
+        // （设备侧关开关经 D2A 推空页也能停，这里给用户一个本地兜底入口）。
+        // gen26.6 D2B: a 停止朗读 (stop reading) button on the TTS status row -
+        // a local, immediate stop of the current utterance (the device's D2A
+        // empty-page stop also works; this is the user's local fallback entry).
+        btnTtsStop = new Button(this);
+        btnTtsStop.setText("停止朗读");
+        btnTtsStop.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                ttsSpeaker.stopSpeaking();
+                stopTtsKeepAlive();
+                refreshTtsStatus();
+                uiLog("已手动停止朗读");
+            }
+        });
+        rowTts.addView(btnTtsStop, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         root.addView(rowTts, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -1476,10 +1495,10 @@ public class MainActivity extends Activity {
         cfg.baseUrl = base.isEmpty() ? AiClient.DEFAULT_BASE_URL : base;
         String model = sp.getString(PREF_MODEL, "");
         cfg.model = model.isEmpty() ? AiClient.DEFAULT_MODEL : model;
-        // M1.2 ①：激活模板注入 user 角色；系统指令（40 字硬约束）仍由 AiClient
-        // 恒定钉在 system 角色，模板永远碰不到。
+        // M1.2 ①：激活模板注入 user 角色；系统指令（180 字硬约束，gen26.6 D3 放宽）
+        // 仍由 AiClient 恒定钉在 system 角色，模板永远碰不到。
         // M1.2 item-1: inject the active template into the user role; the system
-        // instruction (40-char hard constraint) stays pinned in the system role by
+        // instruction (180-char hard constraint, relaxed in gen26.6 D3) stays pinned in the system role by
         // AiClient and is never reachable from the template.
         cfg.promptTemplate = getActiveTemplateContent();
         return cfg;
@@ -1558,7 +1577,7 @@ public class MainActivity extends Activity {
         // ---- M1.2 ① 提示模板：多行编辑，{word} 占位符，恢复默认 ----
         // M1.2 item-1 prompt template: multi-line, {word} placeholder, reset-to-default.
         TextView tplHint = new TextView(this);
-        tplHint.setText("提示模板（可用 {word} 占位符，系统 40 字约束始终生效且不可被覆盖）");
+        tplHint.setText("提示模板（可用 {word} 占位符，系统 180 字约束始终生效且不可被覆盖）");
         tplHint.setTextSize(12);
         tplHint.setPadding(0, dp(8), 0, dp(4));
         box.addView(tplHint);
@@ -2373,10 +2392,10 @@ public class MainActivity extends Activity {
 
     /* ================= M1.2 ① 提示模板库 =================
      * 命名模板列表存 SharedPreferences（JSON 数组），激活模板按名字引用。
-     * 系统指令（40 字硬约束）永远独立于模板、恒定钉在 system 角色——模板只能
+     * 系统指令（180 字硬约束，gen26.6 D3 放宽）永远独立于模板、恒定钉在 system 角色——模板只能
      * 改 user 角色的内容/风格，永远碰不到系统约束。这就是「分层铁律」。
      * Named templates live in SharedPreferences (JSON array); the active one is
-     * referenced by name. The system instruction (40-char hard constraint) is
+     * referenced by name. The system instruction (180-char hard constraint, relaxed in gen26.6 D3) is
      * always pinned in the system role, independent of templates - the "layering
      * rule": a template edits only the user-role content/style.
      */

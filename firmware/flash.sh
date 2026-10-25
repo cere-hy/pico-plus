@@ -145,6 +145,23 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
+# 版本串 / Version string: 0.3.3-pico26.6（gen26.6 M2 三缺陷修复 + 词卡可读性：
+# ① 离线「补查」整体移除——断连 miss 不再入搭车队列，重连零回流零打扰 ② 听书关开关
+# 即推 len=0 的 0x19 空页帧 + 重连补发 ③ 释义槽 PUSH_AI_DEF_MAX 170→768B 三处同源，
+# APK 提示词 40→180 字 / 裁剪 600B；词卡正文 27→36px、行高 42→46、容量 135/270、
+# 右缘 PAD 对称 + 宿主右缘断言、AI 段缓冲 192→769、暂存帽 14→9 对齐显示帽。APK 同步
+# v1.5.1（code 10），加「停止朗读」按钮；D1 串行队列按裁定取消，不做）。
+# Version string: 0.3.3-pico26.6 (gen26.6 M2 three-defect fix + card legibility:
+# offline re-query removed; TTS switch-off pushes a len=0 0x19 empty page plus a
+# reconnect resend; PUSH_AI_DEF_MAX 170->768B across three sites with the APK prompt
+# at 180 chars / 600B trim; card body 27->36px, line height 42->46, capacity 135/270,
+# symmetric right pad with a host right-edge assertion, AI segment buffer 192->769,
+# staging cap 14->9 aligned to the display cap. APK v1.5.1 (code 10) adds a stop
+# button; the D1 serial queue is cancelled by ruling).
+# 体积：4,087,984 B（相对 gen26.5 的 4,085,040 B **+2,944 B**，归因 = 词卡字号/段缓冲
+# 与 D3 槽加宽、D2 空页帧路径；段级闭合待真机 boot 日志 seg1 双锚对表确认）；
+# sha256 713c82b7…；重锚 2026-10-25。
+#
 # 版本串 / Version string: 0.3.3-pico26.5（gen26.5 M2 Step10 TTS 听书：设备侧页文本 +
 # 0x19 STATUS 帧 + 面板朗读进度 + NVS 落盘 / APK 重组朗读流 + FGS 跟随 + AI 联动；
 # 每代 fork 专属可区分串，沿用旧串会让 TF 卡升级判「版本相同」而拒绝）。
@@ -2096,7 +2113,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="3c7892f55b8ebb3d4886d37483bc5d175d6f823627da3c89a07b4ea9d14cb0ed"
+EXPECTED="713c82b7c47024b8042ffb6b3ca49fd986ba3faf7673c338813d11a01f9397c6"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
