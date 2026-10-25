@@ -1,6 +1,6 @@
 {
   "name": "Pico-Plus",
-  "version": "0.3.3-pico26.4.1",
+  "version": "0.3.3-pico26.5",
   "new_install_prompt_erase": true,
   "builds": [
     {

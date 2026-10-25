@@ -145,6 +145,17 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 2610ce20… (defect-discovery round, burned) archived, do NOT flash. gen7 =
 # ace5373b… (pre-fix) archived.
 #
+# 版本串 / Version string: 0.3.3-pico26.5（gen26.5 M2 Step10 TTS 听书：设备侧页文本 +
+# 0x19 STATUS 帧 + 面板朗读进度 + NVS 落盘 / APK 重组朗读流 + FGS 跟随 + AI 联动；
+# 每代 fork 专属可区分串，沿用旧串会让 TF 卡升级判「版本相同」而拒绝）。
+# Version string: 0.3.3-pico26.5 (gen26.5 M2 Step10 TTS audiobook: device-side page
+# text + 0x19 STATUS frame + panel read-along progress + NVS persist / APK reassembled
+# read stream + FGS follow + AI linkage; fork-specific distinguishable tag - reusing an
+# older tag makes the TF-card upgrade reject the package as "same version").
+# 体积：4,085,040 B（相对 gen26.4.1 的 4,071,680 B **+13,360 B**，归因 = TTS 页文本
+# 缓冲 + 0x19 STATUS 通道 + 面板朗读进度/NVS 落盘；段级闭合待真机 boot 日志 seg1 双锚
+# 对表确认）；sha256 3c7892f5…；重锚 2026-10-25。
+#
 # 版本串 / Version string: 0.3.3-pico26.4.1（gen26.4 真机 defect 热修：词典卡「AI」
 # 入口的自引用别名——调用方传 dict_popup_word()（= &s_word 自身），show_pending 入口
 # 先 reset 再查空把别名参数一起清空，查询态建不起来、词典卡被清空、0x07 回来被门 A
@@ -2085,7 +2096,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="a13d0b5e4fb6c83542bd996ef6c8ec85bbce1c796ea282cda623ed007cae7402"
+EXPECTED="3c7892f55b8ebb3d4886d37483bc5d175d6f823627da3c89a07b4ea9d14cb0ed"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
