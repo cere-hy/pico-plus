@@ -11,8 +11,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.readpico.push"
-    android:versionCode="7"
-    android:versionName="1.4.2">
+    android:versionCode="8"
+    android:versionName="1.4.3">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
@@ -32,6 +32,15 @@
     <!-- gen26 M1: AI definitions call an LLM over the network (DeepSeek etc.),
          so INTERNET must be declared. BLE itself never touches the network. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- M1.3（v1.4.3）：息屏查词保活。前台服务（connectedDevice 类型）让后台
+         网络不被 Doze/国产 ROM 挂起；Android 13+ 的通知权限被拒不影响 FGS
+         运行，仅通知不可见（状态行才是可见反馈）。 -->
+    <!-- M1.3: screen-off keep-alive. The connectedDevice FGS keeps background
+         networking alive under Doze/ROM policy; a denied POST_NOTIFICATIONS
+         never stops the FGS (the status row is the visible feedback). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
@@ -40,6 +49,14 @@
         android:icon="@drawable/icon"
         android:allowBackup="false"
         android:supportsRtl="true">
+        <!-- M1.3：监听保活前台服务。started-only（不 bind），随监听起停；
+             connectedDevice 类型（Android 14 要求显式类型），静默低优先级渠道。 -->
+        <!-- M1.3: the listening keep-alive FGS. Started-only, lives exactly as
+             long as the listening session; explicit connectedDevice type. -->
+        <service
+            android:name=".ListenKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

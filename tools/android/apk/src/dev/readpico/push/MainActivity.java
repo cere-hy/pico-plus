@@ -41,14 +41,26 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.location.LocationManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.text.method.ScrollingMovementMethod;
 import android.view.Gravity;
 import android.view.View;
@@ -61,7 +73,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import android.app.AlertDialog;
-import android.content.DialogInterface;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -91,6 +102,7 @@ public class MainActivity extends Activity {
     private static final int REQ_ENABLE_BT = 2;
     private static final int REQ_IMPORT = 3;    // SAF 打开模板库 JSON
     private static final int REQ_EXPORT = 4;    // SAF 创建模板库 JSON
+    private static final int REQ_NOTIF = 5;     // M1.3：POST_NOTIFICATIONS（拒绝不阻塞）
     private static final long SCAN_TIMEOUT_MS = 12000;
     private static final long CONNECT_TIMEOUT_MS = 20000;
     private static final long STEP_TIMEOUT_MS = 20000;
@@ -146,6 +158,32 @@ public class MainActivity extends Activity {
     // any template-library op it MUST be refreshed so the editor == the stored
     // active template (single source of truth, no dual in-memory copy).
     private EditText mActiveTplEditor = null;
+
+    /* ---- M1.3（v1.4.3）：息屏保活 + 事件驱动重试 ----
+     * 真机账：手机息屏后查词 DNS 失败。BLE notify 照常到达（不走网络栈），但
+     * LLM 查询的后台网络被 Doze + 国产 ROM 挂起，解锁即恢复。三件对策：
+     * ① 前台服务（ListenKeepAliveService）：开监听即启、停监听/退出即停，
+     *    connectedDevice 类型；多数 ROM 下恢复后台网络，BLE 稳定性同步受益；
+     * ② 电池白名单引导（requestBatteryWhitelist）：只引导不代决，状态行
+     *    「保活：完整/受限」如实组合 FGS 与白名单；
+     * ③ 事件驱动重试（AiKeepAlive 纯逻辑）：失败后 3s 快速重试一次防 DNS
+     *    抖动，之后只挂 onAvailable / 亮屏，14s 窗口 cap 贴设备 15s 超时。
+     * Screen-off DNS failures: BLE notify still arrives, but the LLM query's
+     * background network is suspended by Doze/ROM policy. Three countermeasures:
+     * FGS, a guided battery-whitelist request, and event-driven retry.
+     */
+    /** 本 APK 侧对 FGS 运行状态的最佳努力记录（start 置位 / stop 清位）。 */
+    private volatile boolean mFgsRunning = false;
+    /** 快速重试专用主线程 Handler（只排 3s 一次性，不轮询）。 */
+    private final Handler mQuickRetryHandler = new Handler(Looper.getMainLooper());
+    /** 当前点词的重试计划；null = 无未决查询。新点词接管时旧计划 markFinished。 */
+    private volatile AiKeepAlive mAiRetry = null;
+    /** 挂起中的快速重试 Runnable（事件抢先时撤回，防双发）。 */
+    private Runnable mQuickRetryRunnable = null;
+    /** 网络可用事件回调（M1.3 注册，查询终态/停监听即注销）。 */
+    private ConnectivityManager.NetworkCallback mNetworkCallback = null;
+    /** 亮屏/解锁事件接收器（同上）。 */
+    private BroadcastReceiver mKeepAliveReceiver = null;
 
     private static final String PREF = "ai";
     private static final String PREF_KEY = "api_key";
@@ -489,11 +527,19 @@ public class MainActivity extends Activity {
         if (!sShortcutMode) {
             refreshLocationBanner();
         }
+        // M1.3：从电池白名单确认页返回时，保活档位可能已变——如实刷新状态行。
+        // M1.3: returning from the whitelist page may change the tier - refresh.
+        refreshAiStatus();
     }
 
     @Override
     protected void onDestroy() {
         listenMode = false; // gen26 M1：退出即停监听，不留悬挂连接
+        // M1.3：退出即停保活 FGS + 注销事件 + 撤销未决重试（监听都没了，重试无意义）。
+        // M1.3: stop the keep-alive FGS, drop event hooks and cancel pending retries.
+        cancelAiRetry();
+        mFgsRunning = false;
+        ListenKeepAliveService.stop(this);
         closeQuietly();
         super.onDestroy();
     }
@@ -1265,6 +1311,16 @@ public class MainActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (requestCode == REQ_NOTIF) {
+            // M1.3：通知权限拒绝不阻塞保活——FGS 照常运行，仅通知栏不可见。
+            // M1.3: a denied notification permission never blocks the keep-alive.
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (!granted) {
+                uiLog("通知权限被拒：保活照常运行，仅通知栏不可见（看状态行即可）");
+            }
+            return;
+        }
         if (requestCode != REQ_PERMS) {
             return;
         }
@@ -1358,6 +1414,13 @@ public class MainActivity extends Activity {
             if (devCaps >= 0) {
                 sb.append(((devCaps & PushProto.CAP_AI_QUERY) != 0) ? " · 设备支持" : " · 设备不支持");
             }
+            // M1.3：保活档位 = FGS 运行中 × 电池白名单，如实组合（单一真相源
+            // AiKeepAlive.keepAliveState，宿测 20 断言覆盖四态）。
+            // M1.3: keep-alive tier = FGS running AND battery whitelisted,
+            // computed by the single source of truth AiKeepAlive.keepAliveState.
+            AiKeepAlive.KeepAlive ka = AiKeepAlive.keepAliveState(
+                    mFgsRunning, batteryWhitelisted());
+            sb.append(ka == AiKeepAlive.KeepAlive.FULL ? " · 保活：完整" : " · 保活：受限");
         } else {
             sb.append(" · 未监听");
         }
@@ -1432,6 +1495,34 @@ public class MainActivity extends Activity {
         });
         box.addView(btnTplLib);
 
+        // ---- M1.3：电池白名单引导（息屏保活第二环）----
+        // 只引导、不代决：受限时给一键入口，去系统页由用户亲手放行；白名单
+        // 动作拿不到返回值，onResume 的 refreshAiStatus 会把新状态如实刷出来。
+        // M1.3 battery-whitelist guide: a one-tap entry when restricted; the
+        // user grants it in the system page (no return value), and onResume's
+        // refreshAiStatus surfaces the new state honestly.
+        final AiKeepAlive.KeepAlive kaNow = AiKeepAlive.keepAliveState(
+                mFgsRunning, batteryWhitelisted());
+        final TextView kaHint = new TextView(this);
+        kaHint.setTextSize(12);
+        kaHint.setPadding(0, dp(8), 0, dp(4));
+        kaHint.setText(kaNow == AiKeepAlive.KeepAlive.FULL
+                ? "保活：完整（前台服务 + 电池白名单均已就位，息屏查词不断网）"
+                : "保活：受限（息屏久置后后台网络可能被系统挂起，建议补全白名单）");
+        box.addView(kaHint);
+
+        if (kaNow != AiKeepAlive.KeepAlive.FULL && !batteryWhitelisted()) {
+            Button btnWhitelist = new Button(this);
+            btnWhitelist.setText("加入电池白名单（系统页确认）");
+            btnWhitelist.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    requestBatteryWhitelist();
+                }
+            });
+            box.addView(btnWhitelist);
+        }
+
         new android.app.AlertDialog.Builder(this)
                 .setTitle("AI 释义设置（默认 DeepSeek）")
                 .setView(box)
@@ -1479,95 +1570,160 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    /**
+     * M1.3：引导式电池白名单请求——跳系统「忽略电池优化」确认页，由用户亲手放行。
+     * 该动作无返回值（用户可能拒绝），onResume 的 refreshAiStatus 会把结果如实
+     * 刷到状态行；个别 ROM 没有此 action 时退到应用详情页，再不行就文字指引。
+     * Guided battery-whitelist request: the system confirm page, granted by the
+     * user's own hand. No return value (may be declined); onResume refreshes
+     * the status row honestly. Fallback chain: details page -> text hint.
+     */
+    private void requestBatteryWhitelist() {
+        try {
+            Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            i.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+            uiLog("已打开电池优化确认页（请选「允许」；回来状态行会自动刷新）");
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())));
+                uiLog("已打开应用详情页（请进电池 → 选「无限制」）");
+            } catch (Throwable t2) {
+                toast("请手动设置：系统设置 → 电池 → 本应用 → 无限制");
+            }
+        }
+    }
+
     /** 扫描 + 连接 + 订阅，然后**保持连接**等设备的点词通知。 */
     private void startListen() {
         if (aiConfig().apiKey.trim().isEmpty()) {
             uiLog("请先点「AI 设置」填写 API key");
             return;
         }
+        // M1.3：Android 13+ 通知权限引导——拒绝不影响 FGS 运行，仅通知不可见
+        // （状态行「保活：完整/受限」才是可见反馈）。调用点在按钮路径，合法。
+        // M1.3: guide the POST_NOTIFICATIONS grant on Android 13+; a denial
+        // never stops the FGS - the notification just stays invisible and the
+        // status row remains the visible feedback. Called from a button, legal.
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},
+                    REQ_NOTIF);
+        }
+        // M1.3：开监听即启前台服务（connectedDevice 类型）——息屏后台网络保活主修。
+        // 调用点在按钮点击路径（前台），不受后台启动 FGS 限制；激进 ROM 拒启时
+        // 服务内部降级不崩，状态行如实显示「保活：受限」。
+        // M1.3: bring up the keep-alive FGS the moment listening starts (the call
+        // site is a foreground button click, so background-FGS limits do not
+        // apply); a refusing ROM degrades inside the service, status row honest.
+        mFgsRunning = true;
+        ListenKeepAliveService.start(this);
         new Thread(new Runnable() {
             @Override
             public void run() {
-                resetState();
-                uiLog("扫描设备……");
-                if (!scanForDevice()) {
-                    uiLog(failReason == null ? "未发现设备" : failReason);
-                    return;
+                // M1.3：链路没建成就不虚挂保活——停 FGS，状态行回落「未监听」。
+                // M1.3: a failed link must not keep a phantom FGS - stop it and
+                // let the status row fall back to "not listening".
+                if (!listenThreadBody()) {
+                    mFgsRunning = false;
+                    ListenKeepAliveService.stop(MainActivity.this);
                 }
-                uiLog("发现 " + foundName + "，连接中……");
-                BluetoothDevice dev = adapter.getRemoteDevice(foundAddr);
-                gatt = dev.connectGatt(MainActivity.this, false, gattCb,
-                        BluetoothDevice.TRANSPORT_LE);
-                if (gatt == null) {
-                    uiLog("connectGatt 返回 null");
-                    return;
-                }
-                if (!waitFlag(STATE_CONNECTED_WAIT, CONNECT_TIMEOUT_MS)) {
-                    return;
-                }
-                gatt.requestMtu(247);
-                waitFlag(MTU_WAIT, 8000); // 失败不致命 / non-fatal
-                gatt.discoverServices();
-                if (!waitFlag(SVC_WAIT, 10000)) {
-                    return;
-                }
-                if (svcStatus != BluetoothGatt.GATT_SUCCESS) {
-                    uiLog("服务发现失败（status=" + svcStatus + "）");
-                    return;
-                }
-                BluetoothGattService svc = gatt.getService(UUID.fromString(PushProto.SERVICE_UUID));
-                if (svc == null) {
-                    uiLog("设备上没有推送服务");
-                    return;
-                }
-                BluetoothGattCharacteristic cStatus =
-                        svc.getCharacteristic(UUID.fromString(PushProto.STATUS_UUID));
-                BluetoothGattCharacteristic cCtrl =
-                        svc.getCharacteristic(UUID.fromString(PushProto.CTRL_UUID));
-                if (cStatus == null || cCtrl == null) {
-                    uiLog("推送特征缺失（5f12/5f13）");
-                    return;
-                }
-                cCtrlAi = cCtrl;
-                gatt.setCharacteristicNotification(cStatus, true);
-                BluetoothGattDescriptor cccd =
-                        cStatus.getDescriptor(UUID.fromString(PushProto.CCCD_UUID));
-                if (cccd == null) {
-                    uiLog("找不到 CCCD 描述符");
-                    return;
-                }
-                cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                if (!gatt.writeDescriptor(cccd) || !waitFlag(DSC_WAIT, 10000)) {
-                    uiLog("订阅失败");
-                    return;
-                }
-                // gen26.5 能力使能（0x09）：订阅建立的同一时刻声明「本 APK 支持
-                // 74B 上下文档」。设备默认发 66B legacy，收到本帧并置起
-                // CAP_AI_CONTEXT 后才改发 74B；老固件不认 0x09 → 回 ERR(2)，
-                // 双方行为都不变（本 APK 的旧解码路径照读 66B）。写失败也不致命。
-                // gen26.5 capability enable (0x09): declare support for the 74B
-                // contextual frame at the same moment the subscription lands. The
-                // device emits 66B legacy by default and only upgrades after this
-                // frame sets CAP_AI_CONTEXT; old firmware rejects 0x09 with ERR(2)
-                // and both sides carry on (our legacy decode path still reads 66B).
-                final byte[] capsEnable = PushProto.encodeAiCapsEnable(
-                        PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT);
-                uiLog("声明 APK 能力（0x09，bits=0x"
-                        + Long.toHexString(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT) + "）……");
-                if (!writeChar(cCtrl, capsEnable)) {
-                    uiLog("能力声明未送达，按旧帧（66B）工作");
-                }
-                listenMode = true;
-                uiLog("已连接并保持监听——在墨水屏上点英文词，释义会自动回传（约 2-5 秒出卡）。");
-                refreshAiStatus();
             }
         }).start();
+    }
+
+    /**
+     * startListen 的 worker 线程体（M1.3 抽出）：扫描 → 连接 → MTU → 服务发现 →
+     * 订阅 → 能力声明。true = 链路建成进入常驻监听；false = 任一步失败（原因已
+     * uiLog），调用方负责停 FGS。
+     */
+    private boolean listenThreadBody() {
+        resetState();
+        uiLog("扫描设备……");
+        if (!scanForDevice()) {
+            uiLog(failReason == null ? "未发现设备" : failReason);
+            return false;
+        }
+        uiLog("发现 " + foundName + "，连接中……");
+        BluetoothDevice dev = adapter.getRemoteDevice(foundAddr);
+        gatt = dev.connectGatt(MainActivity.this, false, gattCb,
+                BluetoothDevice.TRANSPORT_LE);
+        if (gatt == null) {
+            uiLog("connectGatt 返回 null");
+            return false;
+        }
+        if (!waitFlag(STATE_CONNECTED_WAIT, CONNECT_TIMEOUT_MS)) {
+            return false;
+        }
+        gatt.requestMtu(247);
+        waitFlag(MTU_WAIT, 8000); // 失败不致命 / non-fatal
+        gatt.discoverServices();
+        if (!waitFlag(SVC_WAIT, 10000)) {
+            return false;
+        }
+        if (svcStatus != BluetoothGatt.GATT_SUCCESS) {
+            uiLog("服务发现失败（status=" + svcStatus + "）");
+            return false;
+        }
+        BluetoothGattService svc = gatt.getService(UUID.fromString(PushProto.SERVICE_UUID));
+        if (svc == null) {
+            uiLog("设备上没有推送服务");
+            return false;
+        }
+        BluetoothGattCharacteristic cStatus =
+                svc.getCharacteristic(UUID.fromString(PushProto.STATUS_UUID));
+        BluetoothGattCharacteristic cCtrl =
+                svc.getCharacteristic(UUID.fromString(PushProto.CTRL_UUID));
+        if (cStatus == null || cCtrl == null) {
+            uiLog("推送特征缺失（5f12/5f13）");
+            return false;
+        }
+        cCtrlAi = cCtrl;
+        gatt.setCharacteristicNotification(cStatus, true);
+        BluetoothGattDescriptor cccd =
+                cStatus.getDescriptor(UUID.fromString(PushProto.CCCD_UUID));
+        if (cccd == null) {
+            uiLog("找不到 CCCD 描述符");
+            return false;
+        }
+        cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        if (!gatt.writeDescriptor(cccd) || !waitFlag(DSC_WAIT, 10000)) {
+            uiLog("订阅失败");
+            return false;
+        }
+        // gen26.5 能力使能（0x09）：订阅建立的同一时刻声明「本 APK 支持
+        // 74B 上下文档」。设备默认发 66B legacy，收到本帧并置起
+        // CAP_AI_CONTEXT 后才改发 74B；老固件不认 0x09 → 回 ERR(2)，
+        // 双方行为都不变（本 APK 的旧解码路径照读 66B）。写失败也不致命。
+        // gen26.5 capability enable (0x09): declare support for the 74B
+        // contextual frame at the same moment the subscription lands. The
+        // device emits 66B legacy by default and only upgrades after this
+        // frame sets CAP_AI_CONTEXT; old firmware rejects 0x09 with ERR(2)
+        // and both sides carry on (our legacy decode path still reads 66B).
+        final byte[] capsEnable = PushProto.encodeAiCapsEnable(
+                PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT);
+        uiLog("声明 APK 能力（0x09，bits=0x"
+                + Long.toHexString(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT) + "）……");
+        if (!writeChar(cCtrl, capsEnable)) {
+            uiLog("能力声明未送达，按旧帧（66B）工作");
+        }
+        listenMode = true;
+        uiLog("已连接并保持监听——在墨水屏上点英文词，释义会自动回传（约 2-5 秒出卡）。");
+        refreshAiStatus();
+        return true;
     }
 
     private void stopListen() {
         listenMode = false;
         cCtrlAi = null;
         devCaps = -1L;
+        // M1.3：停监听即停保活 FGS + 撤销未决重试（连接都没了，重试无意义）。
+        // M1.3: stop the FGS and cancel pending retries - no link, no retry.
+        cancelAiRetry();
+        mFgsRunning = false;
+        ListenKeepAliveService.stop(this);
         closeQuietly();
         uiLog("已停止监听并断开");
         refreshAiStatus();
@@ -1618,26 +1774,242 @@ public class MainActivity extends Activity {
         uiLog("墨水屏点词「" + word + "」，查询中……"
                 + (bookId != 0L ? "（上下文：书 0x" + Long.toHexString(bookId)
                         + " @ " + pos + "B）" : ""));
+        // M1.3：新点词接管——旧计划立即作废（其迟到回调被 isFinished 挡回），
+        // 未决快速重试由 cancelAiRetry 撤回，防止两次点词互相抢发。
+        // M1.3: a new word takes over; the old plan is marked finished so its
+        // late callbacks are dropped and its pending quick retry is withdrawn.
+        cancelAiRetry();
+        final AiKeepAlive plan = new AiKeepAlive(word, bookId, pos,
+                System.currentTimeMillis());
+        mAiRetry = plan;
+        runAiQueryAttempt(plan);
+    }
+
+    /** M1.3：一次查询尝试（首发与重试共用）。结果回 UI 线程统一编排。 */
+    private void runAiQueryAttempt(final AiKeepAlive plan) {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                final AiClient.Result r = AiClient.define(aiConfig(), word);
+                final AiClient.Result r = AiClient.define(aiConfig(), plan.word());
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
+                        // 已被取代/取消（新点词、停监听、退出）：迟到结果不动作。
+                        // Superseded/cancelled (new word, stop, exit): drop it.
+                        if (plan.isFinished() || mAiRetry != plan) {
+                            return;
+                        }
                         if (!r.ok) {
                             // 失败不回帧：设备不会弹出空卡（诚实优于假成功）。
-                            uiLog("释义失败：" + r.error + "（不回帧）");
+                            // 但 M1.3 不再就此罢手：息屏挂起期间网络恢复时补得上。
+                            // No frame on failure (the device never shows an empty
+                            // card); M1.3 adds event-driven retry so a network
+                            // recovery can still land the 0x07 inside the window.
+                            uiLog("释义失败：" + r.error + "（不回帧，安排重试）");
+                            scheduleAiRetry(plan);
                             refreshAiStatus();
                             return;
                         }
+                        plan.markFinished();
                         uiLog("释义：" + r.text);
-                        sendAiResult(word, r.text);
+                        sendAiResult(plan.word(), r.text);
                         refreshAiStatus();
                     }
                 });
             }
         }).start();
+    }
+
+    /**
+     * M1.3：失败后的重试编排（UI 线程）。3s 快速重试一次（防瞬时 DNS 抖动），
+     * 之后只等事件（网络可用 / 亮屏），14s 窗口 cap 贴设备 15s 超时。快速重试
+     * 与事件互斥：事件抢先时撤回挂起的快速重试，不双发。
+     * Retry orchestration after a failure: one 3s quick retry, then events only,
+     * capped at a 14s window. The quick retry and events are mutually exclusive.
+     */
+    private void scheduleAiRetry(final AiKeepAlive plan) {
+        if (plan.isFinished() || mAiRetry != plan) {
+            return; // 已终态或被新查询接管
+        }
+        final long now = System.currentTimeMillis();
+        if (plan.windowExpired(now)) {
+            // 超窗放弃：迟到释义走设备侧预取缓存门 A 语义，下次点同词秒出。
+            // Window exhausted: a late 0x07 lands in the device prefetch cache
+            // (gate A) and the next tap on the same word answers instantly.
+            plan.markFinished();
+            unregisterKeepAliveEvents();
+            uiLog("重试窗口已过（" + (AiKeepAlive.RETRY_WINDOW_MS / 1000)
+                    + "s），本次点词放弃——下次点同一词会命中预取缓存秒出");
+            refreshAiStatus();
+            return;
+        }
+        if (!plan.quickRetryUsed()) {
+            // 安排一次性快速重试（距查询发起 3s；查询本身耗时时余量自然缩短）。
+            // Schedule the one-shot quick retry at start+3s; a slow query just
+            // shortens the remaining delay.
+            plan.consumeQuickRetry();
+            final long delay = Math.max(
+                    0, plan.startMs() + AiKeepAlive.QUICK_RETRY_DELAY_MS - now);
+            uiLog("网络疑似被挂起，" + (AiKeepAlive.QUICK_RETRY_DELAY_MS / 1000)
+                    + " 秒后快速重试一次，之后只等网络恢复/亮屏事件……");
+            mQuickRetryRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    mQuickRetryRunnable = null;
+                    if (plan.isFinished() || mAiRetry != plan) {
+                        return;
+                    }
+                    final long t = System.currentTimeMillis();
+                    if (plan.windowExpired(t)) {
+                        plan.markFinished();
+                        unregisterKeepAliveEvents();
+                        uiLog("重试窗口已过（" + (AiKeepAlive.RETRY_WINDOW_MS / 1000)
+                                + "s），本次点词放弃——下次点同一词会命中预取缓存秒出");
+                        refreshAiStatus();
+                        return;
+                    }
+                    runAiQueryAttempt(plan); // 快速重试这一次
+                }
+            };
+            mQuickRetryHandler.postDelayed(mQuickRetryRunnable, delay);
+            registerKeepAliveEvents(); // 事件也挂上：快速重试后再失败只等事件
+        } else if (plan.eventRetryDue(now)) {
+            // 额度已用（快速重试已发或事件抢先）：只挂事件等恢复。
+            // Quota spent: wait for events only.
+            registerKeepAliveEvents();
+        }
+        // 其余组合（未用额度但事件也……）不会出现：上面两支穷尽。
+    }
+
+    /** M1.3：网络可用 / 亮屏 / 解锁到达——窗口内补发一次查询。 */
+    private void onKeepAliveEvent(String why) {
+        final AiKeepAlive plan = mAiRetry;
+        if (plan == null || plan.isFinished()) {
+            unregisterKeepAliveEvents(); // 无事可做：撤掉监听，不空转
+            return;
+        }
+        final long now = System.currentTimeMillis();
+        if (plan.windowExpired(now)) {
+            plan.markFinished();
+            unregisterKeepAliveEvents();
+            uiLog("重试窗口已过（" + (AiKeepAlive.RETRY_WINDOW_MS / 1000)
+                    + "s），本次点词放弃——下次点同一词会命中预取缓存秒出");
+            refreshAiStatus();
+            return;
+        }
+        if (plan.eventRetryDue(now)) {
+            // 事件抢先：撤回挂起的快速重试并消耗其额度——两条路不双发。
+            // The event preempts the quick retry: withdraw it and consume its
+            // quota so exactly one retry goes out.
+            plan.consumeQuickRetry();
+            if (mQuickRetryRunnable != null) {
+                mQuickRetryHandler.removeCallbacks(mQuickRetryRunnable);
+                mQuickRetryRunnable = null;
+            }
+            uiLog("网络恢复（" + why + "），重试查询……");
+            runAiQueryAttempt(plan);
+        }
+    }
+
+    /** M1.3：撤销未决重试计划 + 挂起的快速重试 + 事件监听（幂等）。 */
+    private void cancelAiRetry() {
+        final AiKeepAlive plan = mAiRetry;
+        if (plan != null) {
+            plan.markFinished();
+        }
+        mAiRetry = null;
+        if (mQuickRetryRunnable != null) {
+            mQuickRetryHandler.removeCallbacks(mQuickRetryRunnable);
+            mQuickRetryRunnable = null;
+        }
+        unregisterKeepAliveEvents();
+    }
+
+    /** M1.3：挂网络可用 + 亮屏/解锁事件（幂等，查完即撤）。 */
+    private void registerKeepAliveEvents() {
+        if (mNetworkCallback == null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager)
+                        getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    NetworkRequest req = new NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build();
+                    mNetworkCallback = new ConnectivityManager.NetworkCallback() {
+                        @Override
+                        public void onAvailable(Network network) {
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    onKeepAliveEvent("网络可用");
+                                }
+                            });
+                        }
+                    };
+                    cm.registerNetworkCallback(req, mNetworkCallback);
+                }
+            } catch (Throwable ignored) {
+                // 注册失败不崩：快速重试仍在，白名单/FGS 主修不受影响。
+                // A failed registration never crashes; the quick retry and the
+                // FGS/whitelist primary fixes are unaffected.
+                mNetworkCallback = null;
+            }
+        }
+        if (mKeepAliveReceiver == null) {
+            mKeepAliveReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context c, Intent i) {
+                    final String action = i == null ? null : i.getAction();
+                    onKeepAliveEvent(Intent.ACTION_USER_PRESENT.equals(action)
+                            ? "解锁亮屏" : "亮屏");
+                }
+            };
+            try {
+                IntentFilter f = new IntentFilter(Intent.ACTION_SCREEN_ON);
+                f.addAction(Intent.ACTION_USER_PRESENT);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(mKeepAliveReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+                } else {
+                    registerReceiver(mKeepAliveReceiver, f);
+                }
+            } catch (Throwable ignored) {
+                mKeepAliveReceiver = null;
+            }
+        }
+    }
+
+    /** M1.3：注销网络/亮屏事件（幂等）。 */
+    private void unregisterKeepAliveEvents() {
+        if (mNetworkCallback != null) {
+            try {
+                ConnectivityManager cm = (ConnectivityManager)
+                        getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    cm.unregisterNetworkCallback(mNetworkCallback);
+                }
+            } catch (Throwable ignored) {
+                // 重复注销/已回收：无操作即目标态。
+            }
+            mNetworkCallback = null;
+        }
+        if (mKeepAliveReceiver != null) {
+            try {
+                unregisterReceiver(mKeepAliveReceiver);
+            } catch (Throwable ignored) {
+                // 同上。
+            }
+            mKeepAliveReceiver = null;
+        }
+    }
+
+    /** M1.3：电池优化白名单状态（状态行「保活」组合判定的一半）。 */
+    private boolean batteryWhitelisted() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+        } catch (Throwable t) {
+            return false; // 取不到就当未授权：状态行显示「受限」，引导用户去开
+        }
     }
 
     /** 按 UTF-8 字节切段，不切断多字节序列。/ chunk by UTF-8 bytes, never mid-sequence. */
