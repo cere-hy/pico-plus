@@ -679,6 +679,19 @@ static void adv_stop(void) {
 // bytes of gen11); the UUID rides the scan response (a separate 31-byte
 // payload delivered to active scanners).
 static void adv_start(void) {
+    // gen26.6.3：已连接时不起广播——广播在连上那一刻就停了（ble_gap_adv_active()
+    // 为假），而会话状态非 IDLE（CONNECTED/ARMED…），于是 tick/断连/ADV_ON 三条
+    // 恢复路径都会在「已连接」时反复 adv_start()，每次被 NimBLE 拒绝（真机日志里
+    // `ble_gap_adv_validate rc=6` + `adv start rc=6` 每 2s 一条）。这不影响连接，
+    // 但纯属空转噪声；连接在就没必要广播，重连广播由断连事件负责。
+    // gen26.6.3: do not advertise while connected - advertising stopped the moment
+    // the link came up (ble_gap_adv_active() is false) while the session state is
+    // non-IDLE (CONNECTED/ARMED/...), so the tick / disconnect / ADV_ON recovery
+    // paths all called adv_start() every ~2s and NimBLE refused each time
+    // (`ble_gap_adv_validate rc=6` + `adv start rc=6` in the on-device log). The
+    // link is unaffected, but it is pure idle noise; a live link needs no
+    // advertising, and the reconnect broadcast is the disconnect event's job.
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;
     snprintf(s_adv_name, sizeof(s_adv_name), "%s%04X", PUSH_ADV_NAME_PREFIX, s_sess.token);
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
@@ -1359,11 +1372,20 @@ void push_sink_ai_tap_word(const char *word) {
 
 void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos) {
     if (!word || !*word) return;
-    if (s_ai_enabled) {
+    if (!s_ai_enabled) return;
+    // gen26.6.2 离线缓存命中：**预取缓存是设备自己的记忆，不是补查**——命中即本地出卡，
+    // **与连接态无关**（离线 + 已缓存词同样秒出）。它与「断连不入队、错过让它过去」
+    // 同哲学：缓存是已经拿到的答案，补查才是去要新答案。故这一查必须排在 live 门之前，
+    // 顺序颠倒即回归缺陷（wiring 守门 + 变异钉死）。/ gen26.6.2 offline cache hit: the
+    // prefetch cache is the device's OWN memory, not a re-query - a hit surfaces the
+    // card locally REGARDLESS of link state. Same philosophy as "no offline queue, let
+    // missed words pass": the cache is an answer already received, a re-query asks for a
+    // new one. So this lookup must run BEFORE the live gate; flipping the order is the
+    // regression (pinned by the wiring guard and a mutation).
+    {
         const char *cached = ai_cache_find(word);
         if (cached) { ai_surface(word, cached); return; } // 命中预取缓存：秒出卡
     }
-    if (!s_ai_enabled) return;
     lock();
     const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
     if (live) {
@@ -1452,7 +1474,11 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         return;
     }
     if (op == PUSH_OP_AI_RESULT) {
-        push_ai_result_t r;
+        // gen26.6.4：静态化。此结构随 PUSH_AI_DEF_MAX 尺寸化（832→1264B，+432B），
+        // 若留在栈上会压 NimBLE host 任务栈；GATT 写回调在 host 任务上串行执行，无重入。
+        // gen26.6.4: static - the struct scales with PUSH_AI_DEF_MAX (+432B) and the
+        // GATT write callback runs serially on the NimBLE host task (no re-entry).
+        static push_ai_result_t r;
         if (!push_ai_result_decode(data, len, &r)) {
             ESP_LOGW(TAG, "ai result decode rejected: len=%u", (unsigned)len);
             reply_err(PUSH_ERR_BAD_FRAME);
@@ -2249,6 +2275,18 @@ bool push_sink_link_up(void) {
 bool push_sink_tts_send_page(const char *text, size_t len) {
     ensure_init();
     if (!text && len) return false;
+    // gen26.6.2：空页帧（len=0 = 「静默/停止朗读」）留一条串口日志。关听书开关（D2A）
+    // 与重连补发（D2B）这两条停止路径此前**零日志**，真机只能靠听感、审计拿不到证据——
+    // 停止是用户可感知的行为，必须有可查落点。（本轮因热区/离线缓存修复必须重编，
+    // 打点零成本搭车；此前为它单独重编不划算故未做。）
+    // gen26.6.2: log the empty-page frame (len=0 = silence / stop). The switch-off
+    // (D2A) and reconnect-resend (D2B) stop paths logged nothing before, leaving only
+    // ear-witness and no audit evidence - stopping is user-visible and needs a trace.
+    // (This round rebuilds anyway for the hot zone / offline cache, so the log rides
+    // along for free; a rebuild just for it was not worth it.)
+    if (len == 0) {
+        ESP_LOGI(TAG, "tts page stop: empty frame (peer silence; switch off or resend)");
+    }
     lock();
     const size_t total = push_tts_frame_count(text, len);
     bool ok = true;

@@ -44,6 +44,10 @@ enum EpdRotation epd_get_rotation(void) { return g_rotation; }
 /* ---- ui_kit 替身 / ui_kit doubles ---- */
 #define MAX_TEXT_CALLS 48
 static struct { int x; int px; char text[192]; } g_texts[MAX_TEXT_CALLS];
+// gen26.6.3：「看全文 ›」的绘制锚点/基线——用于断言「整段在热区内、左缘可命中」。
+// gen26.6.3: the "看全文 ›" draw anchor/baseline - used to assert "the whole label
+// lies inside the hit zone and its left edge hits".
+static int g_label_x, g_label_y, g_label_px;
 static int g_text_count;
 
 void ui_text_fixed(uint8_t* framebuffer, int x, int y_top, int px, const char* text,
@@ -53,6 +57,7 @@ void ui_text_fixed(uint8_t* framebuffer, int x, int y_top, int px, const char* t
         g_texts[g_text_count].x = x; // gen26.6：右缘断言需要起点 x / the right-edge check needs x
         g_texts[g_text_count].px = px;
         snprintf(g_texts[g_text_count].text, sizeof(g_texts[g_text_count].text), "%s", text);
+        if (strcmp(text, "看全文 ›") == 0) { g_label_x = x; g_label_y = y_top; g_label_px = px; }
         ++g_text_count;
     }
 }
@@ -410,6 +415,102 @@ static void test_wrap_bounds(void) {
     dict_popup_reset();
 }
 
+// gen26.6.2：「……」详解入口——截断标记就是入口，热区以它为中心扩大
+// （真机"按不到、按下去还被判 MISSED 关卡"缺陷的回归断言）。
+// gen26.6.2: the "……" detail entry - the truncation mark IS the entry, its hit zone
+// expanded around it (regression for the on-device "cannot hit it / closes instead").
+static void test_more_entry(void) {
+    static const char unit[] = "\xE4\xB8\xAD"; // 中 / a full-width glyph
+    // 未触顶：无省略号，热区必须为零，点击照旧 MISSED（不吞点击）。
+    // Not truncated: no ellipsis, so the hit zone must be zero and a tap stays MISSED.
+    g_dict_ready = true;
+    g_dict_hit = true;
+    snprintf(g_dict_def, sizeof(g_dict_def), "偶然发现珍宝的运气");
+    CHECK(dict_popup_open("serendipity"));
+    CHECK(!dict_popup_ai_truncated());
+    EpdRect none = dict_popup_more_rect();
+    CHECK(none.width == 0 && none.height == 0);
+    CHECK(dict_popup_full_text() == NULL);
+    EpdRect card0 = dict_popup_rect();
+    CHECK(dict_popup_tap((uint16_t)(card0.x + card0.width - TEST_CARD_PAD),
+                         (uint16_t)(card0.y + card0.height - TEST_CARD_PAD))
+          == DICT_POPUP_TAP_MISSED);
+    // gen26.6.3 A：未触顶不得出现「看全文 ›」（误画即噪音，真机会让用户以为被截断）。
+    // gen26.6.3 A: no "看全文 ›" when nothing is truncated (drawing it would be noise
+    // and would tell the reader the text was cut when it was not).
+    draw_card();
+    CHECK(!drew_text("看全文 ›"));
+    dict_popup_reset();
+
+    // 触顶（词典长条目）：省略号画出，热区扩大到 >= 96 且钳位卡内，中心与右下锚点都可命中。
+    // Truncated (long dictionary entry): the ellipsis is drawn, the hit zone grows to
+    // >= 96 and is clamped inside the card; both its centre and the bottom-right anchor hit.
+    char full[3 * 300 + 1];
+    size_t o = 0;
+    for (int i = 0; i < 300; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    full[o] = 0;
+    snprintf(g_dict_def, sizeof(g_dict_def), "%s", full);
+    CHECK(dict_popup_open("confidence"));
+    CHECK(dict_popup_ai_truncated());
+    EpdRect card = dict_popup_rect();
+    EpdRect more = dict_popup_more_rect();
+    CHECK(more.width >= 96);
+    CHECK(more.height >= 96);
+    CHECK(more.x >= card.x);
+    CHECK(more.y >= card.y);
+    CHECK(more.x + more.width <= card.x + card.width);
+    CHECK(more.y + more.height <= card.y + card.height);
+    // 真机回归点：热区中心 + 原来那三个点的位置（右下角）都必须命中
+    // On-device regression: the centre and the original dots' spot must both hit.
+    CHECK(dict_popup_tap((uint16_t)(more.x + more.width / 2),
+                         (uint16_t)(more.y + more.height / 2)) == DICT_POPUP_TAP_MORE);
+    CHECK(dict_popup_tap((uint16_t)(card.x + card.width - TEST_CARD_PAD),
+                         (uint16_t)(more.y + more.height / 2)) == DICT_POPUP_TAP_MORE);
+    // 全文留存：详解会话要有文可载 / The full text must be there for the session.
+    const char* text = dict_popup_full_text();
+    CHECK(text != NULL);
+    CHECK(text != NULL && strlen(text) > (size_t)200);
+    // gen26.6.3 A：「看全文 ›」触顶才画、24px 纯文字、右缘不越「卡右缘 − PAD」，
+    // 且「……」仍在（截断标记保留，热区几何不动）。
+    // gen26.6.3 A: "看全文 ›" is drawn only when truncated, at 24px plain text, never
+    // past (card right - PAD), and the "……" marker is still there (hit zone untouched).
+    draw_card();
+    CHECK(drew_text("看全文 ›"));
+    CHECK(drew_text("……"));
+    {
+        int seen = 0;
+        const int limit = card.x + card.width - TEST_CARD_PAD;
+        for (int i = 0; i < g_text_count; ++i) {
+            if (strcmp(g_texts[i].text, "看全文 ›") != 0) continue;
+            ++seen;
+            CHECK(g_texts[i].px == 24); // 24px 纯文字，不许变成别的字号 / 24px plain text
+            // 右对齐绘制：x 就是右锚点（不是左起点）。断言锚点不越「卡右缘 − PAD」，
+            // 且整段标签仍在卡内。
+            // Right-aligned draw: x IS the right anchor (not the left origin). Assert the
+            // anchor stays inside (card right - PAD) and the whole label stays in the card.
+            CHECK(g_texts[i].x <= limit);
+            CHECK(g_texts[i].x - ui_text_fixed_width_px(g_texts[i].px, g_texts[i].text) >= card.x);
+        }
+        CHECK(seen == 1); // 只画一次 / drawn exactly once
+    }
+    // gen26.6.3：**同热区并存、一条入口**——标签整段落在 more_rect 内，且左缘也命中
+    // TAP_MORE。旧实现热区只有 96 见方，标签左半截落在区外，点上去被判 MISSED 关卡
+    // （真机「点了字却把卡关了」）。
+    // gen26.6.3: ONE entry, ONE zone - the whole label lies inside more_rect and its
+    // left edge hits TAP_MORE too. The old 96x96 zone left the label's left half
+    // outside, where a tap was judged MISSED and closed the card.
+    {
+        const int label_left = g_label_x - ui_text_fixed_width_px(g_label_px, "看全文 ›");
+        CHECK(g_label_px == 24);
+        CHECK(label_left >= more.x);                       // 整段在热区内 / inside the zone
+        CHECK(g_label_x <= more.x + more.width);
+        CHECK(dict_popup_tap((uint16_t)(label_left + 2), (uint16_t)g_label_y) == DICT_POPUP_TAP_MORE);
+        CHECK(dict_popup_tap((uint16_t)g_label_x, (uint16_t)g_label_y) == DICT_POPUP_TAP_MORE);
+    }
+    dict_popup_reset();
+    CHECK(dict_popup_full_text() == NULL); // reset 清全文 / reset clears it
+}
+
 static void test_pending_timeout(void) {
     CHECK(!dict_popup_pending_expired(15000000)); // 非查询态恒假 / never outside the query state
     dict_test_now_us = 1000000;
@@ -520,6 +621,7 @@ int main(void) {
     test_word_match_edges();
     test_capacity();
     test_wrap_bounds();
+    test_more_entry();
     test_pending_timeout();
     test_reset_clears_pending();
     test_ai_entry();
@@ -527,6 +629,6 @@ int main(void) {
         printf("dict_popup: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 135/270 + right-edge bound + wrap bounds + timeout + AI entry)");
+    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 135/270 + right-edge bound + wrap bounds + more-entry hot zone + timeout + AI entry)");
     return 0;
 }

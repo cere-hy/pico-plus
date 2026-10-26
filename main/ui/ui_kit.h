@@ -163,6 +163,24 @@ int ui_text_title_fit(char *text, int preferred_px, int width, const char *font_
 /// Rasterize the active face directly with gray antialiasing at the target size, visually centered and independent of UI scaling.
 void ui_text_title_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
                       const char *font_sample, enum EpdFontFlags align);
+
+/// 阅读字体优先的正文绘制：当前阅读字体（矢量、抗锯齿）覆盖整行时用它，
+/// 缺字时整行回退内建点阵。字形是否走 TTF 与 ui_text_reader_uses_ttf 同判据。
+/// Reader-face body drawing: use the active reading face (vector, antialiased)
+/// when it covers the whole line; otherwise fall back to the built-in bitmap for
+/// that line. Same predicate as ui_text_reader_uses_ttf.
+void ui_text_reader(uint8_t *fb, int x, int y_top, int px, const char *text);
+/// 与 ui_text_reader 同源的逐字前进宽度（只查度量，不栅格化）。装行必须用它，
+/// 否则「算的」和「画的」又是两套账。
+/// Per-code-point advance from the same face ui_text_reader paints with (metrics
+/// only, no rasterization). Line breaking must use it or measure and paint diverge.
+int ui_text_reader_advance_px(int px, uint32_t codepoint);
+/// 该行是否由阅读字体承载（供日志与宿主断言）。
+/// Whether the reader face covers this whole line (for logging and host assertions).
+bool ui_text_reader_uses_ttf(const char *text);
+/// 阅读字体的大写字母高（cap），用于把「英文视觉 ≈51px」校准成字号。
+/// Cap height of the reading face, used to calibrate the "English visual ~51px" reference.
+int ui_text_reader_cap_px(int px);
 void ui_text_bw(
     uint8_t* framebuffer, int x, int y_top, int px, const char* text,
     enum EpdFontFlags align, bool inverted

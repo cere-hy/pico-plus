@@ -345,6 +345,122 @@ void ui_text_fixed_context_aa_vc(uint8_t *fb,int x,int center_y,int px,const cha
     }
 }
 
+bool ui_text_reader_uses_ttf(const char *text) {
+    return text && *text && ttf_font_ready() && ttf_font_has_text(text);
+}
+
+int ui_text_reader_advance_px(int px, uint32_t codepoint) {
+    if (px <= 0) return 0;
+    if (ttf_font_ready()) {
+        const int advance = ttf_codepoint_advance_px(px, codepoint);
+        if (advance > 0) return advance;
+    }
+    // 字体缺字：用内建点阵的同口径 advance（与整行兜底一致），永不返回 0。
+    // Missing glyph: use the built-in bitmap's advance (same as the whole-line
+    // fallback) and never return 0, so line breaking cannot stall.
+    char utf8[5];
+    int n = 0;
+    if (codepoint < 0x80) {
+        utf8[n++] = (char)codepoint;
+    } else if (codepoint < 0x800) {
+        utf8[n++] = (char)(0xC0 | (codepoint >> 6));
+        utf8[n++] = (char)(0x80 | (codepoint & 0x3F));
+    } else if (codepoint < 0x10000) {
+        utf8[n++] = (char)(0xE0 | (codepoint >> 12));
+        utf8[n++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        utf8[n++] = (char)(0x80 | (codepoint & 0x3F));
+    } else {
+        utf8[n++] = (char)(0xF0 | (codepoint >> 18));
+        utf8[n++] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        utf8[n++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        utf8[n++] = (char)(0x80 | (codepoint & 0x3F));
+    }
+    utf8[n] = 0;
+    const int width = ui_font_text_width_px(px, utf8);
+    return width > 0 ? width : px;
+}
+
+static int reader_utf8_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static uint32_t reader_utf8_cp(const char *s, int *step) {
+    const unsigned char *p = (const unsigned char *)s;
+    const int n = reader_utf8_len(p[0]);
+    uint32_t cp = p[0];
+    if (n == 1) { *step = 1; return cp; }
+    cp = p[0] & (0xFFu >> (n + 1));
+    for (int i = 1; i < n; ++i) cp = (cp << 6) | (p[i] & 0x3Fu);
+    *step = n;
+    return cp;
+}
+
+// 一段文本的宽度：与绘制逐字同一把 advance，游标因此不会随段落切换漂移。
+// Width of a run: the same per-glyph advance the paint uses, so the cursor never
+// drifts when the face switches mid-line.
+static int reader_run_width_px(int px, const char *text) {
+    int width = 0;
+    while (text && *text) {
+        int n = 0;
+        const uint32_t cp = reader_utf8_cp(text, &n);
+        width += ui_text_reader_advance_px(px, cp);
+        text += n;
+    }
+    return width;
+}
+
+void ui_text_reader(uint8_t *fb, int x, int y_top, int px, const char *text) {
+    if (!fb || !text || !*text || px <= 0) return;
+    if (!ttf_font_ready()) {
+        // 没有阅读字体（无字体卡）：整行走内建点阵，行为与旧版一致。
+        // No reading face (no font card): the whole line stays on the bitmap.
+        ui_text_fixed(fb, x, y_top, px, text, EPD_DRAW_ALIGN_LEFT, false);
+        return;
+    }
+    const int baseline = y_top + ttf_ascender_px(px);
+    int cursor = x;
+    const char *p = text;
+    char run[192];
+    while (*p) {
+        int n = 0;
+        const uint32_t first = reader_utf8_cp(p, &n);
+        const bool ttf = ttf_codepoint_covered(first);
+        const char *start = p;
+        while (*p) {
+            int step = 0;
+            const uint32_t cp = reader_utf8_cp(p, &step);
+            if (ttf_codepoint_covered(cp) != ttf) break;
+            p += step;
+        }
+        size_t len = (size_t)(p - start);
+        if (len > sizeof(run) - 1) { // 理论上到不了（一行 ≤ 612px），防御性回退到字符边界
+            len = sizeof(run) - 1;
+            while (len && ((unsigned char)start[len] & 0xC0) == 0x80) --len;
+            p = start + len;
+        }
+        memcpy(run, start, len);
+        run[len] = 0;
+        // 缺字只让那几个字走点阵，其余仍由阅读字体绘制——不再整行降级。
+        // Only the missing glyphs drop to the bitmap; the rest keep the reading face.
+        if (ttf)
+            ttf_draw_text_px(fb, cursor, baseline, px, run, EPD_DRAW_ALIGN_LEFT, 0, 15);
+        else
+            ui_font_draw_text_px(fb, cursor, baseline, px, run, EPD_DRAW_ALIGN_LEFT, 0, 15, false);
+        cursor += reader_run_width_px(px, run);
+    }
+}
+
+int ui_text_reader_cap_px(int px) {
+    if (px <= 0 || !ttf_font_ready()) return 0;
+    int above = 0, below = 0;
+    ttf_measure_line_px(px, "H", &above, &below);
+    return above;
+}
+
 int ui_text_title_fit(char *text, int preferred_px, int width, const char *font_sample) {
     const char *sample = font_sample ? font_sample : text;
     bool builtin = !title_uses_active_font(sample) && ui_font_has_text(sample);

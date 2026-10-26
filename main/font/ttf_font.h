@@ -150,6 +150,19 @@ void ttf_measure_line(int size, const char* text, int* above, int* below);
 void ttf_measure_line_px(int pixel_height, const char* text, int* above, int* below);
 int ttf_text_width_px(int pixel_height, const char* text);
 
+/// 单个码位的前进宽度（与 ttf_draw_text_px / ttf_text_width_px 同一把 scale 和取整）。
+/// 只查 hmtx、不栅格化，供「按真实字宽装行」逐字累加；字体未覆盖该码位返回 0。
+/// Advance of one code point, measured with the same scale and rounding as
+/// ttf_draw_text_px / ttf_text_width_px. Reads hmtx only (no rasterization) so line
+/// breaking can sum real advances; returns 0 when the face has no glyph for it.
+int ttf_codepoint_advance_px(int pixel_height, uint32_t codepoint);
+
+/// 字体是否覆盖该码位（不含 .notdef）。供「逐段回退」判断：缺字只让那几个字走
+/// 点阵，而不是整行降级。
+/// Whether the face covers this code point (excluding .notdef). Used for
+/// per-run fallback: only the missing glyphs drop to the bitmap, not the line.
+bool ttf_codepoint_covered(uint32_t codepoint);
+
 /// 绘制期的字体切换点：从 offset 起改用 slot，直到下一个切换点。
 /// A face switch while drawing: bytes from `offset` use `slot` until the next switch.
 typedef struct {

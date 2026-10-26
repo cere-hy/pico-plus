@@ -649,7 +649,13 @@ void app_loop_run(const app_loop_config_t* config) {
             // the def-arrival/touch-dispatch same-tick window is absorbed by the
             // discard (same treatment as card-removal events).
             char ai_word[PUSH_AI_WORD_MAX + 1];
-            char ai_def[PUSH_AI_DEF_MAX + 1];
+            // gen26.6.4：静态化。PUSH_AI_DEF_MAX 768→1200 若留在栈上会把 12KB 主任务
+            // 栈再压 +432B；栈溢出的排障成本远高于 1.2KB 静态内存。单线程主循环、无
+            // 重入，static 安全。
+            // gen26.6.4: static, not stack - widening DEF_MAX to 1200 would add +432B
+            // to the 12KB main-task stack; a stack overflow costs far more than 1.2KB
+            // of .bss. The main loop is single-threaded and non-reentrant.
+            static char ai_def[PUSH_AI_DEF_MAX + 1];
             if (push_sink_take_ai_def(ai_word, sizeof(ai_word), ai_def, sizeof(ai_def))) {
                 // gen26.5 M2 Step8：释义回流先进 AI 生词批，再走弹卡。两个动作解耦——
                 // 弹卡被门 A 丢弃（其他面板开着）时，落库照旧：交互已经发生，

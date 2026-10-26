@@ -22,12 +22,25 @@ static inline void ui_text_set_system_font(bool enabled) { (void)enabled; }
 // adding declarations creates no references).
 void ui_text(uint8_t* framebuffer, int x, int y_top, int px, const char* text,
              enum EpdFontFlags align, bool inverted);
+// gen26.6.3：详解正文改走 ui_text_fixed（与词卡同族、不随阅读字号缩放）。
+// gen26.6.3: the detail body now draws with ui_text_fixed (same family as the
+// card, no reading-scale).
+void ui_text_fixed(uint8_t* framebuffer, int x, int y_top, int px, const char* text,
+                   enum EpdFontFlags align, bool inverted);
 int ui_text_fixed_width_px(int px, const char* text);
 void ui_text_fixed_vc(uint8_t* framebuffer, int x, int center_y, int px, const char* text,
                       enum EpdFontFlags align, bool inverted);
 int ui_text_title_fit(char* text, int preferred_px, int width, const char* font_sample);
 void ui_text_title_vc(uint8_t* fb, int x, int center_y, int px, const char* text,
                       const char* font_sample, enum EpdFontFlags align);
+
+// gen26.6.5：阅读字体优先的正文绘制与同源度量（宿主侧由测试记录桩实现）。
+// gen26.6.5: reader-face-first body drawing and its same-source metrics
+// (implemented by the test's recording stubs).
+void ui_text_reader(uint8_t* fb, int x, int y_top, int px, const char* text);
+int ui_text_reader_advance_px(int px, uint32_t codepoint);
+bool ui_text_reader_uses_ttf(const char* text);
+int ui_text_reader_cap_px(int px);
 void ui_hairline(uint8_t* framebuffer, int y, int x, int w, uint8_t color);
 void ui_clear_page(uint8_t* framebuffer);
 void ui_nav_status(uint8_t* fb);

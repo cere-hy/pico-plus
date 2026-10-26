@@ -115,24 +115,51 @@ int ai_reader_page_count(void);
 const char* ai_reader_word(void);
 const ai_reader_source_t* ai_reader_source(void);
 
-/// 版面参数（每行全角字符数、每页行数）。render 每次绘制前按当前方向实算
-/// 后设置；turn/页码查询用同一组参数保证分页与所见一致。参数变化才重排。
-/// Layout metrics (full-width chars per line, lines per page). render computes
-/// them for the current rotation before every paint; turns and page queries
-/// use the same metrics so pagination matches what is on screen. Repaginate
-/// only when they change.
-void ai_reader_set_metrics(int chars_per_line, int lines_per_page);
+/// 详解页的排版样式：**全部取自当前阅读正文**，不另立一套度量。
+/// 字号 = 阅读设置字号；行距 = 字号 × 行距% / 100（与 book_layout 同一公式）；
+/// left/width = 正文版心（body_rect，已按整字格收齐）。app_book 每次绘制前注入。
+/// The detail view's type style - every field comes from the LIVE reader body, so
+/// there is no second set of metrics: px is the reading size, line_h is the same
+/// px*spacing%/100 the book layout uses, and left/width are the body rect (already
+/// snapped to whole glyph cells). app_book injects it before each paint.
+typedef struct {
+    int px;     ///< 正文字号 / reading font px
+    int line_h; ///< 正文行距 / reading line pitch
+    int left;   ///< 版心左缘 / body left edge
+    int width;  ///< 版心宽 / body measure
+} ai_reader_style_t;
+
+/// 注入排版样式；NULL 取消注入（回落到内置安全默认，仅调试/宿主场景）。
+/// Inject the style; NULL clears it (falls back to a safe default, debug/host only).
+void ai_reader_set_style(const ai_reader_style_t* style);
+
+/// 版面参数（正文版心像素宽、正文字号、每页行数）。render 每次绘制前按当前
+/// 方向实算后设置；turn/页码查询用同一组参数保证分页与所见一致。参数变化才重排。
+/// 装行按「字号推出来的真实字宽」累加（见 ai_reader_advance_fn），不再用
+/// 「每行几个全角」的理想化单位——度量与绘制必须同源。
+/// Layout metrics (body measure in px, body font px, lines per page). render
+/// computes them for the current rotation before every paint; turns and page
+/// queries reuse them so pagination matches the screen. Repaginate only on
+/// change. Line breaking sums real glyph advances (see ai_reader_advance_fn)
+/// instead of an idealised "full-width slots per line" - measure must equal paint.
+void ai_reader_set_layout(int width_px, int text_px, int lines_per_page);
+
+/// 逐字前进宽度回调（宿主测试注入假宽表；设备侧默认走 ui_text_reader_advance_px）。
+/// 传 NULL 恢复默认。px 为该次排版的字号。
+/// Per-code-point advance callback (host tests inject a width table; the device
+/// defaults to ui_text_reader_advance_px). NULL restores the default.
+typedef int (*ai_reader_advance_fn)(void* ctx, uint32_t codepoint, int px);
+void ai_reader_set_advance(ai_reader_advance_fn fn, void* ctx);
 
 /// 分页纯函数：返回总页数；out_starts[i] = 第 i 页首字符在 text 里的字节偏移。
-/// 规则——按 UTF-8 字符推进（ASCII 也占一个全角位，与词卡 27px advance 口径
-/// 一致，保守不多装）；显式 '\n' 强制断行；空行保留占位。不写 out_starts 也
-/// 能安全调用（传 NULL/0 只数页）。
-/// Pagination pure function: returns the page count; out_starts[i] is the
-/// byte offset of page i's first character. Rules - advance by UTF-8
-/// character (ASCII also takes one full-width slot, matching the card's 27px
-/// advance, so it under- rather than over-fills); an explicit '\n' forces a
-/// break; empty lines keep their slot. Safe to call with NULL/0 to count only.
-int ai_reader_paginate(const char* text, int chars_per_line, int lines_per_page,
+/// 规则——按真实字宽装行（宽度不够时优先退回最近空格/连字符，其次服从避头尾
+/// 标点）；显式 '\n' 强制断行；空行保留占位。不写 out_starts 也能安全调用。
+/// Pagination pure function: returns the page count; out_starts[i] is the byte
+/// offset of page i's first character. Rules - fill by real glyph advances,
+/// backing off to the nearest space/hyphen first and then to the punctuation
+/// no-start/no-end rules; an explicit '\n' forces a break; empty lines keep
+/// their slot. Safe with NULL/0 to count only.
+int ai_reader_paginate(const char* text, int width_px, int text_px, int lines_per_page,
                        size_t* out_starts, int max_pages);
 
 /// 取某一页的各行（指向 text 内部的偏移/长度对，不复制、不改写）。

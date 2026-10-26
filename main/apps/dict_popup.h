@@ -94,6 +94,24 @@ EpdRect dict_popup_save_rect(void);
 /// gen26.4: the "AI" entry chip rect (shared by draw and hit-test) - tappable only
 /// on a dictionary definition card.
 EpdRect dict_popup_ai_rect(void);
+/// gen26.6.2「……」详解入口的区域（绘制与命中共用）：**截断标记就是入口**。
+/// gen26.6.3：热区不再是 96 见方的正方形，而是覆盖「…… 看全文 ›」**整条**的矩形
+/// （高仍是 96）——一条入口、一个 TAP_MORE。只盖 96 见方会让标签左半截落在区外，
+/// 点上去被判 MISSED 关卡（真机「点了字却把卡关了」）。
+/// 无省略号（未触顶）时返回零矩形，点击照旧走 MISSED 关卡片。
+/// gen26.6.2: the "……" DETAIL ENTRY rect (shared by draw and hit-test): the
+/// truncation mark IS the entry. gen26.6.3: the zone is no longer a 96x96 square but
+/// the rectangle covering the whole "…… 看全文 ›" strip (height still 96) - ONE entry,
+/// ONE TAP_MORE. A 96 square alone would leave the label's left half outside, where a
+/// tap is judged MISSED and closes the card ("I tapped the label and it closed").
+/// Returns a zero rect when there is no ellipsis (nothing truncated), so a tap
+/// falls through to MISSED and closes the card as before.
+EpdRect dict_popup_more_rect(void);
+/// gen26.6.2：卡面全文（折行前的整段释义，PSRAM）。点「……」进详解时调用方取它
+/// 开会话；非触顶/无内容返回 NULL。/ gen26.6.2: the card's FULL text (the whole
+/// definition before wrapping, PSRAM). The caller takes it to open the detail
+/// session when "……" is tapped; NULL when nothing is staged or nothing truncated.
+const char* dict_popup_full_text(void);
 /// gen26.4：设置「AI」入口是否可点（app_book 按 push_sink_ai_enabled 设置）——控制
 /// 词典卡上 AI chip 的显示与命中。/ gen26.4: set whether the "AI" entry is tappable
 /// (app_book sets it from push_sink_ai_enabled) - controls the AI chip's visibility
@@ -112,6 +130,8 @@ typedef enum {
                               ///< ignored and the card stays open
     DICT_POPUP_TAP_AI,        ///< gen26.4 命中词典卡上的「AI」入口：调用方据此强制发起 AI 查询
                               ///< gen26.4 the "AI" entry on a dict card: the caller forces an AI query
+    DICT_POPUP_TAP_MORE,      ///< gen26.6.2 命中「……」详解入口：调用方据此开详解会话（全文）
+                              ///< gen26.6.2 the "……" detail entry: the caller opens the detail session
 } dict_popup_tap_t;
 
 /// 点击落在 chip 上时切换生词本保存状态。未命中由调用方关卡片。

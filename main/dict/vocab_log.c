@@ -90,7 +90,7 @@ static const char* TAG = "vocab";
 #define VOCAB_AI_BATCH_MAX 64
 #endif
 #ifndef VOCAB_AI_DEF_MAX
-#define VOCAB_AI_DEF_MAX 768 ///< gen26.6 D3：批内 def 槽与设备 PUSH_AI_DEF_MAX 同源加宽到卡容量
+#define VOCAB_AI_DEF_MAX 1200 ///< gen26.6.4：批内 def 槽随 PUSH_AI_DEF_MAX 同源加宽（768→1200），承接 APK 1152B 帽
 #endif
 // 与设备释义槽同源：批内 def 槽不得窄于协议槽，否则同一条释义在落库时被截断
 // （生词本内容与卡面不一致）。缩槽在此编译失败。

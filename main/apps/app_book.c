@@ -672,7 +672,24 @@ static void draw_control(uint8_t* fb, EpdRect rect, const char* label, int id) {
     if (s_pressed_control == id) ui_draw_pressed_round_rect(fb, rect, UI_BTN_RADIUS);
     ui_draw_button(fb, rect, label, false);
 }
-static void lock_draw(void) { if (s_draw_lock) xSemaphoreTake(s_draw_lock, portMAX_DELAY); }
+// gen26.6.3 运行时兜底：s_draw_lock 由 xSemaphoreCreateMutex() 创建，是**非递归**
+// 互斥量——同一任务二次 Take 即 portMAX_DELAY 永久阻塞（真机「打开详解整机挂死、
+// 无 panic 转储」的根因）。取锁前自检持有者：命中就断言，同类死锁从「挂死、无转储、
+// 只能断电」变成「当场断言 + 转储」，可定位、可预防。非递归语义下同任务重入永远
+// 是 bug，没有合法场景，所以断言而非降级放行。
+// gen26.6.3 runtime backstop: s_draw_lock comes from xSemaphoreCreateMutex() and is
+// a NON-recursive mutex - a second Take by the same task blocks forever on
+// portMAX_DELAY (the on-device "opening the detail view hangs the whole device, no
+// panic dump" root cause). Self-check the holder before taking: on a hit, assert, so
+// this class of deadlock turns from "hang, no dump, power-cycle only" into "assert
+// right here with a dump" - locatable and preventable. Under non-recursive semantics a
+// same-task re-entry is always a bug with no legitimate use, hence assert, not
+// degrade-and-continue.
+static void lock_draw(void) {
+    if (!s_draw_lock) return;
+    configASSERT(xSemaphoreGetMutexHolder(s_draw_lock) != (void*)xTaskGetCurrentTaskHandle());
+    xSemaphoreTake(s_draw_lock, portMAX_DELAY);
+}
 static void unlock_draw(void) { if (s_draw_lock) xSemaphoreGive(s_draw_lock); }
 static size_t fb_bytes(void) { return (size_t)epd_width() * epd_height() / 2; }
 #define READER_FULLSCREEN_PROGRESS_TOP (UI_LOCK_HEIGHT - 12)
@@ -4154,7 +4171,34 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     // The source body is not painted and its chapter buffer is untouched (law
     // 2); render only draws, the input chain owns the session state.
     if (s_view == READING && ai_reader_active()) {
-        lock_draw();
+        // gen26.6.3 死锁修复：本函数入口（上方 lock_draw）**已经持有** s_draw_lock，
+        // 这里再 lock_draw() 就是同一任务对非递归互斥量的二次获取 → portMAX_DELAY
+        // 永久阻塞，设备整机挂死（真机首次打开详解即死机、日志停在
+        // "detail session opened" 后无 panic 转储的根因）。分支只需在返回前解锁一次，
+        // 与其它分支同构。/ gen26.6.3 deadlock fix: this function already holds
+        // s_draw_lock (the lock_draw above); taking it again here is a second
+        // acquire of a NON-recursive mutex by the same task -> blocks forever on
+        // portMAX_DELAY and hangs the whole device (the root cause of the
+        // on-device freeze right after "detail session opened", with no panic
+        // dump because it is a hang, not an exception). The branch only has to
+        // unlock once before returning, like every other branch here.
+        // gen26.6.5：详解页排版**直接取正文**——字号 s_px、行距 s_px×行距%/100（与
+        // book_layout 同一公式）、版心 body_rect()（已按整字格收齐）。上一版在
+        // ai_reader 里写死 72px/92/36，正文是 51px/76/整字格 → 真机「大字报」。
+        // 度量只有一套，这里注入，那边不再自算。
+        // gen26.6.5: the detail view takes the LIVE body's metrics - s_px for size,
+        // s_px*spacing%/100 for pitch (the same formula book_layout uses) and
+        // body_rect() for the measure (already snapped to glyph cells). The previous
+        // build hard-coded 72px/92/36 inside ai_reader while the body ran 51/76 - the
+        // on-device "billboard". One set of metrics: injected here, never re-derived.
+        const EpdRect detail_body = body_rect();
+        const ai_reader_style_t detail_style = {
+            .px = s_px,
+            .line_h = s_px * s_line_spacing / 100,
+            .left = detail_body.x,
+            .width = detail_body.width,
+        };
+        ai_reader_set_style(&detail_style);
         ai_reader_render(fb);
         unlock_draw();
         return;
@@ -6340,6 +6384,60 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);
             invalidate_prep();
             return APP_REDRAW_PAGE;
+        }
+        // gen26.6.2：命中「……」详解入口——卡面装不下的全文交给详解阅读会话
+        // （词卡管快、阅读视图管全）。三个点本身就是入口（此前热区只有字宽，真机
+        // 按不到、按下去还被判 MISSED 关卡）；此处只负责开会话，几何与命中在
+        // dict_popup 内钉死。/ gen26.6.2: the "……" detail entry - hand the text the
+        // card cannot hold to the detail session (the card is quick, the view is
+        // complete). The three dots ARE the entry (its hit zone used to be glyph-wide:
+        // unhittable on hardware, and a near-miss closed the card as MISSED). Geometry
+        // and hit-testing live in dict_popup; this only opens the session.
+        if (tap == DICT_POPUP_TAP_MORE) {
+            const char* full = dict_popup_full_text();
+            if (!full) { // 全文缓冲分配失败：不静默吞点击，照旧关卡片
+                dict_popup_reset();
+                s_reader_panel = READER_PANEL_NONE;
+                invalidate_prep();
+                return APP_REDRAW_PAGE;
+            }
+            // 同 gen26.4.1：dict_popup_word() 是卡内指针，取词必须落局部缓冲
+            // （后续 reset 会把它清掉）。/ Same as gen26.4.1: dict_popup_word() is the
+            // card's own pointer; copy it before any reset clears it.
+            char wbuf[64];
+            copy_text(wbuf, sizeof(wbuf), dict_popup_word());
+            ai_reader_source_t src;
+            memset(&src, 0, sizeof(src));
+            src.chapter = s_chapter;
+            src.page = reader_visual_index(s_page);           // 视觉页号（页脚展示）
+            src.page_start_offset = s_page;                   // 逻辑页索引（锚点兜底）
+            copy_text(src.title, sizeof(src.title),
+                      s_book_title[0] ? s_book_title : s_title);
+            // 先开会话再收卡片：ai_reader 内部自持副本，s_full 随 reset 释放
+            // （顺序颠倒会拿一块已释放的内存去开会话）。/ Open first, reset after: the
+            // detail view keeps its own copy and s_full dies with the reset (the other
+            // order would hand freed memory to the session).
+            if (ai_reader_open(wbuf, full, &src)) {
+                // gen26.6.3：直接请求整屏全刷，与关闭详解的 ai_reader_close_full 同构
+                // （开/关各一次 GC16 的「双 GC16」）。此前置 s_ai_def_full 再返回 PAGE：
+                // 该标志只有**推送回流**那条路径（app_loop 消费）会兑现，点词路径下它
+                // 会滞留到下一次推送释义才被消费，凭空多出一次全刷；且本帧仍走局部刷新，
+                // 词卡→详解的版面跨度会留残影。返回 FULL 把「档位」直接交出去，语义单一。
+                // gen26.6.3: ask for a screen-wide FULL refresh right here, mirroring
+                // ai_reader_close_full (one GC16 on open, one on close = the "double
+                // GC16"). The old code set s_ai_def_full and returned PAGE: that flag is
+                // only honoured by the PUSH-return path (consumed in app_loop), so on the
+                // tap path it lingered until the next pushed definition and caused an
+                // extra full refresh out of nowhere - while THIS frame still went partial
+                // and ghosted across the card->detail layout jump. Returning FULL hands
+                // the tier over directly, one meaning only.
+                ESP_LOGI(TAG, "detail session opened for \"%s\" (more entry tapped)", wbuf);
+                dict_popup_reset();
+                s_reader_panel = READER_PANEL_NONE;
+                invalidate_prep();
+                return APP_REDRAW_FULL;
+            }
+            return APP_REDRAW_NONE; // 开会话失败：卡片保持，不静默吞掉点击
         }
         // gen26.3 查询态卡：chip 点击忽略（存进去会是状态行），零变化不 redraw。
         // gen26.3 querying card: chip tap ignored (a save would store the

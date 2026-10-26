@@ -39,10 +39,16 @@ public final class AiClient {
     public static final String DEFAULT_BASE_URL = "https://api.deepseek.com";
     public static final String DEFAULT_MODEL = "deepseek-chat";
 
-    /** 释义的 UTF-8 字节上限：gen26.6.1 由 600B 放宽到 700B（真机实测 600B ≈ 7/9 行，
-     * 行尾「…」是 APK 侧裁剪标记 = 欠饱和且有真实内容损失）；230 字 ≈ 690B，
-     * 设备侧 PUSH_AI_DEF_MAX=768 兜住，超卡容部分进详解视图承接。 */
-    public static final int DEF_MAX_BYTES = 700;
+    /** 释义的 UTF-8 字节上限：gen26.6.4 由 700B 放宽到 1152B。真机实测 700B 下
+     * 「8 句例句 + 搭配」被切（行尾「…」= APK 侧裁剪）；8 句需求约 900–1100B。
+     * 设备侧 PUSH_AI_DEF_MAX=1200 / ai_reader=1200 兜住，1152 留 48B 给 NUL。
+     * 360 字 ≈ 1080B ≤ 1152B，与 systemPrompt 的字数硬约束同源。 */
+    public static final int DEF_MAX_BYTES = 1152;
+
+    /** 系统提示的字数硬约束（≈ 汉字数）。由 DEF_MAX_BYTES/3 取整并留余量得到，
+     * 设置页文案也从它派生（「系统 %d 字约束」），避免三处各写一个数字再漂移。
+     * gen26.6.4: 360 字（≈1080B）≤ 1152B 硬帽。 */
+    public static final int SYSTEM_CHAR_LIMIT = 360;
 
     /** 连接与读取超时（毫秒）：LLM 秒级返回，15s 足够且不让用户干等。 */
     public static final int DEFAULT_TIMEOUT_MS = 15000;
@@ -50,7 +56,7 @@ public final class AiClient {
     /**
      * 默认用户提示模板（M1.2 ① Prompt 自定义）。占位符 {word} 在渲染时被实际
      * 单词替换，语义等价于历史硬编码的 "word: " + word。用户可在 APK 设置页
-     * 编辑自己的模板，但系统指令（systemPrompt，230 字硬约束，gen26.6.1 放宽）
+     * 编辑自己的模板，但系统指令（systemPrompt，360 字硬约束，gen26.6.4 校准）
      * 永远独立钉在 system 角色、不可被模板覆盖——这就是「分层铁律」。
      *
      * Default user-prompt template (M1.2 item-1 Prompt customization). The
@@ -220,7 +226,7 @@ public final class AiClient {
      * 构造 OpenAI 兼容的 chat/completions 请求体。
      *
      * 分层铁律在这里落地：
-     *   - system 角色恒为 systemPrompt()（230 字硬约束，gen26.6.1 放宽），
+     *   - system 角色恒为 systemPrompt()（360 字硬约束，gen26.6.4 校准），
      *     永远最后追加、不可被用户模板覆盖；
      *   - user 角色为 renderTemplate 渲染后的用户模板（内容/风格由用户掌控）。
      * 两条消息天然分属不同角色，模板再怎么改也碰不到 system 的约束。
@@ -270,23 +276,20 @@ public final class AiClient {
     }
 
     /**
-     * 系统提示（gen26.6.1 校准：230 字硬约束）：把输出形态钉死——「释义不超过 230 字，
-     * 一句核心词义 + 一个短语示例」，且强制纯文本。这是第一道防线（让模型自己
-     * 就范），fitUtf8 的 700 字节帧帽是第二道。230 个汉字 x 3 字节 = 690 字节，
-     * 帧帽（700）与设备词卡容量（PUSH_AI_DEF_MAX=768，gen26.6 D3 放宽）都放得下
-     * ——预算与两端容量自洽，无需再砍。
+     * 系统提示（gen26.6.4 校准：360 字硬约束，由 SYSTEM_CHAR_LIMIT 派生）：把输出形态
+     * 钉死——「释义不超过 360 字」，且强制纯文本。这是第一道防线（让模型自己就范），
+     * fitUtf8 的 1152 字节帧帽是第二道。360 个汉字 x 3 字节 = 1080 字节 ≤ 1152 帧帽，
+     * 设备槽（PUSH_AI_DEF_MAX=1200）与 ai_reader(1200) 都放得下——预算与两端自洽。
      *
-     * System prompt (gen26.6.1 calibration: 230-character hard constraint): pin
-     * the output shape - the definition stays within 180 characters, one core
-     * meaning plus one phrase example, plain text only. First line of defence
-     * (the model behaves); fitUtf8's 700-byte frame cap is the second. 230 chars
-     * x 3 bytes = 540 bytes fits both the frame cap and the device card capacity
-     * (PUSH_AI_DEF_MAX=768, widened in gen26.6 D3) - the budget is consistent
-     * with both ends, no further trim needed.
+     * System prompt (gen26.6.4 calibration: 360-character hard constraint, derived
+     * from SYSTEM_CHAR_LIMIT): pin the output shape - within 360 chars, plain text
+     * only. First line of defence (the model behaves); fitUtf8's 1152-byte cap is the
+     * second. 360 chars x 3 bytes = 1080 <= 1152, and the device slot / ai_reader
+     * (both 1200) hold it - budget consistent with both ends.
      */
     static String systemPrompt() {
         return "你是电子墨水屏阅读器的词典助手。用户给出英文单词，你只返回该词在语境中最常用的"
-                + "中文释义：释义不超过 230 字，一句核心词义 + 一个短语示例。"
+                + "中文释义：释义不超过 " + SYSTEM_CHAR_LIMIT + " 字，一句核心词义 + 一个短语示例。"
                 + "只输出纯文本：不要 Markdown、不要音标、不要解释、不要换行。";
     }
 

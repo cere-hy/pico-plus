@@ -162,6 +162,71 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # 与 D3 槽加宽、D2 空页帧路径；段级闭合待真机 boot 日志 seg1 双锚对表确认）；
 # sha256 bf7e80f6…；重锚 2026-10-25。
 #
+# 版本串 / Version string: 0.3.3-pico26.6.5（gen26.6.5 字形与装行轮：① 详解正文改走
+# **阅读字体全路径**（矢量 + 抗锯齿，与阅读正文同源），点阵只在缺字时整行兜底——修
+# 「同一行 TTF 72px + 点阵 24px 拉到 51px → 台阶」；② 装行改为**真实字宽**累加（新增
+# ttf_codepoint_advance_px / ui_text_reader_advance_px），配词边界与避头尾标点——修
+# 「右侧 1/3 空白 + emer|gencies 拦腰截断」；③ 字号按参照系校准：英文 cap ≈51px，
+# 72px×0.72em≈51.8 命中，标题与正文同大。缺字按**段**回退（不是整行），混排行不掉点阵。
+# 体积 4,088,752 B / sha256 4e92c487…。
+# Version string: 0.3.3-pico26.6.5 (gen26.6.5 glyph/line-breaking round: the detail
+# body now paints through the READING face (vector + AA), with the bitmap only as a
+# whole-line fallback; line breaking sums REAL advances (ttf_codepoint_advance_px /
+# ui_text_reader_advance_px) with word boundaries and CJK no-start/no-end rules; the
+# size is calibrated against an English cap of ~51px, and the title equals the body;
+# glyph fallback is per run, not per line).
+# Size 4,088,752 B / sha256 4e92c487...
+#
+# 版本串 / Version string: 0.3.3-pico26.6.4（gen26.6.4 详解可读性轮：正文 36/46→**72/92**、
+# 标题 48→72（标题不得小于正文）；APK 释义帽 700→1152B、系统提示 230→360 字、设备槽
+# PUSH_AI_DEF_MAX 768→1200、VOCAB_AI_DEF_MAX 768→1200；ai_def[] 与 0x07 解码结构静态化
+# （不让 DEF_MAX 扩容压主任务/NimBLE 栈）。体积 4,086,256 B / sha256 c8ec8f5f…。
+# Version string: 0.3.3-pico26.6.4 (gen26.6.4 readability: body 36/46 -> 72/92, title
+# 48 -> 72; APK def cap 700 -> 1152B, prompt 230 -> 360 chars, device slot 768 -> 1200;
+# ai_def[] and the 0x07 decode struct made static so the slot growth never lands on a
+# task stack). Size 4,086,256 B / sha256 c8ec8f5f...
+#
+# 版本串 / Version string: 0.3.3-pico26.6.3（gen26.6.3 死锁修复轮：详解分支二次取绘制锁——
+# s_draw_lock 是 xSemaphoreCreateMutex() 的非递归互斥量，render 入口已持锁，分支再
+# lock_draw() 即同一任务二次获取 → portMAX_DELAY 永久阻塞。真机表现为「一按触顶『…』
+# 打开详解，整机死机、日志停在 detail session opened 且无 panic 转储」。修法：删掉分支内
+# 层加锁（分支只在返回前 unlock 一次）；守门钉死「render 体内恰好一次 lock_draw」+ P8 变异。
+# 另：adv_start() 加已连接守卫（连上后不再每 2s 空转广播刷 adv start rc=6）。
+# Version string: 0.3.3-pico26.6.3 (gen26.6.3 deadlock fix: the detail branch re-took
+# the NON-recursive s_draw_lock that render() already holds -> the same task blocks
+# forever on portMAX_DELAY. On hardware: tapping the '…' entry froze the whole device,
+# the log stopping right after 'detail session opened' with no panic dump. Fix: drop the
+# inner lock (unlock once before returning); a gatekeeper pins exactly one lock_draw in
+# render, plus a P8 mutation. Also: adv_start() gets a connected guard (no more 2s
+# adv start rc=6 idle churn while the link is up).
+#
+# 并入（同号重出，前一次 568266dd 未上机）：详解页版面三修——(a) 正文按**宽度单位**
+# 装行（全角 2、ASCII 1，预算=每行字数×2），修「英文释义只用半页」；(b) 正文 27/42→
+# 36/46 并与词卡同用 ui_text_fixed（不再受阅读字号缩放影响，修「字还是很小」）；
+# (c) 页脚左段按可用宽度截短，修「书名长时与右侧键位提示叠字」。另加 lock_draw()
+# 运行时自检（同任务二次取锁即断言，把死锁变成可转储的即时故障）。
+#   ⑥ 触顶入口「看全文 ›」：24px 纯文字（非 chip），触顶才画；热区覆盖
+#      「…… 看全文 ›」**整条**（高仍 96）——一条入口、一个 TAP_MORE。只盖 96 见方
+#      会让标签左半截落在区外、点上去被判 MISSED 关卡（真机「点了字却把卡关了」）。
+# 体积：4,089,440 B；sha256 a13afafd…；重锚 2026-10-26（同号重出，e2e57a5d 未上机）。
+#
+# 版本串 / Version string: 0.3.3-pico26.6.2（gen26.6.2 收口轮：详解热区 + 离线缓存命中 +
+# 停止路径日志；本轮因功能修复必须重编，故此前「为可观测性单独重编」的权衡失效，
+# 0x19 空页停止帧的日志顺势搭车）。三处均为行为确认/可查落点，无协议变化：
+#   (1) 详解热区扩大——截断标记「……」即详解入口，热区以其为中心扩大到 ≥96 且钳位卡内
+#       （真机「按不到、按下去还被判 MISSED 关卡」缺陷；宿主钉死几何 + 命中路径 + 变异）。
+#   (2) 离线缓存命中——tap 路径先查预取缓存，命中即本地出卡，**与连接态无关**（离线 +
+#       已缓存词同样秒出）；与「断连不入队、错过让它过去」同哲学。wiring 守门钉死顺序 +
+#       变异（把 cache 查搬进 live 门即被擒）。
+#   (3) 0x19 空页停止帧补串口日志 `tts page stop: empty frame`——关听书开关与重连补发两条
+#       停止路径此前零日志、审计拿不到证据；停止是用户可感知行为，必须有可查落点。
+# Version string: 0.3.3-pico26.6.2 (gen26.6.2 closure: detail-entry hot zone + offline
+# cache hit + stop-path log; rebuilt anyway for the functional fixes, so the stop-frame
+# log rides along - the earlier "rebuild just for observability" trade-off no longer applies).
+#
+# 体积：4,089,408 B（相对 gen26.6.1 的 4,087,984 B **+1,424 B**——热区/缓存/cache 重排
+# 的小幅代码增量）；sha256 9cdaff2e…；重锚 2026-10-26。
+#
 # 版本串 / Version string: 0.3.3-pico26.6.1（gen26.6.1 D-1 修复轮：修 0x07 短释义全灭——
 # decode 守卫 `len < PUSH_AI_RESULT_MAX` 把帧最大长度当最小长度，D3 后该常量随
 # PUSH_AI_DEF_MAX 膨胀到 839，而 APK 的 0x07 是冻结的 241B 帧→恒拒。修法：线格式常量与
@@ -2127,7 +2192,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 #   (same as v1.4.1's all-green showing).
 # 烧前自检：Read_Pico.bin 的 sha256 必须与锚定值逐字一致，杜绝烧错 bin。
 # Pre-flash self-check: Read_Pico.bin's sha256 must match the anchor exactly.
-EXPECTED="a7bed55b3182e167181c255b14f3018b726a2d328dc81526c8a7b1468359c2fd"
+EXPECTED="4e92c487dbcd7b0129be4ba0851bb1c5a60d1478b4088aa4b4b9a718cabb4029"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then

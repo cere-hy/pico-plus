@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-ai_detail_wiring_host_test.py 的变异有牙演示：对六个设计点各做一个针对性变异，
+ai_detail_wiring_host_test.py 的变异有牙演示：对八个设计点各做一个针对性变异，
 守门必须逐一擒红（退出码非 0），否则说明守门是口号。变异在副本上进行，
 原文件逐字节恢复——不动工作区。
 
@@ -79,6 +79,15 @@ MUTATIONS = [
      'void ai_reader_render(uint8_t* fb);',
      '// mutated away',
      'ai_reader_render'),
+    # P8：详解分支二次取绘制锁——非递归互斥量，同一任务再取即 portMAX_DELAY 死锁
+    # （真机「一打开详解整机死机」的根因）。守门必须擒。
+    # P8: the detail branch re-takes the draw lock - a non-recursive mutex, so the
+    # same task blocks forever on portMAX_DELAY (the on-device freeze root cause).
+    ('P8 详解分支二次取锁：非递归互斥量死锁（真机挂死根因）',
+     'main/apps/app_book.c',
+     '        ai_reader_render(fb);',
+     '        lock_draw();\n        ai_reader_render(fb);',
+     'non-recursive'),
 ]
 
 

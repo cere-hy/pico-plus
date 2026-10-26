@@ -265,14 +265,13 @@ typedef struct {
 
 /// 单词 / 释义文本上限（UTF-8 字节，含结尾 0）。/ Word and definition text caps.
 #define PUSH_AI_WORD_MAX 64u  ///< 单词上限 / word cap
-#define PUSH_AI_DEF_MAX  768u ///< gen26.6 D3：释义槽放宽到卡容量（180字≈540B 吃满90%），超长触顶进 Step9 详解；仍受 0x08 重组器(4096B)与 ai_reader(1200B) 兜住 / def slot widened to card capacity
-// gen26.6 D3 契约（编译期钉死）：释义槽必须容下 180 字卡预算，缩回旧的 170 会让
-// 长释义在协议层被截断。任何缩槽改动在此编译失败——常量族的有牙护栏。
-// gen26.6 D3 contract (pinned at compile time): the def slot must hold the
-// 180-char card budget; shrinking back to 170 truncates long definitions at the
-// protocol layer. Any shrink fails to compile here - the teeth for the family.
-_Static_assert(PUSH_AI_DEF_MAX >= 768u,
-               "gen26.6 D3: PUSH_AI_DEF_MAX must stay >= 768 (180-char card budget)");
+#define PUSH_AI_DEF_MAX  1200u ///< gen26.6.4：释义槽 768→1200，承接 APK 1152B 帽（8 句例句+搭配）；仍受 0x08 重组器(4096B)与 ai_reader(1200B) 兜住 / def slot 768->1200 for the APK 1152B cap
+// gen26.6.4 契约（编译期钉死）：释义槽必须容下 1152B 的 APK 帽余量，缩回旧的 768 会让
+// 新预算下的长释义在协议层被截断。任何缩槽改动在此编译失败——常量族的有牙护栏。
+// gen26.6.4 contract (pinned at compile time): the def slot must hold the 1152B APK
+// cap; shrinking back to 768 truncates the new budget at the protocol layer.
+_Static_assert(PUSH_AI_DEF_MAX >= 1200u,
+               "gen26.6.4: PUSH_AI_DEF_MAX must stay >= 1200 (APK 1152B cap)");
 
 /// AI_QUERY（0x06）CTRL 载荷：手机→设备，触发离线队列回流或即时查询。
 /// AI_QUERY (0x06) CTRL payload: phone to device, flush the offline queue or ask now.

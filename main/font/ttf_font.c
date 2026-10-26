@@ -2065,6 +2065,25 @@ static int measure_width(int pixel_height, const char* text) {
     return width;
 }
 
+// 单码位前进宽度。与 measure_width 共用 scale/取整，保证「装行算的」就是
+// 「画出来的」；字体没有该码位时返回 0，调用方据此回退到内建点阵。
+// Single code-point advance. Shares measure_width's scale and rounding so the
+// width used for line breaking is the width actually painted; returns 0 when the
+// face has no glyph, which lets the caller fall back to the built-in bitmap.
+int ttf_codepoint_advance_px(int pixel_height, uint32_t codepoint) {
+    if (!font_ready) return 0;
+    int gid = stbtt_FindGlyphIndex(&font_info, (int)codepoint);
+    if (gid == 0) return 0; // .notdef：视为未覆盖 / .notdef counts as uncovered
+    float scale = stbtt_ScaleForPixelHeight(&font_info, (float)clamp_px(pixel_height));
+    int advance = 0, lsb = 0;
+    stbtt_GetGlyphHMetrics(&font_info, gid, &advance, &lsb);
+    return (int)lroundf(advance * scale);
+}
+
+bool ttf_codepoint_covered(uint32_t codepoint) {
+    return font_ready && stbtt_FindGlyphIndex(&font_info, (int)codepoint) != 0;
+}
+
 // 这两个查询问的是“系统字体”：主循环、设置页和书架都靠它们判断当前字体能否排这本书。
 // 内嵌字体把游标借走时，这里必须仍然看 0 号槽。
 // These two answer for the system face: the loop, settings and shelf ask whether the

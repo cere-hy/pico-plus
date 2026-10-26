@@ -340,9 +340,27 @@ def main() -> int:
     sink_text = SINK_C.read_text(encoding='utf-8') if SINK_C.exists() else ''
     if not sink_text:
         failures.append('push_sink.c: missing')
-    elif 'ai_raloc_enqueue(' in sink_text:
-        failures.append('push_sink.c: an offline miss is queued again '
-                        '(ai_raloc_enqueue found - gen26.6 retired the re-query)')
+    else:
+        if 'ai_raloc_enqueue(' in sink_text:
+            failures.append('push_sink.c: an offline miss is queued again '
+                            '(ai_raloc_enqueue found - gen26.6 retired the re-query)')
+        # gen26.6.2：离线缓存命中——预取缓存是设备自己的记忆，命中即本地出卡，
+        # **与连接态无关**。故查缓存必须排在 live 门之前，顺序颠倒即缺陷。
+        # gen26.6.2: the offline cache hit - the prefetch cache is the device's own
+        # memory, surfacing locally regardless of link state. So the cache lookup must
+        # precede the live gate; flipping the order is the defect.
+        tap = function_body(sink_text, 'void push_sink_ai_tap_word_ctx(')
+        if not tap:
+            failures.append('push_sink.c: push_sink_ai_tap_word_ctx() not found')
+        else:
+            cache_at = tap.find('ai_cache_find(')
+            live_at = tap.find('s_status_subscribed')
+            if cache_at < 0 or live_at < 0:
+                failures.append('push_sink_ai_tap_word_ctx(): missing the cache lookup '
+                                'or the live gate')
+            elif cache_at > live_at:
+                failures.append('push_sink_ai_tap_word_ctx(): the prefetch-cache lookup '
+                                'sits after the live gate (offline cache hits would die)')
 
     # 8. gen26.5 M2 Step8：app_loop 的 flush 驱动与解耦顺序、app_main 的开关读取、
     #    .c/.h 双冻结声明同步。/ The flush driver and decoupling order in app_loop,

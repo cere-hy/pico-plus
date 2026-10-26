@@ -1577,7 +1577,10 @@ public class MainActivity extends Activity {
         // ---- M1.2 ① 提示模板：多行编辑，{word} 占位符，恢复默认 ----
         // M1.2 item-1 prompt template: multi-line, {word} placeholder, reset-to-default.
         TextView tplHint = new TextView(this);
-        tplHint.setText("提示模板（可用 {word} 占位符，系统 230 字约束始终生效且不可被覆盖）");
+        // gen26.6.4：文案从预算常量派生，不再写死数字（180→230→360 已漂三次）。
+        // 单一来源 AiClient.SYSTEM_CHAR_LIMIT，改预算即改文案，防第四次漂移。
+        tplHint.setText("提示模板（可用 {word} 占位符，系统 " + AiClient.SYSTEM_CHAR_LIMIT
+                + " 字约束始终生效且不可被覆盖）");
         tplHint.setTextSize(12);
         tplHint.setPadding(0, dp(8), 0, dp(4));
         box.addView(tplHint);

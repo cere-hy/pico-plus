@@ -198,6 +198,29 @@ def main() -> int:
                 if banned in window:
                     failures.append(f'render(): detail branch reaches {banned} '
                                     '(law 2: the source is never touched under the overlay)')
+            # ---- P1b 详解分支不得二次取绘制锁（gen26.6.3 整机挂死的根因）----
+            # s_draw_lock 是 xSemaphoreCreateMutex() 的**非递归**互斥量，render 入口
+            # 已经 lock_draw()；分支里再取一次就是同一任务二次获取 → portMAX_DELAY
+            # 永久阻塞（或断言瞬时重启），表现为「一打开详解整机死机、日志停在
+            # 'detail session opened' 且无 panic 转储」。分支只在 return 前 unlock 一次。
+            # gen26.6.3: the detail branch must not take the draw lock again.
+            # s_draw_lock is a NON-recursive mutex created with
+            # xSemaphoreCreateMutex(), and render() already holds it on entry; a
+            # second acquire by the same task blocks forever on portMAX_DELAY (or
+            # trips an assert and reboots instantly) - the on-device freeze right
+            # after "detail session opened", with no panic dump. The branch only
+            # unlocks once before returning.
+            if re.search(r'(?<!un)lock_draw\(\)', window):
+                failures.append('render(): the detail branch calls lock_draw() again - '
+                                's_draw_lock is non-recursive and render() already holds it '
+                                '(gen26.6.3 device-freeze root cause); unlock once, do not re-lock')
+        # 整个 render 体内只应有一次 lock_draw（入口那次）——任何分支再加锁都会死锁。
+        # Exactly one lock_draw() may appear in the whole render body (the one on
+        # entry) - any branch that locks again deadlocks.
+        n_locks = len(re.findall(r'(?<!un)lock_draw\(\)', render))
+        if n_locks != 1:
+            failures.append(f'render(): {n_locks} lock_draw() calls in the body - '
+                            'the draw lock is non-recursive; exactly one is allowed')
 
     # ---- P2 五处输入隔离 ----------------------------------------------------
     # 每个人口：守卫必须存在、分支里只调 ai_reader_*、守卫早于首个原书动作。
@@ -388,6 +411,27 @@ def main() -> int:
                             'never declares it (firmware fullclean would fail on an '
                             'implicit declaration)')
 
+    # ---- P8 gen26.6.5 正文必须走「阅读字体全路径」 ---------------------------
+    # 真机锯齿的根因是正文走内建系统（TTF 有的字 72px、没有的字 24px 点阵拉到
+    # 51px）。绘制入口一旦退回 ui_text_fixed，台阶立刻回来——这类回归编译照过、
+    # 宿主桩也照过（桩只记录调用），只有静态守门能钉住。
+    # The on-device stair-steps came from painting the body with the built-in
+    # system (72px TTF for covered glyphs, a 24px bitmap blown up to 51px for the
+    # rest). Dropping back to ui_text_fixed brings the steps straight back - a
+    # regression that compiles fine and even passes the host stubs (they only
+    # record calls), so only this static gate can pin it.
+    reader_c = (ROOT / 'main' / 'apps' / 'ai_reader.c').read_text(encoding='utf-8')
+    if 'ui_text_reader(fb, pad, y, text_px, line);' not in reader_c:
+        failures.append('ai_reader.c: the body must paint through ui_text_reader() '
+                        '(reader face + AA); any other entry paints the bitmap system '
+                        'and brings back the stair-step glyphs')
+    if re.search(r'ui_text_fixed\(\s*fb,\s*pad,\s*y,\s*text_px,\s*line', reader_c):
+        failures.append('ai_reader.c: the body still reaches ui_text_fixed() - that is '
+                        'the bitmap path (mutation N1)')
+    if 'ui_text_reader_uses_ttf(line)' not in reader_c:
+        failures.append('ai_reader.c: the per-line bitmap fallback must ask '
+                        'ui_text_reader_uses_ttf(line)')
+
     if failures:
         for line in failures:
             print(f'FAIL: {line}')
@@ -395,7 +439,8 @@ def main() -> int:
         return 1
     print('PASS: M2 Step9 detail-view wiring: render branch ahead of draw_reader, five '
           'input entry points isolated, both sides of the double GC16, gate A truncation '
-          'detour, zero source unload under the overlay, CMake/host-stub/header declarations in sync')
+          'detour, zero source unload under the overlay, CMake/host-stub/header declarations in sync, '
+          'body painted through the reader face (not the bitmap system)')
     return 0
 
 

@@ -69,6 +69,32 @@ static const char* TAG = "dict";
 #define DICT_POPUP_AI_SEG (PUSH_AI_DEF_MAX + 1u)
 _Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
                "gen26.6 length chain: the segment buffer must hold any protocol-sized definition");
+
+// gen26.6.2：「……」详解入口的热区边长 = max(96, 行高x2)。三个点本身太小手指按不到
+// （真机实测：按不到、按下去还被判 MISSED 关卡）——视觉保留三个点，热区按这个边长
+// 以它为中心铺开。/ gen26.6.2: the "……" detail entry's hit-zone side = max(96,
+// line height x 2). The three dots are far too small to hit (measured: unreachable,
+// and a near-miss is judged MISSED and closes the card) - the dots stay, the hit
+// zone spreads around them at this side length.
+#define DICT_POPUP_MORE_MIN_W 96
+#define DICT_POPUP_MORE_W \
+    ((DICT_POPUP_LINE_H * 2) > DICT_POPUP_MORE_MIN_W ? (DICT_POPUP_LINE_H * 2) : DICT_POPUP_MORE_MIN_W)
+// gen26.6.3 A：入口文案与字号/间隙的唯一来源——**绘制与命中必须同源**，否则
+// 「看全文 ›」左半截落在 96 见方的热区之外，点上去会被判 MISSED 关卡（真机上
+// 就是「点了字却把卡关了」）。热区因此不再是 96×96 的正方形，而是覆盖
+// 「…… 看全文 ›」整条的矩形（高仍 96），仍是一条入口、一个 TAP_MORE。
+// gen26.6.3 A: the single source for the entry label, its px and the gap -
+// **drawing and hit-testing must share it**, otherwise the left half of "看全文 ›"
+// falls outside the 96x96 square and a tap there is judged MISSED (closing the card
+// - on hardware that reads as "I tapped the label and the card closed"). The hit
+// zone therefore stops being a 96x96 square: it is the rectangle covering the whole
+// "…… 看全文 ›" strip (height still 96) - still one entry, one TAP_MORE.
+#define DICT_POPUP_MORE_LABEL "看全文 ›"
+#define DICT_POPUP_MORE_LABEL_PX 24
+#define DICT_POPUP_MORE_LABEL_GAP 10
+#define DICT_POPUP_MORE_DOTS_PX 21
+_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
+               "gen26.6 length chain: the segment buffer must hold any protocol-sized definition");
 // gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
 // query-state text: a one-line real status, not a placeholder fake card.
 #define DICT_POPUP_PENDING_TEXT "AI 查询中…"
@@ -95,6 +121,12 @@ static bool s_anchor_split; ///< 分半几何开关：双栏生效，单栏横�
 // both clear it.
 static bool s_pending;
 static int64_t s_pending_since_us; ///< 进入查询态的时刻（esp_timer 微秒）/ when the query state began
+// gen26.6.2：卡面全文（折行前的整段释义，PSRAM）——点「……」进详解时交给调用方开
+// 会话。卡面只存折行后的行，没有它详解就无文可载。/ gen26.6.2: the card's full
+// text (the whole definition before wrapping, PSRAM) - handed to the caller to open
+// the detail session when "……" is tapped. The card only keeps wrapped lines, so
+// without this there is nothing for the detail view to show.
+static char* s_full;
 // gen26.4：AI 入口可点性（app_book 按 push_sink_ai_enabled 设置）与「查询态由词典
 // 命中卡强制触发」标记（超时回退词典释义）。/ gen26.4: the AI entry's tappability
 // (set by app_book from push_sink_ai_enabled) and the "querying forced from a
@@ -149,6 +181,59 @@ static int body_text_width(void) {
     return dict_popup_rect().width - 2 * DICT_POPUP_PAD;
 }
 
+// 卡面可显示的正文行数（与 draw 的收行条件同一谓词）。
+// Body lines the card can show (same predicate as the draw loop's stop).
+static int visible_lines(void) {
+    const EpdRect card = dict_popup_rect();
+    int n = 0;
+    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) {
+        ++n;
+    }
+    return n;
+}
+
+// 「……」是否画出（有剩文未显示）。/ Is the "……" drawn (text left over)?
+static bool more_shown(void) {
+    if (!s_word[0]) return false;
+    return s_truncated || s_line_count > visible_lines();
+}
+
+// 「……」的绘制基线 y（与 draw 同一算术）。/ The "……" baseline y (same arithmetic as draw).
+static int more_text_y(void) {
+    const EpdRect card = dict_popup_rect();
+    const int shown = s_line_count < visible_lines() ? s_line_count : visible_lines();
+    return card.y + 26 + DICT_POPUP_WORD_PX + 18 + (shown - 1) * DICT_POPUP_LINE_H
+           + DICT_POPUP_TEXT_PX + 8;
+}
+
+EpdRect dict_popup_more_rect(void) {
+    if (!more_shown()) return (EpdRect){0, 0, 0, 0};
+    const EpdRect card = dict_popup_rect();
+    const int right = card.x + card.width - DICT_POPUP_PAD;
+    const int dots_w = ui_text_fixed_width_px(DICT_POPUP_MORE_DOTS_PX, "……");
+    const int label_w = ui_text_fixed_width_px(DICT_POPUP_MORE_LABEL_PX, DICT_POPUP_MORE_LABEL);
+    // gen26.6.3：热区覆盖「…… 看全文 ›」整条——**一条入口、一个 TAP_MORE**。
+    // 起点从标签左缘算，终点到卡内边（PAD）；高度仍是 DICT_POPUP_MORE_W（96），
+    // 与旧版一致。这样点标签任何位置都命中，不会漏到 MISSED 关卡。
+    // gen26.6.3: the zone covers the whole "…… 看全文 ›" strip - ONE entry, ONE
+    // TAP_MORE. It starts at the label's left edge and ends at the card's inner edge
+    // (PAD); the height stays DICT_POPUP_MORE_W (96), unchanged. Tapping anywhere on
+    // the label now hits instead of falling through to a MISSED close.
+    int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP - label_w;
+    if (left < card.x) left = card.x;
+    const int w = (card.x + card.width) - left;
+    const int h = DICT_POPUP_MORE_W;
+    const int cy = more_text_y();
+    int y = cy - h / 2;
+    if (y < card.y) y = card.y;
+    if (y + h > card.y + card.height) y = card.y + card.height - h;
+    return (EpdRect){left, y, w, h};
+}
+
+const char* dict_popup_full_text(void) {
+    return more_shown() ? s_full : NULL;
+}
+
 EpdRect dict_popup_save_rect(void) {
     EpdRect card = dict_popup_rect();
     return (EpdRect){card.x + card.width - DICT_POPUP_PAD - DICT_POPUP_SAVE_W, card.y + 22,
@@ -175,6 +260,8 @@ void dict_popup_reset(void) {
         free(s_lines[i]);
         s_lines[i] = NULL;
     }
+    free(s_full); // gen26.6.2 全文缓冲 / gen26.6.2 full-text buffer
+    s_full = NULL;
     s_line_count = 0;
     s_truncated = false;
     s_saved = false;
@@ -210,6 +297,14 @@ dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y) {
     // only takes the tap when AI is on and the card is not querying.
     if (s_ai_on && !s_pending && ui_rect_hit(dict_popup_ai_rect(), x, y)) {
         return DICT_POPUP_TAP_AI;
+    }
+    // gen26.6.2：截断标记「……」本身就是详解入口，热区已按 DICT_POPUP_MORE_W 扩大
+    // （真机「按不到」缺陷的修法）。无省略号时矩形为零，不吞任何点击。
+    // gen26.6.2: the truncation mark "……" IS the detail entry, its hit zone widened
+    // to DICT_POPUP_MORE_W (the fix for the on-device "cannot hit it" defect). With
+    // no ellipsis the rect is zero, so no tap is swallowed.
+    if (more_shown() && ui_rect_hit(dict_popup_more_rect(), x, y)) {
+        return DICT_POPUP_TAP_MORE;
     }
     if (!ui_rect_hit(dict_popup_save_rect(), x, y)) return DICT_POPUP_TAP_MISSED;
     // gen26.3 ④ 查询态卡的 chip 尚未就绪：释义没到，此刻存进去的摘要是状态行而
@@ -347,6 +442,14 @@ bool dict_popup_open(const char* word) {
             }
             wrap_us = esp_timer_get_time() - b;
             ok = s_line_count > 0;
+            // gen26.6.2：留下折行前的整段释义——词典长条目触顶时「……」详解要靠它开
+            // 会话（卡面只有折行后的行，无全文可载）。/ gen26.6.2: keep the whole
+            // pre-wrap entry - when a long dictionary entry hits the cap, the "……"
+            // detail session needs it (the card only holds wrapped lines).
+            if (ok) {
+                s_full = heap_caps_malloc(strlen(out) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (s_full) memcpy(s_full, out, strlen(out) + 1);
+            }
             // 索引未就绪时返回 false，chip 显示「保存」——绝不在这里读卡。
             // Returns false when the index is unavailable and the chip shows "unsaved";
             // the card is never read here.
@@ -517,6 +620,12 @@ bool dict_popup_show_def(const char* word, const char* def) {
     }
     free(seg);
     const bool ok = s_line_count > 0;
+    // gen26.6.2：同上，AI 释义也留全文（触顶时「……」详解取它开会话）。
+    // gen26.6.2: same for AI definitions (the "……" detail session takes it).
+    if (ok) {
+        s_full = heap_caps_malloc(strlen(def) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_full) memcpy(s_full, def, strlen(def) + 1);
+    }
     // 保存 chip 反映生词本真实落盘状态，与本地词典卡同一谓词。/ The save chip
     // reflects the real vocabulary-book state, same predicate as the dict card.
     if (ok) s_saved = vocab_log_contains(s_word);
@@ -576,8 +685,29 @@ void dict_popup_draw(uint8_t* fb) {
         y += DICT_POPUP_LINE_H;
         if (y + DICT_POPUP_TEXT_PX > card.y + card.height - 20) {
             if (i + 1 < s_line_count || s_truncated) {
-                ui_text_fixed(fb, card.x + card.width - DICT_POPUP_PAD, y - DICT_POPUP_LINE_H + DICT_POPUP_TEXT_PX + 8,
-                              21, "……", EPD_DRAW_ALIGN_RIGHT, false);
+                // gen26.6.3 A：24px 纯文字「看全文 ›」（非 chip、无底色）与「……」同条带并排，
+                // 触顶才画。上一版只扩大了热区、视觉零变化，真机用户「找不到入口」——热区
+                // 96 已实证可点，缺的是「看得出这里能点」。文案压在末行下方的空条带里
+                // （标记本来就在 +44 处，不与正文同行），不遮挡正文、不改卡片容量。
+                // gen26.6.3 A: a 24px plain-text "看全文 ›" (not a chip, no fill) sits on the
+                // same strip as the "……", drawn only when truncated. The previous round only
+                // widened the hit zone and left the pixels untouched, and on hardware the user
+                // "could not find the entry" - the 96px zone is proven tappable, what was
+                // missing is "it looks tappable". The label lives in the empty strip under the
+                // last line (the mark already sits at +44, not on the text row), so it neither
+                // covers the body nor changes the card's capacity.
+                const int right = card.x + card.width - DICT_POPUP_PAD;
+                const int base = y - DICT_POPUP_LINE_H + DICT_POPUP_TEXT_PX + 8;
+                // 字号/文案/间隙全部取自宏——与 dict_popup_more_rect 同源，绘制与
+                // 命中不可能错位。/ Font, text and gap all come from the macros -
+                // same source as dict_popup_more_rect, so paint and hit-test cannot
+                // drift apart.
+                const int dots_w = ui_text_fixed_width_px(DICT_POPUP_MORE_DOTS_PX, "……");
+                ui_text_fixed(fb, right, base, DICT_POPUP_MORE_DOTS_PX, "……",
+                              EPD_DRAW_ALIGN_RIGHT, false);
+                ui_text_fixed(fb, right - dots_w - DICT_POPUP_MORE_LABEL_GAP, base,
+                              DICT_POPUP_MORE_LABEL_PX, DICT_POPUP_MORE_LABEL,
+                              EPD_DRAW_ALIGN_RIGHT, false);
             }
             break;
         }

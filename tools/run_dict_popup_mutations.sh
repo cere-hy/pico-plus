@@ -195,4 +195,59 @@ p.write_text(s)
 EOF
 run_mutation "M9 staging cap back to 14"
 
+# ---- M10：详解入口热区缩回（三个点本身的宽度）——真机「按不到」缺陷复现 ----
+# ---- M10: the detail entry's hit zone shrinks back to the dots themselves - the
+#      on-device "cannot hit it" defect returns.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '#define DICT_POPUP_MORE_MIN_W 96'
+assert old in s, 'M10 target not found'
+p.write_text(s.replace(old, '#define DICT_POPUP_MORE_MIN_W 24 /* MUTATION M10 */', 1))
+EOF
+run_mutation "M10 detail-entry hit zone shrinks back to the dots"
+
+# ---- M11：无剩文也画「……」/「看全文 ›」——非触顶误画，用户会以为释义被截断 ----
+# ---- M11: the marker and "看全文 ›" appear even with nothing truncated - a false
+#      signal that the definition was cut off.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '    return s_truncated || s_line_count > visible_lines();'
+assert old in s, 'M11 target not found'
+p.write_text(s.replace(old, '    return true; /* MUTATION M11 */', 1))
+EOF
+run_mutation "M11 more-entry drawn with nothing truncated"
+
+# ---- M12：「看全文 ›」字号从 24 漂走（规格钉死：24px 纯文字）----
+# ---- M12: the "看全文 ›" label drifts off 24px (spec: 24px plain text).
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '#define DICT_POPUP_MORE_LABEL_PX 24'
+assert old in s, 'M12 target not found'
+p.write_text(s.replace(old, '#define DICT_POPUP_MORE_LABEL_PX 20 /* MUTATION M12 */', 1))
+EOF
+run_mutation "M12 view-full label drops off 24px"
+
+# ---- M13：热区退回 96 见方（不含标签）——标签左半截点不到、会误关卡 ----
+# ---- M13: the hit zone shrinks back to the 96 square without the label - the
+#      label's left half is unclickable and a tap there closes the card.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = 'int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP - label_w;'
+assert old in s, 'M13 target not found'
+p.write_text(s.replace(old, 'int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP; /* MUTATION M13 */', 1))
+EOF
+run_mutation "M13 hit zone excludes the view-full label"
+
 echo "---- mutation sweep done ----"
