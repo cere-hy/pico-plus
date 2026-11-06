@@ -11,7 +11,11 @@
 
 Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
 
-**Current version: v1.0 (internal codename gen22, firmware version `0.3.3-pico22`)**
+**Current version: `0.3.9-pico26.11.19`** · `Read_Pico.bin` 4,216,992 B · SHA-256 `c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0`
+
+> **Source baseline:** the source tree in this repository reflects the 2026-10-26 baseline; the
+> current release firmware is produced by the internal development chain. Verify by SHA-256,
+> not by rebuilding from this tree. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 > **Language note:** the firmware UI is currently **primarily in Chinese**; English UI support
 > is **planned for a future release**. This README is available in both English and Chinese,
@@ -64,6 +68,22 @@ lock screen, USB storage, Wi-Fi book transfer), this modified version mainly add
 | 📱 Geek secondary display | **Bluetooth clock sync** | The phone calibrates the device clock while pushing (the device has no RTC crystal, so it drifts over time) |
 | ⚙️ Low-level polish | Refresh / power tuning | Trimming unnecessary partial refreshes during the arming window, reworked sleep & lock paths, etc. |
 
+### Recent behavior changes (26.11.15–26.11.19)
+
+| Build | Change |
+|---|---|
+| [123] | Justified body text + word-based hyphenation for Latin script (Liang): no large trailing gaps, long words no longer break mid-word |
+| [124] | Offline kerning flatten table, same metrics on all three ends; large inter-word gaps removed |
+| 26.11.15 | Typography enhancement switch in reading settings: off = classic layout, on = enhanced layout; re-lays out immediately and persists across reboot |
+| 26.11.16 | Status-bar battery fix: bookshelf/home battery has its own refresh cadence; plug/unplug and percentage changes update promptly |
+| 26.11.17 | New home gestures: two-finger swipe up opens the latest push; long-press on empty area opens the transfer page. The status bar is excluded from gesture targets to avoid misfires |
+| 26.11.18 | Bookshelf status-bar clock restored to a per-minute cadence, ticking regularly with no cumulative drift (other pages unchanged) |
+| 26.11.19 | After wake from lock screen, the first frame may briefly show the pre-lock battery value and catch up one beat later — a declared, expected behavior verified in field testing. Key response and lock-screen authentication reliability are no longer affected by whether other features are in use |
+
+### Known issue
+
+**Known issue**: While charging over USB, the home-screen battery percentage may stay unchanged for a while; after unplugging, the battery reading updates to the current level. This is a known display behavior and does not affect charging or normal use — unplug once to see the current level immediately.
+
 > ### ⚠️ Important: bring your own dictionary file
 >
 > **This firmware does not include dictionary data.** The lookup feature depends on a
@@ -94,13 +114,13 @@ No software installation needed — flash from a desktop browser.
    and Safari are not supported):
 
    ```
-   https://<your-username>.github.io/<repo-name>/
+   https://<your-username>.github.io/<repo-name>/web-flasher/
    ```
 
-   (Once this repo has GitHub Pages enabled, the address above is the flasher page — the
-   `web-flasher/` directory is published as the site root. If you haven't put the repo on
+   The flasher page lives under `/web-flasher/`. The site root `/` is a rendered README page,
+   **not** the flasher — use the `/web-flasher/` URL above. If you haven't put the repo on
    GitHub, you can also enter the `web-flasher` directory locally and run
-   `python -m http.server 8000`, then open `http://localhost:8000` to flash.)
+   `python -m http.server 8000`, then open `http://localhost:8000` to flash.
 3. Click the **"Install firmware"** button on the page;
 4. Select the device's serial port in the dialog (e.g. `COM3`, `USB JTAG/serial debug unit`)
    and click connect;
@@ -137,8 +157,10 @@ No software installation needed — flash from a desktop browser.
    `sh flash.sh /dev/ttyUSB0`;
 5. Wait for the prompts; done when you see `Flash done`.
 
-The script first verifies that the SHA-256 of `Read_Pico.bin` matches the pinned value, and
-**refuses to flash** if they differ.
+The script first verifies that the SHA-256 of `Read_Pico.bin` matches the pinned value
+(`c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0`), and **refuses to flash** if they differ. After flashing, run `readback.sh`
+to read back and verify. Scripts are shipped in the firmware package — extract the package
+first; a bare `sh readback.sh` is not available if you downloaded only the `.bin`.
 
 ### Method 3: Command-line flashing (Linux / macOS / Windows)
 
@@ -278,7 +300,7 @@ Pick any of the three ways:
 
 ## 7. Changelog
 
-Organized in four categories; **currently v1.0 (firmware version `0.3.3-pico22`)**:
+Organized in four categories; **current firmware version `0.3.9-pico26.11.19`**:
 see [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ## 8. Disclaimer

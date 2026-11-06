@@ -10,7 +10,10 @@
 
 Based on the original work by [MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware).
 
-**当前版本：v1.0 正式版（内部代号 gen22，固件版本号 `0.3.3-pico22`）**
+**当前版本：`0.3.9-pico26.11.19`** · `Read_Pico.bin` 4,216,992 B · SHA-256 `c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0`
+
+> **源码基线说明**：本仓库源码反映 2026-10-26 基线，当前发布物固件产自内部开发链，
+> 两者不假装同步；产物验证以 SHA-256 为准，不从本仓库源码重建。详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 ---
 
@@ -50,6 +53,22 @@ Based on the original work by [MindReset/read_pico_firmware](https://github.com/
 | 📱 极客副屏 | **蓝牙自动校时** | 手机推送时顺带校准设备时钟（设备无 RTC 晶振，长期会漂移） |
 | ⚙️ 底层优化 | 刷新/功耗打磨 | 武装期收口不必要局部刷新、息屏与锁屏路径梳理等 |
 
+### 近期行为变更（26.11.15–26.11.19）
+
+| 代 | 变更 |
+|---|---|
+| [123] | 正文两端对齐 + 西文按词断行（Liang 断词），行尾不再有大段空隙、长词不腰斩 |
+| [124] | 补齐字距（kerning）离线展平表，三端同尺，词间「大峡谷」巨缝消除 |
+| 26.11.15 | 排版增强开关：阅读设置里可切换，关闭态完全回到经典排版、开启态为增强排版，切换即重排、重启保持 |
+| 26.11.16 | 状态栏电量修复：书架/首页电量有了独立刷新节拍，充电插拔与百分比变化会及时更新 |
+| 26.11.17 | 首页新手势：双指上滑打开最新推送内容、空白处长按进入传书页；状态栏信息带不做手势领地，避免误触 |
+| 26.11.18 | 书架状态栏时钟恢复分钟节拍，每分钟规律跳、无累积延迟（其余页保持不变） |
+| 26.11.19 | 锁屏唤醒后首帧电量可能先显示锁屏前的值、随后一拍跟上——申报过的预期行为，A 组实测通过；按键响应与锁屏认证的可靠性不再受其他功能使用情况影响 |
+
+### 已知问题
+
+**已知问题**：插线充电时，首页状态栏的电量数字可能长时间不跳动；拔掉数据线后，电量会更新到当前值。这是已知的显示现象，不影响充电与正常使用——想立即看到最新电量，拔线一次即可。
+
 > ## ⚠️ 重要：离线词典必须自备词典文件
 >
 > **本固件不包含词典数据。** 查词功能依赖放在 TF 卡里的词典文件：
@@ -76,11 +95,11 @@ Based on the original work by [MindReset/read_pico_firmware](https://github.com/
 2. 用电脑打开网页刷机页面（需 **Chrome 或 Edge** 浏览器，暂不支持手机浏览器和 Safari）：
 
    ```
-   https://<你的用户名>.github.io/<仓库名>/
+   https://<你的用户名>.github.io/<仓库名>/web-flasher/
    ```
 
-   （本仓库开启 GitHub Pages 后，上面的地址就是刷机页——`web-flasher/` 目录会被发布为站点根目录。
-   如果你还没把仓库放到 GitHub，也可以在电脑上进入 `web-flasher` 目录后运行
+   （刷机页在 `/web-flasher/` 路径下；**站点根 `/` 是 README 渲染页，不是刷机页**，请用上面的
+   `/web-flasher/` 地址。如果你还没把仓库放到 GitHub，也可以在电脑上进入 `web-flasher` 目录后运行
    `python -m http.server 8000`，然后用浏览器打开 `http://localhost:8000` 刷机。）
 3. 点击页面上的 **「安装固件」** 按钮；
 4. 在弹窗中选择设备对应的串口（如 `COM3`、`USB JTAG/serial debug unit`），点击连接；
@@ -111,7 +130,9 @@ Based on the original work by [MindReset/read_pico_firmware](https://github.com/
 4. 用 USB 线连接设备，**双击 `flash.bat`**（Windows）或执行 `sh flash.sh /dev/ttyUSB0`；
 5. 按提示等待，看到 `Flash done` 即完成。
 
-脚本会先校验 `Read_Pico.bin` 的 SHA-256 与锚定值一致，不一致会**拒绝烧录**并提示。
+脚本会先校验 `Read_Pico.bin` 的 SHA-256 与锚定值（`c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0`）一致，
+不一致会**拒绝烧录**并提示。烧录完成后运行 `readback.sh` 回读验证。脚本随刷机包提供——
+先解压刷机包；只单独下载了 `.bin` 时没有脚本，裸 `sh readback.sh` 不可执行。
 
 ### 方法 3：电脑命令行线刷（Linux / macOS / Windows 通用）
 
@@ -229,7 +250,7 @@ python -m esptool --chip esp32s3 -b 460800 \
 
 ## 七、更新日志
 
-按四分类整理，**当前为 v1.0 正式版（固件版本号 `0.3.3-pico22`）**：
+按四分类整理，**当前固件版本号 `0.3.9-pico26.11.19`**：
 详见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
 
 ## 八、免责声明
