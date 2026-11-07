@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#F2EFE7">
+<meta name="description" content="Pico-Plus 墨水屏极客副屏固件 · 网页一键刷机与刷机后必装附件（安卓 App v1.6.5、离线词典 dict.bin）。固件版本 0.3.9-pico26.11.19，ESP32-S3。">
+<title>Pico-Plus · 一键刷机与必备附件</title>
+<style>
+/* ============================================================
+   Pico-Plus — Editorial tool page
+   Palette: paper #F2EFE7 / ink #1A1A1A / red #C7322E
+            olive #5E6347 / rule #C8C2B0
+   Type: serif display (Chinese Songti) + sans body + mono meta
+   Geometry: 0 radius, no shadow, hairline rules, 4/8/16/24/32/48/96
+   ============================================================ */
+:root{
+  color-scheme: light;
+  --paper:#F2EFE7;
+  --paper-2:#FBF9F3;
+  --white:#FFFFFF;
+  --ink:#1A1A1A;
+  --ink-2:#2A2823;
+  --ink-soft:#55534B;
+  --muted:#7C786C;
+  --red:#C7322E;
+  --red-lite:color-mix(in srgb, var(--red) 72%, white);
+  --olive:#5E6347;
+  --rule:#C8C2B0;
+  --rule-soft:#DDD7C6;
+  --serif:"Songti SC","STSong","Noto Serif CJK SC","Source Han Serif SC","SimSun",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --maxw:1180px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:var(--sans);font-size:16px;line-height:1.75;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--red);text-decoration:none;border-bottom:1px solid var(--rule)}
+a:hover{color:var(--ink);border-bottom-color:var(--red)}
+img{display:block;max-width:100%}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 32px}
+.kicker{
+  font-family:var(--sans);font-size:.7rem;font-weight:700;
+  letter-spacing:.2em;text-transform:uppercase;color:var(--red);
+}
+.kicker--onink{color:var(--red-lite)}
+h1,h2,h3,h4{font-family:var(--serif);font-weight:700;text-wrap:pretty;margin:0}
+.dek{font-family:var(--serif);font-style:italic;font-weight:400;color:var(--ink-soft);text-wrap:pretty}
+.mono{font-family:var(--mono);font-size:.82em}
+.rule{height:1px;background:var(--rule);border:0;margin:0}
+
+/* ---------- persistent top bar : downloads always one glance away ---------- */
+.topbar{
+  position:sticky;top:0;z-index:50;
+  background:color-mix(in srgb,var(--paper) 92%,transparent);
+  backdrop-filter:saturate(140%) blur(10px);
+  border-bottom:1px solid var(--rule);
+}
+.topbar__in{
+  max-width:var(--maxw);margin:0 auto;padding:10px 32px;
+  display:flex;align-items:center;gap:20px;flex-wrap:wrap;
+}
+.brand{display:flex;align-items:baseline;gap:12px;margin-right:auto;white-space:nowrap}
+.brand__name{font-family:var(--serif);font-size:1.12rem;font-weight:700;letter-spacing:.02em}
+.brand__ver{font-family:var(--mono);font-size:.72rem;color:var(--muted)}
+.topbar__label{font-size:.76rem;color:var(--muted);white-space:nowrap}
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:9px;
+  font-family:var(--sans);font-weight:700;text-decoration:none;border:1px solid transparent;
+  cursor:pointer;transition:background .18s ease,color .18s ease,border-color .18s ease,transform .12s ease;
+}
+.btn:hover{transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn--sm{font-size:.82rem;padding:8px 15px}
+.btn--lg{font-size:1rem;padding:15px 22px}
+.btn--red{background:var(--red);color:#fff;border-color:var(--red)}
+.btn--red:hover{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn--ghost{background:transparent;color:var(--ink);border-color:var(--ink)}
+.btn--ghost:hover{background:var(--ink);color:var(--paper)}
+.btn--paper{background:var(--paper-2);color:var(--ink);border-color:var(--paper-2)}
+.btn--paper:hover{background:#fff;border-color:#fff;color:var(--red)}
+.btn__arrow{font-size:1.05em;line-height:1}
+.t-short{display:none}
+
+/* ---------- masthead ---------- */
+.masthead{padding:16px 0 10px}
+.masthead__row{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap}
+.masthead__meta{font-size:.8rem;color:var(--ink-soft);text-align:right;line-height:1.9}
+.masthead__meta b{color:var(--ink)}
+
+/* ---------- hero ---------- */
+.hero{padding:6px 0 16px}
+.hero__grid{display:grid;grid-template-columns:1.08fr .92fr;gap:36px;align-items:start}
+.hero h1{font-size:clamp(1.85rem,3vw,2.6rem);line-height:1.14;letter-spacing:-.01em;margin:9px 0 10px}
+.hero .dek{font-size:.93rem;line-height:1.7;margin:0 0 14px;max-width:36em}
+.hero__install{
+  background:var(--paper-2);border:1px solid var(--rule);
+  padding:13px 18px;display:inline-block;min-width:300px;
+}
+.hero__install .kicker{margin-bottom:7px}
+.hero__install p{font-size:.82rem;color:var(--ink-soft);margin:0 0 11px}
+/* esp-web-tools@10：按钮是 shadow DOM 里 slot 的 fallback，不暴露 part。
+   用 slot="activate" 提供自定义按钮，完全交给文档层样式控制；
+   同时设置官方 CSS 变量作兜底。 */
+esp-web-install-button{
+  --esp-tools-button-color:var(--red);
+  --esp-tools-button-text-color:#fff;
+  --esp-tools-button-border-radius:0;
+  display:inline-block;
+}
+.install-btn{
+  font-family:var(--sans);font-size:1.02rem;font-weight:700;
+  padding:13px 30px;border:1px solid var(--red);border-radius:0;
+  background:var(--red);color:#fff;cursor:pointer;
+  transition:background .18s ease,border-color .18s ease;
+}
+.install-btn:hover{background:var(--ink);border-color:var(--ink)}
+.hero__note{font-size:.78rem;color:var(--muted);margin:11px 0 0;max-width:34em}
+.hero__photo{position:relative}
+.hero__photo img{width:100%;height:196px;object-fit:cover;object-position:center 42%;border:1px solid var(--rule);background:var(--white)}
+.hero__cap{
+  display:flex;justify-content:space-between;gap:12px;
+  font-size:.74rem;color:var(--muted);margin-top:10px;
+  border-bottom:1px solid var(--rule);padding-bottom:8px;
+}
+.hero__cap span:first-child{color:var(--red);font-weight:700;letter-spacing:.1em}
+
+/* fact strip */
+.facts{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--ink);border-bottom:1px solid var(--rule);margin-top:0}
+.fact{padding:16px 18px 15px;border-right:1px solid var(--rule)}
+.fact:last-child{border-right:0}
+.fact__k{font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.fact__v{font-family:var(--mono);font-size:.88rem;color:var(--ink);margin-top:5px;word-break:break-all}
+.fact__v b{color:var(--red)}
+
+/* ---------- AFTER FLASHING : dark, high-contrast, first-screen ---------- */
+.after{background:var(--ink);color:var(--paper);padding:12px 0 44px;margin-top:0}
+.after__head{display:flex;align-items:flex-end;justify-content:space-between;gap:30px;flex-wrap:wrap;margin-bottom:8px}
+.after h2{font-size:clamp(1.5rem,2.5vw,2.05rem);line-height:1.2;margin:7px 0 0;color:var(--paper)}
+.after__lead{font-family:var(--serif);font-style:italic;font-size:1.02rem;color:var(--rule);max-width:30em;margin:0}
+.after__alert{
+  border-left:3px solid var(--red);padding:8px 14px;margin:0 0 14px;
+  background:color-mix(in srgb,var(--red) 12%,var(--ink));
+  font-size:.87rem;color:var(--paper);
+}
+.after__alert b{color:var(--red-lite)}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.card{background:var(--paper-2);color:var(--ink);border:1px solid var(--paper-2);display:flex;flex-direction:column}
+.card__top{background:var(--red);color:#fff;padding:9px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.card__step{font-family:var(--mono);font-size:.76rem;font-weight:700;letter-spacing:.16em}
+.card__tag{font-size:.72rem;letter-spacing:.08em;opacity:.92}
+.card__body{padding:20px 22px 24px;display:flex;flex-direction:column;flex:1}
+.card h3{font-size:1.4rem;line-height:1.25;margin:0 0 3px}
+.card__sub{font-family:var(--mono);font-size:.78rem;color:var(--muted);margin:0 0 12px}
+.card__desc{font-size:.92rem;color:var(--ink-soft);margin:0 0 20px;line-height:1.75}
+.card__dl{display:flex;flex-direction:column;gap:9px;margin-bottom:12px}
+.card__alt{font-size:.8rem;color:var(--ink-soft);margin:0 0 22px}
+.card__alt a{font-family:var(--mono);font-size:.78rem}
+.card__how{border-top:1px solid var(--rule);padding-top:12px;margin-top:12px}
+.card__how .kicker{margin-bottom:12px}
+.steps{list-style:none;margin:0;padding:0;counter-reset:s}
+.steps li{
+  position:relative;padding:0 0 11px 30px;font-size:.88rem;line-height:1.7;color:var(--ink-2);
+  counter-increment:s;
+}
+.steps li::before{
+  content:counter(s,decimal-leading-zero);position:absolute;left:0;top:1px;
+  font-family:var(--mono);font-size:.7rem;font-weight:700;color:var(--red);
+}
+.steps li b{color:var(--ink)}
+.card__warn{
+  margin-top:16px;padding:10px 13px;border:1px solid var(--rule);
+  background:var(--paper);font-size:.8rem;line-height:1.65;color:var(--ink-soft);
+}
+.card__warn b{color:var(--red)}
+
+/* ---------- generic section ---------- */
+section.band{padding:74px 0;border-bottom:1px solid var(--rule)}
+.sec__head{display:flex;align-items:baseline;gap:18px;margin-bottom:12px;flex-wrap:wrap}
+.sec__no{font-family:var(--mono);font-size:.78rem;color:var(--red);font-weight:700;letter-spacing:.1em}
+.sec__head h2{font-size:clamp(1.75rem,3vw,2.4rem);line-height:1.25}
+.sec__dek{font-family:var(--serif);font-style:italic;color:var(--ink-soft);font-size:1rem;margin:0 0 34px;max-width:44em}
+
+/* features (gestures) */
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border-top:1px solid var(--ink)}
+.feature{padding:28px 26px 30px;border-right:1px solid var(--rule)}
+.feature:first-child{padding-left:0}
+.feature:last-child{border-right:0;padding-right:0}
+.feature__no{font-family:var(--mono);font-size:.72rem;font-weight:700;color:var(--red);letter-spacing:.14em}
+.feature h3{font-size:1.3rem;margin:12px 0 10px;line-height:1.35}
+.feature p{font-size:.9rem;color:var(--ink-soft);margin:0 0 12px;line-height:1.75}
+.feature__act{
+  font-family:var(--mono);font-size:.76rem;color:var(--ink);
+  background:var(--paper-2);border:1px solid var(--rule);padding:7px 10px;display:inline-block;
+}
+.feature__act b{color:var(--red)}
+.feature__fig{margin-top:18px;border-top:1px solid var(--rule);padding-top:14px;font-size:.78rem;color:var(--muted)}
+
+/* boxsel spotlight：竖屏真机照完整显示，不裁切 */
+.boxsel{display:grid;grid-template-columns:340px 1fr;gap:0;margin-top:36px;border-top:1px solid var(--ink);border-bottom:1px solid var(--rule)}
+.boxsel__fig{margin:0;padding:28px 30px 28px 0;border-right:1px solid var(--rule)}
+.boxsel__fig img{width:100%;height:auto;display:block;border:1px solid var(--rule);background:var(--white)}
+.boxsel__fig figcaption{font-family:var(--mono);font-size:.71rem;color:var(--muted);margin-top:10px;line-height:1.7}
+.boxsel__txt{padding:28px 0 28px 34px;display:flex;flex-direction:column;justify-content:center}
+.boxsel__no{font-family:var(--mono);font-size:.72rem;font-weight:700;color:var(--red);letter-spacing:.14em}
+.boxsel__txt h3{font-family:var(--serif);font-size:1.7rem;line-height:1.3;margin:14px 0 16px}
+.boxsel__txt p{font-size:.92rem;line-height:1.85;color:var(--ink-soft);margin:0 0 12px;max-width:36em}
+.boxsel__txt b{color:var(--ink)}
+.boxsel__lead{font-family:var(--mono);font-size:.74rem;color:var(--red);border-left:3px solid var(--red);padding:2px 0 2px 12px;margin-top:6px}
+
+/* function list */
+.funclist{display:grid;grid-template-columns:1fr 1fr;column-gap:46px;row-gap:0}
+.func{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid var(--rule-soft)}
+.func__n{font-family:var(--mono);font-size:.72rem;font-weight:700;color:var(--red);padding-top:5px;min-width:26px}
+.func__b b{font-family:var(--serif);font-size:1.05rem}
+.func__b span{display:block;font-size:.87rem;color:var(--ink-soft);line-height:1.7;margin-top:2px}
+
+/* flash steps */
+.flashsteps{display:grid;grid-template-columns:1fr 1fr;gap:0 46px;counter-reset:f}
+.fstep{position:relative;padding:16px 0 18px 62px;border-bottom:1px solid var(--rule-soft);font-size:.93rem;color:var(--ink-2);line-height:1.75;counter-increment:f}
+.fstep::before{
+  content:counter(f,decimal-leading-zero);position:absolute;left:0;top:14px;
+  font-family:var(--serif);font-size:2rem;font-weight:700;color:var(--red);line-height:1;
+}
+.fstep b{color:var(--ink)}
+.note{
+  margin-top:26px;background:var(--paper-2);border:1px solid var(--rule);
+  padding:15px 20px;font-size:.88rem;color:var(--ink-soft);
+}
+.note b{color:var(--ink)}
+
+/* gallery */
+.gallery{display:grid;grid-template-columns:1.25fr .9fr .9fr;gap:18px;align-items:start}
+.gallery figure{margin:0}
+.gallery img{width:100%;height:270px;object-fit:cover;border:1px solid var(--rule);background:#fff}
+.gallery figcaption{font-size:.78rem;color:var(--ink-soft);margin-top:9px;line-height:1.6;border-top:1px solid var(--rule);padding-top:8px}
+.gallery figcaption b{display:block;color:var(--red);font-family:var(--mono);font-size:.7rem;letter-spacing:.12em;margin-bottom:3px}
+
+/* detail columns */
+.detail{display:grid;grid-template-columns:1fr 1fr;gap:0 52px}
+.detail__col{border-top:2px solid var(--ink);padding-top:20px}
+.detail h3{font-size:1.3rem;margin:0 0 14px}
+.detail h4{font-size:1.02rem;margin:24px 0 8px;color:var(--red)}
+.detail p,.detail li{font-size:.88rem;color:var(--ink-soft);line-height:1.8}
+.detail ol,.detail ul{margin:8px 0 0;padding-left:20px}
+.detail li{margin-bottom:6px}
+.detail b{color:var(--ink)}
+.inline-photo{margin:18px 0 0;border:1px solid var(--rule);background:#fff}
+.inline-photo img{width:100%;height:210px;object-fit:cover;object-position:top}
+.inline-photo p{font-size:.76rem;color:var(--muted);margin:0;padding:8px 12px;border-top:1px solid var(--rule)}
+
+/* faq */
+.faq{columns:2;column-gap:52px}
+.faq__item{break-inside:avoid;padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid var(--rule-soft)}
+.faq__q{font-family:var(--serif);font-size:1.02rem;font-weight:700;margin:0 0 6px;color:var(--ink)}
+.faq__a{font-size:.87rem;color:var(--ink-soft);line-height:1.8;margin:0}
+
+/* footer */
+footer{padding:52px 0 64px;background:var(--ink);color:var(--rule)}
+footer .kicker{margin-bottom:18px}
+.foot__quote{font-family:var(--serif);font-size:1.35rem;font-style:italic;color:var(--paper);margin:0 0 26px;max-width:38em;line-height:1.6}
+.foot__credits{font-size:.84rem;line-height:2;color:var(--rule);max-width:60em}
+.foot__credits a{color:var(--red-lite);border-bottom-color:var(--olive)}
+.foot__credits a:hover{color:#fff;border-bottom-color:#fff}
+.foot__disc{margin-top:22px;padding-top:18px;border-top:1px solid var(--olive);font-size:.84rem;color:var(--paper);font-weight:700}
+.foot__rule{height:1px;background:var(--olive);margin:30px 0 20px}
+.foot__end{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;font-size:.74rem;color:var(--muted);font-family:var(--mono)}
+
+/* cdn hint */
+#cdn-hint{display:none;background:var(--paper-2);border:1px solid var(--red);color:var(--red);padding:12px 16px;margin-top:14px;font-size:.85rem}
+
+/* motion */
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.rise{animation:rise .55s ease both}
+.d1{animation-delay:.06s}.d2{animation-delay:.13s}.d3{animation-delay:.2s}
+@media (prefers-reduced-motion:reduce){.rise{animation:none}html{scroll-behavior:auto}}
+
+/* responsive */
+@media (max-width:1000px){
+  .hero__grid{grid-template-columns:1fr;gap:26px}
+  .facts{grid-template-columns:1fr 1fr}
+  .fact:nth-child(2){border-right:0}
+  .fact:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+  .gallery{grid-template-columns:1fr 1fr}
+  .gallery figure:first-child{grid-column:1/-1}
+}
+@media (max-width:760px){
+  .wrap{padding:0 20px}
+  .topbar__in{padding:8px 16px;gap:6px}
+  .topbar__label{display:none}
+  .brand{width:100%;margin-right:0}
+  .brand__name{font-size:1rem}
+  .topbar .btn{flex:1;padding:8px 4px;font-size:.7rem;white-space:nowrap;gap:3px}
+  .btn__arrow{display:none}
+  .t-long{display:none}
+  .t-short{display:inline}
+  .masthead{padding:22px 0 14px}
+  .masthead__meta{text-align:left;font-size:.76rem}
+  .hero{padding:6px 0 26px}
+  .hero__photo{display:none}
+  .hero__install{min-width:0;display:block;width:100%}
+  .facts{grid-template-columns:1fr}
+  .fact{border-right:0;border-bottom:1px solid var(--rule)}
+  .fact:last-child{border-bottom:0}
+  .after{padding:48px 0 54px}
+  .cards,.features,.funclist,.flashsteps,.detail,.faq{grid-template-columns:1fr;columns:auto}
+  .feature{padding:24px 0;border-right:0;border-bottom:1px solid var(--rule)}
+  .feature:last-child{border-bottom:0}
+  .features{border-top:1px solid var(--ink)}
+  .gallery{grid-template-columns:1fr}
+  .gallery figure:first-child{grid-column:auto}
+  .gallery img{height:230px}
+  .boxsel{grid-template-columns:1fr;margin-top:26px}
+  .boxsel__fig{padding:0;border-right:0;max-width:300px;margin:0 auto;width:100%}
+  .boxsel__txt{padding:24px 0 0}
+  .boxsel__txt h3{font-size:1.45rem}
+  .detail__col+.detail__col{margin-top:34px}
+  section.band{padding:52px 0}
+}
+</style>
+<!-- esp-web-tools：主源 jsdelivr（国内访问更稳定），失败时自动回退 unpkg。 -->
+<script type="module" src="https://cdn.jsdelivr.net/npm/esp-web-tools@10/dist/web/install-button.js"></script>
+<script>
+  window.addEventListener('error', function (e) {
+    var t = e && e.target;
+    if (t && t.tagName === 'SCRIPT' && /jsdelivr\.net/.test(t.src || '')) {
+      var s = document.createElement('script');
+      s.type = 'module';
+      s.src = 'https://unpkg.com/esp-web-tools@10/dist/web/install-button.js';
+      document.head.appendChild(s);
+    }
+  }, true);
+  setTimeout(function () {
+    if (!customElements.get('esp-web-install-button')) {
+      document.getElementById('cdn-hint').style.display = 'block';
+    }
+  }, 8000);
+</script>
+</head>
+<body>
+
+<!-- ============ 常驻下载条：任何滚动位置都一眼可见 ============ -->
+<div class="topbar">
+  <div class="topbar__in">
+    <div class="brand">
+      <span class="brand__name">Pico-Plus</span>
+      <span class="brand__ver">0.3.9-pico26.11.19</span>
+    </div>
+    <span class="topbar__label">刷完之后必装 ↓</span>
+    <a class="btn btn--sm btn--red" href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk"><span class="btn__arrow">↓</span><span class="t-long"> 安卓 App v1.6.5</span><span class="t-short">App v1.6.5</span></a>
+    <a class="btn btn--sm btn--ghost" href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin"><span class="btn__arrow">↓</span><span class="t-long"> 词典 dict.bin</span><span class="t-short">词典 dict.bin</span></a>
+    <a class="btn btn--sm btn--paper" href="#flash"><span class="t-long">一键刷机</span><span class="t-short">刷机</span></a>
+  </div>
+</div>
+
+<!-- ============ 刊头 ============ -->
+<header class="masthead">
+  <div class="wrap masthead__row">
+    <div>
+      <div class="kicker">Read Pico · 第三方修改版固件 · 网页刷机与必备附件</div>
+    </div>
+    <div class="masthead__meta">
+      适用硬件：<b>MindReset RDP-G01-W</b> 墨水屏阅读器（ESP32-S3）<br>
+      基于 <b>kiikoread r95 版（0.3.3-rc95）</b> 改造，与 MindReset 官方无关
+    </div>
+  </div>
+</header>
+
+<!-- ============ HERO ============ -->
+<main>
+<section class="hero" id="flash">
+  <div class="wrap">
+    <div class="hero__grid">
+      <div class="rise d1">
+        <div class="kicker">Firmware 0.3.9 · pico26.11.19</div>
+        <h1>把这台墨水屏，<br>刷成趁手的阅读器。</h1>
+        <p class="dek">横屏双栏、离线词典与生词本、手机蓝牙推流副屏，以及首页／阅读页双指手势与框选摘抄。一根数据线，浏览器里点一下就能刷。</p>
+
+          <div class="hero__install">
+          <div class="kicker">Step 00 · 一键刷机</div>
+          <p>用 USB 数据线把设备连到电脑，然后点下面的按钮。</p>
+          <esp-web-install-button manifest="web-flasher/manifest.json">
+            <button slot="activate" class="install-btn">安装固件 · 一键刷机</button>
+            <span slot="unsupported">此浏览器不支持串口刷机，请用电脑版 Chrome 或 Edge 打开本页。</span>
+            <span slot="not-allowed">刷机需在 HTTPS 或 localhost 下进行，请检查页面地址。</span>
+          </esp-web-install-button>
+          <div id="cdn-hint">刷机脚本没能加载出来（网络原因）。请更换网络环境后刷新本页重试；脚本来自 jsdelivr / unpkg 两个公共 CDN。</div>
+          <p class="hero__note">刷完之后，<b>请接着看下面两个必装附件 ↓</b></p>
+        </div>
+      </div>
+
+      <div class="hero__photo rise d2">
+        <img src="screenshots/shot-dual-column.jpg" alt="真机实拍：墨水屏横屏双栏英文正文排版">
+        <div class="hero__cap"><span>FIG. 01 / 真机实拍</span><span>横屏双栏排版 · 一页两栏</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 刷完之后：两个必装附件（首屏深色高对比） ============ -->
+<section class="after" id="downloads" style="scroll-margin-top:62px">
+  <div class="wrap">
+    <div class="after__head">
+      <div>
+        <div class="kicker kicker--onink">After Flashing · 刷完之后，先装这两样</div>
+        <h2>刷完机，还差两个附件才完整。</h2>
+      </div>
+      <p class="after__lead">固件里不含这两样，也不会自动帮你装。下面两个按钮点一下就能下载，各三步即用。</p>
+    </div>
+
+    <p class="after__alert"><b>重要：</b>本固件<b>不包含词典数据</b>，不放 <span class="mono">dict.bin</span> 就无法查词；手机蓝牙推流、AI 释义、听书则需要配套的安卓 App。两样都由你手动下载安装，与刷机分开。</p>
+
+    <div class="cards">
+      <!-- STEP 01 : APK -->
+      <article class="card">
+        <div class="card__top"><span class="card__step">STEP 01 / 手机端</span><span class="card__tag">仅安卓 · 装到手机</span></div>
+        <div class="card__body">
+          <h3>配套安卓 App</h3>
+          <p class="card__sub">ReadPicoPush · v1.6.5 · 61 KB · 仅安卓</p>
+          <div class="card__dl">
+            <a class="btn btn--lg btn--red" href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk"><span class="btn__arrow">↓</span> 下载 App（v1.6.5）</a>
+          </div>
+          <div class="card__how">
+            <div class="kicker">怎么用 · 三步</div>
+            <ol class="steps">
+              <li>把 APK 装到<b>安卓手机</b>；iOS 因系统限制不支持。</li>
+              <li>打开 App，点<b>「连接并监听点词」</b>与设备保持连接（AI 释义与听书的前提）。</li>
+              <li>Android 10/11 需先开启系统<b>「定位服务」</b>并授予位置权限，否则扫描不到设备。</li>
+            </ol>
+          </div>
+          <p class="card__desc">用于<b>蓝牙推流（副屏）、AI 智能释义、语音朗读</b>。也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件下载；<b>请勿再用旧的 v1.5.2</b>。</p>
+          <div class="card__warn"><b>固件与 App 必须配套。</b>固件与 App 必须同时更新，旧版在多台设备并存时可能连错设备；首次用 AI 释义前在「AI 释义设置」填入自己的 API key（默认 DeepSeek）。</div>
+        </div>
+      </article>
+
+      <!-- STEP 02 : 词典 -->
+      <article class="card">
+        <div class="card__top"><span class="card__step">STEP 02 / TF 卡</span><span class="card__tag">离线查词必装</span></div>
+        <div class="card__body">
+          <h3>离线词典文件</h3>
+          <p class="card__sub">dict.bin · 约 8.9 MB · 12.4 万词</p>
+          <div class="card__dl">
+            <a class="btn btn--lg btn--red" href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin"><span class="btn__arrow">↓</span> 下载词典 dict.bin</a>
+            <a class="btn btn--sm btn--ghost" href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin">或下载更全词库 dict-full.bin（23 MB / 40 万词）</a>
+          </div>
+          <div class="card__how">
+            <div class="kicker">怎么用 · 三步</div>
+            <ol class="steps">
+              <li>电脑上插入 TF 卡（或读卡器），在卡盘<b>最上层建一个 dict 文件夹</b>。</li>
+              <li>把 <b>dict.bin</b> 放进去，卡里形成 <span class="mono">dict/dict.bin</span> 这一层结构。</li>
+              <li>TF 卡插回设备并<b>重启</b>，之后选中单词即可查词。</li>
+            </ol>
+          </div>
+          <p class="card__desc">放到 <b>TF 卡根目录的 <span class="mono">dict</span> 文件夹</b>里，阅读时选中单词即可查义，查过的词自动进生词本。下载 <span class="mono">dict-full.bin</span> 的话，先<b>重命名为 <span class="mono">dict.bin</span></b> 再放卡；AI 释义不受影响。</p>
+          <div class="card__warn"><b>命名与位置必须严格一致。</b>不要在卡上建 <span class="mono">sdcard</span> 文件夹（<span class="mono">/sdcard</span> 只是固件里 TF 卡的挂载点名）；<span class="mono">dict</span> 文件夹里只放一个词典文件。</div>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 固件与分区校验（页面级确认） ============ -->
+<section class="band" id="verify" style="padding:44px 0">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">00 / VERIFY</span><h2>本页刷的四件，对不对</h2></div>
+    <p class="sec__dek">刷机按钮读取的清单与本版正式包逐件核对过，四个烧录偏移与分区表一致。</p>
+    <div class="facts">
+      <div class="fact"><div class="fact__k">固件版本</div><div class="fact__v">0.3.9-pico26.11.19</div></div>
+      <div class="fact"><div class="fact__k">主程序</div><div class="fact__v">Read_Pico.bin · 4,216,992 B</div></div>
+      <div class="fact"><div class="fact__k">主程序 SHA-256</div><div class="fact__v"><b>c0972f78d2ab</b>…</div></div>
+      <div class="fact"><div class="fact__k">四件烧录件</div><div class="fact__v">与正式包<b>逐一同源</b>已校验</div></div>
+    </div>
+    <div class="note" style="margin-top:18px">
+      四个烧录偏移 <span class="mono">0x0 / 0x8000 / 0x10000 / 0xb10000</span> 与仓库 <span class="mono">flash.sh</span>、<span class="mono">partition-table.bin</span> 反解结果一致；
+      <span class="mono">0xb10000</span> 正是 <span class="mono">otadata</span> 分区起始，<span class="mono">0x10000</span> 是 <span class="mono">ota_0</span> 起始。
+      网页刷机读取 <span class="mono">web-flasher/manifest.json</span>，四件 bin 就在同目录，<b>与正式包为同一颗</b>。
+    </div>
+  </div>
+</section>
+
+<!-- ============ 手势与框选 ============ -->
+<section class="band" id="gestures">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">01 / GESTURES</span><h2>手势与框选</h2></div>
+    <p class="sec__dek">这台设备不只是翻页：首页、阅读页各有双指手势，正文还能框选一段存成摘抄。</p>
+
+    <div class="features">
+      <article class="feature">
+        <div class="feature__no">FEATURE 01 · 首页</div>
+        <h3>首页双指 / 空白长按</h3>
+        <p>在首页用<b>双指上滑</b>，直接打开最新一条推送内容；在卡片与状态栏之外的<b>空白处长按</b>，进入传书页。</p>
+        <span class="feature__act"><b>双指上滑</b> → 最新推送</span><br>
+        <span class="feature__act" style="margin-top:6px"><b>空白长按</b> → 传书页</span>
+        <div class="feature__fig">状态栏信息带不做手势领地，持机误触不会误开；单指点击、翻页等旧手势照常。</div>
+      </article>
+
+      <article class="feature">
+        <div class="feature__no">FEATURE 02 · 阅读页</div>
+        <h3>阅读页双指</h3>
+        <p>阅读正文时两指一起滑动：<b>上下滑</b>按档位调字号（下滑加大、上滑减小），<b>横向滑</b>切换横屏／竖屏。</p>
+        <span class="feature__act"><b>双指纵向滑</b> → 字号 ±档</span><br>
+        <span class="feature__act" style="margin-top:6px"><b>双指横向滑</b> → 横竖屏切换</span>
+        <div class="feature__fig">滑动太慢或位移太小会被当成按住／抖动，不会误触；框选状态下双指滑动只用于退出框选。</div>
+      </article>
+
+      <article class="feature">
+        <div class="feature__no">FEATURE 03 · 框选</div>
+        <h3>框选与存摘抄</h3>
+        <p>阅读页单栏横排下，<b>两次点按</b>即可框出一段文字：先点首字，再点尾字，选中后底部出现动作栏。</p>
+        <span class="feature__act"><b>点首字 → 再点尾字</b></span><br>
+        <span class="feature__act" style="margin-top:6px"><b>存摘抄 / 取消</b></span>
+        <div class="feature__fig">摘抄可在书架「生词本／摘抄」里回看；点选区外或按键即退出框选。</div>
+      </article>
+    </div>
+
+    <div class="boxsel">
+      <figure class="boxsel__fig">
+        <img src="screenshots/boxsel-realhw.jpg" alt="真机实拍：设备竖屏单栏英文阅读页，顶部一排圆形快捷图标，正文中一段被虚线框标出，右侧一支橙色箭头指向顶部图标">
+        <figcaption>真机实拍 · 竖屏单栏阅读页，非渲染图。</figcaption>
+      </figure>
+      <div class="boxsel__txt">
+        <div class="boxsel__no">FEATURE 03 · 框选 / 真机实拍</div>
+        <h3>框选，就在正文上</h3>
+        <p>画面是设备<b>竖屏单栏</b>下的阅读页：英文正文占满屏幕，顶部浮出一排圆形快捷图标，正文中有一段被虚线框标出，右侧一支橙色箭头指向顶部图标。框选与取词就发生在这样的正文里。</p>
+        <p>两次点按选段、选中后的动作栏与回看位置，见上方 <b>FEATURE 03</b> 的说明；此处只放设备实拍，不重复步骤。</p>
+        <div class="boxsel__lead">注：虚线框与橙色箭头为照片原有标注。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 主要功能 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">02 / FEATURES</span><h2>这台设备能做什么</h2></div>
+    <p class="sec__dek">在原版书架、EPUB/TXT 阅读、进度、字体导入、锁屏、USB 存储、WiFi 传书之上增加的能力。</p>
+    <div class="funclist">
+      <div class="func"><div class="func__n">01</div><div class="func__b"><b>双栏排版</b><span>横屏一页两栏，翻页次数减半，接近捧着一本真书。</span></div></div>
+      <div class="func"><div class="func__n">02</div><div class="func__b"><b>离线词典与生词本</b><span>阅读中取词查义、无需联网；<b>词典文件需自备并放进 TF 卡</b>（见上方 STEP 02）。</span></div></div>
+      <div class="func"><div class="func__n">03</div><div class="func__b"><b>AI 智能释义</b><span>点词经手机调用大模型给出详解，需自备 API key 并保持 App 连接。</span></div></div>
+      <div class="func"><div class="func__n">04</div><div class="func__b"><b>语音朗读（听书）</b><span>翻页自动把当前页推到手机朗读，息屏锁屏不中断。</span></div></div>
+      <div class="func"><div class="func__n">05</div><div class="func__b"><b>蓝牙推流副屏</b><span>安卓手机把长文、网页片段、单词卡推到设备并自动打开阅读。</span></div></div>
+      <div class="func"><div class="func__n">06</div><div class="func__b"><b>网页刷机</b><span>浏览器一键烧录，无需安装任何电脑软件；本页即仓库主页。</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 刷机步骤 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">03 / HOW TO FLASH</span><h2>刷机操作步骤</h2></div>
+    <p class="sec__dek">首次刷机必须连电脑：本固件分区布局与官方不同，需要整片写入。</p>
+    <div class="flashsteps">
+      <div class="fstep">用 <b>USB 数据线</b>把设备连到电脑（部分充电线只能充电，不能传数据）。</div>
+      <div class="fstep">确保设备<b>电量充足</b>，建议 50% 以上。</div>
+      <div class="fstep">点本页上方 <b>「安装固件」</b> 按钮。</div>
+      <div class="fstep">弹窗中选择设备串口（如 <span class="mono">COM3</span>、<span class="mono">USB JTAG/serial debug unit</span>），点连接。</div>
+      <div class="fstep">等待进度条走完（约 1～2 分钟），设备自动重启，刷机完成。</div>
+      <div class="fstep">刷完后回到本页<b>顶部深色区</b>，下载并安装 App 与词典文件。</div>
+    </div>
+    <div class="note"><b>浏览器要求：</b>需电脑版 Chrome 或 Edge；暂不支持手机浏览器和 Safari。<b>首次刷过官方固件的设备，工具会提示「擦除全部数据」，属正常现象</b>——两套分区布局不同，必须整片擦除后才能写入，确认即可。按钮没反应或找不到串口，换一根数据线、换一个 USB 口，并关掉其他可能占用串口的软件；页面一直转圈是刷机脚本没加载出来，换个网络环境重试。</div>
+  </div>
+</section>
+
+<!-- ============ 真机实拍 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">04 / ON DEVICE</span><h2>真机实拍</h2></div>
+    <p class="sec__dek">以下均为设备实际拍摄，非渲染图。</p>
+    <div class="gallery">
+      <figure><img src="screenshots/shot-dual-column.jpg" alt="真机实拍：横屏双栏英文正文"><figcaption><b>FIG. 01</b>横屏双栏正文排版，一页两栏，翻页次数减半。</figcaption></figure>
+      <figure><img src="screenshots/push-session-realhw.jpg" alt="真机实拍：手机 PicoPush 推送 App 与墨水屏"><figcaption><b>FIG. 02</b>手机蓝牙推流：长文推送到墨水屏并自动打开阅读。</figcaption></figure>
+      <figure><img src="screenshots/shortcut-and-home.jpg" alt="真机实拍：手机桌面一键推流快捷方式与设备首页"><figcaption><b>FIG. 03</b>桌面「一键推流」快捷方式与设备首页、未读提醒。</figcaption></figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 详细使用说明 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">05 / DETAILS</span><h2>详细使用说明</h2></div>
+    <p class="sec__dek">上方两张卡是速览；这里是把每一步讲清楚的完整版。</p>
+    <div class="detail">
+      <div class="detail__col">
+        <h3>手机端配套 App（v1.6.5）</h3>
+        <p>刷完固件后，若要使用<b>蓝牙推流、AI 智能释义、语音朗读</b>，请在手机装配套安卓 App：<a href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk">下载 ReadPicoPush.apk</a>（也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件）。</p>
+        <ul>
+          <li><b>仅支持 Android</b>；iOS 因系统限制暂不支持。</li>
+          <li><b>固件与 App 必须同时更新</b>：旧版 App 在有多台设备并存时可能连到非目标设备。</li>
+          <li><b>Android 10/11</b>：需打开「定位服务」总开关并授予位置权限，否则蓝牙扫描返回不了设备（App 顶部会有红／绿横幅提示）。</li>
+          <li>装好后点 <b>「连接并监听点词」</b> 保持连接（手机前台服务保活）——这是 AI 释义和听书的前提，断开后两者即停。</li>
+          <li>首次使用 <b>AI 释义</b> 前，在「AI 释义设置」（默认 DeepSeek）填入 <b>API key</b>；base_url / model / 提示词模板均可改。</li>
+          <li><b>听书无需额外配置</b>：设备侧打开「听书 → 跟随朗读」，手机连接后自动朗读当前页。</li>
+        </ul>
+
+        <h4>手机蓝牙推流怎么用</h4>
+        <ol>
+          <li>设备进入「手机推送」入口开启接收，屏幕显示广播名（如 <span class="mono">PicoPush-1A2B</span>）。</li>
+          <li>安卓手机打开配套 App，扫描到设备后点选连接；多台并存时按列表点选，不会推错。</li>
+          <li>在 App 里输入／粘贴要推送的文本（也支持单词卡），发送；有新推送未打开时首页状态条会出现「有新内容」。</li>
+        </ol>
+
+        <h4>AI 智能释义怎么用</h4>
+        <ol>
+          <li>阅读页选中单词，词典卡上点 <b>「AI」</b> 让手机调用大模型给出详解；点 <b>「看全文 ›」</b> 进详解阅读视图。</li>
+          <li>释义走蓝牙：设备发查询 → 手机 App 调模型 → 回传结果显示在设备。查询中显示「AI 查询中…」，超时会<b>自动回退到离线词典释义</b>。</li>
+          <li>需手机已点「连接并监听点词」保持连接，并已填入 API key。</li>
+          <li>设备侧 AI 释义开关默认开启（设置持久保存）；整页查询无反应时，先确认手机已连接并已填 key。</li>
+        </ol>
+
+        <h4>语音朗读（听书）怎么用</h4>
+        <ol>
+          <li>设备「听书」里打开 <b>跟随朗读</b>，每翻一页自动把当前页文字经蓝牙推到手机，由手机本地中文 TTS 朗读。</li>
+          <li><b>息屏、锁屏都不中断</b>（前台服务保活）；点「停止朗读」或关掉听书开关立即停止。</li>
+          <li>约 10 分钟不翻页会自动停止以省电；点词发音走同一朗读引擎，即插即播。</li>
+        </ol>
+      </div>
+
+      <div class="detail__col">
+        <h3>离线词典设置（不设置就无法查词）</h3>
+        <div class="note" style="margin-top:0"><b>本固件不包含词典数据。</b>查词功能依赖放在 TF 卡里的词典文件，必须按下面步骤放置，否则无法使用查词功能（AI 释义不受影响，但离线释义与离线生词本需要词典文件）。</div>
+        <ol>
+          <li>下载词典文件（二选一，推荐第一个）：<br>
+            <a href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin"><b>dict.bin</b></a> —— 约 8.9 MB，12.4 万词，SHA-256 <span class="mono">2bb228e4…9ee7</span>；<br>
+            <a href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict-full.bin"><b>dict-full.bin</b></a> —— 约 23 MB，40 万词，SHA-256 <span class="mono">7c17cca7…f61b</span>。</li>
+          <li>如果下载的是 <span class="mono">dict-full.bin</span>，先把它<b>重命名为 <span class="mono">dict.bin</span></b>。</li>
+          <li>把 <span class="mono">dict.bin</span> 复制到 <b>TF 卡根目录下的 dict 文件夹</b>：电脑上插入 TF 卡，打开卡盘，在最上层建一个名为 <span class="mono">dict</span> 的文件夹，把文件放进去——放好后卡里就是 <span class="mono">dict/dict.bin</span> 这一层结构。没有 <span class="mono">dict</span> 文件夹就新建一个（设备插卡启动后也会自动创建）。</li>
+          <li>TF 卡插回设备并<b>重启</b>，之后阅读时选中单词即可查词，查过的词自动进生词本。</li>
+        </ol>
+        <div class="inline-photo">
+          <img src="screenshots/shot-dict-card.jpg" alt="真机实拍：点词查译词典卡">
+          <p>FIG. 04 · 真机实拍：点词查译弹出的词典卡</p>
+        </div>
+        <div class="note" style="margin-top:20px"><b>命名与位置必须严格一致</b>：文件叫 <span class="mono">dict.bin</span>，放在 TF 卡<b>根目录</b>的 <span class="mono">dict</span> 文件夹下。文档里的设备内部路径 <span class="mono">/sdcard/dict/dict.bin</span> 中，<span class="mono">/sdcard</span> 只是固件里 TF 卡的挂载点名（卡插到电脑上，看到的就是卡盘根目录本身），不是让你在卡上再建一层 <span class="mono">sdcard</span> 文件夹；其他名字、其他位置都不生效。<span class="mono">dict</span> 文件夹里只放一个词典文件，放多个时打开哪一个不确定。词典数据由 <a href="https://github.com/skywind3000/ECDICT">ECDICT</a>（MIT）转换生成，也可用仓库里的 <span class="mono">tools/build_dict.py</span> 自行构建。</div>
+
+        <h4>常见问题</h4>
+        <ul>
+          <li><b>按钮点了没反应／找不到串口？</b>换数据线、换 USB 口，关掉其他占用串口的软件。</li>
+          <li><b>页面一直转圈或按钮不出现？</b>刷机脚本没加载出来，换网络环境重试（需 Chrome / Edge 电脑版）。</li>
+          <li><b>烧到一半失败？</b>重新插拔 USB 后重试；反复失败可换数据线或 USB 口。</li>
+          <li><b>刷完为什么查不了词？</b>词典文件没放，按 STEP 02 把 <span class="mono">dict.bin</span> 放进 TF 卡根目录的 <span class="mono">dict</span> 文件夹。</li>
+          <li><b>AI 释义点了没反应？</b>确认手机 App 已点「连接并监听点词」保持连接，且已填 API key。</li>
+          <li><b>听书不读／突然停了？</b>确认设备已开「听书 → 跟随朗读」且手机 App 已连接保活；断开蓝牙会立即停止。</li>
+          <li><b>刷完想升级／重刷？</b>可再次使用本页；也可以把 <span class="mono">Read_Pico.bin</span> 重命名为 <span class="mono">Pico-update.bin</span> 放到 TF 卡根目录，在「设置 → 升级和恢复」中安装（相同版本会被设备拒绝重装，此时请用本页重刷）。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- ============ 致谢与免责（原文保留） ============ -->
+<footer>
+  <div class="wrap">
+    <div class="kicker kicker--onink">Credits &amp; Disclaimer · 致谢与免责</div>
+    <p class="foot__quote">站在原版肩膀上的一次改造。感谢上游，也请对自己的设备负责。</p>
+    <div class="foot__credits">
+      Pico-Plus 墨水屏极客副屏固件（修改版）· Based on the original work by
+      <a href="https://github.com/MindReset/read_pico_firmware">MindReset/read_pico_firmware</a> ·
+      基于 kiikoread r95 版（0.3.3-rc95）改造 · 与 MindReset 官方无关 · 网页刷机基于 esp-web-tools（Apache-2.0）<br>
+      词典数据由 <a href="https://github.com/skywind3000/ECDICT">ECDICT</a>（MIT）转换生成 · 项目详细文档见仓库 README。
+    </div>
+    <div class="foot__disc">固件按"原样"提供，刷机有风险，请自行承担。详细说明见仓库 README。</div>
+    <div class="foot__rule"></div>
+    <div class="foot__end"><span>PICO-PLUS / 0.3.9-pico26.11.19</span><span>ESP32-S3 · ESP-WEB-TOOLS · 中文页面</span></div>
+  </div>
+</footer>
+
+</body>
+</html>
