@@ -214,14 +214,21 @@ from [`apk/`](apk/) and install it:
 
 ## 4. TF card upgrade (no computer needed)
 
-1. **Rename** the `Read_Pico.bin` from the firmware package to `Pico-update.bin`;
-2. Copy it to the **root** of the TF card (FAT32) with a card reader;
-3. Insert the TF card back into the device and enter **Settings → Upgrade & Recovery**;
-4. Tap "Install TF card upgrade package" and wait for automatic completion and reboot.
+1. Copy the firmware package's `Read_Pico.bin` to the **root** of the TF card (FAT32) with a
+   card reader. **Either name works — `Pico-update.bin` (original contract name, takes
+   priority) or `Read_Pico.bin` (fork release name); no rename needed.** If both exist,
+   `Pico-update.bin` is used;
+2. Insert the TF card back into the device and enter **Settings → Upgrade & Recovery**;
+3. Tap "Install TF card upgrade package" → confirm the "keep power supplied during upgrade"
+   dialog → confirm;
+4. The button changes to "Installing, do not power off", then the screen stays quiet for a
+   few dozen seconds (no e-paper refresh, no progress bar — **this is not a freeze**);
+   the device reboots automatically. Check the version string in **Settings** afterwards.
 
 > If the device already runs the **same version**, it will show "upgrade package matches the
 > current version" — to reflash in that case, use the web flasher or command-line flashing
-> above.
+> above. If it says the package was not found, the message lists the accepted filenames;
+> check `Pico-update.bin` / `Read_Pico.bin` and the card root.
 >
 > **Important: do not use the device's "Online Upgrade".** Online upgrade checks the official
 > firmware address and would flash back the official version, losing this fork's landscape,
