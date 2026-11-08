@@ -1,14 +1,11 @@
 #!/bin/sh
-# 解耦批 26.11.19 专用刷机脚本 —— 值链采样与取键解耦（出厂 bin）
+# 26.11.20 出厂 bin 线刷恢复兜底脚本
 # 包内 Read_Pico.bin 是唯一可刷的 app；自检锚定它的 sha256，不符即拒。
 #
 # 用法 / Usage:
 #   sh flash.sh /dev/ttyUSB0          # Linux / macOS（默认 460800）
 #   sh flash.sh /dev/ttyUSB0 230400   # 中途报错或校验不过时降速
 #   sh flash.sh COM3                  # Windows (Git Bash / MSYS2)
-#
-# 不要用 read-pico-github/firmware/flash.sh：那个脚本的锚值是 11-01 旧包
-# 1f39cc4ce907...，且它读的就是旧包，自检会打印 sha256 OK 然后把旧固件刷进去。
 #
 # 烧前把完整输出存盘（esptool 的哈希行是烧录证据）：
 #   sh flash.sh /dev/ttyUSB0 2>&1 | tee flash-20261106-decouple.log
@@ -21,7 +18,7 @@ PORT="${1:-/dev/ttyUSB0}"
 BAUD="${2:-460800}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-EXPECTED="c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0"
+EXPECTED="e9ce5b41a3dd9a767468ee841a5c1b41e94496e10bd9339b9878a8f337b2810c"
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL=$(sha256sum "$DIR/Read_Pico.bin" | cut -d' ' -f1)
 elif command -v shasum >/dev/null 2>&1; then
@@ -37,9 +34,9 @@ if [ -n "$ACTUAL" ] && [ "$ACTUAL" != "$EXPECTED" ]; then
     echo "  actual:   $ACTUAL" >&2
     exit 1
 fi
-[ -n "$ACTUAL" ] && echo "sha256 OK: $ACTUAL  (c0972f78d2ab / 4,216,992 B)"
+[ -n "$ACTUAL" ] && echo "sha256 OK: $ACTUAL  (e9ce5b41a3dd / 4,217,088 B)"
 
-echo "烧完先核版本串：0.3.9-pico26.11.19（串口横幅与设置页两处一致）"
+echo "烧完先核版本串：0.3.9-pico26.11.20（串口横幅与设置页两处一致）"
 echo "主 bin 必须落在 0x10000；写到 0x0 会覆盖 bootloader / 分区表 / NVS / phy_init。"
 
 if command -v python3 >/dev/null 2>&1; then
@@ -56,4 +53,4 @@ $ESPTOOL --chip esp32s3 -p "$PORT" -b "$BAUD" \
   0x10000  "$DIR/Read_Pico.bin" \
   0xb10000 "$DIR/ota_data_initial.bin"
 
-echo "Flash done. 版本串 0.3.9-pico26.11.19 核对后再开真机卡 B 组。"
+echo "Flash done. 版本串 0.3.9-pico26.11.20 核对后再开真机卡 B 组。"

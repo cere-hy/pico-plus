@@ -19,12 +19,12 @@ rem 烧前请把完整输出存盘（esptool 的哈希/摘要行是烧录证据�
 rem Save the FULL output (esptool hash lines are the flashing evidence).
 
 setlocal enabledelayedexpansion
-rem 锚：0.3.9-pico26.11.19 Read_Pico.bin 4,216,992 B /
-rem   c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0（与交付包 SHA256SUMS 同源；拒烧语义同 flash.sh：exit 1）。
-rem Anchor: 0.3.9-pico26.11.19 Read_Pico.bin 4,216,992 B /
-rem   c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0 (same source as delivery-package SHA256SUMS;
+rem 锚：0.3.9-pico26.11.20 Read_Pico.bin 4,217,088 B /
+rem   e9ce5b41a3dd9a767468ee841a5c1b41e94496e10bd9339b9878a8f337b2810c（与交付包 SHA256SUMS 同源；拒烧语义同 flash.sh：exit 1）。
+rem Anchor: 0.3.9-pico26.11.20 Read_Pico.bin 4,217,088 B /
+rem   e9ce5b41a3dd9a767468ee841a5c1b41e94496e10bd9339b9878a8f337b2810c (same source as delivery-package SHA256SUMS;
 rem   refusal semantics match flash.sh: exit 1).
-set EXPECTED=c0972f78d2ab56bb0f5e258a29bd5495f94219d4a9c06b3bf80f9e0e1b66bad0
+set EXPECTED=e9ce5b41a3dd9a767468ee841a5c1b41e94496e10bd9339b9878a8f337b2810c
 set DIR=%~dp0
 set PORT=%1
 if "%PORT%"=="" set PORT=COM3
