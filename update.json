@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "version": "0.3.9-pico26.11.22",
+  "project": "Read_Pico",
+  "board": "RDP-G01-W",
+  "layout": "pico-dual-4m-v1",
+  "minimum_base_version": "0.3.9-pico26.11.19",
+  "url": "https://cere-hy.github.io/pico-plus/firmware/Read_Pico-twin26.11.22.bin",
+  "sha256": "cfeccf103bd2a8f8a472d5f4c65a26e66f8dd824e9942eb86a921f63803b19ea",
+  "notes": "26.11.22 D1 孪生靶子（同源 26.11.21，仅版本串 bump，用于在线升级正链首飞）",
+  "size": 4377152
+}
