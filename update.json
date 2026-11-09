@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "0.3.9-pico26.11.26",
+  "version": "0.3.9-pico26.11.25",
   "project": "Read_Pico",
   "board": "RDP-G01-W",
   "layout": "pico-dual-4m-v1",
   "minimum_base_version": "0.3.9-pico26.11.19",
-  "url": "https://cere-hy.github.io/pico-plus/firmware/Read_Pico-twin26.11.26.bin",
-  "sha256": "f9f7e527015922fba7921c7077f95636c737bd72601c427213b3007acba3c409",
-  "notes": "26.11.26 D1 孪生靶子（同源 26.11.25 本地化 OTA 正式版，仅版本串 bump，用于在线升级正链首飞）",
+  "url": "https://cere-hy.github.io/pico-plus/firmware/Read_Pico-26.11.25.bin",
+  "sha256": "0d4e30b70aa1f64a79d6ff3f61a40eef4d1ee13cc884953d840bd92281915bcb",
+  "notes": "26.11.25 本地化 OTA 正式版：在线链路只下载到 TF 卡并校验，UI 确认后由成熟 TF 安装链升级；正链首飞 D1–D4 真机全绿。",
   "size": 4376544
 }
