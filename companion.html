@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#F2EFE7">
+<meta name="description" content="Read Pico AI 伴读功能说明：右栏摘要（约 180～220 字、最多 250 字、分帧推送）、四种解读风格、听书与摘要解耦、连接即校时、检查更新、清晰字体渲染。">
+<title>AI 伴读功能说明 · Pico-Plus 26.11.30</title>
+<style>
+/* 与 index.html 同源的设计 token（Extension 模式：不引入新色/新字体/新组件） */
+:root{
+  color-scheme: light;
+  --paper:#F2EFE7; --paper-2:#FBF9F3; --white:#FFFFFF;
+  --ink:#1A1A1A; --ink-2:#2A2823; --ink-soft:#55534B; --muted:#7C786C;
+  --red:#C7322E; --red-lite:color-mix(in srgb, var(--red) 72%, white);
+  --olive:#5E6347; --rule:#C8C2B0; --rule-soft:#DDD7C6;
+  --serif:"Songti SC","STSong","Noto Serif CJK SC","Source Han Serif SC","SimSun",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --maxw:1180px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.75;-webkit-font-smoothing:antialiased}
+a{color:var(--red);text-decoration:none;border-bottom:1px solid var(--rule)}
+a:hover{color:var(--ink);border-bottom-color:var(--red)}
+img{display:block;max-width:100%}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 32px}
+.kicker{font-family:var(--sans);font-size:.7rem;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--red)}
+h1,h2,h3,h4{font-family:var(--serif);font-weight:700;text-wrap:pretty;margin:0}
+.mono{font-family:var(--mono);font-size:.82em}
+.rule{height:1px;background:var(--rule);border:0;margin:0}
+
+/* topbar —— 与主页同名同类 */
+.topbar{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--paper) 92%,transparent);backdrop-filter:saturate(140%) blur(10px);border-bottom:1px solid var(--rule)}
+.topbar__in{max-width:var(--maxw);margin:0 auto;padding:10px 32px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.brand{display:flex;align-items:baseline;gap:12px;margin-right:auto;white-space:nowrap}
+.brand__name{font-family:var(--serif);font-size:1.12rem;font-weight:700;letter-spacing:.02em}
+.brand__ver{font-family:var(--mono);font-size:.72rem;color:var(--muted)}
+.topbar__label{font-size:.76rem;color:var(--muted);white-space:nowrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:9px;font-family:var(--sans);font-weight:700;text-decoration:none;border:1px solid transparent;cursor:pointer;transition:background .18s ease,color .18s ease,border-color .18s ease,transform .12s ease}
+.btn:hover{transform:translateY(-1px)}
+.btn:active{transform:translateY(0)}
+.btn--sm{font-size:.82rem;padding:8px 15px}
+.btn--lg{font-size:1rem;padding:15px 22px}
+.btn--red{background:var(--red);color:#fff;border-color:var(--red)}
+.btn--red:hover{background:var(--ink);border-color:var(--ink);color:#fff}
+.btn--ghost{background:transparent;color:var(--ink);border-color:var(--ink)}
+.btn--ghost:hover{background:var(--ink);color:var(--paper)}
+.btn--paper{background:var(--paper-2);color:var(--ink);border-color:var(--paper-2)}
+.btn--paper:hover{background:#fff;border-color:#fff;color:var(--red)}
+.btn__arrow{font-size:1.05em;line-height:1}
+.t-short{display:none}
+
+/* masthead / hero —— 与主页同名同类 */
+.masthead{padding:16px 0 10px}
+.masthead__row{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap}
+.masthead__meta{font-size:.8rem;color:var(--ink-soft);text-align:right;line-height:1.9}
+.masthead__meta b{color:var(--ink)}
+.hero{padding:6px 0 16px}
+.hero__grid{display:grid;grid-template-columns:1.08fr .92fr;gap:36px;align-items:start}
+.hero h1{font-size:clamp(1.85rem,3vw,2.6rem);line-height:1.14;letter-spacing:-.01em;margin:9px 0 10px}
+.dek{font-family:var(--serif);font-style:italic;font-weight:400;color:var(--ink-soft);text-wrap:pretty}
+.hero .dek{font-size:.93rem;line-height:1.7;margin:0 0 14px;max-width:36em}
+
+/* fact strip */
+.facts{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--ink);border-bottom:1px solid var(--rule);margin-top:0}
+.fact{padding:16px 18px 15px;border-right:1px solid var(--rule)}
+.fact:last-child{border-right:0}
+.fact__k{font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.fact__v{font-family:var(--mono);font-size:.88rem;color:var(--ink);margin-top:5px;word-break:break-all}
+.fact__v b{color:var(--red)}
+
+/* generic section */
+section.band{padding:74px 0;border-bottom:1px solid var(--rule)}
+.sec__head{display:flex;align-items:baseline;gap:18px;margin-bottom:12px;flex-wrap:wrap}
+.sec__no{font-family:var(--mono);font-size:.78rem;color:var(--red);font-weight:700;letter-spacing:.1em}
+.sec__head h2{font-size:clamp(1.75rem,3vw,2.4rem);line-height:1.25}
+.sec__dek{font-family:var(--serif);font-style:italic;color:var(--ink-soft);font-size:1rem;margin:0 0 34px;max-width:44em}
+
+/* features */
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border-top:1px solid var(--ink)}
+.feature{padding:28px 26px 30px;border-right:1px solid var(--rule)}
+.feature:first-child{padding-left:0}
+.feature:last-child{border-right:0;padding-right:0}
+.feature__no{font-family:var(--mono);font-size:.72rem;font-weight:700;color:var(--red);letter-spacing:.14em}
+.feature h3{font-size:1.3rem;margin:12px 0 10px;line-height:1.35}
+.feature p{font-size:.9rem;color:var(--ink-soft);margin:0 0 12px;line-height:1.75}
+.feature__act{font-family:var(--mono);font-size:.76rem;color:var(--ink);background:var(--paper-2);border:1px solid var(--rule);padding:7px 10px;display:inline-block}
+.feature__act b{color:var(--red)}
+.feature__fig{margin-top:18px;border-top:1px solid var(--rule);padding-top:14px;font-size:.78rem;color:var(--muted)}
+
+/* mode cards —— 复用 .cards/.card/.card__* */
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+.card{background:var(--paper-2);color:var(--ink);border:1px solid var(--paper-2);display:flex;flex-direction:column}
+.card__top{background:var(--red);color:#fff;padding:9px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+.card__step{font-family:var(--mono);font-size:.76rem;font-weight:700;letter-spacing:.16em}
+.card__tag{font-size:.72rem;letter-spacing:.08em;opacity:.92}
+.card__body{padding:20px 22px 24px;display:flex;flex-direction:column;flex:1}
+.card h3{font-size:1.4rem;line-height:1.25;margin:0 0 3px}
+.card__sub{font-family:var(--mono);font-size:.78rem;color:var(--muted);margin:0 0 12px}
+.card__desc{font-size:.92rem;color:var(--ink-soft);margin:0 0 20px;line-height:1.75}
+.card__desc b{color:var(--ink)}
+.card__quote{font-family:var(--serif);font-size:.98rem;line-height:1.85;color:var(--ink-2);border-left:3px solid var(--red);padding:2px 0 2px 14px;margin:0 0 18px}
+.card__warn{margin-top:16px;padding:10px 13px;border:1px solid var(--rule);background:var(--paper);font-size:.8rem;line-height:1.65;color:var(--ink-soft)}
+.card__warn b{color:var(--red)}
+
+/* function list */
+.funclist{display:grid;grid-template-columns:1fr 1fr;column-gap:46px;row-gap:0}
+.func{display:flex;gap:16px;padding:14px 0;border-bottom:1px solid var(--rule-soft)}
+.func__n{font-family:var(--mono);font-size:.72rem;font-weight:700;color:var(--red);padding-top:5px;min-width:26px}
+.func__b b{font-family:var(--serif);font-size:1.05rem}
+.func__b span{display:block;font-size:.87rem;color:var(--ink-soft);line-height:1.7;margin-top:2px}
+
+/* steps */
+.steps{list-style:none;margin:0;padding:0;counter-reset:s}
+.steps li{position:relative;padding:0 0 11px 30px;font-size:.88rem;line-height:1.7;color:var(--ink-2);counter-increment:s}
+.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:0;top:1px;font-family:var(--mono);font-size:.7rem;font-weight:700;color:var(--red)}
+.steps li b{color:var(--ink)}
+
+/* note */
+.note{margin-top:26px;background:var(--paper-2);border:1px solid var(--rule);padding:15px 20px;font-size:.88rem;color:var(--ink-soft)}
+.note b{color:var(--ink)}
+
+/* after（深色收尾下载区，与主页 .after 同源） */
+.after{background:var(--ink);color:var(--paper);padding:12px 0 44px;margin-top:0}
+.after__head{display:flex;align-items:flex-end;justify-content:space-between;gap:30px;flex-wrap:wrap;margin-bottom:8px}
+.after h2{font-size:clamp(1.5rem,2.5vw,2.05rem);line-height:1.2;margin:7px 0 0;color:var(--paper)}
+.after__lead{font-family:var(--serif);font-style:italic;font-size:1.02rem;color:var(--rule);max-width:30em;margin:0}
+.after .kicker{color:var(--red-lite)}
+.after a.btn--ghost{color:var(--paper);border-color:var(--paper)}
+.after a.btn--ghost:hover{background:var(--paper);color:var(--ink)}
+.after__dl{display:flex;flex-wrap:wrap;gap:12px;margin-top:20px}
+
+/* footer */
+footer{padding:52px 0 64px;background:var(--ink);color:var(--rule)}
+footer .kicker{margin-bottom:18px}
+.foot__quote{font-family:var(--serif);font-size:1.35rem;font-style:italic;color:var(--paper);margin:0 0 26px;max-width:38em;line-height:1.6}
+.foot__credits{font-size:.84rem;line-height:2;color:var(--rule);max-width:60em}
+.foot__credits a{color:var(--red-lite);border-bottom-color:var(--olive)}
+.foot__disc{margin-top:22px;padding-top:18px;border-top:1px solid var(--olive);font-size:.84rem;color:var(--paper);font-weight:700}
+.foot__rule{height:1px;background:var(--olive);margin:30px 0 20px}
+.foot__end{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;font-size:.74rem;color:var(--muted);font-family:var(--mono)}
+
+/* motion / responsive —— 与主页一致 */
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.rise{animation:rise .55s ease both}
+.d1{animation-delay:.06s}.d2{animation-delay:.13s}.d3{animation-delay:.2s}
+@media (prefers-reduced-motion:reduce){.rise{animation:none}html{scroll-behavior:auto}}
+@media (max-width:1000px){
+  .hero__grid{grid-template-columns:1fr;gap:26px}
+  .facts{grid-template-columns:1fr 1fr}
+  .fact:nth-child(2){border-right:0}
+  .fact:nth-child(-n+2){border-bottom:1px solid var(--rule)}
+}
+@media (max-width:760px){
+  .wrap{padding:0 20px}
+  .topbar__in{padding:8px 16px;gap:6px}
+  .topbar__label{display:none}
+  .brand{width:100%;margin-right:0}
+  .brand__name{font-size:1rem}
+  .topbar .btn{flex:1;padding:8px 4px;font-size:.7rem;white-space:nowrap;gap:3px}
+  .btn__arrow{display:none}
+  .t-long{display:none}
+  .t-short{display:inline}
+  .masthead{padding:22px 0 14px}
+  .masthead__meta{text-align:left;font-size:.76rem}
+  .hero{padding:6px 0 26px}
+  .facts{grid-template-columns:1fr}
+  .fact{border-right:0;border-bottom:1px solid var(--rule)}
+  .fact:last-child{border-bottom:0}
+  .cards,.features,.funclist{grid-template-columns:1fr;columns:auto}
+  .feature{padding:24px 0;border-right:0;border-bottom:1px solid var(--rule)}
+  .feature:last-child{border-bottom:0}
+  .features{border-top:1px solid var(--ink)}
+  .card+.card{margin-top:0}
+  section.band{padding:52px 0}
+  .after{padding:48px 0 54px}
+}
+</style>
+</head>
+<body>
+
+<!-- ============ 常驻下载条 ============ -->
+<div class="topbar">
+  <div class="topbar__in">
+    <div class="brand">
+      <span class="brand__name">AI 伴读 · 功能说明</span>
+      <span class="brand__ver">0.3.9-pico26.11.30 / v1.6.6</span>
+    </div>
+    <span class="topbar__label">配套固件与 App 已就绪 ↓</span>
+    <a class="btn btn--sm btn--ghost" href="index.html"><span class="t-long">← 返回主页</span><span class="t-short">返回主页</span></a>
+    <a class="btn btn--sm btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span><span class="t-long"> 下载 App v1.6.6</span><span class="t-short">App v1.6.6</span></a>
+  </div>
+</div>
+
+<!-- ============ 刊头 ============ -->
+<header class="masthead">
+  <div class="wrap masthead__row">
+    <div><div class="kicker">Read Pico · Companion Guide · 伴读功能说明</div></div>
+    <div class="masthead__meta">
+      适用：<b>26.11.30 正式固件</b> ＋ <b>ReadPicoPush v1.6.6</b>（安卓）<br>
+      伴读需要<b>手机 App 保持蓝牙连接</b>；摘要由你配置的模型生成
+    </div>
+  </div>
+</header>
+
+<main>
+<!-- ============ HERO ============ -->
+<section class="hero" id="top">
+  <div class="wrap">
+    <div class="hero__grid">
+      <div class="rise d1">
+        <div class="kicker">Firmware 0.3.9 · pico26.11.30 · 伴读案 30 批</div>
+        <h1>读到哪一页，<br>旁边就聊到哪一页。</h1>
+        <p class="dek">翻到新的一页，屏幕右栏会给出这一页的伴读文字：可以是翻译与主旨、一段神评论、几条干货，或把难懂的概念用大白话讲明白。听书是听书，摘要是摘要，两件事互不干扰。</p>
+        <div class="hero__install" style="background:var(--paper-2);border:1px solid var(--rule);padding:13px 18px;display:inline-block">
+          <div class="kicker">开始之前 · 三件前提</div>
+          <p style="font-size:.82rem;color:var(--ink-soft);margin:0">① 设备刷到 <b>26.11.30</b>；② 手机装 <b>v1.6.6</b> 并点「连接并监听点词」保持连接；③ 在「AI 释义设置」填入你自己的 API key（默认 DeepSeek）。</p>
+        </div>
+      </div>
+      <div class="rise d2">
+        <div class="facts" style="grid-template-columns:1fr 1fr">
+          <div class="fact"><div class="fact__k">摘要篇幅</div><div class="fact__v">约 <b>180～220</b> 字</div></div>
+          <div class="fact"><div class="fact__k">字数上限</div><div class="fact__v"><b>250</b> 字</div></div>
+          <div class="fact"><div class="fact__k">分帧推送</div><div class="fact__v">最多 <b>4</b> 帧拼装</div></div>
+          <div class="fact"><div class="fact__k">解读风格</div><div class="fact__v"><b>4</b> 种</div></div>
+        </div>
+        <p class="note" style="margin-top:14px">以上为发布件的<b>实际取值</b>：摘要按 Unicode 码点计数，250 字只作溢出兜底；单帧装不下时分为 3～4 帧推送，设备在收齐后拼装显示，不截断正文。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 01 四种解读风格 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">01 / FOUR MODES</span><h2>四种解读风格，随书切换</h2></div>
+    <p class="sec__dek">模式由设备侧选择，传给手机 App；App 按对应提示词调用模型，把当前页文本生成右栏摘要。四种风格是四套不同的角色设定，不是同一段话换个说法。</p>
+    <div class="cards">
+      <article class="card">
+        <div class="card__top"><span class="card__step">MODE 00</span><span class="card__tag">外文原著 · 默认</span></div>
+        <div class="card__body">
+          <h3>毒舌双语译者</h3>
+          <p class="card__sub">先翻译，再一句话点题</p>
+          <p class="card__quote">「不要逐字死译，要保留原作者的语气和情绪。直接给出翻译和总结，禁止废话。」</p>
+          <p class="card__desc">把这段外文翻成<b>流畅地道的中文</b>，再用最精炼、最接地气的一句话概括核心主旨。适合读外文小说、原文材料。</p>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card__top"><span class="card__step">MODE 01</span><span class="card__tag">小说 · 评论</span></div>
+        <div class="card__body">
+          <h3>幽默书评人</h3>
+          <p class="card__sub">一段接地气的神评论或吐槽</p>
+          <p class="card__quote">「语言犀利、有趣，像朋友聊天一样，一针见血，能让人会心一笑。不要剧透后文，只评当前。」</p>
+          <p class="card__desc">可以结合现代生活与网络热梗解读剧情或人物心理，<b>只评当前页</b>，不剧透后文。适合消遣阅读。</p>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card__top"><span class="card__step">MODE 02</span><span class="card__tag">论述 · 干货</span></div>
+        <div class="card__body">
+          <h3>逻辑专栏主笔</h3>
+          <p class="card__sub">提取论点与方法论，分点给出</p>
+          <p class="card__quote">「不要复述原文，请用大白话重新解构，总结出对读者最有用的 1 到 2 个干货观点。」</p>
+          <p class="card__desc">从当前页提取<b>最核心的论点或方法论</b>，用大白话重新解构、排版分点，让人一秒看懂。适合非虚构、论述类文本。</p>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card__top"><span class="card__step">MODE 03</span><span class="card__tag">专业 · 科普</span></div>
+        <div class="card__body">
+          <h3>擅长打比方的讲书高手</h3>
+          <p class="card__sub">用生活例子讲给中学生听</p>
+          <p class="card__quote">「用生活中常见的例子（比如买菜、开车、建房子等）给中学生讲明白。禁止使用任何晦涩的学术名词。」</p>
+          <p class="card__desc">遇到复杂专业概念，改用<b>大白话＋常见例子</b>讲明白，通俗易懂、生动形象。适合教材、专业书。</p>
+        </div>
+      </article>
+    </div>
+    <div class="note">四种风格均要求<b>纯文本输出</b>、不使用 Markdown 星号或加粗，摘要保留硬换行；越界的模式号会退回 MODE 00（外语原著）。</div>
+  </div>
+</section>
+
+<!-- ============ 02 摘要链路：翻页→生成→右栏 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">02 / HOW IT WORKS</span><h2>翻一页，摘要跟着换一页</h2></div>
+    <p class="sec__dek">右栏约三成宽度用于伴读文字，正文仍占七成。摘要与页号严格对账，不会把上一页的文字留到这一页。</p>
+    <div class="features">
+      <div class="feature">
+        <div class="feature__no">STEP 01</div>
+        <h3>翻页即清空</h3>
+        <p>翻到新的一页时，右栏先清掉上一页的摘要并显示「摘要生成中…」，随后再显示本页结果。旧摘要不会残留，也不会张冠李戴。</p>
+        <div class="feature__act"><b>页号对账</b> · 正文指纹 · 回执快照</div>
+      </div>
+      <div class="feature">
+        <div class="feature__no">STEP 02</div>
+        <h3>模型生成摘要</h3>
+        <p>手机 App 收到当前页纯文本，按你选的模式调用模型。生成结果按码点裁到 250 字以内，正常输出约 180～220 字。</p>
+        <div class="feature__act"><b>纯文本</b> · 无 Markdown · 保留硬换行</div>
+      </div>
+      <div class="feature">
+        <div class="feature__no">STEP 03</div>
+        <h3>分帧推送、设备拼装</h3>
+        <p>单帧装不下时分成 3～4 帧推送，设备侧收齐后拼装成完整摘要，上限 1024 字节。不会截断半句，也不会只显示第一帧。</p>
+        <div class="feature__act"><b>250 字</b> · 4 帧 · 1024 B 拼装帽</div>
+      </div>
+    </div>
+    <div class="note" style="margin-top:30px"><b>关于「摘要生成中…」：</b>设备侧不会自动降级。若模型未回帧（如网络不可用、API key 未配置或额度不足），右栏会停在占位态，或按 App 返回切到「本次未生成」；它<b>不会</b>编一段占位文字冒充摘要。检查手机 App 是否在线、是否已填 API key 即可定位。</div>
+  </div>
+</section>
+
+<!-- ============ 03 排版与字体 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">03 / LAYOUT &amp; TYPE</span><h2>长摘要不挤成一条线</h2></div>
+    <p class="sec__dek">250 字的右栏摘要按多行文本块排版，字号自适应但设有下限，宁可截断也不缩到看不清。</p>
+    <div class="funclist">
+      <div class="func"><div class="func__n">01</div><div class="func__b"><b>多行文本块</b><span>右栏使用自动换行的文本块，按可用宽度逐行排布；不再把整段文字塞进单行再整体缩放，避免挤成一条线。</span></div></div>
+      <div class="func"><div class="func__n">02</div><div class="func__b"><b>字号下限 22 px</b><span>字号从大到小逐档下探，取第一个能完整放下的字号；连 22 px 都放不下就停在 22 px 并补省略号，不无限缩小。</span></div></div>
+      <div class="func"><div class="func__n">03</div><div class="func__b"><b>清晰字体渲染</b><span>右栏复用设备里已验证的清晰字体链与灰阶渲染，不使用发糊的缩放位图；墨水屏上的笔画保持干净可读。</span></div></div>
+      <div class="func"><div class="func__n">04</div><div class="func__b"><b>70 / 30 分栏</b><span>正文仍在左栏七成，伴读摘要在右栏三成，互不遮挡；翻页、刷新波形沿用阅读页既有策略。</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 04 听书与摘要解耦 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">04 / DECOUPLED</span><h2>听书开关，只管声音</h2></div>
+    <p class="sec__dek">听书与右栏摘要是两条独立的链路。关掉听书，摘要照常生成；开听书，也不会改变摘要内容。</p>
+    <div class="features">
+      <div class="feature">
+        <div class="feature__no">听书 / TTS</div>
+        <h3>由「听书」开关控制</h3>
+        <p>设备的听书开关只控制<b>是否朗读出声</b>。朗读由独立的使能信号门控，跟随朗读开启、关闭即停。</p>
+        <div class="feature__act"><b>0x1D</b> 使能信号 · 断开蓝牙即停</div>
+      </div>
+      <div class="feature">
+        <div class="feature__no">摘要 / SUMMARY</div>
+        <h3>不受听书开关影响</h3>
+        <p>右栏摘要走独立的推送链路，只要伴读处于活动状态就照常请求、照常显示。<b>关听书 ≠ 停摘要</b>。</p>
+        <div class="feature__act"><b>0x0A</b> 摘要帧 · 独立门控</div>
+      </div>
+      <div class="feature">
+        <div class="feature__no">推流条件</div>
+        <h3>两条链路取并集</h3>
+        <p>只要「听书开」或「伴读活动」任一成立，手机就保持推流；因此静默阅读时翻页也能拿到新摘要。</p>
+        <div class="feature__act"><b>tts_on ∥ companion_active</b></div>
+      </div>
+    </div>
+    <div class="note">朗读仍依赖手机 App 保持蓝牙连接；断开连接会立即停止朗读。摘要生成依赖 App 在线与模型可用，二者前提不同，互不牵连。</div>
+  </div>
+</section>
+
+<!-- ============ 05 连接即校时 / 检查更新 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">05 / TIME &amp; UPDATE</span><h2>连上就校时，更新自己会查</h2></div>
+    <p class="sec__dek">步 5 收尾补上的两件小事：设备时间不再靠手动，版本新旧不必自己比对。</p>
+    <div class="cards">
+      <article class="card">
+        <div class="card__top"><span class="card__step">SET TIME</span><span class="card__tag">蓝牙连接即下发</span></div>
+        <div class="card__body">
+          <h3>连接即校时</h3>
+          <p class="card__sub">0x05 · 标准时间下发</p>
+          <div class="card__desc" style="margin:0">
+            <ol class="steps" style="margin-top:4px">
+              <li>手机 App 与设备<b>建立蓝牙连接并订阅成功后</b>，立即下发一次标准时间。</li>
+              <li>校时<b>不再依赖先发一段文本</b>；纯监听、不发文本的场景同样会校准。</li>
+              <li>连接保持期间，设备时间维持准确；无需在设备上手动设置。</li>
+            </ol>
+          </div>
+          <div class="card__warn">日志里出现「校准设备时钟（连接即校时）……」即为校时帧已下发，属正常行为。</div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="card__top"><span class="card__step">CHECK UPDATE</span><span class="card__tag">App v1.6.6 / 固件 26.11.30</span></div>
+        <div class="card__body">
+          <h3>检查更新</h3>
+          <p class="card__sub">App 内按钮 · 设备联网 OTA</p>
+          <div class="card__desc" style="margin:0">
+            <ol class="steps" style="margin-top:4px">
+              <li>App 内点<b>「检查更新」</b>读取正式版本源（<span class="mono">apk-update.json</span>）。</li>
+              <li>已是 v1.6.6 会提示<b>「已是最新版本」</b>；有新版则提示前往下载页。</li>
+              <li>断网或版本源不可达时提示<b>「检查失败」</b>，不会误报「已是最新」；本应用<b>不自动下载安装</b>。</li>
+              <li>固件侧在「设置 → 升级和恢复 → 联网 OTA」点「检查更新」，版本源已指向 26.11.30。</li>
+            </ol>
+          </div>
+          <div class="card__warn">已是 26.11.30 的设备点 OTA 会显示「当前已是最新版本」，属预期结果，不是故障。</div>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 06 使用前提与边界 ============ -->
+<section class="band">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">06 / REQUIREMENTS</span><h2>伴读能跑起来的前提</h2></div>
+    <p class="sec__dek">下面几条不是功能缺陷，是这套方案本身依赖的条件。如实列出，便于排查。</p>
+    <div class="funclist">
+      <div class="func"><div class="func__n">01</div><div class="func__b"><b>仅安卓手机</b><span>配套 App 只支持 Android；iOS 因系统限制不支持。Android 10/11 还需开启系统「定位服务」并授予位置权限，否则扫描不到设备。</span></div></div>
+      <div class="func"><div class="func__n">02</div><div class="func__b"><b>手机与设备保持连接</b><span>摘要由手机 App 调用模型生成后推送给设备；App 需点「连接并监听点词」保持前台保活，断开后摘要与朗读都会停。</span></div></div>
+      <div class="func"><div class="func__n">03</div><div class="func__b"><b>需要你自己的 API key</b><span>模型服务不内置账号。首次使用 AI 释义／伴读前，在「AI 释义设置」填入自己的 key（默认 DeepSeek）；base_url、model、提示词模板均可改。</span></div></div>
+      <div class="func"><div class="func__n">04</div><div class="func__b"><b>固件与 App 需配套</b><span>伴读能力落在 26.11.30 固件 ＋ v1.6.6 App 这一对上；请勿混用旧的 v1.6.5 及更早版本，旧版在多台设备并存时可能连错设备。</span></div></div>
+      <div class="func"><div class="func__n">05</div><div class="func__b"><b>联网与额度</b><span>摘要生成需要手机能联网、模型可用且额度充足。网络异常时右栏会停在占位态或显示「本次未生成」，不会伪造内容。</span></div></div>
+      <div class="func"><div class="func__n">06</div><div class="func__b"><b>离线词典另装</b><span>查词所需的 dict.bin 不在固件内，需自行放到 TF 卡根目录的 dict 文件夹；AI 释义与伴读摘要不依赖词典文件。</span></div></div>
+    </div>
+  </div>
+</section>
+</main>
+
+<!-- ============ 收尾下载区 ============ -->
+<section class="after">
+  <div class="wrap">
+    <div class="after__head">
+      <div>
+        <div class="kicker">Get the release · 配套正式版</div>
+        <h2>装这两件，就能用伴读。</h2>
+      </div>
+      <p class="after__lead">固件 26.11.30 ＋ 手机 App v1.6.6。首次刷机请回主页用一键刷机写入基线四件套，再升级到 26.11.30。</p>
+    </div>
+    <div class="after__dl">
+      <a class="btn btn--lg btn--red" href="firmware/Read_Pico-0.3.9-pico26.11.30-0418a6aa.bin" download><span class="btn__arrow">↓</span> 下载固件 26.11.30</a>
+      <a class="btn btn--lg btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span> 下载 App v1.6.6</a>
+      <a class="btn btn--sm btn--ghost" href="read-pico-26.11.30-acceptance.zip" download>验收包 zip（含校验和）</a>
+      <a class="btn btn--sm btn--ghost" href="index.html">← 返回主页</a>
+    </div>
+    <p class="note" style="margin-top:22px;background:transparent;border-color:var(--olive);color:var(--rule)">固件独立命名件用于 <b style="color:var(--paper)">TF 卡升级</b>或联网 OTA：TF 卡路径请下载后<b style="color:var(--paper)">重命名为 <span class="mono">Read_Pico.bin</span></b> 放卡根目录；联网 OTA 走 URL 直链，不受文件名约束。完整下载说明见<a href="index.html#v1130" style="color:var(--red-lite)">主页「26.11.30 正式版下载」区</a>。</p>
+  </div>
+</section>
+
+<!-- ============ 致谢与免责 ============ -->
+<footer>
+  <div class="wrap">
+    <div class="kicker" style="color:var(--red-lite)">About · 关于本页</div>
+    <p class="foot__quote">本页描述的是 26.11.30 正式版与 v1.6.6 App 的已发布行为，不含预测功能。</p>
+    <div class="foot__credits">
+      Pico-Plus 墨水屏极客副屏固件（修改版）· 基于 <a href="https://github.com/MindReset/read_pico_firmware">MindReset/read_pico_firmware</a> 与 kiikoread r95 版改造 · 与 MindReset 官方无关<br>
+      摘要由你自行配置的大模型生成，内容取决于当前页文本与所选模式；词曲、书籍版权归各自权利人所有。
+    </div>
+    <div class="foot__disc">本页为功能说明，不构成对模型输出内容的保证。固件按「原样」提供，刷机有风险，请自行承担。</div>
+    <div class="foot__rule"></div>
+    <div class="foot__end"><span>PICO-PLUS / 伴读功能说明 · 0.3.9-pico26.11.30</span><span>ESP32-S3 · 中文页面 · <a href="index.html" style="color:var(--muted)">返回主页</a></span></div>
+  </div>
+</footer>
+
+</body>
+</html>

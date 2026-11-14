@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#F2EFE7">
-<meta name="description" content="Pico-Plus 墨水屏极客副屏固件 · 网页一键刷机与刷机后必装附件（安卓 App v1.6.5、离线词典 dict.bin）。固件版本 0.3.9-pico26.11.29，ESP32-S3。">
+<meta name="description" content="Pico-Plus 墨水屏极客副屏固件 · 网页一键刷机与刷机后必装附件（安卓 App v1.6.6、离线词典 dict.bin）。固件版本 0.3.9-pico26.11.30，ESP32-S3。">
 <title>Pico-Plus · 一键刷机与必备附件</title>
 <style>
 /* ============================================================
@@ -349,12 +349,13 @@ footer .kicker{margin-bottom:18px}
   <div class="topbar__in">
     <div class="brand">
       <span class="brand__name">Pico-Plus</span>
-      <span class="brand__ver">0.3.9-pico26.11.29</span>
+      <span class="brand__ver">0.3.9-pico26.11.30</span>
     </div>
     <span class="topbar__label">刷完之后必装 ↓</span>
-    <a class="btn btn--sm btn--red" href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk"><span class="btn__arrow">↓</span><span class="t-long"> 安卓 App v1.6.5</span><span class="t-short">App v1.6.5</span></a>
+    <a class="btn btn--sm btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span><span class="t-long"> 安卓 App v1.6.6</span><span class="t-short">App v1.6.6</span></a>
     <a class="btn btn--sm btn--ghost" href="https://github.com/cere-hy/pico-plus/releases/download/v1.0-gen10/dict.bin"><span class="btn__arrow">↓</span><span class="t-long"> 词典 dict.bin</span><span class="t-short">词典 dict.bin</span></a>
     <a class="btn btn--sm btn--paper" href="#flash"><span class="t-long">一键刷机</span><span class="t-short">刷机</span></a>
+    <a class="btn btn--sm btn--ghost" href="companion.html"><span class="t-long">伴读功能说明</span><span class="t-short">伴读说明</span></a>
   </div>
 </div>
 
@@ -377,13 +378,13 @@ footer .kicker{margin-bottom:18px}
   <div class="wrap">
     <div class="hero__grid">
       <div class="rise d1">
-        <div class="kicker">Firmware 0.3.9 · pico26.11.29 · 2026-11-10</div>
+        <div class="kicker">Firmware 0.3.9 · pico26.11.30 · 2026-11-13</div>
         <h1>把这台墨水屏，<br>刷成趁手的阅读器。</h1>
         <p class="dek">横屏双栏、离线词典与生词本、手机蓝牙推流副屏，以及首页／阅读页双指手势与框选摘抄。一根数据线，浏览器里点一下就能刷。</p>
 
           <div class="hero__install">
           <div class="kicker">Step 00 · 一键刷机</div>
-          <p>用 USB 数据线把设备连到电脑，然后点下面的按钮。</p>
+          <p>用 USB 数据线把设备连到电脑，然后点下面的按钮。首次整片刷机写入 <b>26.11.29 基线四件套</b>；随后联网 OTA 或放 TF 卡升级到 <b>26.11.30 正式版</b>（见下方「26.11.30 正式版下载」）。</p>
           <esp-web-install-button manifest="firmware/manifest-26.11.29.json">
             <button slot="activate" class="install-btn">安装固件 · 一键刷机</button>
             <span slot="unsupported">此浏览器不支持串口刷机，请用电脑版 Chrome 或 Edge 打开本页。</span>
@@ -421,9 +422,9 @@ footer .kicker{margin-bottom:18px}
         <div class="card__top"><span class="card__step">STEP 01 / 手机端</span><span class="card__tag">仅安卓 · 装到手机</span></div>
         <div class="card__body">
           <h3>配套安卓 App</h3>
-          <p class="card__sub">ReadPicoPush · v1.6.5 · 61 KB · 仅安卓</p>
+          <p class="card__sub">ReadPicoPush · v1.6.6 · 70,169 B · 仅安卓</p>
           <div class="card__dl">
-            <a class="btn btn--lg btn--red" href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk"><span class="btn__arrow">↓</span> 下载 App（v1.6.5）</a>
+            <a class="btn btn--lg btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span> 下载 App（v1.6.6）</a>
           </div>
           <div class="card__how">
             <div class="kicker">怎么用 · 三步</div>
@@ -433,7 +434,7 @@ footer .kicker{margin-bottom:18px}
               <li>Android 10/11 需先开启系统<b>「定位服务」</b>并授予位置权限，否则扫描不到设备。</li>
             </ol>
           </div>
-          <p class="card__desc">用于<b>蓝牙推流（副屏）、AI 智能释义、语音朗读</b>。也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件下载；<b>请勿再用旧的 v1.5.2</b>。</p>
+          <p class="card__desc">用于<b>蓝牙推流（副屏）、AI 智能释义、语音朗读</b>。也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件下载；<b>请勿再用旧的 v1.6.5 及更早版本</b>。</p>
           <div class="card__warn"><b>固件与 App 必须配套。</b>固件与 App 必须同时更新，旧版在多台设备并存时可能连错设备；首次用 AI 释义前在「AI 释义设置」填入自己的 API key（默认 DeepSeek）。</div>
         </div>
       </article>
@@ -464,11 +465,78 @@ footer .kicker{margin-bottom:18px}
   </div>
 </section>
 
+<!-- ============ 26.11.30 正式版下载（换代轮新增：TF 卡升级 / OTA / 独立命名资产） ============ -->
+<section class="band" id="v1130" style="padding:52px 0">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">NEW / 26.11.30</span><h2>26.11.30 正式版 · 固件与 App</h2></div>
+    <p class="sec__dek">伴读案 30 批收尾正式版。首次整片刷机仍用上方一键刷机（写入 26.11.29 完整分区基线包）；已刷过 26.11.21 或更高版本的设备，可直接联网 OTA 升级，或下载下面这份固件包放 TF 卡升级。</p>
+
+    <div class="facts">
+      <div class="fact"><div class="fact__k">固件版本</div><div class="fact__v">0.3.9-pico26.11.30</div></div>
+      <div class="fact"><div class="fact__k">固件 SHA-256</div><div class="fact__v"><b>0418a6aa</b>…</div></div>
+      <div class="fact"><div class="fact__k">配套 App</div><div class="fact__v">v1.6.6 / 18</div></div>
+      <div class="fact"><div class="fact__k">验收包</div><div class="fact__v">33eac1c1… / 2.4 MB</div></div>
+    </div>
+
+    <div class="cards" style="margin-top:26px">
+      <article class="card">
+        <div class="card__top"><span class="card__step">FIRMWARE / 固件</span><span class="card__tag">TF 卡升级 · 独立命名件</span></div>
+        <div class="card__body">
+          <h3>固件正式件 26.11.30</h3>
+          <p class="card__sub">Read_Pico-0.3.9-pico26.11.30-0418a6aa.bin · 4,385,920 B</p>
+          <div class="card__dl">
+            <a class="btn btn--lg btn--red" href="firmware/Read_Pico-0.3.9-pico26.11.30-0418a6aa.bin" download><span class="btn__arrow">↓</span> 下载固件（26.11.30）</a>
+            <a class="btn btn--sm btn--ghost" href="read-pico-26.11.30-acceptance.zip" download>或下载验收包 zip（固件 / APK / feed / 校验和）</a>
+          </div>
+          <div class="card__how">
+            <div class="kicker">TF 卡升级 · 三步</div>
+            <ol class="steps">
+              <li>下载上面的固件文件，把它<b>重命名为 <span class="mono">Read_Pico.bin</span></b>。</li>
+              <li>把重命名后的文件放到 <b>TF 卡根目录</b>（与 <span class="mono">dict</span> 文件夹同级）。</li>
+              <li>在设备「设置 → 升级和恢复」选择安装；或在「联网 OTA」点「检查更新」直接在线升级。</li>
+            </ol>
+          </div>
+          <p class="card__desc">独立命名件用于 TF 卡升级与联网 OTA 直链；<b>下载后请重命名</b>为 <span class="mono">Read_Pico.bin</span> 再放卡，TF 卡升级路径只认这个文件名。联网 OTA 走 URL 直链，不受文件名约束。</p>
+          <div class="card__warn"><b>已在 26.11.30 的设备无需重刷。</b>联网 OTA 会显示「当前已是最新版本」；相同版本的 TF 卡包会被设备拒绝重装。</div>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card__top"><span class="card__step">APK / 手机端</span><span class="card__tag">v1.6.6 · versionCode 18</span></div>
+        <div class="card__body">
+          <h3>配套安卓 App v1.6.6</h3>
+          <p class="card__sub">ReadPicoPush-v1.6.6-d5ca0e71.apk · 70,169 B</p>
+          <div class="card__dl">
+            <a class="btn btn--lg btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span> 下载 App（v1.6.6）</a>
+          </div>
+          <div class="card__how">
+            <div class="kicker">本版要点</div>
+            <ol class="steps">
+              <li><b>检查更新</b>：App 内点「检查更新」读取正式版本源，已是 v1.6.6 会提示「已是最新版本」。</li>
+              <li><b>连接即校时</b>：蓝牙连接成功后自动下发标准时间，无需先发送文本。</li>
+              <li><b>伴读摘要</b>：右栏摘要与听书各自独立，四种解读风格，用法见<a href="companion.html">伴读功能说明</a>。</li>
+            </ol>
+          </div>
+          <p class="card__desc">固件与 App 需配套。首次使用 AI 释义前在「AI 释义设置」填入自己的 API key（默认 DeepSeek）。仅支持 Android，iOS 因系统限制不支持。</p>
+          <div class="card__warn"><b>请勿再用旧的 v1.6.5 及更早版本。</b>旧版在多台设备并存时可能连错设备。</div>
+        </div>
+      </article>
+    </div>
+
+    <div class="note" style="margin-top:22px">
+      <b>校验值（SHA-256）：</b>固件 <span class="mono">0418a6aad983f27d6ab251753f6f0b469b6de53a98538e67770bd1f30a40e11b</span> ·
+      APK <span class="mono">d5ca0e714b681260dafb2fdd4fb2f7786f779a3b8c816569c908d4de28b6337a</span> ·
+      验收包 <span class="mono">33eac1c131081e52beba05fb0f898aa07872249050c3f768ebd53c73b400a9cb</span>。
+      验收包内附 <span class="mono">SHA256SUMS</span> 与 README，可逐件核对。
+    </div>
+  </div>
+</section>
+
 <!-- ============ 固件与分区校验（页面级确认） ============ -->
 <section class="band" id="verify" style="padding:44px 0">
   <div class="wrap">
-    <div class="sec__head"><span class="sec__no">00 / VERIFY</span><h2>本页刷的四件，对不对</h2></div>
-    <p class="sec__dek">刷机按钮读取的清单与本版正式包逐件核对过，四个烧录偏移与分区表一致。</p>
+    <div class="sec__head"><span class="sec__no">00 / VERIFY</span><h2>一键刷机写入的四件，对不对</h2></div>
+    <p class="sec__dek">上方一键刷机读取的清单（26.11.29 完整分区基线包，首次整片刷机用）与四件烧录件逐件核对过，四个烧录偏移与分区表一致。</p>
     <div class="facts">
       <div class="fact"><div class="fact__k">固件版本</div><div class="fact__v">0.3.9-pico26.11.29</div></div>
       <div class="fact"><div class="fact__k">主程序</div><div class="fact__v">Read_Pico-26.11.29.bin · 4,378,272 B</div></div>
@@ -480,7 +548,7 @@ footer .kicker{margin-bottom:18px}
       <span class="mono">0xb10000</span> 正是 <span class="mono">otadata</span> 分区起始，<span class="mono">0x10000</span> 是 <span class="mono">ota_0</span> 起始。
       网页刷机读取 <span class="mono">firmware/manifest-26.11.29.json</span>，四件 bin 全在 <span class="mono">firmware/</span> 目录下，<b>与正式包为同一颗</b>。
     </div>
-    <p class="note" style="margin-top:12px">本页自 26.11.21 对齐至 11.29，中间批次经 OTA 与 Release 通道发布，变更见 Release notes。</p>
+    <p class="note" style="margin-top:12px">一键刷机写入的是 26.11.29 完整分区基线包；当前正式版 <b>0.3.9-pico26.11.30</b> 已上线，刷完请通过「设置 → 升级和恢复 → 联网 OTA」或下方「26.11.30 正式版下载」区的固件包升级。本页自 26.11.21 对齐至基线包 11.29，变更见 Release notes 与<a href="companion.html">伴读功能说明</a>。</p>
   </div>
 </section>
 
@@ -562,7 +630,7 @@ footer .kicker{margin-bottom:18px}
       <div class="fstep">点本页上方 <b>「安装固件」</b> 按钮。</div>
       <div class="fstep">弹窗中选择设备串口（如 <span class="mono">COM3</span>、<span class="mono">USB JTAG/serial debug unit</span>），点连接。</div>
       <div class="fstep">等待进度条走完（约 1～2 分钟），设备自动重启，刷机完成。</div>
-      <div class="fstep"><b>刷完请确认运行版本 11.29</b>：在设备「设置 → 关于」查看固件版本串，应显示 0.3.9-pico26.11.29。</div>
+      <div class="fstep"><b>刷完请确认一键刷机写入的基线包版本 11.29</b>：在设备「设置 → 关于」查看固件版本串，此时显示 0.3.9-pico26.11.29；随后经联网 OTA 或下方固件包升级到 26.11.30，升级后应显示 0.3.9-pico26.11.30。</div>
       <div class="fstep">刷完后回到本页<b>顶部深色区</b>，下载并安装 App 与词典文件。</div>
     </div>
     <div class="note"><b>浏览器要求：</b>需电脑版 Chrome 或 Edge；暂不支持手机浏览器和 Safari。<b>首次刷过官方固件的设备，工具会提示「擦除全部数据」，属正常现象</b>——两套分区布局不同，必须整片擦除后才能写入，确认即可。按钮没反应或找不到串口，换一根数据线、换一个 USB 口，并关掉其他可能占用串口的软件；页面一直转圈是刷机脚本没加载出来，换个网络环境重试。</div>
@@ -589,8 +657,8 @@ footer .kicker{margin-bottom:18px}
     <p class="sec__dek">上方两张卡是速览；这里是把每一步讲清楚的完整版。</p>
     <div class="detail">
       <div class="detail__col">
-        <h3>手机端配套 App（v1.6.5）</h3>
-        <p>刷完固件后，若要使用<b>蓝牙推流、AI 智能释义、语音朗读</b>，请在手机装配套安卓 App：<a href="apk/ReadPicoPush.apk" download="ReadPicoPush-v1.6.5.apk">下载 ReadPicoPush.apk</a>（也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件）。</p>
+        <h3>手机端配套 App（v1.6.6）</h3>
+        <p>刷完固件后，若要使用<b>蓝牙推流、AI 智能释义、语音朗读</b>，请在手机装配套安卓 App：<a href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk">下载 ReadPicoPush.apk</a>（也可到仓库 <span class="mono">apk/</span> 目录或本版 Release 附件）。</p>
         <ul>
           <li><b>仅支持 Android</b>；iOS 因系统限制暂不支持。</li>
           <li><b>固件与 App 必须同时更新</b>：旧版 App 在有多台设备并存时可能连到非目标设备。</li>
@@ -649,7 +717,7 @@ footer .kicker{margin-bottom:18px}
           <li><b>AI 释义点了没反应？</b>确认手机 App 已点「连接并监听点词」保持连接，且已填 API key。</li>
           <li><b>听书不读／突然停了？</b>确认设备已开「听书 → 跟随朗读」且手机 App 已连接保活；断开蓝牙会立即停止。</li>
           <li><b>刷完想升级／重刷？</b>可再次使用本页；也可以把升级包放到 TF 卡根目录，在「设置 → 升级和恢复」中安装。<b>26.11.20 起 TF 升级双名均可</b>：<span class="mono">Pico-update.bin</span> / <span class="mono">Read_Pico.bin</span> 两个文件名都识别；更早固件升级请把 <span class="mono">Read_Pico.bin</span> 改名为 <span class="mono">Pico-update.bin</span>（相同版本会被设备拒绝重装，此时请用本页重刷）。</li>
-          <li><b>在线升级（OTA）怎么用？</b>需先通过 TF 卡或本页把固件刷到 <b>26.11.21 或更高版本</b>，再在「设置 → 升级和恢复 → 联网 OTA」点「检查更新」；更早版本不含在线升级能力，请先完整刷机。</li>
+          <li><b>在线升级（OTA）怎么用？</b>需先通过 TF 卡或本页把固件刷到 <b>26.11.21 或更高版本</b>，再在「设置 → 升级和恢复 → 联网 OTA」点「检查更新」；更早版本不含在线升级能力，请先完整刷机。<b>版本源已指向 26.11.30</b>：旧版设备会提示「发现新版本」，已是 26.11.30 的设备显示「当前已是最新版本」。</li>
         </ul>
       </div>
     </div>
@@ -670,7 +738,7 @@ footer .kicker{margin-bottom:18px}
     </div>
     <div class="foot__disc">固件按"原样"提供，刷机有风险，请自行承担。详细说明见仓库 README。</div>
     <div class="foot__rule"></div>
-    <div class="foot__end"><span>PICO-PLUS / 0.3.9-pico26.11.29</span><span>ESP32-S3 · ESP-WEB-TOOLS · 中文页面</span></div>
+    <div class="foot__end"><span>PICO-PLUS / 0.3.9-pico26.11.30</span><span>ESP32-S3 · ESP-WEB-TOOLS · 中文页面</span></div>
   </div>
 </footer>
 
