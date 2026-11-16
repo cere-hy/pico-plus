@@ -5,6 +5,9 @@
  * 冻结：仅供测试，不做任何字体工作。/ Frozen: tests only; no font work happens here.
  */
 #pragma once
+/* 与真实头共用同一份对齐计划（单源；桩头不许把规则抄一遍）。 */
+#include "../../main/font/ttf_justify.h"
+#include "../../main/font/ttf_kern.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

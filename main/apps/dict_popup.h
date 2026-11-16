@@ -47,6 +47,28 @@ bool dict_popup_show_def(const char* word, const char* def);
 /// an empty word or a staging failure (PSRAM allocation included), leaving no
 /// half card behind.
 bool dict_popup_show_pending(const char* word);
+/// M3-B：「情景解读中…」待命卡——与 show_pending **同一状态机**（同一超时、
+/// 同一门 B 判定基底），只有状态行文案不同。点「情景解读 ›」后立即调它，
+/// 0x1A 的答案落地由 app_book 转交情景视图，不进本卡的原地更新路径。
+/// M3-B: the "reading the scene..." waiting card - the same state machine as
+/// show_pending (same timeout, same gate-B basis), only the status label differs.
+/// Called right after "情景解读 ›" is tapped; the 0x1A answer goes to the scene
+/// view via app_book and never updates this card in place.
+bool dict_popup_show_pending_scene(const char* word);
+/// 26.9.5 入口卡：本地词典没有释义时（英文未收录 / 中文不查本地）给的**静态入口**
+/// ——词头 + 状态行 + AI / 情景入口 chip，与 show_pending 共用排版骨架，但
+/// **s_pending = false**：不挂超时、不被 0x07 认领（入口卡没发过请求）。
+/// 点「AI 释义 ›」由调用方转 pending 并居中发 0x17，回流按 show_def 整卡替换；
+/// 入口态**不显示「存生词」chip**（有释义才可存，见 §6.3 统一规则）。
+/// 26.9.5 entry card: the static entry shown when the local dictionary has no
+/// definition (English miss, or Chinese that is never looked up locally) - head +
+/// status line + AI/scene entry chips, sharing show_pending's layout skeleton but
+/// with **s_pending = false**: no timeout, never claimed by 0x07 (the entry card
+/// sent no request). Tapping "AI 释义 ›" makes the caller switch to pending and
+/// send 0x17; the answer replaces the whole card via show_def. The entry state
+/// shows **no save chip** (only a definition may be saved, see §6.3).
+/// False on an empty word or a staging failure, leaving no half card.
+bool dict_popup_show_entry(const char* word, const char* notice);
 /// 谓词：当前是否为查询态卡，且查的就是 word 这个词——app_book 双门判定的核心
 /// （门 B：本词的查询卡原地更新为释义；门 A：用户手开的词典卡照旧丢弃进缓存）。
 /// word 传 NULL 只问「是不是查询态」。词长超过词头缓冲时按截断后的词头匹配：
@@ -118,6 +140,17 @@ const char* dict_popup_full_text(void);
 /// and hit-testing on the dictionary card.
 void dict_popup_set_ai_enabled(bool on);
 
+/// M3：设置「情景解读 ›」入口是否可点（app_book 按 push_sink 的 AI+情景开关设置）。
+/// 控制卡底左侧入口的显示与命中；查询态卡不显示。
+/// M3: set whether the "情景解读 ›" entry is tappable (app_book sets it from the
+/// push_sink AI+scene switches). Controls the bottom-left entry's visibility and
+/// hit-testing; the querying card never shows it.
+void dict_popup_set_scene_enabled(bool on);
+
+/// M3：「情景解读 ›」热区（绘制与命中共用）。不可用时返回零矩形。
+/// M3: the "情景解读 ›" hit rect (shared by draw and hit-test); zero when hidden.
+EpdRect dict_popup_scene_rect(void);
+
 /// chip 点击的结果。调用方据此决定「关卡片」「留着」还是「删完要重开视图」。
 /// What a chip tap did; the caller decides whether to close the card, keep it, or
 /// re-open the vocabulary view after a removal.
@@ -132,6 +165,8 @@ typedef enum {
                               ///< gen26.4 the "AI" entry on a dict card: the caller forces an AI query
     DICT_POPUP_TAP_MORE,      ///< gen26.6.2 命中「……」详解入口：调用方据此开详解会话（全文）
                               ///< gen26.6.2 the "……" detail entry: the caller opens the detail session
+    DICT_POPUP_TAP_SCENE,     ///< M3 命中「情景解读 ›」：调用方据此组装上下文并发 0x1A
+                              ///< M3 the "情景解读 ›" entry: the caller builds the context and sends 0x1A
 } dict_popup_tap_t;
 
 /// 点击落在 chip 上时切换生词本保存状态。未命中由调用方关卡片。

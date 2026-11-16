@@ -38,6 +38,13 @@ esp_err_t book_store_upload_root(book_store_root_t* out);
 size_t book_store_file_limit(const book_store_root_t* root);
 /// 查询实时剩余容量，错误返回 0。/ Query current free capacity, returning zero on error.
 uint64_t book_store_free_bytes(const book_store_root_t* root);
+/// 26.9.21 S15：只读**快照**，绝不现场扫表。空间还没算完时返回 false，调用方显示「统计中」。
+/// 书架扫描必须走这条——`book_store_free_bytes()` 会调 `f_getfree()`，在空间未算完时
+/// 那是 2 秒的卷锁持有。
+/// / Read the snapshot only, never scan. Returns false while the space count is still pending;
+/// / shelf scanning must use this - book_store_free_bytes() calls f_getfree(), which holds the
+/// / volume lock for ~2 s whenever the count is not yet known.
+bool book_store_free_snapshot(const book_store_root_t* root, uint64_t* out_free);
 /// 仅查询内置分区是否已挂载，不触发挂载。/ Inspect flash mount state without mounting.
 bool book_store_flash_ready(void);
 /// 仅删除已挂载书根内的直接 TXT/EPUB 普通文件，然后清对应进度及 last。

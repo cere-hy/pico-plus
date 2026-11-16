@@ -701,7 +701,13 @@ static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     err = esp_wifi_start(); if (err != ESP_OK) goto time_cleanup;
     wifi_started = true;
     err = esp_wifi_connect(); if (err != ESP_OK) goto time_cleanup;
-    const int64_t ip_deadline = esp_timer_get_time() + 15000000;
+    // 26.9.14 A2：15 s → 6 s。26.9.13 真机日志里这一次等待正好 15,104 ms（16,301 →
+    // 31,405），而它换来的只是 clock: background calibration: ESP_ERR_TIMEOUT。
+    // 连不上的热点 6 s 内就有结论，剩下的 9 s 纯粹是把射频和内部堆按在窗口里。
+    // A2: 15 s -> 6 s. The 26.9.13 log measured this wait at exactly 15,104 ms and all it
+    // bought was ESP_ERR_TIMEOUT. An unreachable AP answers that question within 6 s; the
+    // other 9 s only held the radio - and the internal heap - open for nothing.
+    const int64_t ip_deadline = esp_timer_get_time() + 6000000;
     EventBits_t bits = 0;
     while (!(bits & TIME_GOT_IP) && esp_timer_get_time() < ip_deadline) {
         if (time_sync_cancelled()) { err = ESP_ERR_INVALID_STATE; goto time_cleanup; }

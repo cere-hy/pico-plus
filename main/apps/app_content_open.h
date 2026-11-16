@@ -38,6 +38,39 @@ bool app_book_has_open_book(void);
 void app_book_mark_push_first_open(void);
 /// 仅导出已打开阅读上下文。/ Export only an already open reader context.
 bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen);
+
+/* ---- 26.9.30 commit 3：读者句柄释放（机制二）/ releasing the reader's handle ---- */
+// 机制二：读者正读着 push.txt 时，book_txt_open() 留在 s_book.file 的 FILE* 仍指着
+// 那条簇链；提交侧的 rename/remove 把簇链还给 FAT 之后，任何 fread 都在读已释放的
+// 簇（现场：乱码页 / 0x101 / 崩）。修法只有一条——提交前把书**关干净**。
+// Mechanism #2: a reader sitting on push.txt still holds the FILE* left in
+// s_book.file. Once the commit side renames/removes that file, the clusters are
+// back in FAT and every later fread reads freed clusters (garbage pages / 0x101 /
+// crash). There is one fix: close the book cleanly before the commit.
+//
+// 七项占用位：每位一条判据，送审与日志逐项对表（位值不重排，只许追加）。
+// Seven occupancy bits, one predicate each, tabulated in review and logs.
+#define BOOK_HOLD_PREP   (1u << 0)  ///< 预排版任务活着：行循环正在读 s_text / prep task alive, its row loop reads s_text
+#define BOOK_HOLD_DRAW   (1u << 1)  ///< 绘制锁被占：有渲染在飞 / draw lock held, a render is in flight
+#define BOOK_HOLD_TURN   (1u << 2)  ///< 正文翻页或正文帧排期中 / a body turn or body frame is queued
+#define BOOK_HOLD_WATER  (1u << 3)  ///< 水墨翻页在飞 / a water-mode turn is in flight
+#define BOOK_HOLD_FOOTER (1u << 4)  ///< 页脚刷新排期中 / the footer repaint is queued
+#define BOOK_HOLD_BOXSEL (1u << 5)  ///< 框选进行中：选区偏移直接索引 s_text / selection active, its offsets index s_text
+#define BOOK_HOLD_PANEL  (1u << 6)  ///< 阅读面板（词典/详解）开着 / a reader panel (dict/detail) is open
+
+/// 读者是否正持有该路径（有书打开且路径相同）。/ Whether the reader holds exactly this path.
+bool app_book_holds_path(const char *path);
+/// 七项占用的当前快照（位值见 BOOK_HOLD_*）。无书时返回 0。
+/// Snapshot of the seven occupancies (bits above); zero when no book is open.
+uint32_t app_book_hold_busy(void);
+/// 提交前释放读者对 path 的持有：不持有 → true；持有且能安全关 → 关书并返回 true；
+/// 持有但被硬阻（prep 未停 / 渲染在飞）→ 返回 false，**本拍什么都不改**，调用方下一帧再来。
+/// 有界重试的所有权在调用方（2 s 死线外必须放弃并明确回复，不许无界重投）。
+/// Release the reader's hold on `path` before a commit: true when not held, or when
+/// held and closed cleanly; false when a hard blocker (prep alive / render in
+/// flight) says "not this frame" - nothing is touched in that case. The caller owns
+/// the bounded retry and must give up loudly past its deadline.
+bool app_book_release_hold(const char *path);
 bool app_image_request_open(const char *path);
 void app_files_request_folder(int folder);
 void app_book_request_manage(void);
@@ -54,6 +87,14 @@ void app_book_cover_mode_changed(void);
 /// stays in the prefetch cache and the next tap on the same word shows it
 /// instantly).
 bool app_book_ai_def_ready(const char* word, const char* def);
+/// M3-B：情景答案回流认领。必须在 app_book_ai_def_ready **之前**调用——0x08 帧
+/// 没有情景标记，待命态先认领（词 + 发起页 + 期限三重匹配）；返回 true 表示这条
+/// 答案已被情景视图消费，调用方**不要**再进生词批、也不要再走释义卡双门。
+/// M3-B: claim a returning scene answer. Must run BEFORE app_book_ai_def_ready -
+/// the 0x08 frame carries no scene mark, so the pending state claims it first by
+/// word + originating page + deadline. True means the scene view consumed it: the
+/// caller must NOT feed the AI vocabulary batch nor take the card double gate.
+bool app_book_scene_def_ready(const char* word, const char* def);
 /// M2 Step9：app_book_ai_def_ready 刚开了一次详解会话（超容量长文改由
 /// ai_reader 覆盖层承载）——主循环据此把呈现档位从 PAGE 提到 FULL（双 GC16
 /// 的 open 侧）。一次性消费：读过即清零，陈旧的 FULL 请求不会滞留。

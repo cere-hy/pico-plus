@@ -9,8 +9,56 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 
 
+def blank_comments(src):
+    """把注释换成等长空格（保留换行），字符串/字面量原样。
+
+    切片前必须做：产品注释里有撇号（"the reader's ..."），而按引号配对的大括号
+    计数器会把撇号当字符字面量开头，一路吞到下一个撇号，于是把 `}` 数漏、切出
+    半个函数——症状是编译期一堆「defined but not used」。26.11.5 就栽在这里。
+    Comment blanking before slicing: product comments contain apostrophes, and a
+    quote-aware brace counter reads one as a char literal and swallows braces,
+    yielding half a function ("defined but not used" at compile time).
+    """
+    out = []
+    i, n = 0, len(src)
+    state = None  # None | 'line' | 'block' | 'str' | 'chr'
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if state is None:
+            if c == "/" and nxt == "/":
+                state = "line"; out.append("  "); i += 2; continue
+            if c == "/" and nxt == "*":
+                state = "block"; out.append("  "); i += 2; continue
+            if c == '"':
+                state = "str"
+            elif c == "'":
+                state = "chr"
+            out.append(c); i += 1; continue
+        if state == "line":
+            if c == "\n":
+                state = None; out.append(c)
+            else:
+                out.append(" ")
+            i += 1; continue
+        if state == "block":
+            if c == "*" and nxt == "/":
+                state = None; out.append("  "); i += 2; continue
+            out.append(c if c == "\n" else " ")
+            i += 1; continue
+        if c == "\\":
+            out.append(c)
+            if nxt:
+                out.append(nxt)
+            i += 2; continue
+        if (state == "str" and c == '"') or (state == "chr" and c == "'"):
+            state = None
+        out.append(c); i += 1
+    return "".join(out)
+
+
 def function(path, name):
-    text = (root / path).read_text()
+    text = blank_comments((root / path).read_text())
     match = re.search(r"^(?:static )?[^\n]+\b" + name + r"\([^;{}]*?\)\s*\{", text, re.M)
     assert match, name
     start, at, depth, quote, escape = match.start(), match.end(), 1, None, False
@@ -55,8 +103,17 @@ enum EpdDrawError {EPD_DRAW_SUCCESS,EPD_DRAW_ERROR};
 #define APP_PAGE_REFRESH_MODE MODE_GL16
 #define SHELF_BOOK_LIFT_PX 16
 #define portMAX_DELAY 0
-static const int E0470_WAVEFORM=0,E0470_FULL_WAVEFORM=1,E0470_FOLLOW_WAVEFORM=2,E0470_TEXTTURN_WAVEFORM=3,E0470_SOFT_TEXTTURN_WAVEFORM=4;
-static const int* display_reader_text_waveform(void){return &E0470_SOFT_TEXTTURN_WAVEFORM;}
+static const int E0470_WAVEFORM=0,E0470_FULL_WAVEFORM=1,E0470_FOLLOW_WAVEFORM=2;
+// 26.11.8 ②：正文翻页改用柔和波形模块。桩只认身份，不复制 48 相表——表本身由
+// check_refresh_ghost.py 的 B82c 逐字节哈希咬住，两处各管一件事。
+// 26.11.8 ②: body turns use the soft waveform module. The stub only carries identity;
+// the table itself is pinned by B82c (byte-identical hash), so each side owns one thing.
+static const int E0470_SOFT_TURN_WAVEFORM=3;
+static const int* display_reader_soft_turn_waveform(void){return &E0470_SOFT_TURN_WAVEFORM;}
+// 26.11.7：display_reader_waveform 模块随 S1 退休（T0 改用 E0470 的 GC16），桩与
+// E0470_TEXTTURN_WAVEFORM 一并退场——留着它就是在替一个不存在的模块站岗。
+// 26.11.7: the display_reader_waveform module retired with S1 (T0 uses E0470's GC16);
+// its stub and E0470_TEXTTURN_WAVEFORM left with it.
 static const char *TAG="test";
 static int s_view,s_presented_view,s_reader_panel,s_pressed_control,s_reader_slider;
 static bool s_shelf_page_pending,s_shelf_feedback_pending,s_reader_cleanup,s_reader_image_refresh_pending,s_toolbar,s_clear_confirm;
@@ -64,6 +121,21 @@ static bool s_shelf_page_pending,s_shelf_feedback_pending,s_reader_cleanup,s_rea
 // Gen24.4: the push finale's one-shot full-refresh flag (consumed by app_book.c's present).
 static bool s_open_full_once;
 static bool s_reader_fullscreen,s_water_turn_pending,s_reader_footer_pending,s_reader_turn_pending,s_reader_text_frame;
+// 26.11.6：四层刷新的三个新静态量 + AI 页呈现游标，必须逐个镜像（切片式 harness 的老规矩）。
+// 26.11.6: the three new statics for the four-tier refresh plus the AI page cursor.
+static bool s_reader_body_turn,s_reader_clear_from_image,s_reader_frame_had_image;
+// 26.11.7 S2：计数搬进 present 之后多出的「页码前进」标记，同样必须镜像。
+// 26.11.7 S2: the page-advance flag S2 added (the counter settles in present()).
+static bool s_reader_page_advance;
+// 26.9.27 S26-4：present() 里新增的「页脚已重绘待刷」闩（S26-2 引入）。
+// 切片式 harness 的每条静态量都必须在这里镜像，否则被切出来的函数一引用就编译不过——
+// 这正是这个 harness 自 S26-2 起静默红灯的原因。s_excerpt_footer_pending 的语义由
+// excerpt 宿测与 B36 牙覆盖，这里只要它存在且可读写。
+// S26-4: the footer-repainted latch present() gained in S26-2. Every static a sliced
+// harness pulls in has to be mirrored here; that mirror is exactly what went stale and
+// turned this harness red without anyone noticing. Its semantics are covered by the
+// excerpt host tests and tooth B36; here it only has to exist and be assignable.
+static bool s_excerpt_footer_pending;
 static enum EpdDrawMode s_mode;
 static EpdRect s_area,s_du_area;
 static unsigned s_du_count;
@@ -102,7 +174,12 @@ static const char *s_text;
 static void prepare_inline_image(void){}
 static bool test_check_cached;
 static unsigned test_button_draws,test_body_draws;
-static void draw_shelf_header_button(uint8_t *fb,EpdRect r,bool importing){(void)fb;assert(r.width==97&&r.height==54);assert(r.x==(importing?551:442));++test_button_draws;}
+/* 26.11.2 入口甲：签名泛化 (fb,rect,id,label,font)，第三个头部按钮 {333,94,97,54}。
+   桩镜像产品签名（26.9.29 桩纪律：每个参数要么断言要么显式不关心）。
+   26.11.2 entrance A: the generalized signature and the third header button;
+   the stub mirrors the product signature. */
+static const char *shelf_excerpt_label(char *buf,size_t cap){(void)cap;buf[0]=0;return buf;}
+static void draw_shelf_header_button(uint8_t *fb,EpdRect r,int id,const char *label,int font){(void)fb;(void)id;(void)font;assert(label!=NULL);assert(r.width==97&&r.height==54);assert(r.x==551||r.x==442||r.x==333);++test_button_draws;}
 static unsigned test_prepare_order,test_render_order,test_step;
 static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++test_body_draws;if(test_check_cached){assert(test_prepare_order);test_render_order=++test_step;}}
 static void prepare_covers(app_ctx_t *ctx){(void)ctx;++test_prepares;if(test_check_cached)test_prepare_order=++test_step;}
@@ -132,6 +209,8 @@ static EpdRect reader_fullscreen_progress_area(void){return (EpdRect){0,1200,684
 static unsigned percent(unsigned page){return page;}
 static unsigned s_page,s_chapter;
 static bool test_hide_images,test_load_failed,s_save_failed,s_input_settle;
+/* 31b B′：turn_page 的掉盘闸在这里不参与用例（恒 false + 空桩）。 */
+static bool s_media_offline;
 static int test_types[2][2],test_push_error,test_effect;
 static uint8_t test_full_pages;
 static unsigned s_turns,s_unsaved,s_stats_pending_turns,s_session_turns;
@@ -163,6 +242,7 @@ static uint8_t app_settings_reader_full_pages(void){return test_full_pages;}
 static int app_settings_reader_turn_effect(void){return test_effect;}
 static void save_progress(void){}
 static void skip_hidden_image_pages(app_ctx_t *ctx,int dir){(void)ctx;(void)dir;}
+static void reader_offline_refuse(void){}
 static bool load_chapter(app_ctx_t *ctx,unsigned chapter,int off,bool last){(void)ctx;(void)off;if(test_load_failed)return false;s_chapter=chapter;s_page=last?1:0;return true;}
 static void set_reader_view(int view){s_view=view;}
 static void lock_draw(void){}
@@ -186,8 +266,23 @@ static enum EpdDrawError update_display_with(void *hl,const int *wave,enum EpdDr
 static enum EpdDrawError update_display_full(void *hl){(void)hl;return record(FULL,MODE_GC16,(EpdRect){0});}
 static enum EpdDrawError update_display_fast_page(void *hl){(void)hl;return record(FAST,MODE_GL16,(EpdRect){0});}
 static enum EpdDrawError update_display_mode_diff(void *hl,enum EpdDrawMode mode){(void)hl;return record(READER,mode,(EpdRect){0});}
+// 26.11.6：AI 解析页翻页的过账路径要单独测，所以把 ai_reader_* 也桩进来。
+// 26.11.6: stub the AI reader so its turn bookkeeping can be tested in isolation.
+static int test_ai_page,test_ai_count;
+static int ai_reader_page(void){return test_ai_page;}
+static app_redraw_t ai_reader_turn(int dir){
+  const int next=test_ai_page+(dir<0?-1:1);
+  if(next<0||next>=test_ai_count)return APP_REDRAW_NONE;
+  test_ai_page=next;return APP_REDRAW_PAGE;
+}
 static enum EpdDrawError update_display_water_turn(void *hl,EpdRect area,int dir){(void)hl;(void)dir;assert(test_tick_us==E0470_TURN_FAST_TICK_US);return record(WATER,MODE_GL16,area);}
 '''
+# 26.11.3：产品里的按钮矩形改由 getter 给出（坐标只许一个来源），桩必须同源取，
+# 不许在本文件里再抄一份坐标——抄一份就正是那批缺陷的病根。
+# 26.11.3: the product hands out button rects via getters (a single source), so the
+# stub pulls the same functions; copying coordinates here is exactly the old disease.
+for _rect_fn in ("shelf_excerpt_rect", "shelf_manage_rect", "shelf_import_rect"):
+    shelf += function("main/apps/app_book.c", _rect_fn) + "\n"
 shelf += function("main/apps/app_book.c", "paint_control") + "\n"
 # 词典弹层：翻页时会关闭它，这里只需空实现。/ Dictionary popup: turns close it; a no-op suffices here.
 shelf += "static void dict_popup_reset(void){}\n"
@@ -196,6 +291,8 @@ shelf += "static void dict_popup_reset(void){}\n"
 # into present: take the product's real teardown (it returns at once when started is false,
 # like the old shim) and keep the existing semaphore doubles referenced.
 shelf += function("main/apps/app_book.c", "reader_prefetch_end") + "\n"
+shelf += function("main/apps/app_book.c", "reader_note_turn") + "\n"
+shelf += function("main/apps/app_book.c", "reader_ai_turn") + "\n"
 for name in ("present", "paint_reading", "reader_turn_chrome", "turn_page"):
     shelf += function("main/apps/app_book.c", name) + "\n"
 shelf += r'''
@@ -208,9 +305,10 @@ int main(void){
  assert(test_prepare_order==1&&test_render_order==2&&pushes==1&&trace_count==1&&route==FAST);
  test_check_cached=false;pushes=trace_count=0;
  unsigned body_before=test_body_draws;
+ assert(paint_control(&ctx,(EpdRect){333,94,97,54})==APP_REDRAW_AREA);
  assert(paint_control(&ctx,(EpdRect){442,94,97,54})==APP_REDRAW_AREA);
  assert(paint_control(&ctx,(EpdRect){551,94,97,54})==APP_REDRAW_AREA);
- assert(test_button_draws==2&&test_body_draws==body_before);
+ assert(test_button_draws==3&&test_body_draws==body_before);
  for(int repeat=0;repeat<80;++repeat){
    int row=repeat%9;EpdRect original=row_rect(row);s_pressed_control=repeat%2?row:-1;
    s_reader_fullscreen=true;
@@ -240,7 +338,11 @@ int main(void){
  s_reader_fullscreen=false;assert(paint_control(&ctx,(EpdRect){500,90,90,54})==APP_REDRAW_AREA&&!s_shelf_feedback_pending);
  assert(present(&ctx,APP_REDRAW_AREA)&&route==AREA&&pushed_mode==MODE_DU);
  assert(paint_control(&ctx,row_rect(0))==APP_REDRAW_AREA);s_view=READING;
- assert(present(&ctx,APP_REDRAW_AREA)&&route==READER&&!s_shelf_feedback_pending);
+ // 26.11.5 刀 A 重签：跨视图进阅读不再是 READER 整屏差分，而是 FULL 整屏 GC16。
+ // 旧断言咬的是「差分」——正是残影的成因；新断言咬「整屏全刷」，改回去必红。
+ // 26.11.5 cut A re-sign: crossing into the reader is FULL/GC16, not a screen-wide
+ // differential. The old assertion bit the differential - the cause of the ghost.
+ assert(present(&ctx,APP_REDRAW_AREA)&&route==FULL&&pushed_mode==MODE_GC16&&!s_shelf_feedback_pending);
  s_view=s_presented_view=SHELF;paint_control(&ctx,row_rect(0));
  assert(present(&ctx,APP_REDRAW_FULL)&&route==FULL&&pushed_mode==MODE_GC16&&!s_shelf_feedback_pending);
  puts("PASS: 80 cover lift/cancel feedbacks use one grayscale differential, preserve the union and never force cleanup; buttons, view transitions and manual refresh retain their paths");
@@ -249,7 +351,18 @@ int main(void){
  s_view=s_presented_view=READING;s_text="text";s_reader_panel=READER_PANEL_NONE;
  s_area=reader_area();s_mode=MODE_GL16;s_reader_turn_pending=s_reader_footer_pending=true;
  trace_count=0;assert(present(&ctx,APP_REDRAW_AREA));
- assert(trace_count==2&&trace_route[0]==DIFF&&trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
+ // 26.11.7 S1 重签：正文翻页＝AREA / GC16 / E0470。
+ //
+ // 26.11.8 ② 反转：正文翻页是 LOCAL_FULL/GL16/柔和波形。26.11.7 的三方判据
+ // （AREA/GC16/E0470）在真机上三档同时炸——整块闪、左缘竖带、反色停留，同源于
+ // 「裁剪表在差分的单次推进里给不出足够的白」。现在的判据：(1) 必须 `_area_full`，
+ // 全像素才有白推；(2) 必须 GL16，柔和序列按它派生；(3) 必须是恢复的柔和模块，
+ // 不是 48 相之外的任何自制表。
+ // 26.11.8 ② inverts this: body turns are LOCAL_FULL/GL16/soft-waveform. The old
+ // AREA/GC16/E0470 triple failed three ways at once on the panel - block flash,
+ // left-edge band, inverted text - all from a trimmed table that cannot supply the
+ // white push a differential needs.
+ assert(trace_count==2&&trace_route[0]==LOCAL_FULL&&trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM);
  assert(trace_area[0].y==reader_area().y&&trace_area[0].height==reader_area().height);
  assert(trace_route[1]==AREA&&trace_mode[1]==MODE_DU&&trace_wave[1]==E0470_FOLLOW_WAVEFORM);
  assert(trace_area[1].y==progress_rect().y&&!s_reader_turn_pending);
@@ -273,7 +386,9 @@ int main(void){
  // reuses the same flag, so this block also covers resume's first-screen base
  // and "turns after restore keep their cadence".
  s_reader_cleanup=false;s_open_full_once=false;trace_count=0;
- assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==READER);
+ // 26.11.5：阅读视图的整页出口本身就是整屏 GC16，故这里 route==FULL（原 READER）。
+ // 26.11.5: the reader's whole-page exit IS a screen-wide GC16 now, so route==FULL.
+ assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==FULL&&pushed_mode==MODE_GC16);
  s_open_full_once=true;trace_count=0;
  assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==FULL&&pushed_mode==MODE_GC16&&!s_open_full_once);
  // gen25.1：resume 序列——首屏一次 GC16 后，下一帧翻页仍走 READER 差分
@@ -281,18 +396,33 @@ int main(void){
  // one-time first-screen GC16, the next turn still takes the READER
  // differential (zero cadence change, the gen24.4 red line).
  s_open_full_once=false;s_reader_turn_pending=true;trace_count=0;
- assert(present(&ctx,APP_REDRAW_PAGE)&&trace_count==1&&route==READER);
+ // 26.11.6：resume 首屏打底之后，普通翻页立刻回到局刷差分（首屏那次 GC16 已把
+ // 旧墨擦干净，后续翻页不该再付闪的代价）。
+ // 26.11.6: after resume's base GC16 the next turn is a local differential again -
+ // the base already wiped the old ink, so later turns must not pay the flash.
+ // 全屏下这一拍是「正文差分 + 进度条差分」两条，所以计数是 2 而不是 1。
+ assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==LOCAL_FULL&&trace_mode[0]==MODE_GL16&&
+        trace_route[1]==DIFF&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM);
  s_reader_fullscreen=false;s_reader_turn_pending=true;s_reader_image_refresh_pending=true;
  trace_count=0;assert(present(&ctx,APP_REDRAW_AREA));
  assert(trace_count==1&&route==AREA&&pushed_mode==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
+ // 26.11.5 裁决 (c)：水波纹是显式选择，动画之后必须补一次清底——但 26.11.7 W1 把
+ // 它从**整屏**收到**正文区**：动画只脏正文，整屏擦一遍正是「每次翻页都闪屏」的来源。
+ // 收尾仍是 LOCAL_FULL（全像素 GC16）：扫过的那块必须重写成白底，差分补不回来。
+ // Ruling (c) stands; 26.11.7 W1 narrows the closing wipe from FULL to LOCAL_FULL over
+ // the body - the animation only dirties the body. Still full-pixel GC16 inside it.
  s_reader_turn_pending=s_water_turn_pending=true;trace_count=0;
- assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==1&&route==WATER);
+ assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==WATER&&trace_route[1]==LOCAL_FULL&&
+        pushed_mode==MODE_GC16&&pushed_area.y==reader_area().y&&pushed_area.height==reader_area().height);
  // 翻页标志已消费，下一次设置绘制不能误走翻页差分。
  // The consumed turn flag must not affect the next settings repaint.
  s_reader_panel=99;trace_count=0;
  assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==1&&route==AREA&&pushed_mode==MODE_GL16&&trace_wave[0]==E0470_WAVEFORM);
  s_reader_panel=READER_PANEL_NONE;s_reader_fullscreen=true;s_reader_turn_pending=true;trace_count=0;
- assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==DIFF&&trace_route[1]==DIFF&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM&&trace_wave[1]==E0470_WAVEFORM);
+ // 26.11.7：全屏翻页同样是局刷（AREA/GC16），进度条单独走一条小差分。
+ // 26.11.7: immersive turns are AREA/GC16 too; the progress strip keeps its own diff.
+ assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==LOCAL_FULL&&trace_mode[0]==MODE_GL16&&
+        trace_route[1]==DIFF&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM&&trace_wave[1]==E0470_WAVEFORM);
  // 快水波仅接管实际动画输出；成功、失败及全屏都恢复主页节拍，优先级分支不改节拍。
  // Fast ripple scopes pacing to actual animation output; success, failure and full screen restore main pacing, while priority branches never change it.
  for(int full=0;full<2;++full)for(int error=0;error<2;++error){
@@ -338,12 +468,20 @@ int main(void){
    app_redraw_t redraw=turn_page(&ctx,1);
    bool eligible=hidden||(from==0&&to==0);
    assert(s_reader_fullscreen && s_reader_panel==READER_PANEL_NONE);
-   if (!full) {assert(redraw==APP_REDRAW_PAGE&&!s_reader_turn_pending);trace_count=0;present(&ctx,redraw);assert(trace_route[0]==(to&&!hidden?WHOLE:READER));continue;}
+   // 26.11.5：非全屏的整页翻页也不再是 READER 差分，而是 FULL 整屏 GC16
+   //（图片页仍走 WHOLE/GC16 的灰度路径，比它早）。
+   // 26.11.5: a plain whole-page turn is FULL/GC16 now, not a READER differential
+   // (image pages still take the earlier WHOLE/GC16 gray path).
+   if (!full) {assert(redraw==APP_REDRAW_PAGE&&!s_reader_turn_pending);trace_count=0;present(&ctx,redraw);assert(trace_route[0]==(to&&!hidden?WHOLE:FULL));continue;}
    assert(redraw==APP_REDRAW_AREA&&s_reader_turn_pending==eligible);
    trace_count=0;present(&ctx,redraw);
-   if(eligible)assert(trace_route[0]==DIFF&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
+   // 26.11.8 ②：纯文字翻页走 T0（柔和波形全像素 GL16）；图 → 有图走灰度路径；
+   // 图 → 文字走 T3 区清（仍 GC16 + 裁剪表，③ 之前不动）。
+   // 26.11.8 ②: plain text takes T0 (soft full-pixel GL16); image->image the gray
+   // path; image->text the T3 area clean (still GC16 + trimmed table until ③).
+   if(eligible)assert(trace_route[0]==LOCAL_FULL&&trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM);
    else if(to)assert(trace_mode[0]==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
-   else assert(trace_wave[0]==E0470_WAVEFORM&&trace_route[0]==(full?DIFF:AREA));
+   else assert(trace_route[0]==LOCAL_FULL&&trace_mode[0]==MODE_GC16&&trace_wave[0]==E0470_WAVEFORM);
    assert(!s_reader_turn_pending&&s_reader_text_frame==(hidden||to==0));
  }
  s_reader_fullscreen=true;test_hide_images=false;
@@ -355,7 +493,11 @@ int main(void){
    app_redraw_t redraw=turn_page(&ctx,dir);
    assert(s_chapter==(unsigned)new&&s_reader_turn_pending==(from==0&&to==0));
    trace_count=0;present(&ctx,redraw);
-   assert((trace_wave[0]!=E0470_TEXTTURN_WAVEFORM&&trace_wave[0]!=E0470_SOFT_TEXTTURN_WAVEFORM)||(from==0&&to==0));
+   // 26.11.6：跨章一律清底（用户裁决「换章节全刷」），且计数归零。
+   // 有图的跨章仍先走灰度整屏路径（它比清底分支更早，图片质量优先），那也是整屏。
+   if(from==0&&to==0)assert(trace_route[0]==FULL);
+   else assert(trace_route[0]==WHOLE||trace_route[0]==FULL||trace_route[0]==READER);
+   assert(s_turns==0);
  }
  // 失败推屏、面板及离开阅读会失效旧基准；下一次正常绘制后恢复。
  // Failed presents, panels and leaving reading invalidate history; a successful body restores it.
@@ -381,7 +523,75 @@ int main(void){
  test_full_pages=0;test_effect=0;s_page=0;test_types[0][0]=1;test_image.gray=NULL;
  trace_count=0;present(&ctx,paint_reading(&ctx,MODE_GL16));assert(!s_reader_text_frame);
  assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_reader_turn_pending);
+ // ---- 谓词完备性（26.11.6 批注①）：READING 的每一条 PAGE 路径 ----
+ // 兜底是 FULL：灰账安全、闪账爆炸。所以每条路径都要显式证明落到哪一边，
+ // 不许有路径靠「反正兜底是 full」活着。
+ s_view=s_presented_view=READING;s_reader_panel=READER_PANEL_NONE;s_reader_fullscreen=false;
+ s_reader_footer_pending=false;s_water_turn_pending=false;s_reader_clear_from_image=false;
+ s_reader_image_refresh_pending=false;
+ struct{const char*name;bool body;bool clean;int want;} pc[]={
+   {"enter / same-view book switch",false,false,FULL},
+   {"chapter or page jump",         false,false,FULL},
+   {"font / margin / background",   false,false,FULL},
+   // 26.11.9 `[122]`：AI 解析页翻页收编 ②——与正文同款 `_area_full_with(柔和, GL16)`，
+   // 路由由 AREA（GC16 差分 + 裁剪表）变 LOCAL_FULL。这一行当时**没跟着改**，
+   // `[122]` 报的「宿主用例 PASS」因此是错的；2026-11-03 四步锁序第一次跑就抓到了它。
+   // [122] pulled AI pages onto the same soft GL16 full-pixel path: AREA -> LOCAL_FULL.
+   // This row was left behind, so [122]'s "host test PASS" claim was false; the
+   // four-step release gate caught it on its very first run.
+   {"AI detail page turn",          true, false,LOCAL_FULL},
+   {"periodic cleanup",             false,true, FULL},
+   {"cleanup on an AI turn",        true, true, FULL},
+ };
+ for(unsigned i=0;i<sizeof(pc)/sizeof(pc[0]);++i){
+   s_reader_body_turn=pc[i].body;s_reader_cleanup=pc[i].clean;s_turns=7;trace_count=0;
+   assert(present(&ctx,APP_REDRAW_PAGE));
+   assert(trace_count==1&&trace_route[0]==pc[i].want);
+   // AI 页必须整块走柔和波形的全像素 GL16——路由对但波形退回裁剪表同样是回归。
+   if(pc[i].body&&!pc[i].clean)
+     assert(trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM);
+   if(pc[i].want==FULL)assert(s_turns==0);
+   assert(!s_reader_body_turn&&!s_reader_cleanup);
+ }
+ // ---- AI 页翻页过账（裁决②）：连翻 N 页，第 N 拍清底，边界不过账 ----
+ //
+ // 26.11.7 S2：账搬进 present 之后，「数意图」和「数屏」分开了。这里刻意在每一翻
+ // **之后、播屏之前**断言计数没动——有人把自增挪回 reader_ai_turn()，这一行先红。
+ // 26.11.7 S2: counting the intent and counting the frame are now separate. Each
+ // iteration asserts the counter has not moved before present() runs, so putting the
+ // increment back inside reader_ai_turn() turns this red first.
+ test_full_pages=5;s_turns=0;test_ai_page=0;test_ai_count=10;s_reader_cleanup=false;
+ for(int i=1;i<=5;++i){
+   assert(reader_ai_turn(1)==APP_REDRAW_PAGE&&s_reader_body_turn&&s_reader_page_advance);
+   assert(s_turns==(unsigned)(i-1));
+   trace_count=0;assert(present(&ctx,APP_REDRAW_PAGE));
+   // 26.11.9 `[122]`：AI 页翻页 = LOCAL_FULL/GL16/柔和（与正文同款）；第 N 拍仍是整屏清底。
+   assert(trace_route[0]==(i==5?FULL:LOCAL_FULL));
+   if(i<5)assert(trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TURN_WAVEFORM);
+   if(i<5)assert(s_turns==(unsigned)i);else assert(s_turns==0);
+   assert(!s_reader_body_turn&&!s_reader_page_advance&&!s_reader_cleanup);
+ }
+ test_ai_page=test_ai_count-1;s_turns=3;
+ assert(reader_ai_turn(1)==APP_REDRAW_NONE&&!s_reader_body_turn&&!s_reader_page_advance&&s_turns==3);
+ // ---- N=0（「不强制」）：永不因计数清底，计数恒 0 ----------------------------
+ // 这一格是 `n &&` 的语义保护：去掉 n 之后 `++s_turns >= 0` 恒真，下面八拍会在第一拍
+ // 就翻成 FULL。断言方向必须是「永不 cleanup」，不是「每拍 cleanup」。
+ // The n == 0 row guards the `n &&`: without it `++count >= 0` is always true and the
+ // first iteration below would go FULL. The assertion is "never cleanup", not "always".
+ test_full_pages=0;s_turns=0;test_effect=0;
+ for(int i=0;i<8;++i){
+   s_reader_body_turn=true;s_reader_page_advance=true;trace_count=0;
+   assert(present(&ctx,APP_REDRAW_PAGE));
+   assert(trace_route[0]!=FULL&&s_turns==0&&!s_reader_cleanup);
+ }
+ // 没播屏的拍不记账：被 request_app 截走的翻页不能把计数推一格。
+ // A frame that never reaches the panel is not booked: request_app must not advance it.
+ test_full_pages=5;s_turns=2;s_reader_page_advance=true;
+ ctx.request_app=(void*)1;assert(present(&ctx,APP_REDRAW_PAGE));
+ ctx.request_app=NULL;assert(s_turns==2&&!s_reader_page_advance);
+ test_full_pages=0;
  puts("PASS: 36 text/mixed/image/hidden/full-screen combinations, 18 bidirectional chapter transitions, failed image/display/load guards and actual cleanup/water turns");
+ puts("PASS: every READING PAGE path lands on an explicit branch (6 predicates, no reliance on the FULL fallback), and AI page turns book into the same counter");
 }
 '''
 
@@ -439,7 +649,7 @@ static void draw_text(uint8_t *fb,int x,int baseline,int px,const char *s,enum E
  text_t *t=&texts[text_count++];t->left=x-(align==EPD_DRAW_ALIGN_RIGHT?width:align==EPD_DRAW_ALIGN_CENTER?width/2:0);
  t->right=t->left+width;t->center=baseline+(below-above)/2;t->px=px;t->align=align;snprintf(t->text,sizeof(t->text),"%s",s);
 }
-static void ui_font_draw_text_px(uint8_t *f,int x,int y,int px,const char *s,enum EpdFontFlags a,int fg,int bg,bool bw){(void)bw;draw_text(f,x,y,px,s,a,fg,bg);}
+static int ui_font_draw_text_px(uint8_t *f,int x,int y,int px,const char *s,enum EpdFontFlags a,int fg,int bg,bool bw){(void)bw;draw_text(f,x,y,px,s,a,fg,bg);return x;}
 static void ttf_draw_text_px(uint8_t *f,int x,int y,int px,const char *s,enum EpdFontFlags a,int fg,int bg){draw_text(f,x,y,px,s,a,fg,bg);}
 static void ui_draw_icon(uint8_t *fb,int x,int y,int px,int icon,int gray){(void)fb;(void)gray;assert(y==40);if(icon==UI_ICON_ZAP)return;if(x-px/2<network_left)network_left=x-px/2;}
 static void ui_nav_wifi_icon(uint8_t *fb,int x,int y,int px,int gray){ui_draw_icon(fb,x,y,px,UI_ICON_WIFI,gray);}

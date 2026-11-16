@@ -45,7 +45,7 @@ static void *heap_caps_malloc(size_t n,int cap){(void)cap;if(test_malloc_fail&&!
 static void read_pico_sd_get_info(read_pico_sd_info_t *out){out->mounted=test_mounted;}
 static const uint8_t display_test_png_start[]={1,2,3,4},display_test_png_end[]={0};
 static bool book_image_dimensions(const uint8_t *data,size_t size,bool png,unsigned *w,unsigned *h){(void)png;assert(data&&size>=4);if(test_dimensions_fail)return false;*w=300;*h=400;return true;}
-static bool book_image_grayscale(const uint8_t *data,size_t size,bool png,unsigned w,unsigned h,uint8_t *out){(void)png;assert(data&&size>=4&&w<=684&&h<=1216);++test_decodes;if(test_decode_fail)return false;memset(out,117,(size_t)w*h);return true;}
+static bool book_image_grayscale(const uint8_t *data,size_t size,bool png,unsigned w,unsigned h,uint8_t *out,unsigned max_out_bytes){(void)max_out_bytes;(void)png;assert(data&&size>=4&&w<=684&&h<=1216);++test_decodes;if(test_decode_fail)return false;memset(out,117,(size_t)w*h);return true;}
 static void ui_clear_page(uint8_t *fb){(void)fb;}
 static uint8_t ui_image_dither_gray(uint8_t gray,int x,int y){(void)x;(void)y;return gray;}
 static void epd_draw_pixel(int x,int y,int gray,uint8_t *fb){(void)gray;(void)fb;assert(x>=0&&y>=0&&x<684&&y<1216);++test_pixels;}
@@ -64,7 +64,7 @@ static void ui_nav_request(app_ctx_t *ctx,int tab){(void)ctx;(void)tab;}
 static bool ui_rect_hit(EpdRect r,int x,int y){return x>=r.x&&y>=r.y&&x<r.x+r.width&&y<r.y+r.height;}
 #define BOOK_IMAGE_FILE_MAX (50u*1024u*1024u)
 static bool book_image_file_dimensions(const char *path,bool png,unsigned *w,unsigned *h){(void)path;return book_image_dimensions((const uint8_t*)"IMG!",4,png,w,h);}
-static bool book_image_file_grayscale(const char *path,bool png,unsigned w,unsigned h,uint8_t *out){(void)path;return book_image_grayscale((const uint8_t*)"IMG!",4,png,w,h,out);}
+static bool book_image_file_grayscale(const char *path,bool png,unsigned w,unsigned h,uint8_t *out){(void)path;return book_image_grayscale((const uint8_t*)"IMG!",4,png,w,h,out,0);}
 """ + source + r"""
 static void image_fixture(const char *name){FILE *f=fopen(name,"wb");assert(f);assert(fwrite("IMG!",1,4,f)==4);assert(!fclose(f));}
 int main(void){

@@ -21,6 +21,16 @@ FNV-1a 摘要逐字段喂入；不匹配时打印全量流并 exit 1。
 用法 / Usage:
     python3 tools/book_layout_single_column_host_test.py           # 比对黄金值
     python3 tools/book_layout_single_column_host_test.py --regen   # 重签黄金值（仅在有意变更单栏排版时）
+
+重签记录 / Re-signing log:
+    2026-11-02  26.11.4 西文按词断行。digest d3a187989f1f617c -> a8fe3409a3368fdb。
+    差异 84 行（42 对），全部落在英文段落所在页的 `page start` 与 `probe` 区间：
+    英文行尾不再把单词切两半，`hit_test` 扩词因此扩不到跨行，命中区间变短，后续
+    偏移整体前移 4 字节。**中文段落逐行未变**——另有独立证据：`tools/book_wrap_golden.py`
+    用 4 组中文语料（含段首全角空格）做当前版 vs HEAD 版逐字节对照，全部相同。
+    Re-signed for word-boundary wrapping. All 84 changed lines are page starts and hit
+    ranges on pages holding English paragraphs; the Chinese paragraphs are untouched,
+    proven independently by book_wrap_golden.py.
 """
 import subprocess
 import sys
@@ -414,6 +424,8 @@ def run_c(unit):
                         '-I' + str(ROOT / 'tools' / 'book_source_host_stubs'),
                         '-I' + str(ROOT / 'main' / 'book'),
                         str(work / 'test.c'), str(ROOT / 'main' / 'book' / 'book_layout.c'),
+                        str(ROOT / 'main' / 'book' / 'hyphen.c'),
+                        str(ROOT / 'main' / 'book' / 'hyph_en_us_data.c'),
                         '-o', str(work / 'test')], check=True)
         proc = subprocess.run([str(work / 'test')], check=True, capture_output=True, text=True)
         return proc.stdout

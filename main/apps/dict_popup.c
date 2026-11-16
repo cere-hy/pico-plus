@@ -53,22 +53,29 @@ static const char* TAG = "dict";
 #define DICT_POPUP_SAVE_H 52
 #define DICT_POPUP_SAVE_PX 26
 #define DICT_POPUP_SUMMARY_LINES 3
-// gen26 AI 释义段缓冲：**由协议槽派生**（PUSH_AI_DEF_MAX + 1）。段间按 \n 切分后
-// 任何单段都短于协议槽，故本缓冲必容得下整段——不是「凑一个够大的数」，而是
-// 长度上限链的一环（SEG > DEF_MAX）。gen26.6 D3 把 DEF_MAX 从 170 放宽到 768 时，
-// 旧的硬编码 192 没有跟着动，导致 >191B 的单段被静默截断；改成派生后这类漂移
-// 不再可能发生。
+// gen26 AI 释义段缓冲：**由词义预算派生**（PUSH_AI_CARD_MAX + 1，26.11.3-C2 起）。
+// 段间按 \n 切分后任何单段都短于词义预算，故本缓冲必容得下整段——不是「凑一个
+// 够大的数」，而是长度上限链的一环（SEG > CARD_MAX）。gen26.6 D3 把上限从 170 放宽
+// 到 768 时，旧的硬编码 192 没有跟着动，导致 >191B 的单段被静默截断；改成派生后
+// 这类漂移不再可能发生。
 // 缓冲放 PSRAM（show_def 内分配），不占 8KB 主栈。
-// gen26 AI def segment buffer: **derived from the protocol slot** (PUSH_AI_DEF_MAX
-// + 1). Any \n-separated segment is shorter than the protocol slot, so this buffer
-// always holds a whole segment - not "a number big enough", but one link of the
-// length chain (SEG > DEF_MAX). When gen26.6 D3 widened DEF_MAX from 170 to 768,
-// the hard-coded 192 did not follow, silently truncating segments over 191B;
+// gen26 AI def segment buffer: **derived from the word budget** (PUSH_AI_CARD_MAX + 1
+// since 26.11.3-C2). Any \n-separated segment is shorter than that budget, so this
+// buffer always holds a whole segment - not "a number big enough", but one link of
+// the length chain (SEG > CARD_MAX). When gen26.6 D3 widened the cap from 170 to
+// 768, the hard-coded 192 did not follow, silently truncating segments over 191B;
 // deriving it makes that drift impossible.
 // The buffer lives in PSRAM (allocated inside show_def), off the 8KB main stack.
-#define DICT_POPUP_AI_SEG (PUSH_AI_DEF_MAX + 1u)
-_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
-               "gen26.6 length chain: the segment buffer must hold any protocol-sized definition");
+// 26.11.3-C2：派生源由传输槽改成**词义预算**（PUSH_AI_CARD_MAX）。本缓冲服务的是
+// 词卡（弹卡按 \n 切段），它永远不会见到段落答案——段落走 ai_reader 的会话缓冲。
+// 跟着传输槽派生会让每次弹卡都从 PSRAM 借 8 KB，而它装的东西 < 1.2 KB。
+// 26.11.3-C2: derived from the WORD budget, not the transport slot. This buffer
+// serves the word card (segments split on \n) and never sees a passage - passages
+// go to the ai_reader session buffer. Deriving from the slot would borrow 8 KB of
+// PSRAM for every card that holds under 1.2 KB.
+#define DICT_POPUP_AI_SEG (PUSH_AI_CARD_MAX + 1u)
+_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_CARD_MAX,
+               "gen26.6 length chain: the segment buffer must hold any card-sized definition");
 
 // gen26.6.2：「……」详解入口的热区边长 = max(96, 行高x2)。三个点本身太小手指按不到
 // （真机实测：按不到、按下去还被判 MISSED 关卡）——视觉保留三个点，热区按这个边长
@@ -89,15 +96,31 @@ _Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
 // - on hardware that reads as "I tapped the label and the card closed"). The hit
 // zone therefore stops being a 96x96 square: it is the rectangle covering the whole
 // "…… 看全文 ›" strip (height still 96) - still one entry, one TAP_MORE.
-#define DICT_POPUP_MORE_LABEL "看全文 ›"
+#define DICT_POPUP_MORE_LABEL "查看全文 ›"
 #define DICT_POPUP_MORE_LABEL_PX 24
 #define DICT_POPUP_MORE_LABEL_GAP 10
 #define DICT_POPUP_MORE_DOTS_PX 21
-_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
-               "gen26.6 length chain: the segment buffer must hold any protocol-sized definition");
+
+// M3-A 真机反馈（2026-10-26）：底部入口像「蚊子腿」——重构为**独立底部操作栏**：
+// 正文区下让出 48px，一条浅灰分隔线隔开正文；「情景解读 ›」占左半、「查看全文 ›」
+// 占右半，热区 = 整个半边（48px 高、半条宽），手指随便点都中。两个入口都在栏内
+// 才画（正文末行只留「……」截断标记）；单入口时各守自己的半边，互不挤。
+// M3-A on-device feedback: the bottom entries were finger-hostile. Rebuilt as a
+// dedicated footer action bar: the body gives up 48px, a light-grey rule separates
+// it from the text; "情景解读 ›" owns the left half, "查看全文 ›" the right, and
+// each hit zone is the WHOLE half-strip. Both labels live in the bar only (the
+// body keeps just the "……" mark); with one entry the other half stays empty.
+#define DICT_POPUP_BAR_H 48
+#define DICT_POPUP_BAR_RULE_W 2
+_Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_CARD_MAX,
+               "gen26.6 length chain: the segment buffer must hold any card-sized definition");
 // gen26.3 ④ 查询态文案：一词一行的真实状态提示，不是占位假卡。/ gen26.3
 // query-state text: a one-line real status, not a placeholder fake card.
 #define DICT_POPUP_PENDING_TEXT "AI 查询中…"
+// M3-B：情景请求的待命文案。与上限文案分开，卡面如实说「在等什么」。
+// M3-B: the scene request's waiting label, kept apart so the card says truthfully
+// what it is waiting for.
+#define DICT_POPUP_PENDING_SCENE_TEXT "情景解读中…"
 // gen26.4「AI」入口 chip：放在保存 chip 左侧（同在卡片头部右侧），只在词典释义卡
 // 上可点。/ gen26.4 "AI" entry chip: left of the save chip, both in the card
 // header; tappable only on a dictionary definition card.
@@ -105,6 +128,15 @@ _Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_DEF_MAX,
 #define DICT_POPUP_AI_H 52
 #define DICT_POPUP_AI_PX 26
 #define DICT_POPUP_AI_LABEL "AI"
+
+// M3「情景解读 ›」入口：卡底与「…… 看全文 ›」同一条带的左侧，纯文字、无底色
+// （与 more 同一视觉层级）。只在「情景开 + 有释义 + 非查询态」时显示与命中。
+// M3 "情景解读 ›" entry: left side of the same bottom strip as "…… 看全文 ›",
+// plain text with no fill (same visual tier as more). Shown and hittable only
+// when the scene switch is on, a definition is staged, and the card is not querying.
+#define DICT_POPUP_SCENE_LABEL "情景解读 ›"
+#define DICT_POPUP_SCENE_PX 24
+#define DICT_POPUP_SCENE_GAP 12
 
 static char s_word[DICT_POPUP_WORD_MAX];
 static char* s_lines[DICT_POPUP_LINES];
@@ -133,6 +165,20 @@ static char* s_full;
 // dict-hit card" mark (fall back to the dict definition on timeout).
 static bool s_ai_on;
 static bool s_ai_over_dict;
+static bool s_scene_on; ///< M3 情景入口可点性 / M3 scene entry tappability
+// 26.9.5 入口卡：本地无释义时的静态入口（词头 + 状态行 + AI/情景 chip）。
+// 与 s_pending **互斥**：入口卡没发过请求，所以不挂超时、不被 0x07 认领；
+// 点「AI 释义 ›」后由 force_ai/show_pending 的入口 reset 清掉本标记、转入 s_pending。
+// 语义要点（审计裁定）：入口卡是 pending 的**前态**，不是终态——不搞「同卡动态长
+// chip」的中间形态，点 AI 后按 show_def 整卡替换。
+// 26.9.5 entry card: the static entry when the local dictionary has no
+// definition (head + status line + AI/scene chips). Mutually exclusive with
+// s_pending: the entry card sent no request, so it has no timeout and is never
+// claimed by 0x07; tapping "AI 释义 ›" clears this flag in force_ai/show_pending's
+// entry reset and switches to s_pending. Semantics (adjudicated): the entry card
+// is the PREFIX state of pending, not a terminal one - no "grow chips on the same
+// card" middle form; tapping AI replaces the whole card via show_def.
+static bool s_entry;
 
 // 避让锚点：按点词 x 选弹出侧（tap 分界与 gutter 中心重合，单栏横屏同一谓词成立）。
 // Avoidance anchor: pick the popup side by the tap x (the tap boundary coincides with
@@ -181,12 +227,13 @@ static int body_text_width(void) {
     return dict_popup_rect().width - 2 * DICT_POPUP_PAD;
 }
 
-// 卡面可显示的正文行数（与 draw 的收行条件同一谓词）。
-// Body lines the card can show (same predicate as the draw loop's stop).
+// 卡面可显示的正文行数（与 draw 的收行条件同一谓词；底部让出操作栏 48px）。
+// Body lines the card can show (same predicate as the draw loop's stop; the
+// footer action bar takes 48px off the bottom).
 static int visible_lines(void) {
     const EpdRect card = dict_popup_rect();
     int n = 0;
-    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20; y += DICT_POPUP_LINE_H) {
+    for (int y = 26 + DICT_POPUP_WORD_PX + 18; y + DICT_POPUP_TEXT_PX <= card.height - 20 - DICT_POPUP_BAR_H; y += DICT_POPUP_LINE_H) {
         ++n;
     }
     return n;
@@ -198,8 +245,17 @@ static bool more_shown(void) {
     return s_truncated || s_line_count > visible_lines();
 }
 
-// 「……」的绘制基线 y（与 draw 同一算术）。/ The "……" baseline y (same arithmetic as draw).
+// 操作栏文字的 top y（栏内垂直居中；绘制与命中同一算术）。
+// Top y of the bar labels (vertically centred; paint and hit-test share it).
 static int more_text_y(void) {
+    const EpdRect card = dict_popup_rect();
+    const int bar_top = card.y + card.height - DICT_POPUP_BAR_H;
+    return bar_top + (DICT_POPUP_BAR_H - DICT_POPUP_MORE_LABEL_PX) / 2;
+}
+
+// 「……」截断标记在正文末行下方的基线（与正文末行同一算术，操作栏之外）。
+// Baseline of the "……" mark under the last body line (outside the action bar).
+static int dots_text_y(void) {
     const EpdRect card = dict_popup_rect();
     const int shown = s_line_count < visible_lines() ? s_line_count : visible_lines();
     return card.y + 26 + DICT_POPUP_WORD_PX + 18 + (shown - 1) * DICT_POPUP_LINE_H
@@ -208,26 +264,25 @@ static int more_text_y(void) {
 
 EpdRect dict_popup_more_rect(void) {
     if (!more_shown()) return (EpdRect){0, 0, 0, 0};
+    // M3-A：操作栏右半——整条 48px 高、从中线到右内缘，手指随便点都中。
+    // M3-A: the bar's right half - full 48px height from the midline to the
+    // right inner edge.
     const EpdRect card = dict_popup_rect();
-    const int right = card.x + card.width - DICT_POPUP_PAD;
-    const int dots_w = ui_text_fixed_width_px(DICT_POPUP_MORE_DOTS_PX, "……");
-    const int label_w = ui_text_fixed_width_px(DICT_POPUP_MORE_LABEL_PX, DICT_POPUP_MORE_LABEL);
-    // gen26.6.3：热区覆盖「…… 看全文 ›」整条——**一条入口、一个 TAP_MORE**。
-    // 起点从标签左缘算，终点到卡内边（PAD）；高度仍是 DICT_POPUP_MORE_W（96），
-    // 与旧版一致。这样点标签任何位置都命中，不会漏到 MISSED 关卡。
-    // gen26.6.3: the zone covers the whole "…… 看全文 ›" strip - ONE entry, ONE
-    // TAP_MORE. It starts at the label's left edge and ends at the card's inner edge
-    // (PAD); the height stays DICT_POPUP_MORE_W (96), unchanged. Tapping anywhere on
-    // the label now hits instead of falling through to a MISSED close.
-    int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP - label_w;
-    if (left < card.x) left = card.x;
-    const int w = (card.x + card.width) - left;
-    const int h = DICT_POPUP_MORE_W;
-    const int cy = more_text_y();
-    int y = cy - h / 2;
-    if (y < card.y) y = card.y;
-    if (y + h > card.y + card.height) y = card.y + card.height - h;
-    return (EpdRect){left, y, w, h};
+    const int bar_top = card.y + card.height - DICT_POPUP_BAR_H;
+    const int mid = card.x + card.width / 2;
+    return (EpdRect){mid, bar_top, card.x + card.width - DICT_POPUP_PAD - mid, DICT_POPUP_BAR_H};
+}
+
+EpdRect dict_popup_scene_rect(void) {
+    if (!s_scene_on || !s_word[0] || s_pending) return (EpdRect){0, 0, 0, 0};
+    // M3-A：操作栏左半——与 more 对称，整条 48px 高、从左内缘到中线。
+    // M3-A: the bar's left half, mirror of more - full 48px from the left inner
+    // edge to the midline.
+    const EpdRect card = dict_popup_rect();
+    const int bar_top = card.y + card.height - DICT_POPUP_BAR_H;
+    const int mid = card.x + card.width / 2;
+    return (EpdRect){card.x + DICT_POPUP_PAD, bar_top, mid - card.x - DICT_POPUP_PAD,
+                     DICT_POPUP_BAR_H};
 }
 
 const char* dict_popup_full_text(void) {
@@ -250,6 +305,7 @@ EpdRect dict_popup_ai_rect(void) {
 }
 
 void dict_popup_set_ai_enabled(bool on) { s_ai_on = on; }
+void dict_popup_set_scene_enabled(bool on) { s_scene_on = on; }
 
 const char* dict_popup_word(void) { return s_word; }
 
@@ -269,6 +325,7 @@ void dict_popup_reset(void) {
     s_pending_since_us = 0;
     s_ai_over_dict = false;
     s_ai_on = false;
+    s_entry = false; // 26.9.5：入口态随卡一起清——生命周期唯一出口
     s_word[0] = 0;
 }
 
@@ -306,6 +363,18 @@ dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y) {
     if (more_shown() && ui_rect_hit(dict_popup_more_rect(), x, y)) {
         return DICT_POPUP_TAP_MORE;
     }
+    // M3：卡底左侧「情景解读 ›」。与 more 条左右分列，几何互不重叠；不可用时
+    // 矩形为零，不吞点击。/ M3: the bottom-left scene entry. It sits beside the
+    // more strip without overlap; a zero rect when hidden swallows nothing.
+    if (ui_rect_hit(dict_popup_scene_rect(), x, y)) {
+        return DICT_POPUP_TAP_SCENE;
+    }
+    // 26.9.5 入口卡没有释义：保存 chip 既不显示也不响应——「有释义才可存」，
+    // 入口态点到底部一律按 MISSED 关卡片（与其它空白区同口径，不吞点击）。
+    // 26.9.5 entry cards hold no definition: the save chip is neither drawn nor
+    // hit-tested - "only a definition may be saved" - so a tap on that strip is a
+    // MISSED that closes the card, the same as any other blank area.
+    if (s_entry) return DICT_POPUP_TAP_MISSED;
     if (!ui_rect_hit(dict_popup_save_rect(), x, y)) return DICT_POPUP_TAP_MISSED;
     // gen26.3 ④ 查询态卡的 chip 尚未就绪：释义没到，此刻存进去的摘要是状态行而
     // 不是释义——忽略 chip 点击、卡片保持打开，等 0x07 落地后再存。chip 之外的
@@ -337,8 +406,41 @@ static int utf8_step(const char* p) {
     return 1; // 非法字节按单字节跳过 / skip invalid bytes one by one
 }
 
+// 词头拷贝：**按 UTF-8 边界**安全截断到 cap-1 字节，绝不切半个字。
+// 旧写法是 snprintf("%.*s", cap-1, ...)——精度按**字节**截，英文无损（1 字节/字），
+// 中文必然切在字中间：卡面出现半个字（ttf 画出替代符），且 s_word 与 0x07 回流词
+// 的前缀匹配也会因半字而失配。中文点词是 26.9.5 才放开的主路径，必须先扎住这条。
+// 落位：utf8_step 之后（open / show_pending_with / show_entry 三条写入路径共用）。
+// Copy the word head truncated on a **UTF-8 boundary** to cap-1 bytes, never
+// splitting a character. The old form snprintf("%.*s", cap-1, ...) truncates by
+// BYTES: harmless for English (1 byte per char) but a Chinese head always gets cut
+// mid-character - half a glyph on the card (ttf draws a replacement box), and the
+// prefix match against the 0x07 word breaks for the same reason. Chinese taps only
+// became a mainstream path in 26.9.5, so this has to be pinned first.
+static void copy_word_head(char* dst, size_t cap, const char* src) {
+    if (!dst || cap == 0) return;
+    size_t o = 0;
+    if (src) {
+        while (*src && o + 1 < cap) {
+            const int step = utf8_step(src);
+            if (step <= 0) break;
+            if (o + (size_t)step > cap - 1) break; // 放不下整字就停，不切 / stop, never split
+            memcpy(dst + o, src, (size_t)step);
+            o += (size_t)step;
+            src += step;
+        }
+    }
+    dst[o] = 0;
+}
+
 static bool store_line(const char* text, size_t len) {
-    if (s_line_count >= DICT_POPUP_LINES) {
+    // 暂存帽 = 显示行数（visible_lines）：操作栏让出 48px 后显示 8 行，暂存帽必须
+    // 同步收窄——否则第 9 行会「暂存了却画不出、也不置 truncated」，静默丢失
+    // （gen26.6「暂存帽与显示帽对齐」裁定的动态版：帽随卡片几何实算）。
+    // Staging cap = the visible line count: the footer takes 48px so 8 lines show;
+    // the cap must shrink with it, or a 9th line is staged but neither drawn nor
+    // flagged - silently lost (the gen26.6 alignment ruling, now dynamic).
+    if (s_line_count >= visible_lines()) {
         s_truncated = true;
         return false;
     }
@@ -405,7 +507,7 @@ bool dict_popup_open(const char* word) {
     // clear along with the card. Copy to a local buffer before the reset.
     char own[DICT_POPUP_WORD_MAX];
     if (!word || !*word) { dict_popup_reset(); return false; }
-    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    copy_word_head(own, sizeof(own), word);
     dict_popup_reset();
     word = own;
     // 释义缓冲放 PSRAM：主任务栈只有 8KB，不能在这里开大数组。
@@ -426,7 +528,7 @@ bool dict_popup_open(const char* word) {
         look_us = esp_timer_get_time() - a;
         if (found) {
             const int64_t b = esp_timer_get_time();
-            snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+            copy_word_head(s_word, sizeof(s_word), word);
             int text_w = body_text_width();
             char* p = out;
             while (*p) {
@@ -472,7 +574,7 @@ bool dict_popup_open(const char* word) {
 // initial value); dict_popup_show_def updates it in place when 0x07 lands.
 // False on an empty word or a staging failure, leaving no half card, so the
 // caller takes its notice path as before.
-bool dict_popup_show_pending(const char* word) {
+static bool show_pending_with(const char* word, const char* text) {
     // 别名防御（gen26.4 真机 defect 根因）：调用方可能直接传 dict_popup_word()——
     // 返回值就是 &s_word 自身。旧代码先 reset 再查空，reset 把别名参数一起清空，
     // 「!*word」误判空词提前返回 → 查询态没建、词典卡被清空，0x07 回来门 B 失配
@@ -485,10 +587,10 @@ bool dict_popup_show_pending(const char* word) {
     // it = every definition lost. Copy to a local buffer before the reset.
     char own[DICT_POPUP_WORD_MAX];
     if (!word || !*word) { dict_popup_reset(); return false; }
-    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    copy_word_head(own, sizeof(own), word);
     dict_popup_reset();
-    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, own);
-    if (!store_line(DICT_POPUP_PENDING_TEXT, strlen(DICT_POPUP_PENDING_TEXT))) {
+    copy_word_head(s_word, sizeof(s_word), own);
+    if (!store_line(text, strlen(text))) {
         dict_popup_reset(); // 不留半张卡 / leave no half card
         return false;
     }
@@ -501,6 +603,58 @@ bool dict_popup_show_pending(const char* word) {
     ESP_LOGI(TAG, "ai pending \"%s\"", s_word);
     return true;
 }
+
+bool dict_popup_show_pending(const char* word) {
+    return show_pending_with(word, DICT_POPUP_PENDING_TEXT);
+}
+
+// M3-B：「情景解读中…」卡。与「AI 查询中…」**同一状态机**（同一超时、同一门 B
+// 判定基底），只有状态行文案不同——用户点的是情景入口，卡面就该说情景，不能
+// 让两种请求共用一个文案再靠日志区分。
+// M3-B: the "reading the scene..." card. Identical state machine to the AI query
+// card (same timeout, same gate-B basis); only the status line differs - the user
+// tapped the scene entry, so the card says scene instead of reusing one label for
+// two different requests and sorting it out in the logs.
+bool dict_popup_show_pending_scene(const char* word) {
+    return show_pending_with(word, DICT_POPUP_PENDING_SCENE_TEXT);
+}
+
+// 26.9.5 入口卡：本地词典没有释义时的静态入口。与 show_pending 共用「词头 + 状态行」
+// 骨架，但**不置 s_pending**——没发请求就不该有超时，也不该被 0x07 认领（否则手机上
+// 一个无关的回包会把入口卡当成查询卡覆盖）。状态行由调用方给（中文 / 英文未收录两态
+// 文案不同，见 app_book 的裁定③），本函数只管排版与状态位。
+// 顺序钉死（§6.2 末句，与 gen26.4 别名 bug 同族）：先拷参 → reset → 写词头 → 存行 →
+// 置位。反序会让上一张卡的 s_pending / s_ai_over_dict 残留成残影。
+// 26.9.5 entry card: the static entry when the local dictionary has no
+// definition. Shares show_pending's "head + status line" skeleton but does **not**
+// set s_pending** - no request was sent, so there is no timeout and 0x07 must not
+// claim it (an unrelated phone reply would otherwise overwrite the entry card as
+// if it were a querying card). The status line comes from the caller (Chinese vs
+// English-miss wording differ, per adjudication 3); this function only lays it
+// out and sets the state flags.
+// The order is pinned (section 6.2, same family as the gen26.4 aliasing bug):
+// copy the argument, reset, write the head, store the line, then set the flags.
+// Reversing it leaves the previous card's s_pending / s_ai_over_dict behind.
+bool dict_popup_show_entry(const char* word, const char* notice) {
+    char own[DICT_POPUP_WORD_MAX];
+    if (!word || !*word) { dict_popup_reset(); return false; }
+    copy_word_head(own, sizeof(own), word);
+    dict_popup_reset();
+    copy_word_head(s_word, sizeof(s_word), own);
+    if (!notice || !*notice || !store_line(notice, strlen(notice))) {
+        dict_popup_reset(); // 不留半张卡 / leave no half card
+        return false;
+    }
+    s_entry = true;
+    s_pending = false;      // reset 已置 false，这里显式再钉一次（防顺序被改坏）
+    s_pending_since_us = 0;
+    // 入口卡没有释义：不反映生词本状态，也不该出现「已存」态。/ No definition on
+    // an entry card: it reflects no vocabulary state and must never read "saved".
+    s_saved = false;
+    ESP_LOGI(TAG, "dict entry \"%s\"", s_word);
+    return true;
+}
+
 
 // gen26.4：词典命中卡上的「AI」入口——强制发起 AI 查询。复用 show_pending 的查询态
 // 状态机（词头 + 状态行 + 保存 chip 初值），唯一区别是置位 s_ai_over_dict：查询失败
@@ -592,7 +746,7 @@ bool dict_popup_show_def(const char* word, const char* def) {
     const int64_t t0 = esp_timer_get_time();
     dict_popup_reset();
     if (!word || !*word || !*def) return false;
-    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    copy_word_head(s_word, sizeof(s_word), word);
     const int text_w = body_text_width();
     // 段缓冲放 PSRAM：gen26.6 D3 起可容 768B 整段，不能压 8KB 主栈。
     // The segment buffer lives in PSRAM: since gen26.6 D3 it holds a full 768-byte
@@ -603,10 +757,10 @@ bool dict_popup_show_def(const char* word, const char* def) {
     while (*p && !s_truncated) {
         const char* nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        // 协议上限（PUSH_AI_DEF_MAX=768）保证单段必小于 seg；此处钳制纯防御。
+        // 词义预算（PUSH_AI_CARD_MAX=1200）保证单段必小于 seg；此处钳制纯防御。
         // 钳位必须落在字符边界上：从中间砍断一个多字节序列，折行器的 utf8_step
         // 会信引导字节踩着 NUL 走过去（ASan 在 300 字段用例上实证过这个越界）。
-        // The protocol cap (PUSH_AI_DEF_MAX=768) guarantees every segment fits in
+        // The word budget (PUSH_AI_CARD_MAX=1200) guarantees every segment fits in
         // seg; the clamp is pure defence. It must land on a character boundary:
         // cutting a multibyte sequence in half makes the wrapper's utf8_step step
         // over the NUL (ASan proved this overflow on a 300-char segment).
@@ -626,9 +780,12 @@ bool dict_popup_show_def(const char* word, const char* def) {
         s_full = heap_caps_malloc(strlen(def) + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_full) memcpy(s_full, def, strlen(def) + 1);
     }
-    // 保存 chip 反映生词本真实落盘状态，与本地词典卡同一谓词。/ The save chip
-    // reflects the real vocabulary-book state, same predicate as the dict card.
-    if (ok) s_saved = vocab_log_contains(s_word);
+    // 26.9.10 B-3：AI 落地不视为「已存」。此前用 vocab_log_contains，AI 自动入库
+    // （F1）后立刻显示「已存」，是假象；改由手工 chip 保存（386–389）唯一置真。
+    // 26.9.10 B-3: an AI landing never counts as "saved". The old predicate showed
+    // "已存" right after an AI auto-save (F1) - a false state. Only the manual chip
+    // save (386-389) may set it true.
+    if (ok) s_saved = false;
     ESP_LOGI(TAG, "ai def \"%s\" lines=%d truncated=%d wrap=%lldms",
              s_word, s_line_count, (int)s_truncated,
              (long long)((esp_timer_get_time() - t0) / 1000));
@@ -646,10 +803,17 @@ void dict_popup_draw(uint8_t* fb) {
     // gen26.4：「AI」入口 chip 只在词典释义卡上显示（AI 开着且非查询态）。
     // gen26.4: the "AI" entry chip shows only on a dictionary card (AI on, not querying).
     const bool ai_chip = s_ai_on && !s_pending;
+    // 26.9.5 入口卡没有释义 → 不画保存 chip（「有释义才可存」）；词头右侧的让位也
+    // 随之收回，否则中文长词会为一块不存在的 chip 白白折短。
+    // 26.9.5 an entry card holds no definition -> no save chip ("only a definition
+    // may be saved"); the head's right-hand reservation is released with it, or a
+    // long Chinese head would be shortened for a chip that does not exist.
+    const bool save_chip = !s_entry;
+    const int reserved = (save_chip ? DICT_POPUP_SAVE_W + 12 : 0) +
+                         (ai_chip ? DICT_POPUP_AI_W + 12 : 0);
     // 词头可能超出卡片宽，按宽度从左截短；可用宽度要扣掉右侧的保存 chip（以及 AI 入口 chip）。
     // Trim overlong heads from the left; the usable width excludes the save chip (and the AI chip).
-    const int head_w = ai_chip ? (inner_w - DICT_POPUP_SAVE_W - DICT_POPUP_AI_W - 24)
-                               : (inner_w - DICT_POPUP_SAVE_W - 12);
+    const int head_w = inner_w - reserved;
     char head[DICT_POPUP_WORD_MAX];
     snprintf(head, sizeof(head), "%s", s_word);
     while (head[0] && ui_text_fixed_width_px(DICT_POPUP_WORD_PX, head) > head_w) {
@@ -669,47 +833,61 @@ void dict_popup_draw(uint8_t* fb) {
         ui_text_fixed(fb, ai.x + (ai.width - ai_w) / 2, ai.y + 12, DICT_POPUP_AI_PX,
                       DICT_POPUP_AI_LABEL, EPD_DRAW_ALIGN_LEFT, true);
     }
-    // 保存 chip：未保存是描边，已保存是选中态。
-    // Save chip: outlined when unsaved, selected when saved.
-    EpdRect chip = dict_popup_save_rect();
-    const char* label = s_saved ? "已存" : "保存";
-    if (s_saved) ui_draw_choice_round_rect(fb, chip, 12, true);
-    else ui_draw_round_rect(fb, chip, 12, UI_GRAY_BLACK);
-    int label_w = ui_text_fixed_width_px(DICT_POPUP_SAVE_PX, label);
-    ui_text_fixed(fb, chip.x + (chip.width - label_w) / 2, chip.y + 12, DICT_POPUP_SAVE_PX,
-                  label, EPD_DRAW_ALIGN_LEFT, false);
+    // 保存 chip：未保存是描边，已保存是选中态。入口卡不画（无释义可存）。
+    // Save chip: outlined when unsaved, selected when saved. Entry cards skip it.
+    if (save_chip) {
+        EpdRect chip = dict_popup_save_rect();
+        const char* label = s_saved ? "已存" : "保存";
+        if (s_saved) ui_draw_choice_round_rect(fb, chip, 12, true);
+        else ui_draw_round_rect(fb, chip, 12, UI_GRAY_BLACK);
+        int label_w = ui_text_fixed_width_px(DICT_POPUP_SAVE_PX, label);
+        ui_text_fixed(fb, chip.x + (chip.width - label_w) / 2, chip.y + 12, DICT_POPUP_SAVE_PX,
+                      label, EPD_DRAW_ALIGN_LEFT, false);
+    }
     int y = card.y + 26 + DICT_POPUP_WORD_PX + 18;
     for (int i = 0; i < s_line_count; ++i) {
         const char* line = s_lines[i];
         ui_text_fixed(fb, inner_x, y, DICT_POPUP_TEXT_PX, line, EPD_DRAW_ALIGN_LEFT, false);
         y += DICT_POPUP_LINE_H;
-        if (y + DICT_POPUP_TEXT_PX > card.y + card.height - 20) {
+        if (y + DICT_POPUP_TEXT_PX > card.y + card.height - 20 - DICT_POPUP_BAR_H) {
             if (i + 1 < s_line_count || s_truncated) {
-                // gen26.6.3 A：24px 纯文字「看全文 ›」（非 chip、无底色）与「……」同条带并排，
-                // 触顶才画。上一版只扩大了热区、视觉零变化，真机用户「找不到入口」——热区
-                // 96 已实证可点，缺的是「看得出这里能点」。文案压在末行下方的空条带里
-                // （标记本来就在 +44 处，不与正文同行），不遮挡正文、不改卡片容量。
-                // gen26.6.3 A: a 24px plain-text "看全文 ›" (not a chip, no fill) sits on the
-                // same strip as the "……", drawn only when truncated. The previous round only
-                // widened the hit zone and left the pixels untouched, and on hardware the user
-                // "could not find the entry" - the 96px zone is proven tappable, what was
-                // missing is "it looks tappable". The label lives in the empty strip under the
-                // last line (the mark already sits at +44, not on the text row), so it neither
-                // covers the body nor changes the card's capacity.
+                // gen26.6.3 A：24px「……」截断标记留在正文末行下方（入口已移入
+                // 底部操作栏，标记只承担「下面还有文」的视觉语义，不再承担热区）。
+                // gen26.6.3 A: the "……" mark stays under the last body line (the
+                // entry moved into the footer bar; the mark now only says "more
+                // text below" and carries no hit zone).
                 const int right = card.x + card.width - DICT_POPUP_PAD;
                 const int base = y - DICT_POPUP_LINE_H + DICT_POPUP_TEXT_PX + 8;
-                // 字号/文案/间隙全部取自宏——与 dict_popup_more_rect 同源，绘制与
-                // 命中不可能错位。/ Font, text and gap all come from the macros -
-                // same source as dict_popup_more_rect, so paint and hit-test cannot
-                // drift apart.
-                const int dots_w = ui_text_fixed_width_px(DICT_POPUP_MORE_DOTS_PX, "……");
-                ui_text_fixed(fb, right, base, DICT_POPUP_MORE_DOTS_PX, "……",
-                              EPD_DRAW_ALIGN_RIGHT, false);
-                ui_text_fixed(fb, right - dots_w - DICT_POPUP_MORE_LABEL_GAP, base,
-                              DICT_POPUP_MORE_LABEL_PX, DICT_POPUP_MORE_LABEL,
+                (void)base;
+                ui_text_fixed(fb, right, dots_text_y(), DICT_POPUP_MORE_DOTS_PX, "……",
                               EPD_DRAW_ALIGN_RIGHT, false);
             }
             break;
+        }
+    }
+    // M3-A 底部操作栏：浅灰分隔线隔开正文；左「情景解读 ›」右「查看全文 ›」，
+    // 热区 = 各自半条（dict_popup_scene_rect / dict_popup_more_rect，绘制与命中同源）。
+    // 单入口时另一半留白，互不挤。
+    // M3-A footer bar: a light-grey rule separates the body; scene on the left,
+    // full text on the right, each hit zone its own half strip (same source as
+    // paint). With one entry the other half stays empty.
+    {
+        const int bar_top = card.y + card.height - DICT_POPUP_BAR_H;
+        // 分隔线用 0x30（与卡片描边同灰）：极浅、可作视觉分界但不抢正文。
+        // The rule shares the card outline's 0x30 grey - visible but never loud.
+        ui_draw_round_rect(fb, (EpdRect){card.x + DICT_POPUP_PAD, bar_top,
+                                         card.width - 2 * DICT_POPUP_PAD,
+                                         DICT_POPUP_BAR_RULE_W},
+                           0, 0x30);
+        if (s_scene_on && !s_pending) {
+            const EpdRect sr = dict_popup_scene_rect();
+            ui_text_fixed(fb, sr.x, more_text_y(), DICT_POPUP_SCENE_PX,
+                          DICT_POPUP_SCENE_LABEL, EPD_DRAW_ALIGN_LEFT, false);
+        }
+        if (more_shown()) {
+            ui_text_fixed(fb, card.x + card.width - DICT_POPUP_PAD, more_text_y(),
+                          DICT_POPUP_MORE_LABEL_PX, DICT_POPUP_MORE_LABEL,
+                          EPD_DRAW_ALIGN_RIGHT, false);
         }
     }
 }

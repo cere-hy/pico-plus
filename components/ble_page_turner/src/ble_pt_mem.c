@@ -15,15 +15,23 @@
  */
 #include "ble_page_turner.h"
 
-// 控制器跑在硬件路径上只能吃内部 RAM；host 的动态分配虽走 PSRAM，但控制器与协议栈任务的
-// 大块分配仍落在内部堆。19K 边缘的最大块起得了栈，运行中也可能崩，所以这是硬闸而不是保守
-// 值。阈值与 CrossMux 同板验证的理由见 ble_page_turner.h。/ The controller sits on the
-// hardware path and can only use internal RAM; even though the host allocates from PSRAM,
-// the controller and stack tasks still need large internal blocks. A 19K largest block
-// might bring the stack up but can still crash mid-run, so this is a hard gate, not a
-// conservative estimate. See ble_page_turner.h for the values and CrossMux's rationale.
-bool ble_pt_mem_gate(size_t free_internal, size_t largest_internal, size_t free_psram) {
+// 26.9.24（审计批复"B2 主攻"）两层判定：内部 RAM 只给「控制块基线」——控制器与协议
+// 栈任务跑在硬件路径上只能吃内部 RAM，free 56K 与 largest 16,384（26.9.23 真机实证的
+// 控制器成功值：二次 BLE_INIT + 20 连开全程无恙）是它们的底线；数据大块（host mbuf、
+// 传书文件写）本就活在 PSRAM，改判 PSRAM 余量——free 256K + largest 64K 两道下限。
+// largest_internal 只差一步时会卡「栈起得来但运行中可能崩」的老话——所以 16,384 不是
+// 拍脑袋：低于实证成功值的任何一格都要有真机日志背书才许再降。
+// Since 26.9.24 (audit ruling "B2") a two-layer verdict: internal RAM reserves only the
+// control-block baseline - the controller and stack tasks sit on the hardware path and can
+// only use internal RAM, so 56K free and 16,384 largest (26.9.23 field-proven controller
+// success value: second BLE_INIT + 20 book opens unharmed) guard them; the data bulk
+// (host mbufs, transfer file writes) already lives in PSRAM and is judged on PSRAM
+// headroom - 256K free + 64K largest. 16,384 is not a guess: going one notch below the
+// proven value requires field-log evidence first.
+bool ble_pt_mem_gate(size_t free_internal, size_t largest_internal,
+                     size_t free_psram, size_t largest_psram) {
     return free_internal >= BLE_PT_MIN_FREE_INTERNAL &&
            largest_internal >= BLE_PT_MIN_LARGEST_INTERNAL &&
-           free_psram >= BLE_PT_MIN_FREE_PSRAM;
+           free_psram >= BLE_PT_MIN_FREE_PSRAM &&
+           largest_psram >= BLE_PT_MIN_LARGEST_PSRAM;
 }

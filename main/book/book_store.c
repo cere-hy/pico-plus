@@ -118,6 +118,25 @@ size_t book_store_file_limit(const book_store_root_t* root) {
     return root->is_flash ? BOOK_STORE_FLASH_FILE_MAX : SIZE_MAX;
 }
 
+// 26.9.21 S15：快照版。SD 根只认探测任务回填的数字，没算完就老实说「不知道」。
+// 书架扫描每进一次页面都会问容量，若它自己扫表，等于让 UI 线程持卷锁 2 秒——
+// 26.9.20 三轮拔插的 3.667 s 就是这条路径贡献的。
+// 26.9.21 S15: the snapshot variant. For the SD root it only trusts what the probe task
+// published; until then it says "unknown". The shelf asks on every entry, and a scan there
+// would hold the volume lock for 2 s on the UI thread.
+bool book_store_free_snapshot(const book_store_root_t* root, uint64_t* out_free) {
+    if (root == NULL || out_free == NULL) return false;
+    if (root->is_flash) {
+        if (!book_store_flash_ready()) return false;
+        *out_free = book_store_free_bytes(root);   // 内置分区没有全表扫描问题
+        return true;
+    }
+    read_pico_sd_info_t info = {0};
+    if (read_pico_sd_get_info(&info) != ESP_OK || !info.mounted || !info.space_valid) return false;
+    *out_free = info.free_bytes;
+    return true;
+}
+
 uint64_t book_store_free_bytes(const book_store_root_t* root) {
     if (root == NULL) return 0;
     if (!root->is_flash && !sd_ready()) return 0;

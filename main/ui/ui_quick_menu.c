@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: Apache-2.0
- * 中文：全宽浅顶部层，下圆角与四个无文字圆钮；三个主页模式统一灰阶和清晰边框。
+ * 中文：全宽浅顶部层，下圆角与五个无文字圆钮；三个主页模式统一灰阶和清晰边框。
  * English: A shallow full-width top layer with rounded bottom corners and four unlabeled circles; all main modes share grayscale and clear borders.
  * 冻结：不访问硬件、设置或刷新，不申请帧缓存；只在展开/状态变化后由主循环调用绘图。
  * Frozen: No hardware, settings, presentation or frame allocations; the loop draws only on opening or state changes.
@@ -11,7 +11,9 @@
 #include "ui_nav.h"
 #include "ui_image_dither.h"
 
-static int center_x(int button) { return (button * 2 + 1) * UI_LOCK_WIDTH / 8; }
+// 五个圆钮等分：800/5 = 160 px 间距，命中直径 132 px < 160 px，互不重叠。
+// Five equal slots: 800/5 = 160 px apart, hit diameter 132 px < 160 px, so they never overlap.
+static int center_x(int button) { return (button * 2 + 1) * UI_LOCK_WIDTH / 10; }
 
 // 根据当前旋转读取逻辑像素；和图形接口相同，画点保持半字节邻居。
 // Read logical pixels using the current rotation; drawing preserves the neighboring nibble like the graphics API.
@@ -51,6 +53,19 @@ static void lock_icon(uint8_t *fb, int cx, int cy) {
     ui_fill_rect_fast((EpdRect){cx - 1, cy + 8, 3, 7}, UI_GRAY_BLACK, fb);
 }
 
+// 框选入口：44px 虚线方框，四边各若干短线，不引入图标资产。
+// Box-selection entry: a 44px dashed square drawn as short segments on four sides; no icon asset.
+static void box_icon(uint8_t *fb, int cx, int cy) {
+    const int half = 21, dash = 7, gap = 6;
+    for (int t = -half; t < half; t += dash + gap) {
+        const int len = t + dash <= half ? dash : half - t;
+        epd_draw_line(cx + t, cy - half, cx + t + len, cy - half, UI_GRAY_BLACK, fb);
+        epd_draw_line(cx + t, cy + half, cx + t + len, cy + half, UI_GRAY_BLACK, fb);
+        epd_draw_line(cx - half, cy + t, cx - half, cy + t + len, UI_GRAY_BLACK, fb);
+        epd_draw_line(cx + half, cy + t, cx + half, cy + t + len, UI_GRAY_BLACK, fb);
+    }
+}
+
 void ui_quick_menu_draw(uint8_t *fb, bool wifi, bool bluetooth) {
     if (!fb) return;
     const int width = epd_rotated_display_width();
@@ -60,7 +75,7 @@ void ui_quick_menu_draw(uint8_t *fb, bool wifi, bool bluetooth) {
     for (int y = 0; y < UI_QUICK_HEIGHT && y < height; ++y) for (int x = 0; x < width; ++x) {
         if (!layer_pixel(x, y, width)) continue;
         unsigned tint = 238;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             int dx = x - center_x(i), dy = y - UI_QUICK_CIRCLE_Y;
             if (dx * dx + dy * dy <= UI_QUICK_RADIUS * UI_QUICK_RADIUS) {
                 tint = (i == 0 && wifi) || (i == 1 && bluetooth) ? 176 : 244;
@@ -75,12 +90,13 @@ void ui_quick_menu_draw(uint8_t *fb, bool wifi, bool bluetooth) {
     ui_fill_rect_fast((EpdRect){0, 0, width, 76}, UI_GRAY_WHITE, fb);
     ui_nav_status(fb);
     static const ui_icon_t icons[] = {UI_ICON_WIFI, UI_ICON_BLUETOOTH, UI_ICON_REFRESH_CW};
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         int cx = center_x(i);
         epd_draw_circle(cx, UI_QUICK_CIRCLE_Y, UI_QUICK_RADIUS, 0x38, fb);
         epd_draw_circle(cx, UI_QUICK_CIRCLE_Y, UI_QUICK_RADIUS - 1, 0x38, fb);
         if (i < 3) ui_draw_icon(fb, cx, UI_QUICK_CIRCLE_Y, 44, icons[i], UI_GRAY_BLACK);
-        else lock_icon(fb, cx, UI_QUICK_CIRCLE_Y);
+        else if (i == 3) lock_icon(fb, cx, UI_QUICK_CIRCLE_Y);
+        else box_icon(fb, cx, UI_QUICK_CIRCLE_Y);
         if ((i == 0 && wifi) || (i == 1 && bluetooth)) {
             epd_fill_circle(cx + 30, UI_QUICK_CIRCLE_Y - 30, 5, UI_GRAY_WHITE, fb);
             epd_draw_circle(cx + 30, UI_QUICK_CIRCLE_Y - 30, 5, 0x50, fb);

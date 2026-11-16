@@ -86,6 +86,9 @@ A/B 取证、产品侧影响核验、重建触发器。runner 里对登记项**�
 
 ## 3. test_home_recent（tools/test_home_recent.py）：上游自带过期测试（观察项）
 
+> 本条也进了 §7 登记簿（KF-7.4，带还账日期 2026-11-14）：§3 讲机制与上游政策，
+> §7 管账期。两份不重复记形态，只有 §7 的日期会被门禁咬。
+
 - **登记形态**：编译失败——harness 序幕缺 r93 `on_enter` 新引用的符号，首个报错
   `error: 's_cover_generation' undeclared`（gcc 用的是弯引号；随后
   `book_cover_jobs_begin`、`book_progress_revision`、`clock_base_prepare`、
@@ -238,9 +241,96 @@ A/B 取证、产品侧影响核验、重建触发器。runner 里对登记项**�
 
 ---
 
+---
+
 ## 6. 登记流程
 
 1. 先做 A/B（对照 r92 锚或等价基线），确认非我方回归；
 2. 查清产品侧影响（真机是否有损）；
-3. 在本文件登记上述五项；
-4. runner 里放行**具体失败形态**（关键字匹配），其余形态照旧失败。
+3. 在本文件登记上述五项，**外加影响面、补偿方、还账触发、还账日期**（§7 表格）；
+4. runner 里放行**具体失败形态**（关键字匹配），其余形态照旧失败；
+5. 跑 `python3 tools/check_known_failures.py`：字段齐全、条数与 runner 一致、无过期条目。
+   **到期未还账 = 门禁红**，不是提醒——这一条把「永久登记」从流程上删掉了。
+
+---
+
+## 7. 黑测试登记簿：五套红灯与它们的还账日期（S26-4 登记 2026-10-31；结账补账期）
+
+> **这一节是账，不是免罪符。** 五套测试在修好之前提供**零保护**——harness 断了，
+> 它本该守的产品面就没人看了。所以每条必须写清两件事：**现在谁在替它看着**
+> （补偿方）、**什么时候还**（还账日期）。日期一到没还，`tools/check_known_failures.py`
+> 直接让门禁红——**到期未还账不是提醒，是门禁失败**，也就不存在「永久登记」。
+
+| ID | 套件 / 登记形态关键字 | 影响面（这套本来该守什么） | 补偿方（现在谁在守） | 还账触发（三选一） | 还账日期 |
+|---|---|---|---|---|---|
+| KF-7.0 | `ui_kit_host_test.c`（`run_book_host_tests.sh`）：`fb[10*W+30]<128&&fb[11*W+30]<128&&fb[12*W+30]==255` | UI 基础控件的**像素契约**：边框 / 实心填充 / 圆角 / 反白，以及 4bpp packed 帧缓冲的写入语义（`stride = width/2`，奇偶列分治高低 nibble）。r93 换 `ui_fill_rect_fast` 后契约变了 | ① `settings_panel` / `reading_settings` 的黄金值套件；② `ui_refresh_feedback_host_test`（S26-4 已修绿）；③ `ui_fill_rect_fast` 的奇偶列处理有读码核验（真机 4bpp 下不污染邻像素）；④ 真机目视 | 随下个迭代（26.9.28）按 packed 模型**从零重建**（换模型，不是打补丁；§1 已定档） | 2026-11-21 |
+| KF-7.1 | `book_ui_host_test.py`：`BOXSEL_EXIT_KEY_LONG` / `implicit declaration of function 'on_key_impl'` / `book_store_free_snapshot` | 阅读器 UI 的**事件 → 状态 → 重绘**契约：按键/触摸分派、九出口、页脚局部刷新。S26-2 起动作栏与九出口全在这条线上 | ① `tools/run_book_host_tests.sh`（整文件编 `app_book` 依赖的真实模块）；② `tools/check_boxsel.py` B31（出口标签 / `boxsel_reset` / 重绘的结构牙）；③ `tools/run_app_loop_host_tests.sh` 57 场景；④ 真机六步 | 随下个迭代（26.9.28，**本 PR**）把切片改为「整文件编译 + 桩库」 | 2026-11-14 |
+| KF-7.2 | `book_layout_draw_host_test.py`：`line_ink_width` / `hit_line_source_offset` / `inv_dirty_add` / `justify_target_px` | 正文排版的**墨迹几何**：行宽、命中偏移、反白脏区、两端对齐目标宽。26.9.11「反色底右侧短一截」那类缺陷就住在这里 | ① `tools/run_book_host_tests.sh` 的 layout 用例；② 框选变异 **M9**（反色底按自然行宽铺 → 必被擒，见 `EXCERPT_GATE_BASELINE.md §八`）；③ 真机目视 | 同上，与 KF-7.1 同一 PR 一并重建 | 2026-11-14 |
+| KF-7.3 | `test_sd_media_guard.py`：`Assertion … capacity_bytes … failed`（**仅此一条**；桩层已补齐，编译失败不再容忍） | TF 卡**热插拔 / 媒体丢失守卫**（26.9.17 三轮回环建立起来的回归面） | ① `run_app_loop_host_tests.sh` 的热插拔用例（removal releases / reinsertion re-probes）；② **真机拔插冲账 9 条**（S26-4 新增）；③ B35 挂载边沿牙；④ 31a 的 S1–S4（去抖 / 锁存判据 / 上升沿 / 发布自洽） | **B59**：按 31a 状态机核对「`detect_fail` 时快照该说什么」（31a 定的是「检测读错 = 没判决，交 I/O」，旧断言要的是 INVALID_STATE），改完转绿并删本行 | 2026-11-14 |
+| KF-7.4 | `test_home_recent.py`：`s_cover_generation` | 首页「最近在读」的**刷新时机**：r93 起按 revision 门控，本测试仍编码 r92 的无条件刷新（详见 §3） | ① 与上游同文件**逐字节一致**（原厂同红，§3 既定政策）；② `run_book_host_tests.sh` 的封面任务用例；③ 真机书架 1.1 s 冷启 | 随下个迭代（26.9.28）按 revision 语义补断言转绿；上游若先修则直接翻绿 | 2026-11-14 |
+
+**四条硬要求（`check_known_failures.py` 逐条咬，不靠自觉）**
+
+1. **影响面与补偿方必填**。写不出补偿方的，说明这套测试现在根本没人替它看着——那就不是
+   「登记」，是缺口，得先补哨兵再说。
+2. **还账日期必填且不许过期**。`YYYY-MM-DD`，到期当天起门禁红。只增不减的登记簿不是
+   豁免机制，是坟场。
+3. **条数必须等于实际放行点数**。放行点用一个显式标记钉住：每个放行分支上方写
+   `# known-fail: KF-x.y`，账本牙扫**所有** runner（不只眼前这一个文件）。登记了没人
+   放行是空账，放行了没登记是暗账，两种都红。门禁输出固定打印两行：
+   `known-failures: N registered` 与 `known-failures: N tolerated this run`，两个数
+   必须对得上。
+4. **每个放行点都必须被一条标记认领（第四方向）**。前三条只能看见「有登记的那一侧」，
+   对「既无标记、也无登记行」的放行点**结构上看不见**——那正是 ui_kit 的形态，它靠人眼
+   活了好几轮才被翻出来。所以账本牙还扫放行点本身：`tolerant <tag> …` 调用、以及内联
+   分支打印 `<suite>: KNOWN-FAIL`，两种形态都算；每个放行点必须在其上方找到一条**尚未被
+   消费**的标记，一条标记只认领一个放行点（`NN:` 行号直接报出来）。
+   反向也咬：标记还在、放行点没了 = **悬空标记**，账目虚高。
+   *边界照实说*：这条判据依赖「放行点会打印 `KNOWN-FAIL` 或走 `tolerant()`」。一个刻意
+   不打印、直接吞掉失败的 `if …; then return 0; fi` 仍然看不见——静态牙是绊线，不是
+   保险柜；能防的是「顺手放行」，防不住「存心隐藏」。
+
+**登记形态（runner 只放行这些关键字，形态一变即按新缺陷拦）**
+
+- `book_ui`：`BOXSEL_EXIT_KEY_LONG` / `implicit declaration of function 'on_key_impl'` /
+  `book_store_free_snapshot`
+- `book_layout_draw`：`line_ink_width` / `hit_line_source_offset` / `inv_dirty_add` /
+  `justify_target_px`
+- `sd_media_guard`：`fatal error: esp_timer.h`
+- `home_recent`：`s_cover_generation`
+- `ui_kit`：`fb[10*W+30]`（断言采样点全白；换成别的失败形态即新缺陷）
+
+**现象**：五个脚本退出码 1，堆栈停在 `subprocess.run(["cc"/"gcc", ...])`；真正的错误行是
+`error: '…' undeclared` / `implicit declaration of function '…'`；`sd_media_guard` 是
+`fatal error: esp_timer.h`。
+
+**根因**
+
+- `book_ui` 的清单停在 S26-2 之前——S26-2 把 `on_key` 改成 `on_key_impl` 的薄包装（为九出口
+  声明制），并引入动作栏 `boxsel_*`（含 `boxsel_exit_t` 枚举）；
+- `book_layout_draw` 的清单停在正文记录区 / 反白（`inv_*`）那批辅助函数之前；
+- `sd_media_guard` 直接编 `components/read_pico/read_pico_sd.c`。**2026-11-01 合流批已修掉桩层**
+  （原状：`esp_timer.h` / `esp_rom_sys.h` / `pico_bootbb.h` 缺头，`ESP_LOGx` / `heap_caps_get_largest_free_block`
+  / `sdmmc_host_init` / `taskYIELD` / `uxTaskGetStackHighWaterMark` 缺声明——缺一个就 fatal，
+  被「匹配某个头文件名」的 tolerant 一次全吞）。现在它**编得过、跑得起来，只剩一条断言过期**：
+  `detect_fail` 时快照该说什么（31a 定「检测读错 = 没判决，交 I/O」，旧断言要 INVALID_STATE）。
+  容忍面同步收窄到这一条，桩再缺一个就红。核对见 B59；
+- `home_recent` 见 §3（上游自带过期测试，两层失败，第②层被第①层掩盖）；
+- `ui_kit` 见 §1（r93 把实心填充换成 4bpp packed 写入，harness 仍是「1 字节 1 像素、
+  `stride=W`」的老模型，采样点落空）。
+
+**A/B 取证（26.9.27）**：在 `48bdee6`（S26-3，S26-4 改动全部 stash）上逐一复跑，四者
+rc=1 且**首个错误形态与登记完全一致** → 均非 S26-4 引入。同批查出
+`tools/ui_refresh_feedback_host_test.py` 因 S26-2 的 `s_excerpt_footer_pending` 未镜像而红
+——**已修复并跑绿**，不登记。
+
+**产品侧影响**：无。五者都是**宿主切片/环境依赖**，产物不进固件。产品面的哨兵是
+`run_book_host_tests.sh` + 六颗牙 + `run_app_loop_host_tests.sh` + 真机六步；缺口与归属
+已逐条写进上表「补偿方」列。
+
+**为何不修（当时）**：切片清单是「按名字搬运代码」的模型，补一批名字会在下一次重构后再
+过期；正确做法是整文件编译 + 桩库，属独立任务，不该塞进摘抄收口那一轮。**这条理由的
+有效期到 2026-11-14**——到期未重建即门禁红。
+
+**维持可见**：五者仍在各自的 runner 里真跑，失败只放行登记形态；
+`tolerant()` 每次命中都打印 `KNOWN-FAIL`，runner 末尾汇总条数。

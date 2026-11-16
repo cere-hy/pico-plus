@@ -1,0 +1,28 @@
+# 黑匣子事件码级别登记簿（门禁体检批 ④ / §13.21）
+#
+# 为什么要有这张表：事件码有三个落点——枚举（pico_bootbb.h）、名字表（note_name）、
+# 关键级（note_is_critical）。三处里漏一处，症状各不相同：
+#   · 漏枚举   → 编译不过，好抓；
+#   · 漏名字表 → 重放日志里打成 `?`，「留痕了但读不出来」= 没留痕（31b 第 1 条自捕获）；
+#   · 漏关键级 → 环满时被普通事件挤掉，最该活下来的那条先死，而且**没有任何报错**。
+# 第三处只能靠一张显式登记：新码必须在这里写下「它值不值得在环满时活下来」，
+# 不许默认继承、不许忘了决定。
+#
+# 格式：码名 <TAB> 级别(critical|normal) <TAB> 说明
+# 每行三个字段，TAB 分隔；`#` 开头为注释。级别只认这两个词，别的拼写一律红。
+#
+# 级别语义：
+#   critical — 环满（64 条）时也要挤进来的强信号：数据丢失 / 只有重启能出 / 硬件在坏。
+#   normal   — 常规观测，环满时先让位。
+
+PICO_BOOTBB_NOTE_SD_STATE	normal	poll_media 看到的状态，每次轮询都可能记
+PICO_BOOTBB_NOTE_SD_PROBE	normal	一次探测被发起
+PICO_BOOTBB_NOTE_SD_DONE	normal	一次探测结束（含失败）
+PICO_BOOTBB_NOTE_SD_STAGE	critical	挂载内部三段耗时，诊断「卡在哪一段」的唯一来源
+PICO_BOOTBB_NOTE_SD_SPACE	critical	挂载后空间统计，证明 3.5 s 已挪出关键路径
+PICO_BOOTBB_NOTE_EXCERPT_FAIL	critical	主动丢弃用户数据，必须自证发生过几次
+PICO_BOOTBB_NOTE_SD_DMA	normal	派生事件：DMA 池创新低才记，健康会话零输出
+PICO_BOOTBB_NOTE_PUSH_WRITE_FAIL	critical	卡在变坏的早期信号，写失败是数据丢失前兆
+PICO_BOOTBB_NOTE_PUSH_FREEZE	critical	看门狗超时冻结，只有重启能出
+PICO_BOOTBB_NOTE_PUSH_HOLD	critical	毒卷有意保持冻结，只有重启或重挂能出
+PICO_BOOTBB_NOTE_SD_IO_DEAD	critical	CD 说在、I/O 说不在一一掉盘的第二信源，出现即代表卷即将卸载（31b P1-1）

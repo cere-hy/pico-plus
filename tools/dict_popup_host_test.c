@@ -44,8 +44,8 @@ enum EpdRotation epd_get_rotation(void) { return g_rotation; }
 /* ---- ui_kit 替身 / ui_kit doubles ---- */
 #define MAX_TEXT_CALLS 48
 static struct { int x; int px; char text[192]; } g_texts[MAX_TEXT_CALLS];
-// gen26.6.3：「看全文 ›」的绘制锚点/基线——用于断言「整段在热区内、左缘可命中」。
-// gen26.6.3: the "看全文 ›" draw anchor/baseline - used to assert "the whole label
+// gen26.6.3：「查看全文 ›」的绘制锚点/基线——用于断言「整段在热区内、左缘可命中」。
+// gen26.6.3: the "查看全文 ›" draw anchor/baseline - used to assert "the whole label
 // lies inside the hit zone and its left edge hits".
 static int g_label_x, g_label_y, g_label_px;
 static int g_text_count;
@@ -57,7 +57,7 @@ void ui_text_fixed(uint8_t* framebuffer, int x, int y_top, int px, const char* t
         g_texts[g_text_count].x = x; // gen26.6：右缘断言需要起点 x / the right-edge check needs x
         g_texts[g_text_count].px = px;
         snprintf(g_texts[g_text_count].text, sizeof(g_texts[g_text_count].text), "%s", text);
-        if (strcmp(text, "看全文 ›") == 0) { g_label_x = x; g_label_y = y_top; g_label_px = px; }
+        if (strcmp(text, "查看全文 ›") == 0) { g_label_x = x; g_label_y = y_top; g_label_px = px; }
         ++g_text_count;
     }
 }
@@ -343,27 +343,27 @@ static void test_wrap_bounds(void) {
     // 显示/暂存对齐（gen26.6 36px）：135 字正好 9 行放满、不截断；第 136 字开第
     // 10 行，必须置截断位（app_book 据此开详解），否则尾部静默丢失。这条对
     // 「暂存帽回退到 14」有牙——那时 136 字仍 10 行暂存、不置位。
-    // Display/staging alignment (gen26.6 36px): 135 chars fill exactly 9 lines
-    // with no truncation; the 136th opens a 10th line and must set the flag
+    // Display/staging alignment (gen26.6 36px): 120 chars fill exactly 8 lines
+    // with no truncation; the 121st opens a 9th line and must set the flag
     // (app_book opens the detail view), else the tail is silently lost. This has
-    // teeth against a "staging cap back to 14" regression (then 136 chars stage 10
+    // teeth against a "staging cap back to 14" regression (then 121 chars stage 9
     // lines and never set the flag).
     o = 0;
-    for (int i = 0; i < 135; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    for (int i = 0; i < 120; ++i) { memcpy(full + o, unit, 3); o += 3; }
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     CHECK(!dict_popup_ai_truncated());
     draw_card();
-    CHECK(body_lines_drawn() == 9);
+    CHECK(body_lines_drawn() == 8);
     CHECK(!drew_text("……"));
     dict_popup_reset();
     o = 0;
-    for (int i = 0; i < 136; ++i) { memcpy(full + o, unit, 3); o += 3; }
+    for (int i = 0; i < 121; ++i) { memcpy(full + o, unit, 3); o += 3; }
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     CHECK(dict_popup_ai_truncated());
     draw_card();
-    CHECK(body_lines_drawn() == 9);
+    CHECK(body_lines_drawn() == 8);
     CHECK(drew_text("……"));
     dict_popup_reset();
     // gen26.6 D3 联动回归：180 字（540B）单段释义必须整段进入折行——旧 AI_SEG=192
@@ -379,7 +379,7 @@ static void test_wrap_bounds(void) {
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     draw_card();
-    CHECK(body_lines_drawn() == 9);
+    CHECK(body_lines_drawn() == 8);
     CHECK(drew_text("……"));
     CHECK(dict_popup_is_pending(NULL) == false);
     dict_popup_reset();
@@ -394,7 +394,7 @@ static void test_wrap_bounds(void) {
     full[o] = 0;
     CHECK(dict_popup_show_def("capacity", full));
     draw_card();
-    CHECK(body_lines_drawn() == 9);
+    CHECK(body_lines_drawn() == 8);
     CHECK(drew_text("……"));
     CHECK(dict_popup_is_pending(NULL) == false);
     dict_popup_reset();
@@ -410,7 +410,7 @@ static void test_wrap_bounds(void) {
     g_dict_def[o] = 0;
     CHECK(dict_popup_open("longdef"));
     draw_card();
-    CHECK(body_lines_drawn() == 9);
+    CHECK(body_lines_drawn() == 8);
     CHECK(drew_text("……"));
     dict_popup_reset();
 }
@@ -435,11 +435,11 @@ static void test_more_entry(void) {
     CHECK(dict_popup_tap((uint16_t)(card0.x + card0.width - TEST_CARD_PAD),
                          (uint16_t)(card0.y + card0.height - TEST_CARD_PAD))
           == DICT_POPUP_TAP_MISSED);
-    // gen26.6.3 A：未触顶不得出现「看全文 ›」（误画即噪音，真机会让用户以为被截断）。
-    // gen26.6.3 A: no "看全文 ›" when nothing is truncated (drawing it would be noise
+    // gen26.6.3 A：未触顶不得出现「查看全文 ›」（误画即噪音，真机会让用户以为被截断）。
+    // gen26.6.3 A: no "查看全文 ›" when nothing is truncated (drawing it would be noise
     // and would tell the reader the text was cut when it was not).
     draw_card();
-    CHECK(!drew_text("看全文 ›"));
+    CHECK(!drew_text("查看全文 ›"));
     dict_popup_reset();
 
     // 触顶（词典长条目）：省略号画出，热区扩大到 >= 96 且钳位卡内，中心与右下锚点都可命中。
@@ -455,7 +455,7 @@ static void test_more_entry(void) {
     EpdRect card = dict_popup_rect();
     EpdRect more = dict_popup_more_rect();
     CHECK(more.width >= 96);
-    CHECK(more.height >= 96);
+    CHECK(more.height >= 48); // M3-A 操作栏 48px 热区 / footer bar 48px zone
     CHECK(more.x >= card.x);
     CHECK(more.y >= card.y);
     CHECK(more.x + more.width <= card.x + card.width);
@@ -464,24 +464,24 @@ static void test_more_entry(void) {
     // On-device regression: the centre and the original dots' spot must both hit.
     CHECK(dict_popup_tap((uint16_t)(more.x + more.width / 2),
                          (uint16_t)(more.y + more.height / 2)) == DICT_POPUP_TAP_MORE);
-    CHECK(dict_popup_tap((uint16_t)(card.x + card.width - TEST_CARD_PAD),
+    CHECK(dict_popup_tap((uint16_t)(more.x + more.width - 4),
                          (uint16_t)(more.y + more.height / 2)) == DICT_POPUP_TAP_MORE);
     // 全文留存：详解会话要有文可载 / The full text must be there for the session.
     const char* text = dict_popup_full_text();
     CHECK(text != NULL);
     CHECK(text != NULL && strlen(text) > (size_t)200);
-    // gen26.6.3 A：「看全文 ›」触顶才画、24px 纯文字、右缘不越「卡右缘 − PAD」，
+    // gen26.6.3 A：「查看全文 ›」触顶才画、24px 纯文字、右缘不越「卡右缘 − PAD」，
     // 且「……」仍在（截断标记保留，热区几何不动）。
-    // gen26.6.3 A: "看全文 ›" is drawn only when truncated, at 24px plain text, never
+    // gen26.6.3 A: "查看全文 ›" is drawn only when truncated, at 24px plain text, never
     // past (card right - PAD), and the "……" marker is still there (hit zone untouched).
     draw_card();
-    CHECK(drew_text("看全文 ›"));
+    CHECK(drew_text("查看全文 ›"));
     CHECK(drew_text("……"));
     {
         int seen = 0;
         const int limit = card.x + card.width - TEST_CARD_PAD;
         for (int i = 0; i < g_text_count; ++i) {
-            if (strcmp(g_texts[i].text, "看全文 ›") != 0) continue;
+            if (strcmp(g_texts[i].text, "查看全文 ›") != 0) continue;
             ++seen;
             CHECK(g_texts[i].px == 24); // 24px 纯文字，不许变成别的字号 / 24px plain text
             // 右对齐绘制：x 就是右锚点（不是左起点）。断言锚点不越「卡右缘 − PAD」，
@@ -500,12 +500,12 @@ static void test_more_entry(void) {
     // left edge hits TAP_MORE too. The old 96x96 zone left the label's left half
     // outside, where a tap was judged MISSED and closed the card.
     {
-        const int label_left = g_label_x - ui_text_fixed_width_px(g_label_px, "看全文 ›");
+        const int label_left = g_label_x - ui_text_fixed_width_px(g_label_px, "查看全文 ›");
         CHECK(g_label_px == 24);
         CHECK(label_left >= more.x);                       // 整段在热区内 / inside the zone
         CHECK(g_label_x <= more.x + more.width);
         CHECK(dict_popup_tap((uint16_t)(label_left + 2), (uint16_t)g_label_y) == DICT_POPUP_TAP_MORE);
-        CHECK(dict_popup_tap((uint16_t)g_label_x, (uint16_t)g_label_y) == DICT_POPUP_TAP_MORE);
+        CHECK(dict_popup_tap((uint16_t)(g_label_x - 2), (uint16_t)g_label_y) == DICT_POPUP_TAP_MORE); // 右锚点恰在热区右界，退 2px / right anchor sits on the edge
     }
     dict_popup_reset();
     CHECK(dict_popup_full_text() == NULL); // reset 清全文 / reset clears it
@@ -614,6 +614,110 @@ static void test_ai_entry(void) {
     dict_popup_set_ai_enabled(false); // 复位开关，避免影响后续用例 / reset the switch for later cases
 }
 
+// 26.9.5 入口卡：本地无释义时的静态入口（中文与英文未收录共用一张）。
+// 钉四件事：① 形态（词头 + 状态行，**无保存 chip**）；② 状态语义（不挂超时、
+// 不被 0x07 认领——这条是「入口卡没发过请求」的全部意义）；③ 前态转终态
+// （点 AI → pending → show_def 整卡替换，chip 齐全）；④ 生命周期（reset 清、
+// 空参不留半卡、上一张 pending 的 s_pending/over_dict 不得残留成残影）。
+// 另加：中文超长词按 UTF-8 边界截断，卡面绝不出现半个字。
+// 26.9.5 entry card: the static entry when the local dictionary has nothing
+// (Chinese and English misses share one). Pins four things: (1) the shape (head +
+// status line, **no save chip**); (2) the state semantics (no timeout, never
+// claimed by 0x07 - the entire point of "the entry card sent no request");
+// (3) prefix -> terminal (tap AI -> pending -> show_def replaces the whole card,
+// chips complete); (4) lifecycle (reset clears, empty input leaves no half card,
+// the previous pending card's s_pending/over_dict must not survive as a ghost).
+// Plus: an overlong Chinese word truncates on a UTF-8 boundary - never half a glyph.
+static void test_entry_card(void) {
+    /* ---- ① 形态 ---- */
+    CHECK(dict_popup_show_entry("privileged", "本地未收录 · 点 AI 释义"));
+    // 开关是**外部配置**：reset 会清（开卡先 reset），产品在开卡之后才设——
+    // app_book 的 `if (found || entry) { set_ai_enabled(...) }` 就是这个顺序。
+    // The switches are EXTERNAL config and reset clears them (opening resets first),
+    // so the product sets them after opening - exactly app_book's
+    // `if (found || entry) { set_ai_enabled(...) }` order.
+    dict_popup_set_ai_enabled(true);
+    dict_popup_set_scene_enabled(true);
+    CHECK(strcmp(dict_popup_word(), "privileged") == 0);
+    draw_card();
+    CHECK(drew_text("privileged"));
+    CHECK(drew_text("本地未收录 · 点 AI 释义"));
+    CHECK(body_lines_drawn() == 1);
+    CHECK(!drew_text("保存"));        // 有释义才可存 / only a definition may be saved
+    CHECK(!drew_text("已存"));
+    CHECK(!drew_text("AI 查询中…"));  // 不是查询态 / not the querying state
+    CHECK(drew_text("AI"));           // AI 入口在 / the AI entry is present
+    CHECK(drew_text("情景解读 ›"));    // 情景入口在 / the scene entry is present
+
+    /* ---- ② 不挂超时、不被 0x07 认领 ---- */
+    CHECK(!dict_popup_is_pending(NULL));
+    CHECK(!dict_popup_is_pending("privileged"));
+    CHECK(!dict_popup_ai_over_dict());
+    dict_test_now_us += 60LL * 1000 * 1000; // 推 60 s，远超声明的 15 s 超时
+    CHECK(!dict_popup_pending_expired(15LL * 1000 * 1000));
+    draw_card(); // 时钟推过也不许降级成失败提示
+    CHECK(drew_text("本地未收录 · 点 AI 释义"));
+
+    /* ---- chip 命中：AI / 情景可点；保存区是 MISSED 且不落库 ---- */
+    EpdRect ai = dict_popup_ai_rect();
+    CHECK(ai.width > 0);
+    CHECK(dict_popup_tap((uint16_t)(ai.x + ai.width / 2),
+                         (uint16_t)(ai.y + ai.height / 2)) == DICT_POPUP_TAP_AI);
+    EpdRect sc = dict_popup_scene_rect();
+    CHECK(sc.width > 0);
+    CHECK(dict_popup_tap((uint16_t)(sc.x + sc.width / 2),
+                         (uint16_t)(sc.y + sc.height / 2)) == DICT_POPUP_TAP_SCENE);
+    EpdRect save = dict_popup_save_rect();
+    CHECK(dict_popup_tap((uint16_t)(save.x + save.width / 2),
+                         (uint16_t)(save.y + save.height / 2)) == DICT_POPUP_TAP_MISSED);
+    CHECK(g_save_calls == 0); // 空壳不得进生词本 / no empty shell in the vocabulary book
+
+    /* ---- ③ 前态 → 终态 ---- */
+    CHECK(dict_popup_force_ai("privileged"));
+    CHECK(dict_popup_is_pending("privileged"));
+    draw_card();
+    CHECK(drew_text("AI 查询中…"));
+    CHECK(!drew_text("AI")); // 查询态不显示 AI chip（既有语义）/ no AI chip while querying
+    CHECK(dict_popup_show_def("privileged", "享有特权的"));
+    draw_card();
+    CHECK(drew_text("享有特权的"));
+    CHECK(drew_text("保存")); // 有释义 → chip 齐全 / chips complete once a def exists
+    CHECK(!dict_popup_is_pending(NULL));
+
+    /* ---- ④ 生命周期 ---- */
+    // 上一张 pending 卡 → 直接开入口卡：s_pending / over_dict 必须被清（残影）。
+    CHECK(dict_popup_show_pending("ghost"));
+    CHECK(dict_popup_is_pending(NULL));
+    CHECK(dict_popup_show_entry("ghost", "本地未收录 · 点 AI 释义"));
+    CHECK(!dict_popup_is_pending(NULL));
+    CHECK(!dict_popup_ai_over_dict());
+    // 空词 / 空状态行：失败且不留半张卡。
+    dict_popup_reset();
+    CHECK(!dict_popup_show_entry("", "x"));
+    CHECK(!dict_popup_show_entry("w", ""));
+    CHECK(!dict_popup_show_entry(NULL, "x"));
+    CHECK(dict_popup_word()[0] == 0);
+    draw_card();
+    CHECK(body_lines_drawn() == 0);
+
+    /* ---- 中文超长词：UTF-8 边界截断 ---- */
+    char longw[80];
+    memset(longw, 0, sizeof(longw));
+    for (int i = 0; i < 24; ++i) memcpy(longw + i * 3, "中", 3); // 72 B，超词头帽
+    CHECK(dict_popup_show_entry(longw, "本地词典仅收英文 · 点 AI 释义"));
+    const size_t wl = strlen(dict_popup_word());
+    CHECK(wl > 0 && wl < strlen(longw));      // 确实截断了 / really truncated
+    CHECK(wl % 3 == 0);                        // 不切半字 / no split character
+    CHECK(strncmp(dict_popup_word(), longw, wl) == 0); // 是干净前缀 / a clean prefix
+    CHECK(wl < PUSH_AI_WORD_MAX);              // 也在协议槽内 / fits the protocol slot
+    draw_card();
+    CHECK(drew_text("本地词典仅收英文 · 点 AI 释义")); // 中文状态行正常绘制
+
+    dict_popup_reset();
+    dict_popup_set_ai_enabled(false);
+    dict_popup_set_scene_enabled(false);
+}
+
 int main(void) {
     test_open_miss_contract();
     test_pending_card();
@@ -625,10 +729,11 @@ int main(void) {
     test_pending_timeout();
     test_reset_clears_pending();
     test_ai_entry();
+    test_entry_card();
     if (g_failures) {
         printf("dict_popup: %d FAILURE(S)\n", g_failures);
         return 1;
     }
-    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 135/270 + right-edge bound + wrap bounds + more-entry hot zone + timeout + AI entry)");
+    puts("dict_popup: PASS (querying card + double-gate predicate + capacity 135/270 + right-edge bound + wrap bounds + more-entry hot zone + timeout + AI entry + 26.9.5 entry card)");
     return 0;
 }

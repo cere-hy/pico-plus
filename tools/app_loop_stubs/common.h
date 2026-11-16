@@ -7,6 +7,8 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_NOT_FINISHED 1
 #define ESP_ERR_INVALID_STATE 2
+#define ESP_ERR_NOT_FOUND 0x105   // 26.9.16 R3：无卡时 read_pico_sd_get_info 的错误码
+#define ESP_ERR_TIMEOUT 0x107     // 26.9.31a：看门狗用例要一个「非 INVALID_STATE」的硬错误
 const char* esp_err_to_name(int err);
 typedef void* cst836u_handle_t;
 typedef void* sc7a20h_handle_t;
@@ -16,6 +18,9 @@ typedef struct { bool touched; uint8_t count; uint16_t x,y; cst836u_point_t poin
 typedef struct { int unused; } cst836u_info_t;
 int cst836u_read(void*, cst836u_touch_t*);
 int cst836u_get_info(void*, cst836u_info_t*);
+// M 批 D/C 插点电平门控：真机是 GPIO43 的 INT 电平（低=有指），宿主要给同一形状。
+// M-batch D/C level gate: the device reads GPIO43 (low = contact); the host mirrors it.
+int cst836u_int_level(void*);
 typedef struct { int unused; } EpdiyHighlevelState;
 typedef struct { int x,y,width,height; } EpdRect;
 enum EpdDrawError { EPD_DRAW_SUCCESS };
@@ -49,7 +54,7 @@ void display_main_transition_cancel(void);
 void rails_idle_check(int64_t);
 bool read_pico_pmu_ready(void);
 typedef enum { READ_PICO_PMU_KEY_NONE, READ_PICO_PMU_KEY_SHORT, READ_PICO_PMU_KEY_LONG } read_pico_pmu_key_action_t;
-read_pico_pmu_key_action_t read_pico_pmu_take_key_action(void);
+read_pico_pmu_key_action_t read_pico_pmu_take_key_action(uint16_t* held_out);
 void enter_lock_and_sleep(EpdiyHighlevelState*, int64_t*, void*, void*, bool);
 void app_lock_feedback(EpdiyHighlevelState*);
 void app_lock_wait_key_idle(int);
@@ -68,7 +73,8 @@ int ttf_font_open(const char*);
 int ttf_font_open_builtin(void);
 typedef struct { bool present, mounted; } read_pico_sd_info_t;
 int read_pico_sd_get_info(read_pico_sd_info_t*);
-void read_pico_sd_start_probe(void);
+int read_pico_sd_start_probe(void);
+int read_pico_sd_remount(void);   // 26.9.16 R3：挂载失败后的自愈重挂
 
 // 旋转尺寸带头定义：宿主测试默认竖屏 684x1216，各测试无需再自带替身。
 // Define the rotation sizes here: host tests default to portrait 684x1216, so

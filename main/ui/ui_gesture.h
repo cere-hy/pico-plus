@@ -42,6 +42,12 @@ typedef struct {
 
 /// 清除状态；进出页面时调用。/ Clear state when entering or leaving a page.
 void ui_gesture_reset(ui_gesture_t *gesture);
-/// 每次最多一个事件；consumed、多点或缺失快照取消活动序列。
-/// Emit at most one event; consumed, multitouch or a missing snapshot cancels an active sequence.
+/// 每次最多一个事件；consumed 或缺失快照取消活动序列。
+/// 多点是否取消由 `ctx->single_finger_priority` 决定（26.9.13）：默认仍取消（防两指
+/// 手势顺手点一下），框选态不取消（那里一次点按被一帧两点作废就是「点了没反应」）。
+/// Emit at most one event; consumed, or a missing snapshot cancels an active sequence.
+/// Whether multitouch cancels is `ctx->single_finger_priority`'s call (26.9.13): it
+/// still cancels by default (a two-finger gesture must not also click), and stops
+/// cancelling in the box mode, where a tap voided by one two-contact frame reads as
+/// "the tap did nothing".
 bool ui_gesture_feed(ui_gesture_t *gesture, const app_ctx_t *ctx, ui_gesture_event_t *out);

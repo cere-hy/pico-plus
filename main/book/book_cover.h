@@ -10,8 +10,21 @@
 bool book_cover_thumbnail(const uint8_t *data, size_t size, bool png,
                           uint8_t out[BOOK_COVER_W * BOOK_COVER_H]);
 // Decode an image to a chosen grayscale size; output is one byte per pixel.
+// gen26.9.25 S25：max_out_bytes 收紧 JPEG 解码预算（RGB565 输出字节上限；0 = 沿用
+// 内置 3/6 MB 规则）。插图路径传 2 MB：26.9.24 真机 t=190 s 实证一张逼近 6 MB 预算的
+// 图会让单次 esp_jpeg_decode 占住 CPU0 超过 5 s，IDLE0 饿到触发 task_wdt；解码耗时
+// 与输出字节成正比，2 MB（≈1 M 像素）把单次解码压到 ~2 s，而插图最终只显示页宽，
+// 质量无损。封面/锁屏拼贴传 0 维持原状。
+// gen26.9.25 S25: cap the JPEG decode budget in RGB565 output bytes (0 = keep the
+// built-in 3/6 MB rule). The inline-image path passes 2 MB: the 26.9.24 field log
+// showed a single esp_jpeg_decode near the 6 MB budget hogging CPU0 past 5 s and
+// starving IDLE0 into a task_wdt trigger at t=190 s. Decode time scales with output
+// bytes, so 2 MB (~1 M pixels) keeps one decode around 2 s while illustrations only
+// ever render page-wide - no visible quality cost. Covers and the lock collage pass
+// 0 and keep the old behaviour.
 bool book_image_grayscale(const uint8_t *data, size_t size, bool png,
-                          unsigned out_width, unsigned out_height, uint8_t *out);
+                          unsigned out_width, unsigned out_height, uint8_t *out,
+                          unsigned max_out_bytes);
 bool book_image_dimensions(const uint8_t *data, size_t size, bool png,
                            unsigned *width, unsigned *height);
 

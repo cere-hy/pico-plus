@@ -8,7 +8,7 @@
 #include "ui_kit.h"
 #include "ui_menu.h"
 
-static int center_x(int button) { return (button * 2 + 1) * UI_LOCK_WIDTH / 8; }
+static int center_x(int button) { return (button * 2 + 1) * UI_LOCK_WIDTH / 10; }
 
 EpdRect ui_quick_menu_rect(void) { return (EpdRect){0, 0, UI_LOCK_WIDTH, UI_QUICK_HEIGHT}; }
 
@@ -26,7 +26,7 @@ static void dismiss(ui_quick_menu_t *menu, ui_quick_action_t *action) {
 }
 
 static int hit_test(int x, int y) {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 5; ++i) {
         const int dx = x - center_x(i), dy = y - UI_QUICK_CIRCLE_Y;
         if (dx * dx + dy * dy <= UI_QUICK_HIT_RADIUS * UI_QUICK_HIT_RADIUS) return i;
     }
@@ -85,6 +85,7 @@ bool ui_quick_menu_feed(ui_quick_menu_t *menu, const app_ctx_t *ctx, bool allowe
             if (menu->hit >= 0 && hit_test(x, y) == menu->hit) {
                 static const ui_quick_action_t actions[] = {
                     UI_QUICK_WIFI, UI_QUICK_BLUETOOTH, UI_QUICK_FULL, UI_QUICK_LOCK,
+                    UI_QUICK_BOX,
                 };
                 *action = actions[menu->hit];
             } else if (menu->y0 >= UI_QUICK_HEIGHT && y >= UI_QUICK_HEIGHT) {

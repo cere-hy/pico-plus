@@ -47,7 +47,7 @@ static bool book_title_from_path(const char *p,char *out,size_t n){(void)p;snpri
 static size_t heap_caps_get_free_size(int flags){assert(flags==3);return available;}
 static esp_err_t book_epub_cover_bounded(const char *p,uint8_t **data,size_t *bytes,bool *png,size_t budget){(void)p;assert(budget<=4u*1024u*1024u&&budget+1536u*1024u<=available);++requests;if(error)return error;*data=malloc(1);assert(*data);**data=1;*bytes=1;*png=false;return ESP_OK;}
 static bool book_image_dimensions(const uint8_t *data,size_t bytes,bool png,unsigned *w,unsigned *h){(void)png;assert(data&&bytes==1);*w=source_w;*h=source_h;return true;}
-static bool book_image_grayscale(const uint8_t *data,size_t bytes,bool png,unsigned w,unsigned h,uint8_t *out){(void)png;assert(data&&bytes==1&&w&&h&&w<=176&&h<=240);++decoded;if(decode_fail)return false;memset(out,61,w*h);return true;}
+static bool book_image_grayscale(const uint8_t *data,size_t bytes,bool png,unsigned w,unsigned h,uint8_t *out,unsigned max_out_bytes){(void)max_out_bytes;(void)png;assert(data&&bytes==1&&w&&h&&w<=176&&h<=240);++decoded;if(decode_fail)return false;memset(out,61,w*h);return true;}
 static bool book_auto_cover_render(const char *p,const char *t,const char *a,unsigned w,unsigned h,uint8_t *out){(void)p;(void)t;(void)a;assert(w==176&&h==240);memset(out,191,w*h);return true;}
 '''
 for name in ('cover_hash', 'cover_cache_key', 'book_cover_load_list_gray_impl', 'book_cover_load_list_gray'):

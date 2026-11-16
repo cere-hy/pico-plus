@@ -224,7 +224,7 @@ static bool jpegdec_gray(const uint8_t *data, size_t size, unsigned frame_width,
 }
 
 static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
-                      unsigned out_height, uint8_t *out) {
+                      unsigned out_height, uint8_t *out, unsigned max_out_bytes) {
     // 失败现场必须留全（gen26 真机观察项「JPEG 单图降级」销项）：字节数、SOF 类型、
     // 帧尺寸、走的哪条库、目标尺寸。SOF=0xC2（progressive）走 JPEGDEC 软解，
     // 其余走 esp_jpeg 硬解循环——两条路径的失败原因完全不同，日志必须能区分。
@@ -251,8 +251,17 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
     esp_jpeg_image_cfg_t cfg = { .indata = (uint8_t *)data, .indata_size = (uint32_t)size,
                                  .out_format = JPEG_IMAGE_FORMAT_RGB565 };
     esp_jpeg_image_output_t info = {0};
-    size_t limit = out_width <= BOOK_COVER_W && out_height <= BOOK_COVER_H
-        ? 3u * 1024u * 1024u : 6u * 1024u * 1024u;
+    // S25：预算可由调用方收紧（0 = 内置规则）。26.9.24 真机 t=190 s 实证单次
+    // esp_jpeg_decode 逼近 6 MB 预算时占住 CPU0 超 5 s 触发 task_wdt——该调用是
+    // 单个库函数，内部无法让出，唯一能压它的是输出预算（耗时 ∝ 输出字节）。
+    // S25: the caller may tighten the budget (0 = built-in rule). The 26.9.24
+    // field log (t=190 s) showed a single esp_jpeg_decode near the 6 MB budget
+    // hogging CPU0 past 5 s into a task_wdt trigger - that call is one opaque
+    // library function that cannot yield inside, so the output budget (decode
+    // time ∝ output bytes) is the only lever that shrinks it.
+    size_t limit = max_out_bytes ? (size_t)max_out_bytes
+        : (out_width <= BOOK_COVER_W && out_height <= BOOK_COVER_H
+        ? 3u * 1024u * 1024u : 6u * 1024u * 1024u);
     bool decoded = false;
     for (int scale = JPEG_IMAGE_SCALE_0; scale <= JPEG_IMAGE_SCALE_1_8; ++scale) {
         cfg.out_scale = scale;
@@ -286,6 +295,10 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
                             rgb565_gray(r1, crop.x + (unsigned)sx), rgb565_gray(r1, crop.x + (unsigned)sx1),
                             fx, fy);
                     }
+                    // S25 备注：循环尾的 decode_yield(y) 原已存在（行级让出）；
+                    // 本轮核实归档，勿重复插入。/ S25 note: the trailing
+                    // decode_yield(y) was already here (per-row yield); recorded
+                    // during the S25 audit - do not duplicate it.
                     decode_yield(y);
                 }
                 decoded = true;
@@ -424,16 +437,17 @@ done:
 
 bool book_cover_thumbnail(const uint8_t *data, size_t size, bool png,
                           uint8_t out[BOOK_COVER_W * BOOK_COVER_H]) {
-    return book_image_grayscale(data, size, png, BOOK_COVER_W, BOOK_COVER_H, out);
+    return book_image_grayscale(data, size, png, BOOK_COVER_W, BOOK_COVER_H, out, 0);
 }
 
 bool book_image_grayscale(const uint8_t *data, size_t size, bool png,
-                          unsigned out_width, unsigned out_height, uint8_t *out) {
+                          unsigned out_width, unsigned out_height, uint8_t *out,
+                          unsigned max_out_bytes) {
     if (!data || !size || !out || !out_width || !out_height ||
         out_width > 1216 || out_height > 1216 || (size_t)out_width * out_height > 684u * 1216u)
         return false;
     return png ? png_gray_input(data, size, NULL, out_width, out_height, out)
-               : jpeg_gray(data, size, out_width, out_height, out);
+               : jpeg_gray(data, size, out_width, out_height, out, max_out_bytes);
 }
 
 
@@ -597,7 +611,7 @@ static bool book_cover_load_list_gray_impl(const char *path, const char *title, 
             } else { *height = BOOK_COVER_H; *width = ((uint64_t)sw*BOOK_COVER_H + sh/2)/sh; }
             if (!*width) *width = 1;
             if (!*height) *height = 1;
-            good = book_image_grayscale(data, size, png, *width, *height, out);
+            good = book_image_grayscale(data, size, png, *width, *height, out, 0);
             // 失败现场（同封面口径）：书路径、字节数、格式。/ The failure scene (same as
             // the cover path): book path, byte count, format.
             if (!good)

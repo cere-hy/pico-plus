@@ -15,6 +15,24 @@ for name in ('driver/sdmmc_host.h', 'esp_log.h', 'esp_vfs_fat.h',
     p.write_text('#pragma once\n', encoding='utf-8')
 for name in ('ff.h','diskio_sdmmc.h'):
     (out/name).write_text((root/'tools/sd_probe_stubs'/name).read_text())
+# 26.9.31a：CD 去抖窗用 `esp_rom_delay_us()` 忙等（100 Hz tick 下 pdMS_TO_TICKS(2)==0）。
+# 空桩不够——这个符号必须在编译期就有定义，所以单独写一份带内联函数的。
+# 合流时才暴露：这条测试编译同一个 read_pico_sd.c，但用自己的一套桩目录。
+(out/'esp_rom_sys.h').write_text(
+    '#pragma once\n#include <stdint.h>\n'
+    'static inline void esp_rom_delay_us(uint32_t us) { (void)us; }\n',
+    encoding='utf-8')
+# 26.9.31b P1-1：watch_io 的判据是墙钟（3 s），本测试不测那条判据，给个停在 0 的钟即可
+# ——它只要「编译得通、媒体守卫的断言照旧」。这条桩此前一直缺，被 runner 的 tolerant
+# 规则以 `esp_timer.h` 字样吞掉；31a 的 `esp_rom_sys.h` 排在这个 include 之前，
+# 错误信息一换，tolerant 就匹配不上，这才暴露出来。
+# P1-1 needs a clock; this test does not exercise the 3 s criterion, so a stopped one
+# is enough. The stub was always missing - the runner's tolerant rule used to swallow
+# it by matching the `esp_timer.h` text, and 31a's include shifted that text.
+(out/'esp_timer.h').write_text(
+    '#pragma once\n#include <stdint.h>\n'
+    'static inline int64_t esp_timer_get_time(void) { return 0; }\n',
+    encoding='utf-8')
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -63,6 +81,21 @@ typedef int BaseType_t;
 #define pdMS_TO_TICKS(x) (x)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGI(...) ((void)0)
+// 26.9.31b 合流：这条测试长期卡在「桩层缺声明」，被 runner 的 tolerant 规则按
+// `fatal error: esp_timer.h` 四个字吞掉——缺的从来不止一个头文件。既然本轮把
+// esp_rom_sys / esp_timer / pico_bootbb 都补齐了，就把剩下的一并补到底：
+// 差一个符号，编不过；编不过，这条测试从来没跑过它的断言。
+// The harness was stuck on missing declarations, swallowed by a text match on one
+// header name. Fill them all: one missing symbol means the assertions never ran.
+#define ESP_LOGE(...) ((void)0)
+#define ESP_ERR_NOT_SUPPORTED 7
+#define ESP_ERR_INVALID_SIZE 8
+#define taskYIELD() ((void)0)
+static void vTaskPrioritySet(void* t,int p){(void)t;(void)p;}
+static size_t heap_caps_get_largest_free_block(int caps){(void)caps;return 1024*1024;}
+static esp_err_t sdmmc_host_init(void){return ESP_OK;}
+typedef unsigned UBaseType_t;
+static UBaseType_t uxTaskGetStackHighWaterMark(void* t){(void)t;return 1024;}
 static bool present=true, drop_during_mount=false, unmount_fail=false, detect_fail=false;
 static int mounts, unmounts, formats;
 static bool made_books, made_fonts, made_pictures;
@@ -155,7 +188,12 @@ int main(void) {
     assert(read_pico_sd_get_info(&info)==ESP_ERR_NOT_FOUND);
     present=true;
     finish_probe();
-    assert(read_pico_sd_get_info(&info)==ESP_ERR_INVALID_STATE && !info.mounted && !info.needs_format);
+    // 26.9.31a 的语义变更（合流暴露）：上升沿 + 无残留句柄即清闩——「插回是人的意图」。
+    // 旧断言要的是「插回也不认卡」，那正是 26.9.29 死锁本身，31a 把它当缺陷逐掉了。
+    // 断言过期两年没人知道，因为这条测试连编译都过不去（tolerant 按头文件名吞掉）。
+    // 31a semantics: a rising edge with no stale handle clears the latch. The old
+    // assertion demanded "reinsert still doesn't work" - the deadlock itself.
+    assert(read_pico_sd_get_info(&info)==ESP_OK && info.mounted && !info.needs_format);
     // 真拔卡之后的检测读错不能让探测结果绕过失效锁存。
     // A detection fault after real removal must not let a probe bypass the removal latch.
     assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED);
@@ -209,5 +247,10 @@ detect = board[board.index('esp_err_t read_pico_sd_detect('):board.index('void r
 subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                 '-Wno-unused-variable', '-fsanitize=address,undefined', '-g', '-pthread',
                 '-I'+str(out), '-I'+str(root/'components/read_pico/include'),
+                # 26.9.31b：read_pico_sd.c 现在会调 pico_bootbb_note()（SD_STAGE 打点）。
+                # 不定义 CONFIG_PICO_BOOTBB 时真头文件给的是全空 inline，正是宿主测试要的。
+                # pico_bootbb_note() is now called from read_pico_sd.c; without
+                # CONFIG_PICO_BOOTBB the real header degrades to empty inlines.
+                '-I'+str(root/'components/pico_heapdiag/include'),
                 str(out/'test.c'), '-o', str(out/'test')], check=True)
 subprocess.run([str(out/'test')], check=True)

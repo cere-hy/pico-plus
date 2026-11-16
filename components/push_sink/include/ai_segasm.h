@@ -35,7 +35,17 @@
 extern "C" {
 #endif
 
-#define AI_SEGASM_MAX 4096u ///< 重组缓冲上限（字节）/ reassembly buffer cap (bytes)
+#define AI_SEGASM_MAX 8192u ///< 重组缓冲上限（字节）= 传输槽上界，两者必须同数 / reassembly cap, must equal the transport slot
+// 26.11.3-C2（门梯第四道）：重组器是链路上**最后一个**能无声吃掉答案的地方——
+// 低于传输槽就会在 4096 处把 8 KB 的段落截在句子中间，而且没有任何告示，比 1152
+// 时代的「带省略号截断」更糟。故它不是「够用就行」的缓冲，而是门梯上的一档：
+// 任何一档低于 8192，8192 就是假门。
+// 26.11.3-C2 (the fourth gate in the ladder): the reassembler is the last place that can
+// silently eat an answer. Below the transport slot it would cut an 8 KB passage mid
+// sentence with no notice at all - worse than the 1152-era ellipsis. It is a rung, not
+// a "big enough" buffer: any rung under 8192 makes 8192 a fake ceiling.
+_Static_assert(AI_SEGASM_MAX >= PUSH_AI_DEF_MAX,
+               "26.11.3-C2 gate ladder: the reassembler must not be narrower than the slot");
 
 typedef struct {
     char word[PUSH_AI_WORD_MAX]; ///< 正在重组的词 / word being reassembled

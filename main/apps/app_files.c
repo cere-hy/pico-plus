@@ -68,6 +68,14 @@ static int64_t s_space_poll_ms;
 static char s_message[96];
 static char s_dir[288] = "/sdcard";
 static read_pico_sd_info_t s_sd;
+// 29 批：写后置脏 + 算术修正。空间只被写操作改变，进页面不必盲扫 3 秒。
+// dirty 置位后，界面每次读缓存都用 s_space_free 覆盖 free_bytes；换卡 / 重挂载 /
+// 后台重算（space_valid 掉回 false）时作废修正，真值优先。
+// Batch 29: mark dirty after a write and correct the cached free count arithmetically.
+// Opening the page no longer rescans the whole FAT; only a precheck makes the value fresh.
+static bool s_space_dirty;
+static uint64_t s_space_free;
+static uint64_t s_space_total;
 // 卡在、挂不上、又不是超时，多半是文件系统本机不认（exFAT 之类）。这种卡仍然格得动，
 // 所以卡片本身变成可点的：第一次点只是问，第二次点才真的格。
 // A card is in the slot but will not mount and it is not a timeout: most likely a filesystem this
@@ -85,7 +93,96 @@ static int s_move_origin_folder, s_move_origin_page;
 static char s_move_origin_dir[288];
 static char s_editor[121], s_editor_ext[16], s_editor_notice[96];
 static ui_text_edit_t s_editor_input;
-static void scan_folder(int folder);
+// M 批 C①：目录扫描带 ctx，是为了在逐条 readdir 的循环里插导航采样点。
+// ctx 允许为 NULL——移动视图进出、删除/重命名后的重扫这些微秒级小窗不采样，
+// 传 NULL 即「本窗不采」，不是漏传：它们几毫秒就回去，主循环下一拍自会采到。
+// M-batch C①: the scan carries ctx so a nav sample can be taken inside the readdir loop.
+// NULL means "no sampling in this window" (microsecond-scale rescans after a move or a
+// delete), not a missing argument - the loop samples again on its next tick.
+static void scan_folder(int folder, app_ctx_t *ctx);
+
+// 29 批门控：进页面不再同步重算空间。只有后台还没算完（NOT_FINISHED）时催一次——
+// `refresh_space()` 在这条分支上只置 `space_urge` 立即返回，不读一个扇区
+// （read_pico_sd.c:987）。已算过（OK）的卡一个字不调：上一次真值就在缓存里，
+// 盲扫 3 秒换来的大概率是同一个数字。
+// Batch 29 gate: opening the page never rescans. Only a still-pending backend is urged
+// once, a path that just sets space_urge and returns without touching the FAT.
+static void space_request_if_pending(void) {
+    read_pico_sd_info_t info;
+    if (read_pico_sd_get_info(&info) != ESP_OK || !info.mounted) return;
+    if (info.space_error == ESP_ERR_NOT_FINISHED) (void)read_pico_sd_refresh_space();
+}
+
+// 29 批：界面读缓存时把写后修正值叠回去。卷变了（换卡 / 重挂载）或缓存被作废
+// （space_valid 掉回 false，后台重算中）就丢弃修正——真值永远优先。
+// Batch 29: overlay the post-write correction on every cache read. A changed volume or an
+// invalidated cache discards the correction - the real value always wins.
+static esp_err_t files_sd_read(void) {
+    const esp_err_t err = read_pico_sd_get_info(&s_sd);
+    if (!s_space_dirty) return err;
+    if (!s_sd.space_valid) {
+        s_space_dirty = false;
+        s_space_free = 0;
+        s_space_total = 0;
+        return err;
+    }
+    // 只有脏标记、没有修正值（字节数取不到 / 写失败）：保留 dirty 等预检，别拿真值
+    // 把「需要校准」这件事抹掉。
+    if (s_space_total == 0) return err;
+    if (s_sd.filesystem_bytes != s_space_total) {
+        s_space_dirty = false;
+        s_space_free = 0;
+        s_space_total = 0;
+        return err;
+    }
+    s_sd.free_bytes = s_space_free;
+    return err;
+}
+
+// 29 批：写成功后立即修正缓存值（删除加回、复制扣减）。`sized == false` 表示取不到
+// 精确字节数，只置脏，等预检重算；同卷 rename 不改变空间，不走这里。
+// Batch 29: correct the cached free count right after a write. Without a precise byte
+// count only the dirty bit is set and the next precheck recalibrates.
+static void space_note_write(bool freed, bool sized, uint64_t bytes) {
+    if (!sized || !s_sd.space_valid) {
+        // 没有精确字节数：只留脏，不留会误导的修正值。
+        s_space_dirty = true; s_space_free = 0; s_space_total = 0; return;
+    }
+    const uint64_t cap = s_sd.filesystem_bytes ? s_sd.filesystem_bytes : s_sd.capacity_bytes;
+    if (cap == 0) { s_space_dirty = true; s_space_free = 0; s_space_total = 0; return; }
+    // 脏但只有标记（total==0）时基值仍是真值，不能从 0 起算。
+    uint64_t value = (s_space_dirty && s_space_total != 0) ? s_space_free : s_sd.free_bytes;
+    if (freed) value = (bytes >= cap || value > cap - bytes) ? cap : value + bytes;
+    else value = (bytes > value) ? 0 : value - bytes;
+    s_space_dirty = true;
+    s_space_free = value;
+    s_space_total = s_sd.filesystem_bytes;
+}
+
+// 29 批：复制 / 移动前的空间预检门。三种结局：
+//   OK            → 缓存可用，直接走既有 file_tree_copy 预检（不扫）
+//   NOT_FINISHED  → 后台正在算，本次不执行、也不并行扫（会撞 begin_operation 的忙状态）
+//   其他          → 卡不可用，交回既有错误路径
+// 脏或未算过时在本线程同步算一次：这是用户主动动作，3 秒等待有明确预期，也是唯一
+// 不引入新错误路径的选项——跳过预检会留半截文件，拒绝提示伤体验。
+// Batch 29 precheck gate. Dirty or never-counted means one synchronous scan here: it is a
+// user-initiated action with a visible wait, and the only option that neither skips the
+// check nor leaves a half-written file. A still-pending backend is never scanned in parallel.
+static esp_err_t space_precheck_ready(void) {
+    read_pico_sd_get_info(&s_sd);
+    if (!s_sd.mounted) return ESP_ERR_INVALID_STATE;
+    if (s_sd.space_error == ESP_ERR_NOT_FINISHED) return ESP_ERR_NOT_FINISHED;
+    if (s_sd.space_error != ESP_OK) return s_sd.space_error;
+    if (s_sd.space_valid && !s_space_dirty) return ESP_OK;
+    const esp_err_t err = read_pico_sd_refresh_space();
+    if (err != ESP_OK) return err;
+    read_pico_sd_get_info(&s_sd);
+    if (!s_sd.space_valid) return ESP_ERR_INVALID_STATE;
+    s_space_dirty = false;
+    s_space_free = 0;
+    s_space_total = 0;
+    return ESP_OK;
+}
 
 static const char *const names[] = {"书籍", "图片", "字体", "TF 卡目录"};
 static const char *folder_root(int folder) {
@@ -178,10 +275,14 @@ static esp_err_t copy_selected_item(char out_name[128]) {
         }
         if (number == 99) return ESP_ERR_INVALID_SIZE;
     }
-    read_pico_sd_get_info(&s_sd);
-    if (!s_sd.mounted) return ESP_ERR_INVALID_STATE;
+    const esp_err_t ready = space_precheck_ready();
+    if (ready != ESP_OK) return ready;
+    file_tree_info_t tree = {0};
+    const bool sized = file_tree_inspect(s_selected.path, &tree) == ESP_OK;
     esp_err_t err = file_tree_copy(s_selected.path, destination, s_sd.free_bytes);
-    if (err != ESP_OK) return err;
+    // 失败也可能已经写进去半截，置脏让下一次预检校准，不拿旧数字赌。
+    if (err != ESP_OK) { s_space_dirty = true; s_space_free = 0; s_space_total = 0; return err; }
+    space_note_write(false, sized, tree.bytes);
     copy_utf8(out_name, 128, candidate);
     book_store_notify_changed();
     return ESP_OK;
@@ -288,21 +389,23 @@ static void start_move(void) {
     copy_utf8(s_dir, sizeof(s_dir), "/sdcard");
     s_folder = 3;
     s_view = FILE_VIEW_MOVE;
-    scan_folder(3);
+    scan_folder(3, NULL);  // C①：移动视图进出是小窗，不采
 }
 
 static void leave_move(bool changed) {
     s_folder = s_move_origin_folder;
     copy_utf8(s_dir, sizeof(s_dir), s_move_origin_dir);
     s_view = FILE_VIEW_LIST;
-    scan_folder(s_folder >= 0 ? s_folder : 3);
+    scan_folder(s_folder >= 0 ? s_folder : 3, NULL);  // C①：退出移动视图小窗，不采
     if (!changed) s_page = s_move_origin_page;
 }
 
 static app_redraw_t move_selected(void) {
-    read_pico_sd_get_info(&s_sd);
-    if (!s_sd.mounted) {
-        snprintf(s_message, sizeof(s_message), "TF 卡不可用"); return APP_REDRAW_PAGE;
+    const esp_err_t ready = space_precheck_ready();
+    if (ready != ESP_OK) {
+        snprintf(s_message, sizeof(s_message), ready == ESP_ERR_NOT_FINISHED ?
+                 "空间统计中，请稍后再试" : "TF 卡不可用");
+        return APP_REDRAW_PAGE;
     }
     char destination[288];
     if (snprintf(destination, sizeof(destination), "%s/%s", s_dir, s_selected.name) >= sizeof(destination)) {
@@ -347,17 +450,22 @@ static int compare_files(const void *left, const void *right) {
     return strcasecmp(a->name, b->name);
 }
 
-static void scan_folder(int folder) {
+static void scan_folder(int folder, app_ctx_t *ctx) {
     if (!files_alloc()) return;
     s_count = s_page = 0;
     s_message[0] = 0;
-    read_pico_sd_get_info(&s_sd);
+    (void)files_sd_read();
     if (!s_sd.mounted) { snprintf(s_message, sizeof(s_message), "TF 卡尚未挂载"); return; }
     const char *root = folder_root(folder);
     DIR *dir = opendir(root);
     if (!dir) { snprintf(s_message, sizeof(s_message), "目录不存在：%.60s", root); return; }
     struct dirent *entry;
+    // M 批 C① 插点：Files 进入时的同步目录扫描是 3.1s 的大头，主循环在这段里停转。
+    // 采样只折叠意图、不中断扫描（中断会留下半张列表），切页在扫描结束后由收敛窗补执行。
+    // C① hook: the synchronous entry scan is most of the 3.1s head. Sampling only folds the
+    // intent - aborting would leave a half-filled list; the switch lands after the scan.
     while (s_count < FILE_MAX && (entry = readdir(dir))) {
+        if (ctx != NULL) (void)app_nav_probe(ctx, APP_NAV_SRC_FILES);
         if (entry->d_name[0] == '.' || !strncmp(entry->d_name, "._", 2)) continue;
         file_item_t *item = &s_files[s_count];
         if (snprintf(item->path, sizeof(item->path), "%s/%s", root, entry->d_name) >= sizeof(item->path)) continue;
@@ -385,16 +493,21 @@ static void scan_folder(int folder) {
 }
 
 static void rescan_current(void) {
-    scan_folder(s_folder >= 0 ? s_folder : 3);
+    scan_folder(s_folder >= 0 ? s_folder : 3, NULL);  // C①：删除/重命名后重扫，小窗不采
 }
 
-static int count_root(int folder) {
+static int count_root(int folder, app_ctx_t *ctx) {
     if (!s_sd.mounted) return 0;
     DIR *dir = opendir(folder_root(folder));
     if (!dir) return 0;
     int count = 0;
     struct dirent *entry;
-    while ((entry = readdir(dir))) if (supported(folder, entry->d_name)) ++count;
+    // 三个根目录的计数扫描同样是同步长活（:700 三连叫），同一个插点原语。
+    // The three root counts are synchronous too (called three times at :700), same hook.
+    while ((entry = readdir(dir))) {
+        if (ctx != NULL) (void)app_nav_probe(ctx, APP_NAV_SRC_FILES);
+        if (supported(folder, entry->d_name)) ++count;
+    }
     closedir(dir);
     return count;
 }
@@ -524,7 +637,15 @@ static void storage_amount(char *text,size_t size,uint64_t bytes) {
 }
 static void storage_usage(const read_pico_sd_info_t *info,char *total,size_t total_size,char *usage,size_t usage_size) {
     storage_amount(total,total_size,info->space_valid?info->filesystem_bytes:info->capacity_bytes);
-    if (!storage_space_valid(info)) { snprintf(usage,usage_size,"空间统计暂不可用，请重新进入此页"); return; }
+    // 26.9.20 S9(b)：挂载已发布、空间还在后台算，是**正常的两步发布中间态**，
+    // 不是故障。以前这里只有一句「暂不可用，请重新进入此页」——用户会以为卡坏了。
+    // 26.9.20 S9(b): "mounted, space still being counted" is the normal midpoint of the
+    // two-step publish, not a fault. The old wording told the user to re-enter the page.
+    if (!storage_space_valid(info)) {
+        if (info->mounted && info->space_error==ESP_ERR_NOT_FINISHED) snprintf(usage,usage_size,"正在统计空间…");
+        else snprintf(usage,usage_size,"空间统计暂不可用，请重新进入此页");
+        return;
+    }
     char used[24],available[24];
     storage_amount(used,sizeof(used),info->filesystem_bytes-info->free_bytes);
     storage_amount(available,sizeof(available),info->free_bytes);
@@ -683,20 +804,22 @@ static void on_enter(app_ctx_t *ctx) {
     snprintf(s_dir, sizeof(s_dir), "/sdcard");
     s_page = 0; s_scan_pending = true;
     read_pico_sd_start_probe();
-    if (read_pico_sd_get_info(&s_sd)==ESP_OK && s_sd.mounted) {
-        (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd);
+    if (files_sd_read()==ESP_OK && s_sd.mounted) {
+        // 29 批：只有后台还在算（NOT_FINISHED）才催一次，已算过的卡不扫。
+        space_request_if_pending(); (void)files_sd_read();
     }
     s_space_poll_ms=ctx->now_ms;
     s_sd_format_confirm = false;
     s_sd_notice[0] = 0;
-    for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i);
-    if (s_folder >= 0) scan_folder(s_folder);
-    else scan_folder(3);
+    // C① 主插点（B2 验收对象）：进 Files 的同步目录扫描，3.1s 的大头就在这里。
+    for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i, ctx);
+    if (s_folder >= 0) scan_folder(s_folder, ctx);
+    else scan_folder(3, ctx);
 }
 static void on_media_lost(app_ctx_t *ctx) {
     (void)ctx; ui_keyboard_end(); s_folder = -1; s_count = 0; s_scan_pending = false;
     s_view = FILE_VIEW_LIST; s_delete_confirm = false;
-    memset(s_counts, 0, sizeof(s_counts)); read_pico_sd_get_info(&s_sd);
+    memset(s_counts, 0, sizeof(s_counts)); (void)files_sd_read();
 }
 static void on_media_ready(app_ctx_t *ctx) {
     (void)ctx;
@@ -713,22 +836,35 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
             ? rename_paint(ctx, false) : APP_REDRAW_NONE;
     }
     if (!s_scan_pending) {
+        // 26.9.20 S9(b)：空间由后台补算，界面只负责「到点看一眼、变了就重画」。
+        // 500 ms 一次，纯读缓存结构（不碰 FAT 表），所以不会把界面拖住。
+        // 26.9.20 S9(b): the space arrives from the background task; the UI only glances
+        // every 500 ms and repaints on change. It reads cached fields, never the FAT.
+        if (s_sd.mounted && !s_sd.space_valid && ctx->now_ms - s_space_poll_ms >= 500) {
+            s_space_poll_ms = ctx->now_ms;
+            read_pico_sd_info_t previous = s_sd;
+            (void)files_sd_read();
+            if (previous.space_valid != s_sd.space_valid || previous.free_bytes != s_sd.free_bytes)
+                return APP_REDRAW_PAGE;
+        }
         if (s_folder<0 && s_sd.mounted && !(ctx->touch && ctx->touch->touched) && ctx->now_ms-s_space_poll_ms>=15000) {
             s_space_poll_ms=ctx->now_ms;
             read_pico_sd_info_t previous=s_sd;
-            (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd);
+            // 29 批：15 秒这一拍也不再盲扫，只对「后台还在算」的卡催一次。
+            space_request_if_pending(); (void)files_sd_read();
             if (previous.space_valid!=s_sd.space_valid || previous.filesystem_bytes!=s_sd.filesystem_bytes || previous.free_bytes!=s_sd.free_bytes)
                 return APP_REDRAW_PAGE;
         }
         return APP_REDRAW_NONE;
     }
-    if (read_pico_sd_get_info(&s_sd) == ESP_ERR_NOT_FINISHED) return APP_REDRAW_NONE;
+    if (files_sd_read() == ESP_ERR_NOT_FINISHED) return APP_REDRAW_NONE;
     s_scan_pending = false;
-    if (s_sd.mounted) { (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd); }
+    // 29 批：进页那一拍同样只催不算。已算过的卡不再花 3 秒重扫整张 FAT。
+    if (s_sd.mounted) { space_request_if_pending(); (void)files_sd_read(); }
     s_space_poll_ms=ctx->now_ms;
-    for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i);
-    if (s_folder >= 0) scan_folder(s_folder);
-    else scan_folder(3);
+    for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i, ctx);  // C①：on_tick 重扫同一插点
+    if (s_folder >= 0) scan_folder(s_folder, ctx);
+    else scan_folder(3, ctx);
     return APP_REDRAW_PAGE;
 }
 
@@ -752,8 +888,12 @@ static void open_selected(app_ctx_t *ctx) {
 
 static void delete_selected(void) {
     char old_path[288]; copy_utf8(old_path, sizeof(old_path), s_selected.path);
+    // 先量口径再删：删完就再也数不出来了。数不到就只置脏，由预检校准。
+    file_tree_info_t tree = {0};
+    const bool sized = file_tree_inspect(old_path, &tree) == ESP_OK;
     esp_err_t err = file_tree_delete(old_path, file_deleted, NULL);
     if (err != ESP_OK) {
+        s_space_dirty = true; s_space_free = 0; s_space_total = 0;   // 可能已经删掉一部分
         s_delete_confirm = false;
         repair_deleted_directories();
         book_store_notify_changed();
@@ -765,6 +905,7 @@ static void delete_selected(void) {
     book_store_notify_changed();
     s_view = FILE_VIEW_LIST; s_delete_confirm = false;
     rescan_current();
+    space_note_write(true, sized, tree.bytes);
     snprintf(s_message, sizeof(s_message), s_selected.is_dir ? "文件夹已删除" : "文件已删除");
 }
 
@@ -834,7 +975,8 @@ static app_redraw_t action_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
             char copied[128] = {0};
             esp_err_t err = copy_selected_item(copied);
             if (err == ESP_OK) snprintf(s_message, sizeof(s_message), "已复制：%.74s", copied);
-            else snprintf(s_message, sizeof(s_message), err == ESP_ERR_NO_MEM ? "内存不足，复制失败" : "复制失败，请检查空间");
+            else snprintf(s_message, sizeof(s_message), err == ESP_ERR_NO_MEM ? "内存不足，复制失败" :
+                          err == ESP_ERR_NOT_FINISHED ? "空间统计中，请稍后再试" : "复制失败，请检查空间");
         } else if (action == 2) start_move();
         else { s_delete_confirm = true; s_message[0] = 0; }
         return ctx->request_app ? APP_REDRAW_NONE : APP_REDRAW_PAGE;
@@ -892,7 +1034,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         if (ev->y0 < 185) {
             if (strcmp(s_dir, "/sdcard")) {
                 char *slash = strrchr(s_dir, '/'); if (slash) *slash = 0;
-                scan_folder(3);
+                scan_folder(3, ctx);
             } else leave_move(false);
             return APP_REDRAW_PAGE;
         }
@@ -905,7 +1047,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         int index = s_page * visible_rows() + row;
         if (ev->y0 >= 214 && row >= 0 && row < visible_rows() && index < s_count) {
             copy_utf8(s_dir, sizeof(s_dir), s_files[index].path);
-            scan_folder(3);
+            scan_folder(3, ctx);
             return APP_REDRAW_PAGE;
         }
         return APP_REDRAW_NONE;
@@ -923,7 +1065,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         if (!long_press && ev->y0 < 185) {
             if (s_folder == 3 && strcmp(s_dir, "/sdcard")) {
                 char *slash = strrchr(s_dir, '/'); if (slash) *slash = 0;
-                scan_folder(3);
+                scan_folder(3, ctx);
             } else s_folder = -1;
             return APP_REDRAW_PAGE;
         }
@@ -942,7 +1084,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
                     snprintf(s_message, sizeof(s_message), "已设为字体目录");
                 } else snprintf(s_message, sizeof(s_message), "目录路径过长，无法设置");
             }
-            s_counts[0] = count_root(0); s_counts[2] = count_root(2);
+            s_counts[0] = count_root(0, ctx); s_counts[2] = count_root(2, ctx);
             return APP_REDRAW_PAGE;
         }
         int row = (int)(ev->y0 - 214) / 91;
@@ -958,7 +1100,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
                     snprintf(s_message, sizeof(s_message), "目录路径过长"); return APP_REDRAW_PAGE;
                 }
                 snprintf(s_dir, sizeof(s_dir), "%s", s_files[index].path);
-                scan_folder(3);
+                scan_folder(3, ctx);
                 return APP_REDRAW_PAGE;
             }
             s_selected = s_files[index];
@@ -978,6 +1120,8 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             s_sd_format_confirm = false;
             snprintf(s_sd_notice, sizeof(s_sd_notice), "正在格式化…");
             esp_err_t err = (book_cover_jobs_quiesce(2000) && ui_avatar_quiesce(2000)) ? read_pico_sd_format() : ESP_ERR_NOT_FINISHED;
+            // 29 批：格式化重写整张卷，旧的写后修正一律作废，以新真值为准。
+            s_space_dirty = false; s_space_free = 0; s_space_total = 0;
             read_pico_sd_get_info(&s_sd);
             if (err == ESP_OK) {
                 s_sd_notice[0] = 0;
@@ -1022,7 +1166,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             if (s_files[index].is_dir) {
                 s_folder = 3;
                 copy_utf8(s_dir, sizeof(s_dir), s_files[index].path);
-                scan_folder(3);
+                scan_folder(3, ctx);
                 return APP_REDRAW_PAGE;
             }
             s_selected = s_files[index];
@@ -1043,7 +1187,7 @@ static app_redraw_t on_key(app_ctx_t *ctx, int key) {
     if (s_folder >= 0) {
         if (s_folder == 3 && strcmp(s_dir, "/sdcard")) {
             char *slash = strrchr(s_dir, '/'); if (slash) *slash = 0;
-            scan_folder(3);
+            scan_folder(3, ctx);
         } else s_folder = -1;
         return APP_REDRAW_PAGE;
     }

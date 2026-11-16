@@ -28,16 +28,29 @@ ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'main' / 'book' / 'book_layout.c'
 
 # 共享内联函数：两个孪生循环都必须调用。/ Shared inline helpers both twin loops must call.
-HELPERS = [
+COMMON_HELPERS = [
     'advance_after_image(',
     'line_leading(',
     'line_fits(',
     'line_origin_x(',
     'line_is_final(',
     'line_is_justified(',
-    'justify_target_px(',
     'advance_after_line(',
 ]
+
+# 右边界这一段两边走的是**同一个函数的两条入口**，不是同一个名字：
+#   · draw_page 取 `line_ink_width()`（它要的是着墨宽度，反色底也用它）；
+#   · hit_test  取 `justify_target_px()`（它要的是字距调整的 target）。
+# 26.9.12 把绘制侧统一到 line_ink_width 之后，写死「两边都必须出现 justify_target_px(」
+# 就不再成立——而这条断言当时没人跑（脚本在门禁外），红了很久没人知道。
+# `line_ink_width()` 内部必须仍调用 `justify_target_px()`：只断了这一层，两个循环体看
+# 起来一个字都没变，右边界却已经开始各算各的。下面 INDIRECT 就是咬这一层。
+DRAW_ONLY = ['line_ink_width(']
+HIT_ONLY = ['justify_target_px(']
+# (helper 定义名, 它体内必须出现的调用)
+# (definition name, the call its body must still contain)
+INDIRECT = [('line_ink_width', 'justify_target_px(')]
+HELPERS = COMMON_HELPERS + DRAW_ONLY + HIT_ONLY
 
 # 曾经被手抄进两个循环、现在必须只存在于 helper 定义里的原始算术。
 # Raw arithmetic that used to be hand-copied into both loops and must now live only in the helpers.
@@ -91,7 +104,8 @@ def main() -> int:
     failures = []
     for signature, body in bodies.items():
         name = signature.split('(')[0].split()[-1]
-        for helper in HELPERS:
+        required = COMMON_HELPERS + (DRAW_ONLY if name == 'book_layout_draw_page' else HIT_ONLY)
+        for helper in required:
             if helper not in body:
                 failures.append(f'{name}: does not call {helper[:-1]}()')
         for needle, label in FORBIDDEN:
@@ -105,12 +119,24 @@ def main() -> int:
         if defined != 1:
             failures.append(f'{name}(): expected exactly one definition, found {defined}')
 
+    # 间接那一层：draw 侧的着墨宽度必须仍然是 justify_target_px 的调用者。
+    # The indirect link: drawing's ink width must still be a caller of justify_target_px.
+    for name, must_call in INDIRECT:
+        body = function_body(text, f'static inline int {name}(')
+        if not body:
+            failures.append(f'{name}(): missing definition, so the indirect link cannot be judged')
+        elif must_call not in body:
+            failures.append(f'{name}() no longer delegates to {must_call[:-1]}(): draw and hit '
+                            f'would then compute the right edge separately')
+
     if failures:
         for line in failures:
             print('  FAIL ' + line)
         print('book_layout_twin_host_test: FAIL')
         return 1
-    print(f'PASS: {len(HELPERS)} shared helpers used by both twins, '
+    print(f'PASS: {len(COMMON_HELPERS)} shared helpers used by both twins, '
+          f'{len(DRAW_ONLY)}+{len(HIT_ONLY)} entry points for the right edge (line_ink_width '
+          f'still delegates to justify_target_px), '
           f'{len(FORBIDDEN)} hand-copied expressions absent from both loops')
     return 0
 

@@ -38,16 +38,26 @@ bool ui_font_has_text(const char *text) {
 int ui_font_text_width_px(int px, const char *text) { return characters(text) * px / 2; }
 int ui_font_title_px(int px, const char *text) { return strchr(text, 'Z') ? 24 : px; }
 int ttf_text_width_px(int px, const char *text) { return characters(text) * px * 3 / 4; }
+/* gen26.6 装行轮在 ui_kit 里新增了逐码位调用；测试桩与 text_width 同口径（每字 3/4），
+ * covered 恒真——缺字回退路径另有专门测试覆盖。/ gen26.6 added per-codepoint calls in
+ * ui_kit; the shims share text_width's per-char measure, and covered is always true -
+ * the missing-glyph fallback path has its own dedicated tests. */
+int ttf_codepoint_advance_px(int px, uint32_t codepoint) {
+    (void)codepoint;
+    return px * 3 / 4;
+}
+bool ttf_codepoint_covered(uint32_t codepoint) { return codepoint >= 32; }
 void ui_font_measure_line_px(int px, const char *text, int *above, int *below) {
     (void)text; *above = px * 3 / 4; *below = px / 4;
 }
 void ttf_measure_line_px(int px, const char *text, int *above, int *below) {
     (void)text; *above = px * 2 / 3; *below = px / 3;
 }
-void ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
-                          enum EpdFontFlags align, uint8_t fg, uint8_t bg, bool bw) {
-    (void)fb; (void)x; (void)px; (void)text; (void)align; (void)fg; (void)bg; (void)bw;
+int ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
+                         enum EpdFontFlags align, uint8_t fg, uint8_t bg, bool bw) {
+    (void)fb; (void)px; (void)text; (void)align; (void)fg; (void)bg; (void)bw;
     painted_ttf = false; painted_baseline = baseline;
+    return x;
 }
 void ttf_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
                       enum EpdFontFlags align, uint8_t fg, uint8_t bg) {
@@ -214,3 +224,8 @@ int main(void) {
     test_native_titles();
     puts("ui kit host tests passed");
 }
+
+// 替身字体没有 GPOS kern：返回 0 就是 [124] 细则 1 的静默降级路径。
+int ttf_kern_px(int px, uint32_t a, uint32_t b) { (void)px; (void)a; (void)b; return 0; }
+bool app_typography_enhanced(void) { return true; }  /* 宿主替身：增强态（排版开关批的默认态） */
+

@@ -58,6 +58,9 @@ static uint32_t s_page_images_generation;
 static size_t s_page,s_chapter=3,s_image_count;
 static char **s_images;
 static bool hidden,locked;
+/* 31b B′：prepare_inline_image / turn_page 的掉盘闸在本用例恒关（桩）。 */
+static bool s_media_offline;
+static void reader_offline_refuse(void){}
 static int alloc_fail_after=-1,read_failure=-1,decode_failure=-1;
 static unsigned reads,decodes,pixels,notices,invalidations;
 static int reading_image;
@@ -119,7 +122,7 @@ static esp_err_t book_chapter_image(size_t chapter,const char *path,uint8_t **ou
 static bool book_image_dimensions(const uint8_t *data,size_t len,bool png,unsigned *w,unsigned *h){
  (void)png;assert(data&&len==1);*w=60;*h=20;return true;
 }
-static bool book_image_grayscale(const uint8_t *data,size_t len,bool png,unsigned w,unsigned h,uint8_t *gray){
+static bool book_image_grayscale(const uint8_t *data,size_t len,bool png,unsigned w,unsigned h,uint8_t *gray,unsigned max_out_bytes){(void)max_out_bytes;
  (void)png;assert(data&&len==1&&w&&h&&gray);++decodes;
  if(reading_image==decode_failure)return false;
  memset(gray,128,(size_t)w*h);return true;

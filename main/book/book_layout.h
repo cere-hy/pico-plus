@@ -103,6 +103,23 @@ size_t book_layout_page_for_offset(size_t off);
 /// 点词定位：把页面内坐标扩成原文字节单词区间；须持调用方绘制锁（与 draw_page 共享行缓冲）。
 /// Hit-test a page coordinate into a source byte word; caller holds the font draw lock.
 bool book_layout_hit_test(size_t page, int x, int y, size_t* word_start, size_t* word_end);
+
+/// 框选反色区间：下一次 draw_page 时，凡与本区间相交的行先铺黑底、再用白字重画。
+/// 传 [a, b) 且 b > a 开启，传相同值或反序关闭。反色只发生在 draw_page 内部同一次
+/// 排版游走里——矩形与文字必然对齐，不存在第二份行几何可漂移。
+/// Invert range for box selection: on the next draw_page, every line intersecting the
+/// range is filled black and redrawn in white. Enabled by [a, b) with b > a; equal or
+/// reversed values disable it. Inversion happens inside draw_page's own single walk, so
+/// the rectangle and the glyphs cannot drift apart — there is no second copy of the line
+/// geometry.
+void book_layout_set_invert_range(size_t off_a, size_t off_b);
+
+/// 取走上一次 draw_page 的反色脏矩形并清零；没有反色行时返回 false。
+/// 用于只推这一段屏幕，避免整屏刷新。竖排未实现反色，恒为 false。
+/// Take the inverted dirty rect of the last draw_page and clear it; false when no line
+/// was inverted. Callers push only that region instead of a full refresh. Vertical
+/// setting has no inversion and always returns false.
+bool book_layout_take_invert_dirty(EpdRect* out);
 /// 返回页首原文字节偏移；越界页返回文本长度。/ Return source byte offset at page start; invalid pages return text length.
 size_t book_layout_page_start_offset(size_t page);
 

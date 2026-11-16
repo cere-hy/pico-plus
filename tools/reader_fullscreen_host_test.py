@@ -32,14 +32,20 @@ static void *s_blocks;
 static int s_px=48,s_reader_panel=READER_PANEL_NONE,s_reader_slider=-1,s_view=READING;
 #define s_toolbar (s_reader_panel!=READER_PANEL_NONE)
 static bool s_reader_fullscreen,s_clear_confirm,s_reader_text_frame,s_reader_turn_pending;
+/* 26.11.6：四层刷新的两个新静态量（T3 的触发与「上一帧有图」记录）。 */
+static bool s_reader_clear_from_image,s_reader_frame_had_image;
+/* 26.11.7 S2：页码前进的标记（计数已搬进 present，本 harness 不切 present）。 */
+static bool s_reader_page_advance;
 static bool s_water_turn_pending,s_reader_cleanup,draw_locked,load_failed;
 static int s_water_turn_dir;
 static unsigned s_stats_pending_turns,s_session_turns,s_turns,s_unsaved;
 static int64_t s_last_turn_ms,s_stats_activity_ms;
 static bool s_save_failed;
+/* 31b B′：turn_page 的掉盘闸在这个 harness 里不参与用例（恒 false + 空桩）。
+   抽取式 harness 的符号面也是"抽层必核"的一处，漏了就是整颗牙编不出来。 */
+static bool s_media_offline;
 static char s_message[128];
 static unsigned layout_span=100,reflows,paints,saves,failed_reflows;
-static uint8_t full_pages;
 static const char *app_settings_book_background_path(void){return "";}
 static void copy_text(char *to,size_t cap,const char *from){snprintf(to,cap,"%s",from);}
 static void lock_draw(void){assert(!draw_locked);draw_locked=true;}
@@ -84,7 +90,7 @@ static size_t book_chapter_count(void){return 2;}
 static bool load_chapter(app_ctx_t *ctx,size_t chapter,int off,bool last){(void)ctx;(void)off;if(load_failed)return false;s_chapter=chapter;s_page=last?book_layout_page_count()-1:0;return true;}
 static void set_reader_view(int view){s_view=view;}
 static void skip_hidden_image_pages(app_ctx_t *ctx,int dir){(void)ctx;(void)dir;}
-static uint8_t app_settings_reader_full_pages(void){return full_pages;}
+static void reader_offline_refuse(void){}
 static int effect=1;
 static int app_settings_reader_turn_effect(void){return effect;}
 static int test_images;
@@ -123,8 +129,10 @@ static void reset(bool full,bool tools,size_t page,size_t chapter){
  s_text="text";s_view=READING;s_reader_fullscreen=full;layout_span=full?150:100;s_page=page;s_chapter=chapter;
  s_reader_panel=tools?READER_PANEL_TOOLS:READER_PANEL_NONE;s_reader_slider=2;
  reflows=paints=saves=s_stats_pending_turns=s_session_turns=s_turns=s_unsaved=0;
- failed_reflows=0;load_failed=false;full_pages=0;s_reader_text_frame=true;
+ failed_reflows=0;load_failed=false;s_reader_text_frame=true;
  s_reader_turn_pending=s_water_turn_pending=s_reader_cleanup=false;s_jump_offset=0;
+ s_reader_page_advance=false;
+ s_reader_clear_from_image=s_reader_frame_had_image=false;
 }
 int main(void){
  app_ctx_t ctx={.now_ms=1000};
@@ -160,8 +168,12 @@ int main(void){
  // 普通文字恢复正式版的翻页与周期清屏标志。/ Restore release text-turn and periodic-cleanup state.
  effect=0;
  for(int tools=0;tools<2;++tools)for(int full=0;full<2;++full)for(int prior=0;prior<2;++prior){
-  reset(full,tools,2,0);s_reader_text_frame=prior;full_pages=5;s_turns=4;
-  assert(turn_page(&ctx,1)!=APP_REDRAW_NONE&&!s_water_turn_pending&&s_reader_cleanup);
+  reset(full,tools,2,0);s_reader_text_frame=prior;s_turns=4;
+  // 26.11.7 S2：turn_page 不再自己清底，只置「这一拍是页码前进」；清底与否由 present 判定
+  //（宿主真值表覆盖那条）。这里咬的是标记，不是结果。
+  // 26.11.7 S2: turn_page only marks the advance; present decides cleanup (covered by the
+  // truth table). This asserts the flag, not the outcome.
+  assert(turn_page(&ctx,1)!=APP_REDRAW_NONE&&!s_water_turn_pending&&s_reader_page_advance&&!s_reader_cleanup);
  }
  reset(true,false,2,0);test_images=1;assert(turn_page(&ctx,1)==APP_REDRAW_AREA);
  test_images=0;effect=1;

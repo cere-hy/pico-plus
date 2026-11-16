@@ -75,6 +75,39 @@ int main(int argc, char **argv) {
     assert(book_open("/tmp/missing.epub") == ESP_ERR_NOT_FOUND);
     assert(book_open("/tmp/missing.unknown") == ESP_ERR_NOT_SUPPORTED);
     assert(book_chapter_count() == 0);
+    // ---- 26.11.1 真机「插卡被踢回书架」的最小可复现单元 -------------------
+    // 掉盘时 `book_enter_offline()` 调 `book_close()`（句柄不能跨卷卸载存活）；
+    // 插回后若直接 `load_chapter()` 而不重开，这里第一步就是真机那条失败签名。
+    // 这三条断言钉住的是**依赖的真实行为**，不是 app 层写法——删掉
+    // `book_leave_offline()` 里的 `book_open()`，真机就重现。
+    {
+        const char *t = "Chapter 1 Start\nhello\nChapter 2 End\nworld\n";
+        write_bytes(t, strlen(t));
+        assert(book_open(path) == ESP_OK);
+        const size_t chapters = book_chapter_count();
+        const uint32_t bytes = book_total_bytes();
+        assert(chapters == 2 && bytes == strlen(t));
+        book_close();                       // = 掉盘：book_enter_offline() 那一次
+        out = NULL; len = 0;
+        // 牙①：不重开必 INVALID_ARG（`!s_book.file` 分支）——真机日志同码
+        assert(book_chapter_load(0, &out, &len) == ESP_ERR_INVALID_ARG);
+        assert(out == NULL && len == 0);
+        assert(book_open(path) == ESP_OK);  // = 插回：book_leave_offline() 新增的那一步
+        // 牙②：同一本书 → 章节数与总字节不变，锚点（章内偏移）仍然有效
+        assert(book_chapter_count() == chapters);
+        assert(book_total_bytes() == bytes);
+        // 牙③：重开后同章可加载，且字节偏移语义不变（锚点能落回原处）
+        assert(book_chapter_load(0, &out, &len) == ESP_OK);
+        assert(len == 22 && !memcmp(out, t, len)); free(out);
+        book_close();
+        // 牙④：换了一张卡（内容不同）→ 章节数或总字节变化，`same_book` 必须为假，
+        // 锚点作废、回章首。这里只验「判据的输入确实会变」，判据本身在 app 层。
+        const char *other = "Chapter 1\nonly\n";
+        write_bytes(other, strlen(other));
+        assert(book_open(path) == ESP_OK);
+        assert(book_chapter_count() != chapters || book_total_bytes() != bytes);
+        book_close();
+    }
     for (int a = 1; a < argc; ++a) {
         assert(book_open(argv[a]) == ESP_OK); assert(book_chapter_count() > 0);
         bool epub = strstr(argv[a], ".epub") != NULL;

@@ -1,0 +1,129 @@
+menu "Read Pico application options"
+
+config BOOK_PREP_STACK_PSRAM
+    bool "Put the book_prep task stack in PSRAM (26.9.13 P0-a, shipped in 26.9.19)"
+    default y
+    depends on SPIRAM
+    help
+        把 book_prep（翻页预排）的任务栈从内部 DRAM 搬到 PSRAM。
+
+        背景：26.9.12 真机日志实测，开书瞬间内部最大连续块从 21,504 掉到 14,336
+        （差 7,168 = 6,144 栈 + 1,024 TCB 及对齐），关书后栈已归还但块再也合并不回去，
+        于是整代会话都过不了 BLE 的 20 K 闸门——只有重启能复位。26.9.13 P0-d 的取证
+        已经把这个推断写进日志口径，这一项是把推断变成对照实验的开关。
+
+        **26.9.19 起默认开启**（审计裁定，推翻 26.9.13「永不启用」）。原因不是推断变了，
+        是证据到了：26.9.18 真机的 boot-post 块表证明这 6,144 B 后面紧跟着一个 100 B 的
+        常驻块，关书归还后**不能与后面 13,632 B 的空闲块合并**，于是 largest 永远停在
+        13,312 < 面板红线 15,360，用户看到的是「内存不足，请重启」——而重启再开一次书
+        就回到原样。6,144 B 的常驻块只用得到 2,788 B（45%）。
+
+        真机判据（26.9.19 测试端）：
+          - 开机 → 开词典 → 开书 → 关书，`book: open start ... largest=` 应从 13,312 回到
+            **19,456 左右**（整整多出这 6,144），内存面板不再报红；
+          - 注意 19,456 仍低于 BLE 闸门 20,480：闸门放行是 26.9.20 的活（还要再归因两笔
+            各 1,024 B），本开关只负责这 6,144；
+          - 阅读 + 翻页 + 开蓝牙的整条链路不崩。
+
+        **回滚条件**：若真机在 cache 关闭窗口（NVS 提交 / OTA 写 flash）出现崩溃，
+        立刻回滚本开关，改走 26.9.19 方案里的 (b)：BOOK_PREP_STACK_SZ 6144 → 3584。
+
+        前提与代价（写在 app_book.c 的调用点）：
+          - prep 不是每帧热路径，是翻页预排，一次几十到几百毫秒，延迟可接受；
+          - 它的重缓冲（字体 working 区、预取页位图）本来就在 PSRAM；
+          - 真正的风险是 cache 关闭窗口（NVS 提交 / OTA 写 flash）。prep 自身不碰
+            这两类 API（已逐条核对），且 flash 操作期间调度器不会切进 PSRAM 栈任务。
+
+        Put book_prep's task stack in PSRAM instead of internal DRAM.
+        Measured on hardware: opening a book drops the internal largest block from
+        21,504 to 14,336 (7,168 = 6,144 stack + 1,024 TCB/alignment) and closing never
+        merges it back, so the BLE 20 K gate fails for the rest of the boot.
+
+        DEFAULT ON since 26.9.19. The 26.9.18 boot-post block table showed why the hole
+        never merges: a permanent 100-byte block sits right behind the 6,144-byte stack,
+        so the returned stack cannot join the 13,632-byte free block behind it. largest
+        therefore sticks at 13,312, below the panel's 15,360 red line, and the unit keeps
+        telling the user to reboot - which does not help. The stack's peak use is 2,788 B.
+        Roll back to (b) shrink-to-3,584 if a cache-off window ever crashes on hardware.
+
+config CLOCK_OFFLINE_AUTO_SYNC
+    bool "Let the idle clock poll open a temporary radio link when offline (26.9.14 A1)"
+    default n
+    help
+        允许「空闲对时」在**没有在线网络**时自行拉起一条临时 WiFi 链路去连已保存的
+        热点。默认关闭。
+
+        背景（26.9.13 真机日志，gen26.9.13.txt）：开机 16,301 ms 处 esp_wifi_init，
+        31,405 ms 处超时 teardown，中间正好 15,104 ms。这一次 init/deinit 把一个
+        32,767 B 的内部堆池切成 5 段（30,935 B 空闲、最大块只剩 18,432 B、11 个约
+        96 B 的残块），此后整个开机周期内 BLE 的「20 K 连续块」闸门再也过不了——
+        「开过书就再也开不了蓝牙」的真身其实是「开机 16 秒后」。
+        同一份日志内部可复现：WiFi 在跑时 largest=19,456，teardown 之后 18,432。
+
+        关掉它之后，无网场景的校时由**蓝牙校时**（push_sink 收到手机时间）承担，
+        在线场景由 sync_time_online_impl 承担；用户仍可在设置页手动校准（那条路
+        保留临时射频通路，因为它是显式请求）。
+
+        Let the idle clock poll bring up a temporary radio link while offline. Default
+        OFF: the 26.9.13 field log shows one 15.1 s esp_wifi_init/deinit cycle chopping a
+        32 KB internal pool into five fragments (18,432 B largest, 11 ~96 B remnants),
+        after which the BLE 20 K gate can never pass again. BLE time sync and the online
+        path cover calibration; manual calibration keeps its radio path.
+
+config PICO_BOOTBB
+    bool "Arm the boot blackbox (26.9.15 B1, ON by default since 26.9.18)"
+    default y
+    depends on SPIRAM
+    help
+        在 `app_main` 里启动开机黑匣子：每 50 ms 采一次内部堆水位，只在数值变化时
+        落点，缓冲放 PSRAM，等 USB 主机连上再以 `[DELAYED-BOOT]` 前缀分批吐出。
+        除堆水位外还记两类**非堆事件**：`poll_media` 的 SD 状态四元组、以及
+        `mount_card()` 的三段时刻（进入 / 进 VFS 挂载 / 返回）与挂载后的空间统计。
+
+        容量（26.9.20 S11）：**512 点 + 64 事件**（PSRAM 8.5 KB，池 A 零字节）。
+        26.9.19 的 128 点在 t=172.6 s 写满，此后 300 秒的数据全丢——正好是第二次
+        开书、蓝牙、第三轮拔插的窗口。关键事件（`sd-stage` / `sd-space`）在环满时
+        可以挤掉一条**还没吐出去**的普通事件，挤掉的次数会打印出来。
+        吐点分块（每次最多 64 行），否则 512 行一次倒出来会把主循环按住好几秒。
+
+        **26.9.18 起默认打开。** 这个开关的历史值得留着：26.9.15 把它插在 `app_main`
+        的第一条语句（早于 `usb_storage_phy_init()`），真机结果是 **TF 卡完全不挂载**
+        （`books=7 roots=2` → `books=0 roots=1`，`dict opendir errno=2`，池 A 的
+        alloc_blocks 从 14 掉到 11）。26.9.16 把它挪到 PHY 交还之后并改成默认 n，用
+        「关掉它卡就回来」把因果关系钉死——        26.9.17 真机验证成立（三轮热插拔全恢复）。
+        26.9.18 因诊断需要重新打开，**位置约束一条都没放松**。
+
+        打开它的必要条件（`tools/check_boot_order.py` 会检查）：
+          - `pico_bootbb_start()` 必须排在 `usb_storage_phy_init()` **之后**；
+          - 调用点必须被 `#if CONFIG_PICO_BOOTBB` 包住；
+          - 缓冲必须来自 `MALLOC_CAP_SPIRAM`，拿不到就整体禁用，不许降级。
+
+        ON by default since 26.9.18. The history is worth keeping: 26.9.15 called it as
+        the very first statement of app_main (before usb_storage_phy_init()) and the field
+        unit stopped mounting the TF card entirely - books 7 -> 0, ENOENT for /sdcard, pool
+        A's alloc_blocks 14 -> 11. 26.9.16 moved it after the PHY hand-back and defaulted
+        the switch to n, so "turn it off and the card comes back" pinned the causality; the
+        26.9.17 field run confirmed it across three hot-plug cycles. 26.9.18 turns it back
+        on for diagnosis and relaxes NONE of the ordering rules above.
+
+config PICO_EXCERPT_AI_SEND
+    bool "Send box-selected excerpts to the phone for AI analysis (0x1A bit2, M5-A S26-3)"
+    default n
+    help
+        框选动作栏的「AI解析」是否真的上行一条 0x1A（payload 同 M3 情景帧，新增
+        bit2 = FLAG_EXCERPT，word 为选区首词、ctx 为选区全文）。
+
+        **默认 n，且这不是保守，是协议状态的真实写照**：bit2 的 APK 侧分流尚未联调，
+        登记簿 `docs/PROTOCOL.md` 里「联调日期 / APK 版本」两格还空着。开关为 n 时
+        按钮画成**置灰不可点**，点它既不退框选也不发帧——置灰是唯一不会撒谎的形态
+        （可点 + 「未开放」的提示等于承诺了一个按下就有的反应）。
+
+        要把它改成 y，必须先补凭证：`docs/PROTOCOL.md` 的 bit2 行填上真实联调日期
+        （YYYY-MM-DD）与 APK 版本（vX.Y.Z），否则 `tools/check_excerpt.py` 的 B33
+        会强制 FAIL，把开关挡回去。这道锁不删、只退役。
+
+        Send the box-selected excerpt as one 0x1A request with bit2 set. Default n because
+        the APK-side branch is not interop-tested yet; while n the button is drawn greyed
+        and taps are not consumed. Flipping to y requires real credentials in
+        docs/PROTOCOL.md, enforced by tooth B33.
+endmenu

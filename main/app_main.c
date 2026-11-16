@@ -16,6 +16,7 @@
 #include <sys/time.h>
 
 #include "app_loop.h"
+#include "esp_app_desc.h" // 26.9.6：启动自证版本串（esp_app_get_description()->version）
 #include "app_content_open.h"
 #include "boot_state.h"
 #include "book_store.h"
@@ -37,6 +38,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "read_pico_board.h"
 #include "read_pico_crashlog.h"
+#include "pico_bootbb.h" // 26.9.15 B1：开机黑匣子（必须最先启动）
 #include "read_pico_init.h"
 #include "read_pico_pmu.h"
 #include "read_pico_pmu_protocol.h"
@@ -118,6 +120,47 @@ void app_main(void) {
     // Reclaim Serial/JTAG after a reset during card sharing, then clear the served BOOT request.
     usb_storage_phy_init();
     REG_CLR_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+
+    // 26.9.16 R1：黑匣子**必须**排在 PHY 交还之后，而且必须挂在开关后面。
+    //
+    // 26.9.15 把它放在 app_main 的第一条语句，真机结果是 **TF 卡完全不挂载**：
+    // books 7→0、dict opendir errno=2（ENOENT，/sdcard 不存在）、池 A 的 alloc_blocks
+    // 从 14 掉到 11——挂载成功会留下三个块，一个都没建，说明 SD 根本没进初始化流程。
+    // 用户插拔一次卡书库就回来了，因为 observe_media_locked() 的 inserted 分支会把
+    // probe_state 重置、把探测唤醒。
+    //
+    // 当时写在这里的理由是「早于 fw:，是目前能拿到的最早时刻」。这个理由不值一条卡命：
+    // PHY 交还只动寄存器、没有任何堆分配，挪后几十毫秒丢掉的只是时间轴起点，
+    // 不是任何一个采样点。
+    //
+    // 26.9.16 R1: the blackbox MUST sit after the PHY hand-back and MUST be behind the
+    // switch. 26.9.15 called it as the first statement of app_main and the field unit
+    // stopped mounting the TF card entirely: books 7 -> 0, opendir errno=2 (ENOENT, no
+    // /sdcard), and pool A's alloc_blocks fell 14 -> 11 - a successful mount leaves three
+    // blocks behind, none existed, so SD never entered the init path. Re-seating the card
+    // brought the shelf back, because observe_media_locked()'s `inserted` branch resets
+    // probe_state and wakes the probe. The old rationale ("earlier than `fw:`, the
+    // earliest instant reachable") is not worth a dead card slot: the PHY hand-back only
+    // touches registers and allocates nothing, so moving it later costs the time origin,
+    // not a single sample.
+#if CONFIG_PICO_BOOTBB
+    pico_bootbb_start();
+#endif
+
+    // 26.9.6 · 固件自证版本串（审计裁定③：**每版必修**，与 APK 的 0x09 装锚对齐）。
+    // 由来：PROJECT_VER 此前只存在于 CMakeLists.txt，固件运行期没有任何一处打印它，
+    // 于是 round-3 复验无法区分「26.9.5 在跑但修复无效」与「26.9.4-r2 还在跑」——
+    // 两者在日志上行为完全一致，严谨结论只能停在「未改善、不可归因」。从此每一轮
+    // 复验的第一条判据都是这行串，先证明基线、再谈行为。
+    // 26.9.6 - the firmware states its own version (adjudication 3: mandatory for every
+    // release, mirroring the APK's 0x09 install anchor). PROJECT_VER used to exist only
+    // in CMakeLists.txt with nothing printing it at runtime, so the round-3
+    // re-verification could not tell "26.9.5 is running but the repair does not work"
+    // from "26.9.4-r2 is still running" - both look identical in the log, and the honest
+    // verdict could only be "no improvement, not attributable". From now on the first
+    // acceptance item of every round is this line: prove the baseline before reading
+    // any behaviour.
+    ESP_LOGI(TAG, "fw: %s", esp_app_get_description()->version);
 
     const esp_reset_reason_t reset = esp_reset_reason();
     ESP_LOGI(TAG, "startup reset=%d stack=%u", (int)reset, (unsigned)uxTaskGetStackHighWaterMark(NULL));

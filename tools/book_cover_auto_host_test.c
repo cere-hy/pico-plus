@@ -37,10 +37,11 @@ static void glyph_rect(uint8_t *fb, int x, int baseline, int px, const char *tex
                 else *at = (*at & 0xf0) | fg;
             }
 }
-void ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
-                          enum EpdFontFlags align, uint8_t fg, uint8_t bg, bool black_white) {
+int ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
+                         enum EpdFontFlags align, uint8_t fg, uint8_t bg, bool black_white) {
     (void)bg; (void)black_white;
     glyph_rect(fb, x, baseline, px, text, align, fg);
+    return x; // 桩不建模 advance；真实笔位由门 1 断言
 }
 void ttf_draw_text_px(uint8_t *fb, int x, int baseline, int px, const char *text,
                       enum EpdFontFlags align, uint8_t fg, uint8_t bg) {
@@ -95,3 +96,8 @@ int main(void) {
     puts("automatic cover templates: OK");
     return 0;
 }
+
+// 替身字体没有 GPOS kern：返回 0 就是 [124] 细则 1 的静默降级路径。
+int ttf_kern_px(int px, uint32_t a, uint32_t b) { (void)px; (void)a; (void)b; return 0; }
+bool app_typography_enhanced(void) { return true; }  /* 宿主替身：增强态（排版开关批的默认态） */
+

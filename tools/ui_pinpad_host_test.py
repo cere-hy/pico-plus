@@ -91,7 +91,7 @@ void ui_draw_icon(uint8_t* framebuffer, int cx, int cy, int size, ui_icon_t icon
  unit+=r'''
 int ui_font_title_px(int n,const char *v){(void)v;return n;}
 void ui_font_measure_line_px(int n,const char *v,int *a,int *b){(void)v;*a=n;*b=0;}
-void ui_font_draw_text_px(uint8_t *f,int x,int y,int n,const char *v,enum EpdFontFlags a,uint8_t fg,uint8_t bg,bool bw){(void)f;(void)x;(void)y;(void)n;(void)v;(void)a;(void)bw;assert(fg<16&&bg<16);++fallbacks;}
+int ui_font_draw_text_px(uint8_t *f,int x,int y,int n,const char *v,enum EpdFontFlags a,uint8_t fg,uint8_t bg,bool bw){(void)f;(void)y;(void)n;(void)v;(void)a;(void)bw;assert(fg<16&&bg<16);++fallbacks;return x;}
 #define free host_free
 #include "ui_pinpad.c"
 #undef free

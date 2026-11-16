@@ -24,5 +24,5 @@ gcc "${flags[@]}" -Itools/transfer_ui_stubs -Icomponents/read_pico_transfer/incl
     -Icomponents/read_pico_search/include -Imain/ui -Icomponents/ble_page_turner/include \
     tools/transfer_ui_host_test.c main/ui/ui_text_edit.c main/ui/ui_text_input.c \
     main/ui/ui_keyboard.c main/ui/ui_ime.c components/read_pico_search/read_pico_search.c \
-    -o build/book-tests/transfer-ui
+    main/apps/transfer_commit.c -o build/book-tests/transfer-ui
 build/book-tests/transfer-ui

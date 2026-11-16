@@ -7,5 +7,5 @@ mkdir -p build/book-tests
 cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
    -Itools/app_loop_stubs -Imain -Imain/app -Imain/apps -Imain/ui \
    -Icomponents/push_sink/include -Icomponents/ble_page_turner/include \
-   -o build/book-tests/ai_reader tools/ai_reader_host_test.c
+   -o build/book-tests/ai_reader tools/ai_reader_host_test.c main/apps/scene_req.c
 ./build/book-tests/ai_reader

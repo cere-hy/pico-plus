@@ -45,6 +45,16 @@
 static int rec_title_x, rec_title_cy, rec_title_px, rec_title_fit_w;
 static int rec_counter_x, rec_counter_cy, rec_tag_cy, rec_foot_x_l, rec_foot_x_r, rec_foot_cy;
 static int rec_hairline_body_y, rec_hairline_foot_y, rec_hairline_x, rec_hairline_w;
+// M3-B：引用条记录（底带的 y/高/灰阶、左侧竖条的 x/y）。/ M3-B quote-strip recorders.
+static int rec_quote_band_y = -1, rec_quote_band_h = 0, rec_quote_band_gray = -1;
+static int rec_quote_bar_x = -1, rec_quote_bar_y = -1;
+// M3-B 渲染修复：目标词黑底方块 + 反色/普通文字计数（见 gen26.9.1 账本——
+// 黑底黑字曾经在 42 项全绿下漏出，因为桩不建模颜色）。
+// M3-B render fix: the target word's black box plus inverted/plain counters (see
+// the gen26.9.1 ledger - black-on-black slipped past 42 green checks because the
+// stubs did not model colour).
+static int rec_quote_word_box, rec_quote_word_box_w, rec_quote_word_box_h, rec_quote_word_box_y = -1;
+static int rec_quote_inv_calls, rec_quote_plain_calls;
 static int rec_fit_calls;
 // gen26.6.3：正文行（ui_text_fixed）的字号/行距/起点，以及页脚左段文本——
 // 「正文与词卡同族 36/46」与「页脚左段必须让位」两条断言要靠它们。
@@ -72,7 +82,15 @@ void ui_text_fixed(uint8_t* fb, int x, int y_top, int px, const char* text,
 }
 void ui_text_fixed_vc(uint8_t* fb, int x, int center_y, int px, const char* text,
                       enum EpdFontFlags align, bool inverted) {
-    (void)fb; (void)px; (void)align; (void)inverted;
+    (void)fb; (void)align;
+    // 引用条是唯一的固定 22px 用户：按 px==22 归集，页脚 24px / 标题其它字号
+    // 不会混进来。反色与普通两路都计数，才能挡住「全反色 / 全不反色」。
+    // The quote strip is the only fixed-22px user; bucket by px==22 so the 24px
+    // footer never pollutes it. Counting both paths catches "all inverted" and
+    // "none inverted".
+    if (px == 22) {
+        if (inverted) ++rec_quote_inv_calls; else ++rec_quote_plain_calls;
+    }
     if (text && strcmp(text, "AI 详解") == 0) {
         rec_tag_cy = center_y;                 // 标签行 / the tag row
     } else if (text && strncmp(text, "摘自", 4) == 0) {
@@ -103,6 +121,27 @@ void ui_hairline(uint8_t* fb, int y, int x, int w, uint8_t color) {
     (void)fb; (void)color;
     if (y < 400) rec_hairline_body_y = y; else rec_hairline_foot_y = y;
     rec_hairline_x = x; rec_hairline_w = w;
+}
+void ui_fill_rect_fast(EpdRect rect, uint8_t gray, uint8_t* fb) {
+    (void)fb;
+    // 记录引用条底/竖条/目标词黑底，供断言。/ Record the wash, bar and word box.
+    // 按几何+灰度区分：底带整屏宽且高 96；竖条 4px；目标词黑底是灰 0x00 的小方块。
+    // 必须先判底带再判词块——词块高≈px+8 若落进旧的 height>20 分支，会把底带
+    // 记录覆盖掉（与「chip 1px 边框覆盖竖条」同族的桩记录覆盖事故）。
+    // Distinguished by geometry+gray: the wash is 96px tall; the bar is 4px; the
+    // word box is a small 0x00 block. Band must be tested before the box - a box
+    // (~px+8 tall) falling into the old height>20 branch would overwrite the band
+    // record (same recorder-overwrite family as the chip-border incident).
+    if (rect.width == 4) {
+        rec_quote_bar_x = rect.x; rec_quote_bar_y = rect.y;
+    } else if (rect.height >= 90) {
+        rec_quote_band_y = rect.y; rec_quote_band_h = rect.height; rec_quote_band_gray = gray;
+    } else if (gray == 0x00 && rect.width > 4 && rect.height >= 8 && rect.height <= 40) {
+        rec_quote_word_box = 1;
+        rec_quote_word_box_w = rect.width;
+        rec_quote_word_box_h = rect.height;
+        rec_quote_word_box_y = rect.y;
+    }
 }
 
 /* ---------- 阅读字体路径桩 / Reader-face path stubs ----------
@@ -526,6 +565,7 @@ static void test_layout_metrics(void) {
     rec_body_pitch = 0;
     rec_ttf_body_calls = 0;
     rec_bitmap_body_calls = 0;
+    rec_quote_band_y = -1; rec_quote_band_h = 0; rec_quote_band_gray = -1;
     // 注入与正文一致的样式（真机 px=51、行距 150%→76、左缘 36、版心 612）。
     // Inject the live body's style (on-device px=51, 150% -> 76, left 36, measure 612).
     use_reader_style(51, 76, 36, 612);
@@ -548,6 +588,14 @@ static void test_layout_metrics(void) {
     CHECK(rec_body_pitch == 76);   // 51 × 150% / the body's own pitch
     CHECK(rec_body_y0 == 236);
     CHECK(rec_body_count == 11);   // (1216-72-236)/76 / lines per page
+    // 对称守卫：详解路径**不画**引用条 band（引用条是 SCENE 专属，顶替标题）。若
+    // 有人误把场景几何/引用条套到详解路径，band_y 会被设置 ≠ -1，这里必红——与
+    // SCENE 的 band_y==96 互为镜像，固化「详解逐像素不变」的不变性。
+    // Symmetric guard: the detail path never paints the quote band (SCENE-only, it
+    // replaces the title). If scene geometry/the band is wrongly applied to detail,
+    // band_y would be set != -1 and fail - the mirror of SCENE's band_y==96, pinning
+    // "detail stays pixel-identical".
+    CHECK(rec_quote_band_y == -1);
     CHECK(rec_body_x == 36);       // 正文版心左缘 / the body's left edge
     const int cap = ui_text_reader_cap_px(rec_body_px);
     CHECK(cap >= 35 && cap <= 39); // 51 × 0.72 ≈ 37，与正文同观感 / same optical size
@@ -600,7 +648,165 @@ static void test_layout_metrics(void) {
     ai_reader_close();
 }
 
+// M3-B：情景卡形态。与详解**同一套分页**，只有几何与外框不同：引用条顶替标题、
+// 正文从引用条下开始、页脚换成「存生词 ›」+ 页码。
+// M3-B: the scene card. Same pagination as the detail view; only geometry and
+// chrome differ - the quote strip replaces the title, the body starts under it,
+// and the footer becomes "save word" plus a page counter.
+// 清空引用条记录器：每个情景用例开跑前都从零计数，避免残留。
+// Clear the quote recorders: every scene case starts from zero, no carry-over.
+static void reset_quote_recorders(void) {
+    rec_quote_band_y = -1; rec_quote_band_h = 0; rec_quote_band_gray = -1;
+    rec_quote_bar_x = -1; rec_quote_bar_y = -1;
+    rec_quote_word_box = 0; rec_quote_word_box_w = 0;
+    rec_quote_word_box_h = 0; rec_quote_word_box_y = -1;
+    rec_quote_inv_calls = 0; rec_quote_plain_calls = 0;
+}
+
+static void test_scene_mode(void) {
+    const int h = 1216;
+    ai_reader_source_t src;
+    memset(&src, 0, sizeof(src));
+    src.page = 3;
+    snprintf(src.title, sizeof(src.title), "%s", "某书");
+    // 「前一句。」= 12 字节，词从 12 起、长 9 字节。/ "前一句。" is 12 bytes; the word starts at 12, 9 bytes long.
+    const char* quote = "前一句。目标词在这里。后一句。";
+    // 正文要足够长才能填满 10 行（612px / 51px = 12 全角/行）：短文本只能证明
+    // 「不溢出」，证明不了「几何注入给出的确实是 10 行」。
+    // The body must be long enough to fill all 10 lines (612px / 51px = 12 per
+    // line): a short text only proves "no overflow", not "the injection really
+    // yields 10 lines".
+    char text[512];
+    text[0] = 0;
+    for (int i = 0; i < 8; ++i) strncat(text, "【词义】此句中指代该词的确切含义。", sizeof(text) - strlen(text) - 1);
+    CHECK(ai_reader_open_scene("目标词", text, quote, 12, 9, &src));
+    CHECK(ai_reader_mode() == AI_READER_MODE_SCENE);
+
+    use_reader_style(51, 76, 36, 612);
+    const ai_reader_style_t scene_style = {51, 76, 36, 612};
+    const ai_reader_geom_t g = ai_reader_scene_geom(&scene_style, h);
+    ai_reader_set_geometry(&g);
+    rec_body_count = 0;
+    rec_body_y0 = -1;
+    reset_quote_recorders();
+    use_real_widths(1); // CJK 按真实 51px 装行；桩默认 12px 会把 136 字塞进 3 行
+    ai_reader_render(NULL);
+    use_real_widths(0);
+
+    // 引用条：上沿 AI_READER_SCENE_TOP=96（阅读页全屏正文顶）、高 96；底色必须
+    // 「亮」（>=0xC0）且等于共享常量 UI_QUOTE_BAND_BG——0x0A 那种量化后纯黑的值
+    // 一律红。目标词必须自有黑底方块（高 = px22 + 8），其余句子非反色、目标词反色。
+    // 结构守卫：上沿必须等于 AI_READER_SCENE_TOP（挡住又退回详解的 236）。
+    // Quote strip: top AI_READER_SCENE_TOP=96 (the reader's fullscreen body top),
+    // height 96; the wash must be LIGHT (>=0xC0) and equal UI_QUOTE_BAND_BG. The
+    // target word owns a black box (22+8 tall); the rest is plain, the word
+    // inverted. Structure guard: the top must equal AI_READER_SCENE_TOP (blocks a
+    // fallback to the detail view's 236).
+    CHECK(rec_quote_band_y == AI_READER_SCENE_TOP);
+    CHECK(rec_quote_band_y == 96);
+    CHECK(rec_quote_band_h == 96);
+    CHECK(rec_quote_band_gray == UI_QUOTE_BAND_BG);
+    CHECK(rec_quote_band_gray >= 0xC0);
+    CHECK(rec_quote_bar_x == 0 && rec_quote_bar_y == AI_READER_SCENE_TOP);
+    CHECK(rec_quote_word_box == 1);
+    CHECK(rec_quote_word_box_w > 4);
+    CHECK(rec_quote_word_box_h == 22 + 8);
+    CHECK(rec_quote_word_box_y >= AI_READER_SCENE_TOP &&
+          rec_quote_word_box_y + rec_quote_word_box_h <= AI_READER_SCENE_TOP + 96);
+    CHECK(rec_quote_inv_calls >= 1);
+    CHECK(rec_quote_plain_calls >= 1);
+    // 正文起点 = 96 + 96 + 12 = 204；行数 = (1168-204)/76 = 12（几何注入真的生效：
+    // 详解缺省会给 11 行、起点 236；改用阅读页全屏正文顶 96 后多出 2 行）。
+    // Body starts at 204; 12 lines. The injection is live - the detail default would
+    // give 11 lines starting at 236; the reader's fullscreen top (96) yields 2 more.
+    CHECK(rec_body_y0 == AI_READER_SCENE_TOP + 96 + 12);
+    CHECK(rec_body_y0 == 204);
+    CHECK(rec_body_count == 12);
+    // 「存生词 ›」chip 必须落在页脚带内且在屏内。/ The chip sits inside the footer band and on screen.
+    const EpdRect chip = ai_reader_scene_save_rect();
+    CHECK(chip.width > 0);
+    CHECK(chip.y >= h - 48 && chip.y + chip.height <= h);
+
+    // 关掉注入后回到详解缺省：详解路径不读几何，逐像素不变（上方详解断言已钉）。
+    // Dropping the injection returns to the detail default: the detail path never
+    // reads geometry, so it stays pixel-identical (the assertions above pin it).
+    ai_reader_set_geometry(NULL);
+    ai_reader_close();
+    CHECK(ai_reader_mode() == AI_READER_MODE_DEF);
+}
+
+// M3-B 修复：真机失败面是 Latin（privileged），既有用例却是 CJK——用例必须覆盖
+// 真实失败面。英文引用按空格分词、目标词落在第二行，正好走「跨行 + 局部反色」。
+// M3-B fix: the on-device failure was Latin ("privileged") while the existing case
+// was CJK - tests must cover the real failure face. The English quote splits on
+// spaces and puts the word on line two, exercising wrap + local inversion.
+static void test_scene_quote_latin(void) {
+    const int h = 1216;
+    ai_reader_source_t src;
+    memset(&src, 0, sizeof(src));
+    src.page = 0;
+    snprintf(src.title, sizeof(src.title), "%s", "Flatland");
+    const char* word = "privileged";
+    const char* quote =
+        "Not because we call it so, but to make clear its nature to "
+        "privileged readers who live in space.";
+    const char* hit = strstr(quote, word);
+    CHECK(hit != NULL);
+    const size_t woff = (size_t)(hit - quote);
+    const size_t wlen = strlen(word);
+    char text[512];
+    text[0] = 0;
+    for (int i = 0; i < 8; ++i) strncat(text, "【词义】此句中指代该词的确切含义。", sizeof(text) - strlen(text) - 1);
+    CHECK(ai_reader_open_scene(word, text, quote, woff, wlen, &src));
+    CHECK(ai_reader_mode() == AI_READER_MODE_SCENE);
+
+    use_reader_style(51, 76, 36, 612);
+    const ai_reader_style_t scene_style = {51, 76, 36, 612};
+    const ai_reader_geom_t g = ai_reader_scene_geom(&scene_style, h);
+    ai_reader_set_geometry(&g);
+    rec_body_count = 0;
+    rec_body_y0 = -1;
+    reset_quote_recorders();
+    use_real_widths(1);
+    ai_reader_render(NULL);
+    use_real_widths(0);
+
+    CHECK(rec_quote_band_y == AI_READER_SCENE_TOP && rec_quote_band_h == 96);
+    CHECK(rec_quote_band_gray == UI_QUOTE_BAND_BG);
+    CHECK(rec_quote_band_gray >= 0xC0);
+    CHECK(rec_quote_word_box == 1);
+    CHECK(rec_quote_word_box_w > 4);
+    CHECK(rec_quote_word_box_h == 22 + 8);
+    CHECK(rec_quote_word_box_y >= AI_READER_SCENE_TOP &&
+          rec_quote_word_box_y + rec_quote_word_box_h <= AI_READER_SCENE_TOP + 96);
+    CHECK(rec_quote_inv_calls >= 1);
+    CHECK(rec_quote_plain_calls >= 1);
+    CHECK(rec_body_y0 == AI_READER_SCENE_TOP + 96 + 12);
+    CHECK(rec_body_count == 12);
+
+    ai_reader_set_geometry(NULL);
+    ai_reader_close();
+    CHECK(ai_reader_mode() == AI_READER_MODE_DEF);
+}
+
+// 情景卡几何：上沿必须等于 AI_READER_SCENE_TOP（阅读页全屏正文顶），下沿扣动作栏，
+// 左右/版心取注入样式。这条用例让「注入 top 退回 236」的变异可被宿主直接命中。
+// Scene geometry: top must equal AI_READER_SCENE_TOP (the reader's fullscreen body
+// top), bottom above the action bar, left/measure from the injected style. This
+// case makes a "top falls back to 236" mutation directly catchable on the host.
+static void test_scene_geom(void) {
+    const ai_reader_style_t st = {51, 76, 36, 612};
+    const ai_reader_geom_t g = ai_reader_scene_geom(&st, 1216);
+    CHECK(g.top == AI_READER_SCENE_TOP);
+    CHECK(g.top == 96);            // 锚点值：阅读页全屏非沉浸正文顶 / the anchor value
+    CHECK(g.bottom == 1216 - 48);  // 扣动作栏 / above the action bar
+    CHECK(g.left == 36 && g.width == 612);
+}
+
 int main(void) {
+    test_scene_geom();
+    test_scene_mode();
+    test_scene_quote_latin();
     test_paginate_ascii();
     test_paginate_chinese_boundary();
     test_paginate_newlines();

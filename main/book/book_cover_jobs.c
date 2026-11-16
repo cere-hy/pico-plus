@@ -178,6 +178,22 @@ void book_cover_jobs_cancel(unsigned generation) {
     portEXIT_CRITICAL(&s_lock);
     for(unsigned i=0;i<BOOK_COVER_JOB_SLOTS*2;++i)free(old[i]);
 }
+// B42：作废当前代次的全部封面结果，**不等待**。
+//
+// 为什么它与 `quiesce` 必须分开：`quiesce` 的语义是「收齐文件句柄」，超时是失败；
+// 传 0 等于「宣布收口、却一个 tick 都不等」，无论返回值是什么都是假收口——调用方
+// 还会写 `(void)` 把失败扔掉。早先 app_loop 的插拔边沿就是这行写法：卡已经拔了，
+// 它想要的其实是「别再给我上一页的封面」，不是「等解码器停」。
+// 真正的收口在 lost 分支的三拍里（`push_sink_quiesce(2000)` 到 `remount`），
+// 那里传的是 2000，不是 0。牙 B42 咬的就是「两者混用」。
+// B42: discard the current generation's results WITHOUT waiting. `quiesce` means
+// "join the file handles" and a timeout is a failure; passing 0 announces a
+// quiesce while waiting for nothing, and callers discard the false anyway. The
+// loop's hotplug edge wanted "drop the stale page", not "join the decoder".
+void book_cover_jobs_discard(void) {
+    book_cover_jobs_cancel(s_generation);
+}
+
 bool book_cover_jobs_quiesce(unsigned timeout_ms) {
     book_cover_jobs_cancel(s_generation);
     int64_t deadline=esp_timer_get_time()+(int64_t)timeout_ms*1000;

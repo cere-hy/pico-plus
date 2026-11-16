@@ -23,6 +23,9 @@ void ui_font_draw_title_px(uint8_t *fb, int x, int baseline, int px,
                           const char *text, enum EpdFontFlags align);
 /// 以实际字形测量基线上下范围，不分配位图。/ Measure actual glyph extents above/below baseline without bitmap allocation.
 void ui_font_measure_line_px(int px, const char *text, int *above, int *below);
-void ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px,
-                          const char *text, enum EpdFontFlags align,
-                          uint8_t fg, uint8_t bg, bool black_white);
+/// 返回绘制结束时的笔位（不是墨迹右缘）。门 1 用它断言「度量 == 绘制」零差值——
+/// 这个位图字模的 advance 是预生成的，绘制与度量必须加同一个 g->advance。
+/// Returns the end pen position (not the ink edge); gate 1 asserts measure == draw.
+int ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px,
+                         const char *text, enum EpdFontFlags align,
+                         uint8_t fg, uint8_t bg, bool black_white);

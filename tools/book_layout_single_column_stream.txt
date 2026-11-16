@@ -17,8 +17,8 @@ scenario=plain_portrait ok=1 gen=1 pages=2 body={43,188,598,916}
   probe page=1 (581,244) -> 0 [0,0)
   probe page=1 (83,280) -> 1 [1169,1170)
   probe page=1 (581,280) -> 1 [1201,1209)
-  probe page=1 (83,316) -> 1 [1210,1221)
-  probe page=1 (581,316) -> 1 [1247,1258)
+  probe page=1 (83,316) -> 1 [1210,1214)
+  probe page=1 (581,316) -> 1 [1247,1252)
   offset=0 -> page=0
   offset=1 -> page=0
   offset=660 -> page=0
@@ -441,26 +441,26 @@ scenario=kinsoku_narrow ok=1 gen=19 pages=4 body={36,258,300,900}
   probe page=1 (276,350) -> 1 [643,646)
   probe page=1 (76,386) -> 0 [0,0)
   probe page=1 (276,386) -> 0 [0,0)
-  page=2 start=1188 images=0
+  page=2 start=1184 images=0
   page=2 draws=21 guides=0
-  probe page=2 (76,278) -> 1 [1190,1192)
-  probe page=2 (276,278) -> 1 [1201,1209)
-  probe page=2 (76,314) -> 1 [1210,1221)
-  probe page=2 (276,314) -> 1 [1228,1232)
-  probe page=2 (76,350) -> 1 [1233,1238)
-  probe page=2 (276,350) -> 1 [1247,1258)
-  probe page=2 (76,386) -> 1 [1259,1262)
-  probe page=2 (276,386) -> 1 [1263,1269)
-  page=3 start=1794 images=0
-  page=3 draws=7 guides=0
-  probe page=3 (76,278) -> 1 [1797,1800)
-  probe page=3 (276,278) -> 1 [1800,1803)
-  probe page=3 (76,314) -> 0 [0,0)
-  probe page=3 (276,314) -> 0 [0,0)
-  probe page=3 (76,350) -> 1 [1804,1807)
-  probe page=3 (276,350) -> 1 [1825,1828)
-  probe page=3 (76,386) -> 1 [1837,1840)
-  probe page=3 (276,386) -> 1 [1858,1861)
+  probe page=2 (76,278) -> 1 [1184,1189)
+  probe page=2 (276,278) -> 1 [1200,1209)
+  probe page=2 (76,314) -> 1 [1201,1209)
+  probe page=2 (276,314) -> 1 [1215,1221)
+  probe page=2 (76,350) -> 1 [1222,1227)
+  probe page=2 (276,350) -> 1 [1239,1242)
+  probe page=2 (76,386) -> 1 [1243,1252)
+  probe page=2 (276,386) -> 1 [1259,1262)
+  page=3 start=1761 images=0
+  page=3 draws=8 guides=0
+  probe page=3 (76,278) -> 1 [1764,1767)
+  probe page=3 (276,278) -> 1 [1785,1788)
+  probe page=3 (76,314) -> 1 [1797,1800)
+  probe page=3 (276,314) -> 1 [1800,1803)
+  probe page=3 (76,350) -> 0 [0,0)
+  probe page=3 (276,350) -> 0 [0,0)
+  probe page=3 (76,386) -> 1 [1804,1807)
+  probe page=3 (276,386) -> 1 [1825,1828)
   offset=0 -> page=0
   offset=1 -> page=0
   offset=660 -> page=1
@@ -487,8 +487,8 @@ scenario=plain_portrait ok=1 gen=21 pages=2 body={43,188,598,916}
   probe page=1 (581,244) -> 0 [0,0)
   probe page=1 (83,280) -> 1 [1169,1170)
   probe page=1 (581,280) -> 1 [1201,1209)
-  probe page=1 (83,316) -> 1 [1210,1221)
-  probe page=1 (581,316) -> 1 [1247,1258)
+  probe page=1 (83,316) -> 1 [1210,1214)
+  probe page=1 (581,316) -> 1 [1247,1252)
   offset=0 -> page=0
   offset=1 -> page=0
   offset=660 -> page=0
@@ -911,26 +911,26 @@ scenario=kinsoku_narrow ok=1 gen=39 pages=4 body={36,258,300,900}
   probe page=1 (276,350) -> 1 [643,646)
   probe page=1 (76,386) -> 0 [0,0)
   probe page=1 (276,386) -> 0 [0,0)
-  page=2 start=1188 images=0
+  page=2 start=1184 images=0
   page=2 draws=21 guides=0
-  probe page=2 (76,278) -> 1 [1190,1192)
-  probe page=2 (276,278) -> 1 [1201,1209)
-  probe page=2 (76,314) -> 1 [1210,1221)
-  probe page=2 (276,314) -> 1 [1228,1232)
-  probe page=2 (76,350) -> 1 [1233,1238)
-  probe page=2 (276,350) -> 1 [1247,1258)
-  probe page=2 (76,386) -> 1 [1259,1262)
-  probe page=2 (276,386) -> 1 [1263,1269)
-  page=3 start=1794 images=0
-  page=3 draws=7 guides=0
-  probe page=3 (76,278) -> 1 [1797,1800)
-  probe page=3 (276,278) -> 1 [1800,1803)
-  probe page=3 (76,314) -> 0 [0,0)
-  probe page=3 (276,314) -> 0 [0,0)
-  probe page=3 (76,350) -> 1 [1804,1807)
-  probe page=3 (276,350) -> 1 [1825,1828)
-  probe page=3 (76,386) -> 1 [1837,1840)
-  probe page=3 (276,386) -> 1 [1858,1861)
+  probe page=2 (76,278) -> 1 [1184,1189)
+  probe page=2 (276,278) -> 1 [1200,1209)
+  probe page=2 (76,314) -> 1 [1201,1209)
+  probe page=2 (276,314) -> 1 [1215,1221)
+  probe page=2 (76,350) -> 1 [1222,1227)
+  probe page=2 (276,350) -> 1 [1239,1242)
+  probe page=2 (76,386) -> 1 [1243,1252)
+  probe page=2 (276,386) -> 1 [1259,1262)
+  page=3 start=1761 images=0
+  page=3 draws=8 guides=0
+  probe page=3 (76,278) -> 1 [1764,1767)
+  probe page=3 (276,278) -> 1 [1785,1788)
+  probe page=3 (76,314) -> 1 [1797,1800)
+  probe page=3 (276,314) -> 1 [1800,1803)
+  probe page=3 (76,350) -> 0 [0,0)
+  probe page=3 (276,350) -> 0 [0,0)
+  probe page=3 (76,386) -> 1 [1804,1807)
+  probe page=3 (276,386) -> 1 [1825,1828)
   offset=0 -> page=0
   offset=1 -> page=0
   offset=660 -> page=1

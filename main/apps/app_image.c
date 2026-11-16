@@ -147,7 +147,7 @@ static bool load_image(int index) {
     if (!fit_h) fit_h = 1;
     s_gray = heap_caps_malloc((size_t)fit_w * fit_h, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     bool ok = s_gray && (from_file ? book_image_file_grayscale(item->path, item->png, fit_w, fit_h, s_gray)
-                                  : book_image_grayscale(data, size, item->png, fit_w, fit_h, s_gray));
+                                  : book_image_grayscale(data, size, item->png, fit_w, fit_h, s_gray, 0));
     if (!ok) { free(s_gray); s_gray = NULL; strcpy(s_message, "解码失败或内存不足"); return false; }
     s_width = fit_w; s_height = fit_h; s_selected = index; s_viewing = true;
     s_message[0] = 0;

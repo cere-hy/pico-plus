@@ -90,15 +90,17 @@ static const char* TAG = "vocab";
 #define VOCAB_AI_BATCH_MAX 64
 #endif
 #ifndef VOCAB_AI_DEF_MAX
-#define VOCAB_AI_DEF_MAX 1200 ///< gen26.6.4：批内 def 槽随 PUSH_AI_DEF_MAX 同源加宽（768→1200），承接 APK 1152B 帽
+#define VOCAB_AI_DEF_MAX 1200 ///< gen26.6.4：批内 def 槽随词义预算同源加宽（768→1200），承接 APK 1152B 帽
 #endif
-// 与设备释义槽同源：批内 def 槽不得窄于协议槽，否则同一条释义在落库时被截断
-// （生词本内容与卡面不一致）。缩槽在此编译失败。
-// Shares the device def slot: the batch slot must not be narrower than the
-// protocol slot, or the same definition is truncated on the way into the
-// vocabulary book (its content would disagree with the card). A shrink fails here.
-_Static_assert(VOCAB_AI_DEF_MAX >= PUSH_AI_DEF_MAX,
-               "gen26.6 length chain: the batch def slot must hold any protocol-sized definition");
+// 与**词义预算**同源（26.11.3-C2 起不再对着传输槽）：生词批里落的永远是「这个词的
+// 释义」，段落答案从不入批（见 app_loop 认领分支）。所以它跟 CARD_MAX 对齐即可；
+// 对着 DEF_MAX 会在段落抬到 8192 时白占 7 KB，且让「批槽必须同源」这条断言失去含义。
+// Shares the WORD budget (no longer the transport slot, as of 26.11.3-C2): the batch
+// only ever holds "this word's definition" - passage answers never enter it (see the
+// claim branch in app_loop). Aligning to CARD_MAX is the honest rule; aligning to
+// DEF_MAX would waste 7 KB once passages reach 8192 and empty the assertion of meaning.
+_Static_assert(VOCAB_AI_DEF_MAX >= PUSH_AI_CARD_MAX,
+               "gen26.6 length chain: the batch def slot must hold any card-sized definition");
 
 #define VOCAB_HEADER "# read-pico vocab.txt — 列：word<TAB>时间<TAB>书名<TAB>原句<TAB>释义"
 #define VOCAB_INDEX_MAX 4096u
@@ -693,30 +695,15 @@ static ai_batch_entry_t* batch_find(const char* lower) {
 }
 
 void vocab_log_ai_queue(const char* word) {
-    if (!s_autosave) return; // 开关关着：静默丢弃 / switch off: dropped silently
-    if (!word) return;
-    char lower[VOCAB_WORD_MAX];
-    lower_copy(lower, sizeof(lower), word);
-    if (!lower[0]) return;
-    if (s_batch && batch_find(lower)) return; // 批内已有，首次为准 / first wins
-    if (s_batch_count >= VOCAB_AI_BATCH_MAX) {
-        ESP_LOGW(TAG, "ai batch full (%u), dropping \"%s\"", (unsigned)VOCAB_AI_BATCH_MAX, lower);
-        return;
-    }
-    if (!batch_ensure()) return; // 分配失败：静默，不阻塞查词 / silent, never blocks lookup
-    ai_batch_entry_t* e = &s_batch[s_batch_count];
-    snprintf(e->word, sizeof(e->word), "%s", lower);
-    e->def[0] = 0;
-    // 原句必须快照：之后每点一个词都会覆盖 s_sentence，落盘时早不是这一句了。
-    // Snapshot the sentence: every later tap overwrites s_sentence, so by flush
-    // time it would no longer belong to this word.
-    snprintf(e->sentence, sizeof(e->sentence), "%s", s_sentence);
-    ++s_batch_count;
-    // deadline 取**首次**入队时刻：连续点词只会并入同批，不会把落盘一推再推。
-    // The deadline is the FIRST queue: later taps join the same batch instead of
-    // pushing the write back forever.
-    if (!s_batch_deadline_us)
-        s_batch_deadline_us = esp_timer_get_time() + VOCAB_AI_BATCH_DELAY_US;
+    // 26.9.10 B-1：切断 AI 自动落库（中英文皆禁）——AI 交互不再入批、不触文件写入；
+    // AI 内容仍由 push_sink 的 RAM 缓存提供。批次机制保留（下条 ai_flush 修正顺序），
+    // 供将来手工批量保存（如摘抄本一键存多句）复用。
+    // 26.9.10 B-1: AI auto-save is cut (both languages): AI interactions no longer
+    // enter the batch or touch the file; the AI content still comes from push_sink's
+    // RAM cache. The batch machinery is kept (ai_flush ordering fixed below) for a
+    // future manual batch save.
+    (void)word;
+    (void)batch_ensure; // 保留机制符号；不调用、不分配 / keep the symbol, no call, no alloc
 }
 
 void vocab_log_ai_set_def(const char* word, const char* def) {
@@ -752,6 +739,8 @@ void vocab_log_ai_flush(void) {
     // One open, every row in a loop - the writes the batch saves. De-duplication
     // matches the manual save (index first, file scan otherwise). Rows written
     // before a mid-way failure are de-duplicated on retry, never doubled.
+    const char* added[VOCAB_AI_BATCH_MAX];
+    size_t added_n = 0;
     for (size_t i = 0; ok && i < s_batch_count; ++i) {
         const char* lower = s_batch[i].word;
         if (s_words) {
@@ -762,7 +751,13 @@ void vocab_log_ai_flush(void) {
             continue;
         }
         append_row(f, lower, s_batch[i].def, s_batch[i].sentence);
-        index_add(lower);
+        // 26.9.10 B-4：只登记，**落盘成功后才入索引**。原顺序在 fclose 校验前
+        // index_add，一旦 fclose 失败就「索引有、文件无」，下次 flush 因命中而
+        // 永不补写——静默丢词。此处先收集，校验通过后统一入索引。
+        // 26.9.10 B-4: register only; add to the index **after** the fclose check
+        // succeeds. The old order indexed before fclose, so a failed close left
+        // "indexed but not on disk" and the next flush skipped it forever.
+        added[added_n++] = lower;
     }
     if (fclose(f) != 0) ok = false;
     if (!ok) {
@@ -771,6 +766,7 @@ void vocab_log_ai_flush(void) {
         ESP_LOGW(TAG, "ai batch write failed, kept for retry");
         return;
     }
+    for (size_t i = 0; i < added_n; ++i) index_add(added[i]);
     batch_clear();
 }
 

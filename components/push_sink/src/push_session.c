@@ -16,10 +16,45 @@
 
 #include <string.h>
 
+// 26.11.5：`push_quiesce_idle()` 用「枚举序落在 RECEIVING..PROCESSING 之间」表达
+// 「在传」，这条判据隐含枚举顺序。有人重排枚举值（把 COOLDOWN 挪到 RECEIVING
+// 前面、或给新状态插在中间）时，判据会**静默翻转语义**——编译不报、测试不红，
+// 只有真机上「拔卡不卸载」重演。静态断言零成本，钉住这条假设。
+// 26.11.5: the predicate reads "the state sorts inside RECEIVING..PROCESSING" as
+// "mid-transfer", which assumes the enum order. Reordering the values would
+// silently flip its meaning - no build error, no red test, just "card never
+// unmounts" on hardware. Static asserts pin the assumption.
+_Static_assert(PUSH_STATE_CONNECTED < PUSH_STATE_RECEIVING,
+               "quiesce: CONNECTED must sort below RECEIVING (a connected-but-idle "
+               "phone does not hold the medium)");
+_Static_assert(PUSH_STATE_RECEIVING < PUSH_STATE_PROCESSING,
+               "quiesce: PROCESSING (the CRC reader) sorts directly above RECEIVING");
+_Static_assert(PUSH_STATE_COOLDOWN > PUSH_STATE_PROCESSING,
+               "quiesce: COOLDOWN holds no FILE* and must sort OUTSIDE the "
+               "RECEIVING..PROCESSING window (pull the card right after a successful "
+               "push and the unmount must not wait for the grace timer)");
+
 void push_session_init(push_session_t *s) {
     if (!s) return;
     memset(s, 0, sizeof(*s));
     s->state = PUSH_STATE_IDLE;
+}
+
+bool push_quiesce_idle(push_state_t state, bool pending_arm, unsigned live_files) {
+    // 在传 = 真的握着介质，即 RECEIVING（.part 写句柄）与 PROCESSING（CRC 读句柄）
+    // 这一段。CONNECTED 只是链路活着（APK 常驻时是常态），WINDOW/ARMED 握着倒计时，
+    // COOLDOWN 是「刚推完、可能续推」的宽限——三者都不握介质，都不该拦住卸载。
+    // 注意 COOLDOWN 必须**排除**在窗口外：「推完就拔卡」是最常见的动作序列，若它
+    // 也算在传，卸载要先等完宽限计时器，日志还会打出一串「release waiting for
+    // push」——那不是真在等谁，是判据把倒计时当成了写盘。
+    // Mid-transfer is exactly RECEIVING (.part writer) through PROCESSING (CRC
+    // reader). CONNECTED is a live link (the resident-APK norm), WINDOW/ARMED hold
+    // countdowns, and COOLDOWN is the post-success grace - none of them holds the
+    // medium. COOLDOWN must stay OUTSIDE the window: "push, then pull the card" is
+    // the most common sequence, and counting the grace timer as writing would make
+    // the unmount wait for a countdown and log a string of false "still waiting".
+    const bool mid_transfer = state >= PUSH_STATE_RECEIVING && state <= PUSH_STATE_PROCESSING;
+    return !mid_transfer && !pending_arm && live_files == 0u;
 }
 
 // 簿记安装的公共体：resume 与 adopt 共用。/ Shared body of resume and adopt.

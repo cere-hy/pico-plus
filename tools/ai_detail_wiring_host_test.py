@@ -432,6 +432,103 @@ def main() -> int:
         failures.append('ai_reader.c: the per-line bitmap fallback must ask '
                         'ui_text_reader_uses_ttf(line)')
 
+    # ---- P9 新增 CAP 位必须同步入口掩码（M4-A 审计追加） ---------------------
+    # 本次事故形态：新增 PUSH_CAP_AI_SCENE 时只加了常量与消费点判断，漏了入口
+    # 掩码 `caps.bits & (CONTEXT | MULTI)`，于是 APK 声明的位在入口就被清掉——
+    # 功能静默不发，且日志打印的是采纳值，把版本判据一起污染（v1.5.2 的 0x03 与
+    # v1.6.0 的 0x0b 过滤后逐字相同，据此误判过两轮）。属「常量新增漏消费方」族，
+    # 本检查把这一族钉进门禁：凡 s_apk_caps 消费的位，必须出现在入口掩码里。
+    # The M4-A bug: adding PUSH_CAP_AI_SCENE updated the constant and the consumer
+    # but not the ingress mask, so the APK's declared bit was cleared on arrival -
+    # the feature never fired, and because the log printed the adopted value the
+    # version evidence was poisoned too (v1.5.2's 0x03 and v1.6.0's 0x0b both print
+    # as 0x02; two rounds mis-read it). This pins the whole family: every bit read
+    # through s_apk_caps must appear in the ingress mask.
+    proto_h = (ROOT / 'components' / 'push_sink' / 'include' / 'push_proto.h').read_text(
+        encoding='utf-8')
+    sink_c = (ROOT / 'components' / 'push_sink' / 'src' / 'push_sink.c').read_text(
+        encoding='utf-8')
+    defined = set(re.findall(r'#define\s+(PUSH_CAP_\w+)\s+\(', proto_h))
+    mask_m = re.search(r's_apk_caps\s*=\s*caps\.bits\s*&\s*\(([^)]*)\)', sink_c)
+    if mask_m is None:
+        failures.append('push_sink.c: the ingress mask (s_apk_caps = caps.bits & (...)) is '
+                        'gone - every declared capability would be dropped silently')
+    else:
+        masked = set(re.findall(r'PUSH_CAP_\w+', mask_m.group(1)))
+        consumed = set(re.findall(r's_apk_caps\s*&\s*(PUSH_CAP_\w+)', sink_c))
+        for bit in sorted(consumed - masked):
+            failures.append(f'push_sink.c: {bit} is read through s_apk_caps but missing '
+                            'from the ingress mask - a declared bit is cleared on arrival '
+                            '(the M4-A SCENE bug: silent no-op plus a poisoned version log)')
+        for bit in sorted((masked | consumed) - defined):
+            failures.append(f'push_sink.c: {bit} is not defined in push_proto.h')
+
+    # ---- P10 双指期间不得进单指按下大分支（M4-A v2 咬合） ---------------------
+    # 那个大分支里会拿 points[0] 撞按键热区（ui_key_hit_test）、跑菜单和旧页
+    # on_touch——它们都没有 count 守卫，双指落下那一拍会透传成一次「按下」。
+    # `count==1` 挡住双指拍，`!ui_dual_engaged` 挡住「双指后剩一指」的拍。
+    # The press branch feeds points[0] into key hit-testing, the menu and legacy
+    # on_touch - none of them guard on count, so a two-finger landing leaked through
+    # as a press. count==1 blocks the two-finger tick, !engaged blocks the tick after
+    # one finger lifts (hard rule 2).
+    loop_src = LOOP.read_text(encoding='utf-8')
+    if 'touch.count == 1 && !ui_dual_engaged(&dual)' not in loop_src:
+        failures.append('app_loop.c: the single-finger press branch must be guarded by '
+                        '"touch.count == 1 && !ui_dual_engaged(&dual)" - without it a '
+                        'two-finger landing leaks points[0] into key hit-testing, the menu '
+                        'and legacy on_touch (M4-A v2 cross-talk)')
+
+    # ---- P11 情景请求：发出去必须有人接（M3-B 审计追加） ---------------------
+    # 三条互锁，缺一条就出现「发了 0x1A 没人认领」或「答案落错地方」：
+    # ① 0x1A 的发送点必须与 scene_req_arm 同一函数——只发不 arm，答案回来无人认领，
+    #    用户看到「情景解读中…」直到超时；
+    # ② 清零点 ≥3（新点词 / 发送失败 / 离页）——只置不清，翻页后回来的答案会拿
+    #    旧页号对上、把 A 页分析贴到 B 页；
+    # ③ app_loop 必须先问 scene 再进生词批——顺序反了，340 字四节分析会先落库
+    #    成「释义」，正是审计裁定的内容边界。
+    # Three interlocked checks: (1) the 0x1A send and scene_req_arm must live in the
+    # same function - send without arming leaves the answer unclaimed and the card
+    # spinning until timeout; (2) at least three clear points (new tap / failed send
+    # / page exit) - arm-only would let a late answer match a stale page and pin
+    # page A's analysis onto page B; (3) app_loop must ask the scene path BEFORE the
+    # vocabulary batch - reversed, the 340-char four-section text lands in the
+    # vocabulary book as a "definition", exactly the ruling's content boundary.
+    # 26.11.3-C：整段路径用 scene_req_arm_excerpt（同一置位路径 + excerpt 标记），
+    # 计数必须两种都算，否则「发得比 arm 多」会被误判成漏 arm。
+    # The passage path arms through scene_req_arm_excerpt; count both forms or the check
+    # misreads a legitimate second pair as a missing arm.
+    arm_points = (book.count('scene_req_arm(&s_scene_req')
+                  + book.count('scene_req_arm_excerpt(&s_scene_req'))
+    send_points = book.count('push_sink_ai_scene_send(')
+    disarm_points = book.count('scene_req_disarm(&s_scene_req)')
+    if send_points == 0:
+        failures.append('app_book.c: no push_sink_ai_scene_send() call - the scene entry '
+                        'cannot reach the phone at all')
+    elif arm_points < send_points:
+        failures.append(f'app_book.c: {send_points} 0x1A send point(s) but only '
+                        f'{arm_points} scene_req_arm() call(s) - a request sent without '
+                        'arming is never claimed and the card spins until timeout')
+    if disarm_points < 3:
+        failures.append(f'app_book.c: only {disarm_points} scene_req_disarm() call(s); '
+                        'need >= 3 (new tap / failed send / page exit) or a late answer '
+                        'can claim against a stale page')
+    try:
+        loop_book_order = re.search(r'app_book_scene_def_ready\(', loop_src)
+        if loop_book_order is None:
+            failures.append('app_loop.c: app_book_scene_def_ready() is never called - '
+                            'scene answers fall through into the plain definition card')
+        else:
+            first_scene = loop_src.index('app_book_scene_def_ready(')
+            first_vocab = loop_src.index('vocab_log_ai_set_def(')
+            if first_vocab < first_scene:
+                failures.append('app_loop.c: vocab_log_ai_set_def() runs BEFORE '
+                                'app_book_scene_def_ready() - the 340-char scene analysis '
+                                'would be logged as this word\'s definition (the ruling\'s '
+                                'content boundary)')
+    except ValueError:
+        failures.append('app_loop.c: vocab_log_ai_set_def() disappeared from the AI return '
+                        'path - the vocabulary batch wiring is broken')
+
     if failures:
         for line in failures:
             print(f'FAIL: {line}')

@@ -141,5 +141,6 @@ with tempfile.TemporaryDirectory(prefix='book-image-record-') as directory:
     (work/'test.c').write_text(unit)
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
                     '-I'+str(root/'tools/book_layout_stubs'),'-I'+str(root/'tools/book_source_host_stubs'),'-I'+str(root/'main/book'),
-                    str(work/'test.c'),'-o',str(work/'test')],check=True)
+                    str(work/'test.c'), str(root/'main/book/hyphen.c'),
+                    str(root/'main/book/hyph_en_us_data.c'),'-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],check=True)

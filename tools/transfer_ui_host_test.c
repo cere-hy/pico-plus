@@ -55,6 +55,19 @@ static int test_prep_stop_calls_book, test_yield_calls, test_restore_calls;
 void app_book_request_prep_stop(void) { ++test_prep_stop_calls_book; }
 bool app_book_prep_stopped(void) { return test_prep_stopped; }
 bool app_book_has_open_book(void) { return test_book_open_held; }
+/* 26.9.30 commit 3：提交前完整关书（释放读者句柄）。抽层后 `transfer_commit.c`
+   是独立编译单元，它调的是外部符号，所以替身必须是真函数、不能是 static inline。
+   默认「能关」；用例把它拨到 false 才走「留标志到下一帧 → 超时 abort」。
+   26.9.30 commit 3: full book release before commit. After the pump was lifted into
+   its own translation unit this must be a real symbol, not a static inline. Defaults
+   to "can release"; cases dial it to false to reach "keep the flag, abort on timeout". */
+static bool test_release_hold_ok = true;
+static int test_release_hold_calls;
+bool app_book_release_hold(const char *path) {
+    (void)path;
+    ++test_release_hold_calls;
+    return test_release_hold_ok;
+}
 bool app_book_yield_active(void) { return test_yield_active; }
 static int test_push_first_open_marks;
 void app_book_mark_push_first_open(void) { ++test_push_first_open_marks; }
@@ -438,14 +451,24 @@ static void push_arm_regression(app_ctx_t *ctx) {
 // path the other rows keep working).
 static void push_multistate_regression(app_ctx_t *ctx) {
     // ---- gate 真身：边界逐项（start_locked 用的就是这一个函数）----
+    // 26.9.24：四参两层——内部是控制块基线（16K 实证值），PSRAM 看数据大块（64K）。
     // The real gate, bounds one by one (the very function start_locked calls).
-    assert(ble_pt_mem_gate(90 * 1024, 32 * 1024, 4 * 1024 * 1024));
-    assert(!ble_pt_mem_gate(90 * 1024, 19 * 1024, 4 * 1024 * 1024)); // gen23 真机现场 / the gen23 field case
-    assert(!ble_pt_mem_gate(90 * 1024, 32 * 1024, 128 * 1024));      // PSRAM 不够 / PSRAM short
-    assert(ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM));
-    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL - 1, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM));
-    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL - 1, BLE_PT_MIN_FREE_PSRAM));
-    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM - 1));
+    // Since 26.9.24: four arguments, two layers - internal is the control-block
+    // baseline (16K proven value), PSRAM guards the data bulk (64K).
+    assert(ble_pt_mem_gate(90 * 1024, 32 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024));
+    // gen26.9.23 真机现场：largest=16,384 时控制器二次起栈成功——**必须放行**，
+    // 这是 26.9.24 降闸的实证锚点。/ the gen26.9.23 field case: the controller
+    // re-initialised at largest=16,384 - the gate MUST pass; this is the proven
+    // anchor behind the 26.9.24 lowering.
+    assert(ble_pt_mem_gate(90 * 1024, 16 * 1024, 4 * 1024 * 1024, 4 * 1024 * 1024));
+    assert(!ble_pt_mem_gate(90 * 1024, 16 * 1024 - 1, 4 * 1024 * 1024, 4 * 1024 * 1024)); // 低于实证值 / below the proven value
+    assert(!ble_pt_mem_gate(90 * 1024, 32 * 1024, 128 * 1024, 4 * 1024 * 1024));      // PSRAM 总量不够 / PSRAM free short
+    assert(!ble_pt_mem_gate(90 * 1024, 32 * 1024, 4 * 1024 * 1024, 32 * 1024));       // PSRAM 碎到 32K（数据层）/ PSRAM shredded
+    assert(ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM, BLE_PT_MIN_LARGEST_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL - 1, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM, BLE_PT_MIN_LARGEST_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL - 1, BLE_PT_MIN_FREE_PSRAM, BLE_PT_MIN_LARGEST_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM - 1, BLE_PT_MIN_LARGEST_PSRAM));
+    assert(!ble_pt_mem_gate(BLE_PT_MIN_FREE_INTERNAL, BLE_PT_MIN_LARGEST_INTERNAL, BLE_PT_MIN_FREE_PSRAM, BLE_PT_MIN_LARGEST_PSRAM - 1));
 
     // 干净开局：富余堆、无锁、方法页。/ A clean slate: ample heap, no lock, method page.
     test_push_state = PUSH_STATE_IDLE;
@@ -454,6 +477,7 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     test_ble_free_internal = 90 * 1024;
     test_ble_largest_internal = 32 * 1024;
     test_ble_free_psram = 4 * 1024 * 1024;
+    test_ble_largest_psram = 4 * 1024 * 1024;
     test_ble_reset_calls = 0;
     s_method_message[0] = 0;
     on_enter(ctx);
@@ -482,14 +506,16 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     ctx->now_ms += 500;
     assert(on_tick(ctx) == APP_REDRAW_PAGE && !strcmp(s_method_message, "已取消接收"));
 
-    // ---- 姿态 3a：锁死 + 预检不过（gen23 现场：最大块 19K）----
+    // ---- 姿态 3a：锁死 + 预检不过（gen26.9.24 口径：最大块 15K，低于 16K 实证闸）----
     // 提示带数字、不武装、不清锁、零等待（不进 pending、不吞 30s 退避）。
-    // Pose 3a: locked + precheck fails (the gen23 field case: 19K largest) - the
-    // prompt carries the numbers, nothing arms, no lock clearing, zero wait (no
-    // pending, no 30 s back-off to sit through).
+    // （gen23 的 19K 现场在 26.9.24 降闸后应**放行**——见姿态 3a''。）
+    // Pose 3a: locked + precheck fails (the 26.9.24 framing: 15K largest, below the
+    // 16K proven gate) - the prompt carries the numbers, nothing arms, no lock
+    // clearing, zero wait. (gen23's 19K field case now PASSES after the 26.9.24
+    // lowering - see pose 3a''.)
     test_push_state = PUSH_STATE_IDLE;
     test_ble_locked = true;
-    test_ble_largest_internal = 19 * 1024;
+    test_ble_largest_internal = 15 * 1024;
     s_method_message[0] = 0;
     arms = test_push_arm_calls;
     cancels = test_push_cancel_calls;
@@ -498,8 +524,8 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
     assert(test_ble_reset_calls == resets); // 预检不过不清锁 / a failed precheck clears nothing
     assert(s_view == TRANSFER_METHODS);
-    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "19K") &&
-           strstr(s_method_message, "20K"));
+    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "15K") &&
+           strstr(s_method_message, "16K"));
     // 不假死：再点一次同样只出提示；on_tick 不挂。/ No freeze: tapping again only
     // re-prompts, and on_tick never hangs.
     tap(ctx, method_control_rect(2));
@@ -515,27 +541,64 @@ static void push_multistate_regression(app_ctx_t *ctx) {
     on_enter(ctx);
     assert(s_view == TRANSFER_METHODS);
 
-    // ---- 姿态 3a'：未锁 + 栈 down + 预检不过（gen24.1 D1：两段式文案）----
-    // 与 3a 同一条拒绝路径但未锁：提示带数字，且两段话都落到消息串里——
-    // 先让用户卸书（大概率自愈），再兜底重启。不武装、不清锁、零退避。
-    // Pose 3a': unlocked + stack down + precheck fails - the gen24.1 D1
-    // two-segment prompt. Same refusal path as 3a but unlocked: numbers ride
-    // along and BOTH segments land in the string - first ask the user to leave
-    // the book (likely self-heals), then fall back to a restart. No arm, no
-    // lock clearing, zero back-off.
+    // ---- 姿态 3a'：未锁 + 栈 down + 预检不过 → **放行武装**（26.9.21 裁定③）----
+    // 26.9.20 真机证明这段预检在用户路径上不可达：总开关开着 → 主循环第一拍就把栈拉起；
+    // 总开关关着 → 闸门跑完也被「蓝牙已关闭」覆盖。它唯一还有价值的场合是自锁（姿态 3a）。
+    // 所以裁定③把拦截面收窄成「只在 ble_pt_locked() 时拦」：未锁的第一次尝试一律放行，
+    // 由 start_locked 里的同一个 ble_pt_mem_gate() 兜底。本用例锁住这条**行为改动**——
+    // 若有人把条件改回 `!ble_pt_running()`，这里会立刻红。
+    // Pose 3a': unlocked + stack down + precheck fails -> **arm anyway** (26.9.21
+    // ruling 3). 26.9.20's hardware log proved this precheck unreachable on the user
+    // path (master on brings the stack up on the loop's first tick; master off is
+    // refused by the next gate), so its only remaining value is the locked case
+    // (pose 3a). Ruling 3 therefore narrows the blocking surface to ble_pt_locked();
+    // an unlocked first attempt always arms and start_locked's very same
+    // ble_pt_mem_gate() is the backstop. This case pins the behaviour change: putting
+    // the condition back to `!ble_pt_running()` turns it red immediately.
     test_ble_locked = false;
-    test_ble_largest_internal = 19 * 1024;
+    test_ble_largest_internal = 15 * 1024;
     s_method_message[0] = 0;
     arms = test_push_arm_calls;
     cancels = test_push_cancel_calls;
     resets = test_ble_reset_calls;
     tap(ctx, method_control_rect(2));
-    assert(test_push_arm_calls == arms && test_push_cancel_calls == cancels);
-    assert(test_ble_reset_calls == resets);
-    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "19K") &&
-           strstr(s_method_message, "20K"));
-    assert(strstr(s_method_message, "退出当前书籍后重试") && strstr(s_method_message, "请重启设备"));
-    assert(strstr(s_method_message, "——")); // 两段式分界落进消息串 / the split lands in the string
+    assert(test_push_arm_calls == arms + 1 && test_push_cancel_calls == cancels);
+    assert(test_ble_reset_calls == resets + 1); // 自愈清理幂等随行 / the idempotent heal rides along
+    assert(s_view == TRANSFER_PUSH);
+    assert(s_method_message[0] == 0); // 没有假拒绝文案 / no manufactured refusal
+    s_view = TRANSFER_METHODS;        // 回方法页（不収摊）/ back to the method page
+
+    // 反证：同一组数字，只要**锁着**就必须拦（否则收窄会退化成"删闸门"）。
+    // Counter-check: the same numbers must still refuse while LOCKED - otherwise
+    // "narrowing" would have degenerated into "deleting the gate".
+    test_ble_locked = true;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms);
+    assert(strstr(s_method_message, "内存碎片不足") && strstr(s_method_message, "15K"));
+    test_ble_locked = false;
+
+    // ---- 姿态 3a-16K：锁死 + 最大块恰为 16,384（gen26.9.23 实证现场）→ **自愈放行**----
+    // 这是 26.9.24 降闸的行为锚点：26.9.23 真机上控制器在 largest=16,384 下二次起栈
+    // 成功并稳定运行，同一数字必须过闸——老 20K 闸把这一现场冤杀成「内存碎片不足」。
+    // Pose 3a-16K: locked + largest exactly 16,384 (the gen26.9.23 proven scene) ->
+    // the self-heal path PASSES. This pins the 26.9.24 lowering: the controller
+    // re-initialised at 16,384 on hardware, so the gate must pass - the old 20K line
+    // wrongly refused this exact scene.
+    test_ble_locked = true;
+    test_ble_largest_internal = 16 * 1024;
+    s_method_message[0] = 0;
+    arms = test_push_arm_calls;
+    resets = test_ble_reset_calls;
+    tap(ctx, method_control_rect(2));
+    assert(test_push_arm_calls == arms + 1);
+    assert(test_ble_reset_calls == resets + 1); // 自愈：预检过 → 清锁重试 / heal: precheck passes -> clear and retry
+    assert(s_view == TRANSFER_PUSH);
+    assert(s_method_message[0] == 0);
+    s_view = TRANSFER_METHODS;
+    test_ble_locked = false;
+    test_ble_largest_internal = 32 * 1024;
 
     // ---- 姿态 3a''：栈 up + 预检不过 → 跳过闸门直接武装（gen24.1 D2）----
     // 栈已在跑时点按钮被 gen24 冤拒（boot1 实证：BLE 自开机 up、碎片窗口内
@@ -775,9 +838,17 @@ static void push_pending_ui_regression(app_ctx_t *ctx) {
 // failed yield or a still-failing gate lands on the restart fallback wording;
 // the finale restores the book and must speak up when that fails.
 static void push_yield_regression(app_ctx_t *ctx) {
-    // 现场：栈 down、有一本书、最大块 19K（低于 20K 闸门）。
-    // Field: stack down, a book open, largest block 19K (below the 20K gate).
-    test_ble_largest_internal = 19 * 1024;
+    // 现场：栈 down、**自锁**、有一本书、最大块 15K（低于 16K 闸门，26.9.24 口径）。
+    // 26.9.21 裁定③之后让路链只在自锁态可达：未锁的第一次尝试一律放行去 arm
+    // （见姿态 3a'），所以这里必须置 locked——这不是为了让用例通过，而是让用例
+    // 覆盖**唯一还会拒绝的那条路**。
+    // Field: stack down, LOCKED, a book open, largest block 15K (below the 16K
+    // gate, the 26.9.24 framing). After ruling 3 the yield chain is only reachable
+    // in the locked state - an unlocked first attempt always arms (pose 3a') - so
+    // the lock is part of the scene, not a convenience: it is the only path that
+    // still refuses.
+    test_ble_locked = true;
+    test_ble_largest_internal = 15 * 1024;
     test_book_open_held = true;
     test_prep_stopped = true;
     test_yield_ok = true;
@@ -810,7 +881,7 @@ static void push_yield_regression(app_ctx_t *ctx) {
     test_push_armed = false;
     test_yield_active = false;
     test_book_open_held = true;
-    test_ble_largest_internal = 19 * 1024;
+    test_ble_largest_internal = 15 * 1024;
     s_push_yield_phase = 0;
     s_view = TRANSFER_METHODS; // 上一场景已武装进推送页，回到方法页再点 / the previous scene armed into the push page; back to the method page before tapping
     s_method_message[0] = 0;
@@ -873,14 +944,16 @@ static void mem_panel_regression(app_ctx_t *ctx) {
     // gen25 内存体检面板回归：纯函数阈值 → 位置边界 → 开关模态 → 视图卫兵。
     // Gen25 memory-health panel regression: pure thresholds -> position bounds
     // -> open/close modality -> the view guard.
-    // 红绿灯阈值边界（裁定：largest 主判；黄区才看碎片率）。
-    // Traffic-light threshold bounds (the ruling: largest decides; only the
-    // yellow tier reads fragmentation).
+    // 26.9.21：绿线已删（20,480 在用户路径上不可达），只剩红/黄两档。
+    // 边界仍要逐个钉：14,336 / 15,359 是红，15,360 起一律黄——包括原来判绿的那一段。
+    // 26.9.21: the green tier is gone (20,480 is unreachable on the user path).
+    // The boundary is still pinned to the byte: red below 15,360, yellow everywhere above.
     assert(mem_health_level(0) == MEM_LEVEL_RED);
     assert(mem_health_level(15 * 1024 - 1) == MEM_LEVEL_RED);
     assert(mem_health_level(15 * 1024) == MEM_LEVEL_YELLOW);
     assert(mem_health_level(20 * 1024 - 1) == MEM_LEVEL_YELLOW);
-    assert(mem_health_level(BLE_PT_MIN_LARGEST_INTERNAL) == MEM_LEVEL_GREEN);
+    assert(mem_health_level(BLE_PT_MIN_LARGEST_INTERNAL) == MEM_LEVEL_YELLOW);
+    assert(mem_health_level(64 * 1024) == MEM_LEVEL_YELLOW);
     // 碎片率边界：free=0 记 100%（最坏解释、不除零）；largest≥free 记 0%。
     // Fragmentation bounds: free=0 reads 100% (worst case, no division by
     // zero); largest >= free reads 0%.
@@ -889,18 +962,19 @@ static void mem_panel_regression(app_ctx_t *ctx) {
     assert(mem_fragmentation_pct(40 * 1024, 40 * 1024) == 0);
     assert(mem_fragmentation_pct(40 * 1024, 10 * 1024) == 75);
     assert(mem_fragmentation_pct(100, 101) == 0);
-    // 判定文案对表：绿区过闸/绿区未过闸/黄区两档/红区。
-    // Verdict wording: green passing/failing the full gate, both yellow tiers, red.
+    // 判定文案对表（26.9.21：黄区细分成三种真实处境，信息不丢、只少一个颜色）。
+    // ①黄+够推送 ②黄+连续块够但总内存不够 ③黄+连续块也不够（两档碎片率） ④红。
+    // Verdict wording (26.9.21: the yellow tier carries what green used to say).
     char verdict[96];
-    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_GREEN, 0, true);
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 0, true, true);
     assert(!strcmp(verdict, "内存充足，可以开启推送"));
-    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_GREEN, 0, false);
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 0, false, true);
     assert(!strcmp(verdict, "连续块充足，总内存未达推送门槛"));
-    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 30, true);
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 30, false, false);
     assert(!strcmp(verdict, "内存偏紧，建议退出阅读后再试"));
-    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 50, true);
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_YELLOW, 50, false, false);
     assert(!strcmp(verdict, "内存偏紧且碎片较多，建议退出阅读"));
-    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_RED, 90, false);
+    mem_panel_verdict(verdict, sizeof(verdict), MEM_LEVEL_RED, 90, false, false);
     assert(!strcmp(verdict, "内存不足，请重启设备"));
     // 位置边界（预审点 2②）：面板恰好盖住方法卡三行（224..560），下沿不进
     // 提示条横幅（584 起），【知道了】按钮不越面板。

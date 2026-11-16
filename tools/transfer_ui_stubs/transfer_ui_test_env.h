@@ -92,6 +92,8 @@ static inline void epd_draw_rect(EpdRect r,...) {(void)r;}
 static inline void epd_draw_circle(int x,int y,int radius,...) {(void)x;(void)y;(void)radius;}
 static inline void epd_draw_line(int x0,int y0,int x1,int y1,...) {(void)x0;(void)y0;(void)x1;(void)y1;}
 static inline int ttf_text_width_px(int px,const char* s) {return (int)strlen(s)*px/2;}
+static inline int ttf_kern_px(int px,uint32_t a,uint32_t b) {(void)px;(void)a;(void)b;return 0;}
+static inline bool app_typography_enhanced(void) {return true;}
 static inline void display_set_bulk_io(bool b) {(void)b;}
 static inline int update_display_area_diff_with(void* p,...) {(void)p;return 0;}
 static inline int update_display_area_full_with(void* p,...) {(void)p;return 0;}
@@ -304,6 +306,18 @@ static inline bool push_sink_take_err(int *code) {
     return true;
 }
 
+/* 26.9.30 commit 2/3：提交段封送后的三个入口。`transfer_commit.c` 直接调它们，
+   而本测试不跑真实会话机，故给最小替身：没有待提交请求（空转）、跑提交恒成功、
+   abort 只记参数不做事。两拍逻辑本身由 `app_loop_host_test.c` 用例 20 跑真身
+   （那里有可拨的时钟与可注入的失败），这里只为让链接成立。
+   26.9.30 commit 2/3: the three post-mailbox entries. This test never runs the real
+   session machine, so they are minimal: no pending request, commit always succeeds,
+   abort discards its code. The two-beat logic itself runs for real in app_loop's
+   case 20 (dialable clock, injectable failure); these exist so the link holds. */
+static inline bool push_sink_take_commit_request(void) { return false; }
+static inline bool push_sink_run_commit(void) { return true; }
+static inline void push_sink_commit_abort(int err) { (void)err; }
+
 /* gen24：ble_page_turner 的锁态查询、堆快照与失败重置桩——多态按钮一键自愈
    路径的旋钮。快照默认给富余值（闸门全过），用例按需调成碎片现场
    （largest 19K）验证「预检不过 → 行内提示、零等待」。
@@ -318,13 +332,16 @@ static bool test_ble_running; // gen24.1：BLE 栈运行态——预检只该拦
 static size_t test_ble_free_internal = 90 * 1024;
 static size_t test_ble_largest_internal = 32 * 1024;
 static size_t test_ble_free_psram = 4 * 1024 * 1024;
+static size_t test_ble_largest_psram = 4 * 1024 * 1024;
 static int test_ble_reset_calls;
 static inline bool ble_pt_locked(void) { return test_ble_locked; }
 static inline bool ble_pt_running(void) { return test_ble_running; }
-static inline void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram) {
+static inline void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal,
+                                       size_t *free_psram, size_t *largest_psram) {
     if (free_internal) *free_internal = test_ble_free_internal;
     if (largest_internal) *largest_internal = test_ble_largest_internal;
     if (free_psram) *free_psram = test_ble_free_psram;
+    if (largest_psram) *largest_psram = test_ble_largest_psram;
 }
 static inline void ble_pt_reset_failure(void) {
     ++test_ble_reset_calls;

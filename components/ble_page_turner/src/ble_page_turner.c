@@ -29,6 +29,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "pico_heapdiag.h"
 #include "push_sink.h"
 #include "read_pico_crashlog.h"
 
@@ -1477,12 +1478,14 @@ bool ble_pt_take_passkey(uint32_t *out) {
 // gen24：内存闸门的判定真身在 ble_pt_mem.c（纯函数、宿主测试直接覆盖）；这里只留
 // 读堆的快照 helper。/ gen24: the gate's verdict lives in ble_pt_mem.c (a pure
 // function host tests cover directly); only the heap-reading snapshot stays here.
-void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal, size_t *free_psram) {
+void ble_pt_mem_snapshot(size_t *free_internal, size_t *largest_internal,
+                         size_t *free_psram, size_t *largest_psram) {
     if (free_internal) *free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (largest_internal) {
         *largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (free_psram) *free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (largest_psram) *largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 }
 
 static void on_sync(void) {
@@ -1504,6 +1507,21 @@ static void host_task(void *param) {
     vTaskDelete(NULL);
 }
 
+// 26.9.12 P0 取证（S1）→ 26.9.13 P0-d：实现已提成公共组件 pico_heapdiag。
+// 26.9.13 改这一处的原因是**位置错了**：同一个函数埋在本文件里、还是 static，就只有
+// 「翻页器起栈被拒」这一条路会触发；而真机上失败的是手机推送（push_sink），两条 BLE
+// 路径两套闸门。26.9.12 的真机日志因此出现最坏组合：面板判红、这边一行输出都没有、
+// 广播照起。现在各站点共用一个实现、一种格式、一份限额，`who=` 直接点名调用方。
+// 本文件的站点名是 `ble-start`，语义与 26.9.12 等价（同样失败才打、同样限次），
+// 只是从「本文件独有」变成「全线同口径」。
+// 26.9.12 P0 evidence run (S1) -> 26.9.13 P0-d: the implementation moved to the shared
+// pico_heapdiag component. It moved because it was in the WRONG PLACE: buried here and
+// static, only the page-turner's start-gate refusal could ever fire it - while the field
+// failure was the phone push (push_sink), two BLE paths with two separate gates. The
+// 26.9.12 log therefore showed the worst combination: the panel read red, this side said
+// nothing, and the radio came up. Every site now shares one implementation, one format and
+// one budget, and `who=` names the caller. The site here is `ble-start` and the semantics
+// are unchanged (failure-only, rate-limited) - it merely stopped being private.
 static esp_err_t start_locked(void) {
     if (atomic_load(&s_network_users)) return ESP_ERR_INVALID_STATE;
     if (s_running) return ESP_OK;
@@ -1519,13 +1537,32 @@ static esp_err_t start_locked(void) {
     // 按钮用同一对函数，两边数字永远一致。/ gen24: snapshot and verdict go through the
     // shared ble_pt_mem_snapshot/ble_pt_mem_gate pair; the transfer page's self-heal button
     // uses the same pair so the two sides can never disagree.
-    size_t free_internal, largest_internal, free_psram;
-    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
-    if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
-        ESP_LOGW(TAG, "not enough memory: internal %u B free / %u B largest, psram %u B free",
-                 (unsigned)free_internal, (unsigned)largest_internal, (unsigned)free_psram);
-        snprintf(s_failure, sizeof(s_failure), "内存不足（内部 %uK，最大块 %uK）",
-                 (unsigned)(free_internal / 1024), (unsigned)(largest_internal / 1024));
+    size_t free_internal, largest_internal, free_psram, largest_psram;
+    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram, &largest_psram);
+    if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram, largest_psram)) {
+        ESP_LOGW(TAG, "not enough memory: internal %u B free / %u B largest, psram %u B free / %u B largest",
+                 (unsigned)free_internal, (unsigned)largest_internal,
+                 (unsigned)free_psram, (unsigned)largest_psram);
+        // 26.9.13 P0-d：块分布走公共取证组件（原来这里是本文件私有的 static）。
+        // 26.9.13 P0-d: the block layout comes from the shared evidence component
+        // (this used to be a private static in this file).
+        pico_heap_dump("ble-start", "ble_page_turner:start_locked");
+        // 26.9.12 S3：把「内存不足」换成能指导动作的话。原提示只说了缺多少，用户唯一
+        // 能做的却是「重启」——而真机上的实际解法是**先开蓝牙再开书**（开机态最大块
+        // 21,504 刚好过闸，进过阅读就掉到 19,456）。提示要直接说这件事。
+        // 26.9.24：两层各自一句——内部块不够说「退出阅读」，PSRAM 不够（数据层被
+        // 碎掉）只能重启。/ 26.9.12 S3: replace "out of memory" with something
+        // actionable... Since 26.9.24 each layer gets its own sentence: internal block
+        // short -> "leave the book"; PSRAM short (data layer shredded) -> reboot.
+        if (free_psram < BLE_PT_MIN_FREE_PSRAM || largest_psram < BLE_PT_MIN_LARGEST_PSRAM) {
+            snprintf(s_failure, sizeof(s_failure),
+                     "设备临时存储不足（%uK），请重启后再试",
+                     (unsigned)(largest_psram / 1024));
+        } else {
+            snprintf(s_failure, sizeof(s_failure),
+                     "蓝牙需 16K 连续内存，当前 %uK，请退出阅读后再开",
+                     (unsigned)(largest_internal / 1024));
+        }
         return ESP_ERR_NO_MEM;
     }
 

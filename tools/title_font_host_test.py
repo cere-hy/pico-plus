@@ -85,7 +85,7 @@ void ui_font_draw_title_px(uint8_t *fb,int x,int y,int px,const char *s,enum Epd
 // Since r93 the title/text entries reference ui_font_draw_text_px for the builtin-UI-font
 // branch; this test always runs an imported TTF, so that branch is never taken at runtime,
 // same never-taken semantics as the stubs above.
-void ui_font_draw_text_px(uint8_t *fb,int x,int baseline,int px,const char *s,enum EpdFontFlags a,uint8_t fg,uint8_t bg,bool bw){(void)fb;(void)x;(void)baseline;(void)px;(void)s;(void)a;(void)fg;(void)bg;(void)bw;assert(0);}
+int ui_font_draw_text_px(uint8_t *fb,int x,int baseline,int px,const char *s,enum EpdFontFlags a,uint8_t fg,uint8_t bg,bool bw){(void)fb;(void)baseline;(void)px;(void)s;(void)a;(void)fg;(void)bg;(void)bw;assert(0);return x;}
 static uint8_t pixels[400*200];
 static bool record_coverage;
 void epd_draw_pixel(int x,int y,uint8_t c,uint8_t *fb){assert(x>=0&&x<400&&y>=0&&y<200);if(record_coverage)fb[y*400+x]=c>>4;else{assert(c==0);fb[y*400+x]=1;}++painted;}

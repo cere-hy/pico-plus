@@ -152,12 +152,14 @@ p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
 old = '''    char own[DICT_POPUP_WORD_MAX];
     if (!word || !*word) { dict_popup_reset(); return false; }
-    snprintf(own, sizeof(own), "%.*s", DICT_POPUP_WORD_MAX - 1, word);
+    copy_word_head(own, sizeof(own), word);
     dict_popup_reset();
-    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, own);'''
+    copy_word_head(s_word, sizeof(s_word), own);
+    if (!store_line(text, strlen(text))) {'''
 new = '''    if (!word || !*word) { dict_popup_reset(); return false; }
     dict_popup_reset();
-    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word); /* MUTATION M7 */'''
+    snprintf(s_word, sizeof(s_word), "%.*s", DICT_POPUP_WORD_MAX - 1, word); /* MUTATION M7 */
+    if (!store_line(text, strlen(text))) {'''
 assert old in s, "M7 target not found"
 s = s.replace(old, new)
 p.write_text(s)
@@ -180,17 +182,18 @@ p.write_text(s)
 EOF
 run_mutation "M8 wrap width drops the right pad"
 
-# M9：暂存行帽回退到 14（旧值）——10~14 行的释义被画成 9 行 + 省略号却不置截断位，
-# 不开详解、尾部静默丢失。宿主「136 字必须 truncated」断言应擒住。
-# M9: the staging cap back to 14 (the old value) - a 10-14 line definition paints
-# 9 lines plus an ellipsis without setting the flag, so no detail view and a
-# silently lost tail. The host's "136 chars must be truncated" assertion catches it.
+# M9：暂存帽与显示行数脱钩（+6）——第 9 行起「暂存了却画不出、也不置截断位」，
+# 尾部静默丢失。宿主「121 字必须 truncated」断言应擒住（M3-A 操作栏让行后帽=8）。
+# M9: decouple the staging cap from the visible count (+6) - lines beyond the bar
+# shrink get staged but neither drawn nor flagged. The host's "121 chars must be
+# truncated" assertion catches it (cap = 8 after the M3-A footer).
 python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
-assert '#define DICT_POPUP_LINES 9' in s, 'M9 target not found'
-s = s.replace('#define DICT_POPUP_LINES 9', '#define DICT_POPUP_LINES 14 /* MUTATION M9 */')
+old = 'if (s_line_count >= visible_lines()) {'
+assert old in s, 'M9 target not found'
+s = s.replace(old, 'if (s_line_count >= visible_lines() + 6) { /* MUTATION M9 */', 1)
 p.write_text(s)
 EOF
 run_mutation "M9 staging cap back to 14"
@@ -203,9 +206,9 @@ python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
-old = '#define DICT_POPUP_MORE_MIN_W 96'
+old = 'return (EpdRect){mid, bar_top, card.x + card.width - DICT_POPUP_PAD - mid, DICT_POPUP_BAR_H};'
 assert old in s, 'M10 target not found'
-p.write_text(s.replace(old, '#define DICT_POPUP_MORE_MIN_W 24 /* MUTATION M10 */', 1))
+p.write_text(s.replace(old, 'return (EpdRect){card.x + card.width - DICT_POPUP_PAD - 21, bar_top, 21, DICT_POPUP_BAR_H}; /* MUTATION M10 */', 1))
 EOF
 run_mutation "M10 detail-entry hit zone shrinks back to the dots"
 
@@ -236,18 +239,120 @@ p.write_text(s.replace(old, '#define DICT_POPUP_MORE_LABEL_PX 20 /* MUTATION M12
 EOF
 run_mutation "M12 view-full label drops off 24px"
 
-# ---- M13：热区退回 96 见方（不含标签）——标签左半截点不到、会误关卡 ----
-# ---- M13: the hit zone shrinks back to the 96 square without the label - the
-#      label's left half is unclickable and a tap there closes the card.
+# ---- M13：热区退回标签级小方块（M3-A 操作栏重构后的等价回归）——半条热区
+#      缩成 24 见方，手指点不中、误关卡 ----
+# ---- M13: the hit zone shrinks back to a label-sized square (the M3-A bar
+#      equivalent of the old regression) - unclickable, taps close the card.
 restore
 python3 - <<'EOF'
 import pathlib
 p = pathlib.Path('main/apps/dict_popup.c')
 s = p.read_text()
-old = 'int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP - label_w;'
+old = 'return (EpdRect){mid, bar_top, card.x + card.width - DICT_POPUP_PAD - mid, DICT_POPUP_BAR_H};'
 assert old in s, 'M13 target not found'
-p.write_text(s.replace(old, 'int left = right - dots_w - DICT_POPUP_MORE_LABEL_GAP; /* MUTATION M13 */', 1))
+p.write_text(s.replace(old, 'return (EpdRect){mid + 60, bar_top, 24, 24}; /* MUTATION M13 */', 1))
 EOF
-run_mutation "M13 hit zone excludes the view-full label"
+run_mutation "M13 hit zone shrinks to a label-sized square"
+
+# ---- 26.9.5 入口卡四颗牙 + 一颗跨文件静态牙 ----
+# 这五条对应本版的新逻辑：拆掉 english 总闸后，任何一条退回旧形态都会让中文读者
+# 重新变成二等公民，而编译、既有用例、真机点词都不会报错——只有断言能说话。
+
+# M14：入口卡照旧画保存 chip（「有释义才可存」被拆）——空壳能被存进生词本。
+# M14: the entry card draws the save chip again (the "only a definition may be
+# saved" rule torn out) - an empty shell could enter the vocabulary book.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '    const bool save_chip = !s_entry;'
+assert old in s, 'M14 target not found'
+p.write_text(s.replace(old, '    const bool save_chip = true; /* MUTATION M14 */', 1))
+EOF
+run_mutation "M14 entry card draws the save chip"
+
+# M15：入口卡置位 s_pending——没发过请求却被 0x07 认领、被超时降级。
+# M15: the entry card sets s_pending - an unsent card gets claimed by 0x07 and
+# degraded by the timeout.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '    s_pending = false;      // reset 已置 false，这里显式再钉一次（防顺序被改坏）'
+assert old in s, 'M15 target not found'
+p.write_text(s.replace(old, '    s_pending = true; /* MUTATION M15 */', 1))
+EOF
+run_mutation "M15 entry card pins s_pending = true"
+
+# M16：词头截断退回按字节（snprintf "%.*s"）——中文卡面切出半个字，且与 0x07
+# 回流词的前缀匹配失配。
+# M16: the head truncation falls back to byte-wise snprintf - a Chinese head gets
+# cut mid-character and the prefix match against the 0x07 word breaks.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '''    size_t o = 0;
+    if (src) {
+        while (*src && o + 1 < cap) {
+            const int step = utf8_step(src);
+            if (step <= 0) break;
+            if (o + (size_t)step > cap - 1) break; // 放不下整字就停，不切 / stop, never split
+            memcpy(dst + o, src, (size_t)step);
+            o += (size_t)step;
+            src += step;
+        }
+    }
+    dst[o] = 0;'''
+assert old in s, 'M16 target not found'
+p.write_text(s.replace(old, '    snprintf(dst, cap, "%.*s", (int)(cap - 1), src ? src : ""); /* MUTATION M16 */', 1))
+EOF
+run_mutation "M16 head truncation cuts UTF-8 mid-character"
+
+# M17：入口卡仍响应保存 chip（不落库的护栏被拆）——点一下就把状态行存成释义。
+# M17: the entry card still answers the save chip (the no-save guard torn out) -
+# a tap stores the status line as the definition.
+restore
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/dict_popup.c')
+s = p.read_text()
+old = '    if (s_entry) return DICT_POPUP_TAP_MISSED;'
+assert old in s, 'M17 target not found'
+p.write_text(s.replace(old, '    /* MUTATION M17: guard removed */', 1))
+EOF
+run_mutation "M17 entry card answers the save chip"
+
+# M18（跨文件静态牙）：app_book 的入口分支退回 `hit && english` ——中文重新静默
+# 不弹卡（本版要根治的那个缺陷）。dict_popup 宿主编不到 app_book.c，故用
+# vocab_wiring_host_test.py 这颗静态牙来咬；它不编译，只读文本。
+# M18 (cross-file static tooth): app_book's entry branch falls back to
+# `hit && english` - Chinese goes silent again (the very defect this version
+# kills). The dict_popup host test never compiles app_book.c, so the static
+# vocab_wiring_host_test.py does the biting (text only, nothing compiled).
+restore
+cp main/apps/app_book.c /tmp/app_book_orig.c
+python3 - <<'EOF'
+import pathlib
+p = pathlib.Path('main/apps/app_book.c')
+s = p.read_text()
+old = '    if (hit && !found && push_sink_ai_enabled()) {'
+assert old in s, 'M18 target not found'
+p.write_text(s.replace(old,
+    '    if (hit && english && !found && push_sink_ai_enabled()) { /* MUTATION M18 */', 1))
+EOF
+if python3 tools/vocab_wiring_host_test.py >/tmp/mut_wire.txt 2>&1; then
+    echo "MUTATION SURVIVED (BAD): M18 entry branch gated by english again (static)"
+else
+    echo "caught: M18 entry branch gated by english again (static)"
+fi
+cp /tmp/app_book_orig.c main/apps/app_book.c
+cmp -s /tmp/app_book_orig.c main/apps/app_book.c || {
+    echo "FATAL: app_book.c did not return to its pre-mutation snapshot" >&2
+    exit 3
+}
 
 echo "---- mutation sweep done ----"

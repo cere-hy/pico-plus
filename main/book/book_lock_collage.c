@@ -356,7 +356,7 @@ static uint8_t *cover_load_bounded(lock_book_t *book, bool *complete, size_t lim
             w = (w + 1) / 2; h = (h + 1) / 2;
         }
         gray = lock_alloc((size_t)w * h);
-        decoded = gray && book_image_grayscale(data, bytes, png, w, h, gray);
+        decoded = gray && book_image_grayscale(data, bytes, png, w, h, gray, 0);
         if (decoded) { book->width = w; book->height = h; }
         else { free(gray); gray = NULL; }
     }

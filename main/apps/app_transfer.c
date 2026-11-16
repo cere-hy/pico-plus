@@ -45,9 +45,15 @@
 #include "e0470_epaper_waveform.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
 #include "ble_page_turner.h"
+#include "pico_heapdiag.h"
+// 26.11.1：两拍提交泵与 PUSH_YIELD_WAIT_MS 都在这里（同一份代码进宿主测试）。
+// The two-beat commit pump and PUSH_YIELD_WAIT_MS live here; the host test builds
+// this same file, never a copy.
+#include "transfer_commit.h"
 #include "push_sink.h"
 #include "read_pico_pmu.h"
 #include "settings.h"
@@ -261,6 +267,14 @@ static transfer_view_t s_view;
 // down - the sink moves to a background owner and the phone can still push
 // within the grace/window. Manual exits close up as before.
 static bool s_push_handed_off;
+// 26.11.1：两拍提交簿记（等待态 / 死线 / 拍号）已搬到 `transfer_commit.c`，
+// 连同它的注释——理由见该文件头（宿主跑真身，替代 7b busy 路径的空桩）。
+// 这里只剩调用点：`transfer_pump_commit()` 是同名薄封装，行为与抽取前一致。
+// The two-beat commit bookkeeping (waiting flag, deadline, beat number) moved to
+// transfer_commit.c along with its comments - see that file's header for why (the
+// host now runs the real thing instead of 7b's empty stub). What stays here is the
+// call site: transfer_pump_commit() is the same-named thin wrapper, unchanged.
+
 // gen25 让路链（接线裁定 #1 异步形态）：0 = 无让路；1 = 已发停机请求、等 prep
 // 退出（12K 栈归还）；UI 在 phase 1 期间显示「正在为推送腾出内存…」，收尾由
 // push_tick 的下一拍完成，绝不在一个按钮回调里同步等满 1000ms。
@@ -270,13 +284,10 @@ static bool s_push_handed_off;
 // a button callback never blocks for the full 1000 ms.
 static int s_push_yield_phase;
 static int64_t s_push_yield_deadline;
-// 分拍等待上限：prep 一轮是百毫秒量级，给 1500ms（3 个 500ms tick）覆盖最大书
-// 的最长 prep；到点未停即按失败处理（裁定 #3：不原地重试，等待 = 卡死观感）。
-// Tick-wait ceiling: a prep round runs in the hundreds of milliseconds, so
-// 1500 ms (three 500 ms ticks) covers the longest prep of the biggest book; on
-// expiry it is treated as a failure (ruling #3: never retry in place - waiting
-// reads as a freeze).
-#define PUSH_YIELD_WAIT_MS 1500
+// 分拍等待上限 `PUSH_YIELD_WAIT_MS` 定义在 `transfer_commit.h`：让路链与提交泵
+// 共用同一个数（同一种「等 prep 停下来」的语义），两处各自 define 就是两个数。
+// The tick-wait ceiling lives in transfer_commit.h so the yield chain and the commit
+// pump share one number - two defines would be two numbers for one semantic.
 static void push_arm_now(void); // gen25：让路链收尾在 push_tick 里武装，早于其定义 / gen25: the yield chain arms from push_tick, above push_arm_now's definition
 static read_pico_transfer_network_t s_networks[READ_PICO_TRANSFER_SCAN_MAX], s_selected;
 static size_t s_network_count, s_network_page;
@@ -333,24 +344,28 @@ static EpdRect method_control_rect(int id) {
 // Same-source readings (the other half of pre-audit 1): ble_pt_mem_snapshot +
 // ble_pt_mem_gate - the very figures and verdict the phone-push button's
 // precheck and start_locked use, so the panel never speaks a second dialect.
-// 红绿灯（用户裁定定案）：以最大连续块为主判、碎片率为辅显——红 <15K 直接
-// 判红（不看碎片率）；黄 15–20K 时碎片率只作附加说明；绿 ≥20K（即 BLE 闸门的
-// 最大块门槛）。free 趋于 0 时 1−largest/free 会虚低（free=4K、largest=4K
-// →0% 但实际濒危），主判根本不读它，误导显示从结构上出局。
-// The traffic light (the user's ruling, now settled): the largest block
-// decides and fragmentation only annotates - red below 15K outright
-// (fragmentation unread), yellow 15-20K with fragmentation as a note only,
-// green from 20K (the BLE gate's own largest threshold). As free approaches
-// zero 1-largest/free reads artificially low (free=4K with largest=4K says 0%
-// while the heap is dying); the verdict never reads it, so the misleading
-// display is designed out structurally.
+// 红绿灯（26.9.21 审计裁定 ④）：**删掉绿线**，只留红/黄两档。
+//
+// 绿线的来源是 BLE 启动闸门 `BLE_PT_MIN_LARGEST_INTERNAL = 20,480`。26.9.20 的验收
+// 把这条闸门钉死成"死判定"：蓝牙总开关默认开 → 主循环第一拍就把 NimBLE 栈拉起来 →
+// `push gate skipped: stack already up`，闸门在用户路径上根本不可达；而占着 8,192 B 的
+// `nimble_host` 又搬不动（hwm 6,084，占 74%）。于是「开到绿灯」是一个物理上到不了的状态，
+// 面板天天亮黄只会制造虚假的焦虑。
+//
+// 现在：红 <15,360（真的危险）；黄 ≥15,360（能用）。推送能不能开，仍由 `gate_ok` 决定，
+// 那是一条真实能力判断，不是装饰——它只是不再化作第三种颜色。
+// The green line came from the BLE start gate (largest >= 20,480). 26.9.20 proved that gate
+// is dead on the user path: the BLE switch defaults on, so the NimBLE stack is already up on
+// the main loop's first tick ("push gate skipped: stack already up"), and the 8,192 B
+// nimble_host stack cannot move (hwm 6,084 of 8,192). "Reaching green" was unreachable by
+// physics, so the panel only ever showed yellow. Two levels now: red below 15,360, yellow at
+// or above. Whether push can actually start is still answered by gate_ok - a real capability
+// check, just no longer a third colour.
 #define MEM_HEALTH_RED_BELOW (15 * 1024) // 红线：低于此直接判红 / the red line
-typedef enum { MEM_LEVEL_RED, MEM_LEVEL_YELLOW, MEM_LEVEL_GREEN } mem_level_t;
+typedef enum { MEM_LEVEL_RED, MEM_LEVEL_YELLOW } mem_level_t;
 
 static mem_level_t mem_health_level(size_t largest_internal) {
-    if (largest_internal < MEM_HEALTH_RED_BELOW) return MEM_LEVEL_RED;
-    if (largest_internal < BLE_PT_MIN_LARGEST_INTERNAL) return MEM_LEVEL_YELLOW;
-    return MEM_LEVEL_GREEN;
+    return largest_internal < MEM_HEALTH_RED_BELOW ? MEM_LEVEL_RED : MEM_LEVEL_YELLOW;
 }
 
 // 碎片率 = 1 − largest/free（整数百分比）。free 为 0 按 100% 计——最坏解释，
@@ -371,18 +386,19 @@ static unsigned mem_fragmentation_pct(size_t free_internal, size_t largest_inter
 // gate: when the largest block is fine but total/PSRAM misses the gate it must
 // not say "ample" - the mirror image of trusting the largest-only light.
 static void mem_panel_verdict(char *out, size_t cap, mem_level_t level,
-                              unsigned frag_pct, bool gate_ok) {
+                              unsigned frag_pct, bool gate_ok, bool blocks_enough) {
     switch (level) {
     case MEM_LEVEL_RED:
         snprintf(out, cap, "内存不足，请重启设备");
         break;
-    case MEM_LEVEL_YELLOW:
-        snprintf(out, cap, frag_pct >= 50 ? "内存偏紧且碎片较多，建议退出阅读"
-                                          : "内存偏紧，建议退出阅读后再试");
-        break;
     default:
-        snprintf(out, cap, gate_ok ? "内存充足，可以开启推送"
-                                   : "连续块充足，总内存未达推送门槛");
+        // 26.9.21：绿线删掉之后，原来「绿区」那两句并入这里——信息不丢，只是不再多一个颜色。
+        // 三个分支对应三种真实处境：能推送 / 连续块够但总量不够 / 连连续块都不够。
+        // The two former green-zone sentences move here: same information, one colour less.
+        if (gate_ok) snprintf(out, cap, "内存充足，可以开启推送");
+        else if (blocks_enough) snprintf(out, cap, "连续块充足，总内存未达推送门槛");
+        else snprintf(out, cap, frag_pct >= 50 ? "内存偏紧且碎片较多，建议退出阅读"
+                                               : "内存偏紧，建议退出阅读后再试");
         break;
     }
 }
@@ -411,11 +427,11 @@ static void draw_mem_panel(uint8_t *fb) {
     ui_draw_round_rect(fb, (EpdRect){panel.x + 1, panel.y + 1, panel.width - 2, panel.height - 2}, 23, UI_GRAY_BLACK);
     ui_text(fb, 64, 246, 27, "内存体检", EPD_DRAW_ALIGN_LEFT, false);
     ui_hairline(fb, 292, 64, 556, UI_GRAY_LIGHT);
-    size_t free_internal, largest_internal, free_psram;
-    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+    size_t free_internal, largest_internal, free_psram, largest_psram;
+    ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram, &largest_psram);
     const mem_level_t level = mem_health_level(largest_internal);
     const unsigned frag = mem_fragmentation_pct(free_internal, largest_internal);
-    const bool gate_ok = ble_pt_mem_gate(free_internal, largest_internal, free_psram);
+    const bool gate_ok = ble_pt_mem_gate(free_internal, largest_internal, free_psram, largest_psram);
     const struct { const char *label; size_t bytes; } rows[] = {
         {"内部可用内存", free_internal}, {"最大连续块", largest_internal}, {"PSRAM 可用", free_psram},
     };
@@ -429,19 +445,19 @@ static void draw_mem_panel(uint8_t *fb) {
     snprintf(value, sizeof(value), "%u%%", frag);
     ui_text(fb, 64, y, 19, "内部碎片率", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 620, y, 19, value, EPD_DRAW_ALIGN_RIGHT, false);
-    // 红绿灯：三圆点左→右 = 红/黄/绿，实心为当前档。墨水屏无彩色，实心/空心
-    // 即档位语言，判定与「手机推送」按钮预检同源。/ The traffic light: three
-    // dots left to right = red/yellow/green, the solid one marks the level. An
-    // e-ink panel has no colour, so solid vs hollow is the level language - and
-    // the verdict shares the phone-push button's precheck source.
+    // 红绿灯：**两个**圆点，左→右 = 红/黄，实心为当前档。26.9.21 起没有绿点：
+    // 20,480 那条线在用户路径上不可达（见 mem_health_level 上方注释），亮着只会误导读的人。
+    // The traffic light is two dots now (red, yellow): the 20,480 line is unreachable on
+    // the user path, so a green dot would only mislead.
     const int cy = 470;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         EpdRect dot = {80 + i * 24 - 8, cy - 8, 16, 16};
         if ((mem_level_t)i == level) ui_fill_round_rect(fb, dot, 8, UI_GRAY_BLACK);
         else ui_draw_round_rect(fb, dot, 8, 0x88);
     }
     char verdict[96];
-    mem_panel_verdict(verdict, sizeof(verdict), level, frag, gate_ok);
+    mem_panel_verdict(verdict, sizeof(verdict), level, frag, gate_ok,
+                      largest_internal >= BLE_PT_MIN_LARGEST_INTERNAL);
     fit_label(verdict, 20, 460);
     ui_text(fb, 152, cy - 10, 20, verdict, EPD_DRAW_ALIGN_LEFT, false);
     ui_draw_button(fb, mem_panel_close_rect(), "知道了", false);
@@ -1307,6 +1323,23 @@ static void absorb_close_why(void) {
 }
 
 // 武装页轮询：消费 push_sink 的一次性 UI 事件，500ms 节流刷新倒计时与进度。
+// 26.9.30 commit 2：提交段的执行体。app_loop 取走请求后调到这里——四拍
+// （rename/remove）只在主循环帧间跑，绝不上 BLE 回调栈：那里和读者的 fread
+// 抢同一个卷，而且没有「读者已释放」这个前提。
+// commit 3 会在这行之前加 book_release_hold()：释放读者句柄是四拍成立的前提。
+// The commit executor: app_loop calls it after taking the request, so the four
+// beats run between frames and never on the BLE callback stack - that stack
+// contends with the reader's fread for the same volume and carries no "reader
+// released" precondition. Commit 3 adds book_release_hold() right here.
+void transfer_pump_commit(void) {
+    // 26.11.1：函数体搬到 `transfer_commit.c`（宿主可编，7b busy 路径靠它跑真身）。
+    // 这里保留同名封装：调用点 `app_loop.c` 与本文件其它引用零改动，行为一字未变。
+    // The body moved to transfer_commit.c (host-buildable; 7b's busy path runs the
+    // real thing there). This keeps the same-named wrapper so app_loop.c's call site
+    // and every other reference here stay put, with behaviour byte-identical.
+    transfer_commit_pump();
+}
+
 // The arm page's pump: consume the push sink's one-shot UI events and refresh the
 // countdown and progress at a 500 ms cadence.
 static app_redraw_t push_tick(app_ctx_t *ctx) {
@@ -1742,20 +1775,44 @@ static void push_button_action(void) {
     // the push needed no stack start at all. Restores the gen23 semantics:
     // stack up -> take the existing arm path; stack down -> precheck first.
     s_push_requested = false;
-    if (!ble_pt_running()) {
-        size_t free_internal, largest_internal, free_psram;
-        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
-        if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
+    // 26.9.21 裁定③（闸门收窄，绝不删）：26.9.20 真机证明这段预检在用户路径上**不可达**
+    // —— 总开关开着 → 主循环第一拍就把栈拉起来 → 这里走不到；总开关关着 → 闸门跑完也被
+    // 后面「蓝牙已关闭」那道门覆盖。它唯一还有诊断价值的场合是**上一次启动已经失败过**
+    // （`ble_pt_locked()`）：那时候用户需要的是「为什么起不来」而不是再撞一次同样的墙。
+    // 所以拦截面收窄成：**只有自锁态才在按钮口先拦**；其余情况直接 arm，让 start_locked
+    // 里的同一个 `ble_pt_mem_gate()` 去兜底（闸门一个字都没删，只是换了个站位）。
+    // 判据：首次尝试一律放行；失败后 s_locked 置真，再点才由这里给出内存文案。
+    // 26.9.21 ruling 3 (narrow the gate, never delete it): the 26.9.20 hardware log
+    // proved this precheck unreachable on the user path - master switch on brings the
+    // stack up on the loop's first tick, so this code is skipped; master switch off runs
+    // it but the "BLE is off" gate right after overwrites the verdict. Its only remaining
+    // diagnostic value is the case where a start has ALREADY failed (`ble_pt_locked()`):
+    // then the user needs "why won't it start" rather than another identical crash. So
+    // the blocking surface narrows to "locked only"; every other case arms and lets the
+    // very same ble_pt_mem_gate() inside start_locked act as the backstop - not one line
+    // of the gate is deleted, it just changed position.
+    if (!ble_pt_running() && ble_pt_locked()) {
+        size_t free_internal, largest_internal, free_psram, largest_psram;
+        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram, &largest_psram);
+        if (!ble_pt_mem_gate(free_internal, largest_internal, free_psram, largest_psram)) {
             // gen24.1（D3 仪表）：与 UI 提示同源记日志——真机日志由此可分辨「按钮
             // 预检拒绝」与 start_locked 的「启动拒绝」（后者也打日志），gen24 真机
-            // 轮就因缺这一行分不清两种拒绝。
+            // 轮就因缺这一行分不清两种拒绝。26.9.24：取证行带上 PSRAM largest——
+            // 两层闸门，两层都留痕。
             // gen24.1 (D3 instrumentation): log with the same figures as the UI
             // hint - hardware logs can now tell a button precheck refusal from a
             // start_locked refusal (which also logs); the gen24 hardware round
-            // could not tell the two apart for want of this line.
-            ESP_LOGW(TAG, "push precheck refused: internal %u B free / %u B largest (gate %u K), psram %u B free",
+            // could not tell the two apart for want of this line. Since 26.9.24
+            // the evidence line carries the PSRAM largest too: two layers, both
+            // leave a trace.
+            ESP_LOGW(TAG, "push precheck refused: internal %u B free / %u B largest (gate %u K), psram %u B free / %u B largest (gate %u K)",
                      (unsigned)free_internal, (unsigned)largest_internal,
-                     (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024), (unsigned)free_psram);
+                     (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024), (unsigned)free_psram,
+                     (unsigned)largest_psram, (unsigned)(BLE_PT_MIN_LARGEST_PSRAM / 1024));
+            // 26.9.13 P0-d：拒绝时打一份块分布，站点名与 ble-start 分开统计。
+            // 26.9.13 P0-d: dump the block layout on refusal, grouped under its own site
+            // name so offline statistics never mix it with ble-start.
+            pico_heap_dump("push-precheck", "app_transfer:push_button_action");
             // gen24.1（D1 文案说真话）：gen24 原文案「重启设备后可用」被真机证伪——
             // NVS 自锁（tries+why）跨重启存活，重启 alone 并不解锁；且重启后开大书
             // 几秒内 largest 再破闸（boot2：70.4s 开书 → 76.2s 跌到 19K）。boot1
@@ -1795,12 +1852,47 @@ static void push_button_action(void) {
                 return;
             }
             snprintf(s_method_message, sizeof(s_method_message),
-                     "内存碎片不足（最大块 %uK，需 %uK）——退出当前书籍后重试；若仍失败，请重启设备",
+                     (free_psram < BLE_PT_MIN_FREE_PSRAM || largest_psram < BLE_PT_MIN_LARGEST_PSRAM)
+                         ? "设备临时存储不足——请重启设备后再试"
+                         : "内存碎片不足（最大块 %uK，需 %uK）——退出当前书籍后重试；若仍失败，请重启设备",
                      (unsigned)(largest_internal / 1024),
                      (unsigned)(BLE_PT_MIN_LARGEST_INTERNAL / 1024));
             s_method_inline_enable = false;
             return;
         }
+    } else if (!ble_pt_running()) {
+        // 裁定③的另一半：栈 down 且**没锁**（第一次尝试，或上次成功过）→ 不拦，直接 arm。
+        // 必须与下面「栈已在跑」那一支分开打点：两件事在日志上长得像，判读时却完全不同
+        // ——一个是「无需启动所以没闸门」，一个是「要启动但先放行、由 start_locked 兜底」。
+        // 合成一句话，26.9.22 的人就会以为闸门又被绕过了。
+        // The other half of ruling 3: stack down and NOT locked (first attempt, or the
+        // last one succeeded) -> do not block, arm directly. This needs its own line
+        // apart from "stack already up": the two look alike on the wire yet mean
+        // opposite things - "no start needed, so no gate" versus "a start is needed,
+        // released here with start_locked as the backstop". Merging them would make a
+        // later reader believe the gate was bypassed again.
+        ESP_LOGW(TAG, "push gate released: stack down, not locked - start_locked holds the gate "
+                      "(who=app_transfer:push_button_action)");
+        pico_heap_dump("push-release", "app_transfer:push_button_action");
+    } else {
+        // 26.9.13 P0-d（本轮最要紧的一条取证）：栈已在跑 → 上面整段内存预检**被跳过**。
+        // 跳过本身是 gen24.1 的 D2 裁定，不是缺陷；缺陷是它不留痕——26.9.12 的真机日志
+        // 里 `push precheck refused` 一条都没有、`ble_pt` 一条都没有，广播却起来了，
+        // 于是「谁放行的」无从回答。这里补一行 `who=`，把跳过这件事点名：
+        //   stack_up=1 + 站点 push-bypass = 这一次根本没有内存闸门参与。
+        // 同时打一份堆证据：如果 largest 确实低于闸门（14 K），那就说明**跳过是唯一的
+        // 放行原因**，而不是「闸门判定通过」——两者在日志上从此可分辨。
+        // 26.9.13 P0-d (this round's most important evidence): with the stack already
+        // up, the whole memory precheck above is SKIPPED. Skipping is gen24.1's D2
+        // ruling, not a defect; the defect is that it leaves no trace - the 26.9.12
+        // log had no `push precheck refused` and no `ble_pt` line at all, yet the radio
+        // came up, so "who let it through" had no answer. This line names the bypass:
+        //   stack_up=1 + site push-bypass = no memory gate took part in this arm at all.
+        // The heap dump rides along: if largest really is below the gate (14 K), the
+        // bypass is the ONLY reason it armed - not a gate that judged "pass". The two
+        // are distinguishable on the wire from now on.
+        ESP_LOGW(TAG, "push gate skipped: stack already up (who=app_transfer:push_button_action)");
+        pico_heap_dump("push-bypass", "app_transfer:push_button_action");
     }
     // gen24.2 门 2（块 3，B 模型）：蓝牙总开关。开关关着时不武装、不进
     // pending——给行内提示 + 【开启】按钮，用户原地写设置项继续，不必跳
@@ -1883,11 +1975,19 @@ static void on_enter(app_ctx_t* ctx) {
     // style directly - the data gen25 needs to pin down the long-run internal-heap
     // layout degradation.
     {
-        size_t free_internal, largest_internal, free_psram;
-        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
+        size_t free_internal, largest_internal, free_psram, largest_psram;
+        ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram, &largest_psram);
         ESP_LOGI(TAG, "on_enter internal free=%u largest=%u psram free=%u largest=%u",
                  (unsigned)free_internal, (unsigned)largest_internal, (unsigned)free_psram,
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                 (unsigned)largest_psram);
+        // 26.9.13 P0-d：除了上面两行数字，再落一份**逐块清单**。现场那张照片上的
+        // 「31.5 K / 14.0 K / 55%」只够证明面板没算错，不够说明 14 K 之外的那 17 K
+        // 碎在谁身上；进页这一刻的块分布才是「关书之后到底还剩什么」的定格。
+        // 26.9.13 P0-d: beyond the two numbers above, drop a per-block listing. The
+        // field photo's "31.5 K / 14.0 K / 55%" only proves the panel did the math; it
+        // cannot say who owns the 17 K outside the largest block. The layout at page
+        // entry is the freeze-frame of "what is left after closing a book".
+        pico_heap_dump("transfer-enter", "app_transfer:on_enter");
     }
     s_start_pending = false;
     s_usb_message[0] = 0;
@@ -2116,9 +2216,9 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         if (app_book_prep_stopped()) {
             s_push_yield_phase = 0;
             if (app_book_request_yield_for_push()) {
-                size_t free_internal, largest_internal, free_psram;
-                ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram);
-                if (ble_pt_mem_gate(free_internal, largest_internal, free_psram)) {
+                size_t free_internal, largest_internal, free_psram, largest_psram;
+                ble_pt_mem_snapshot(&free_internal, &largest_internal, &free_psram, &largest_psram);
+                if (ble_pt_mem_gate(free_internal, largest_internal, free_psram, largest_psram)) {
                     ESP_LOGW(TAG, "yield ok: arming after unload (internal %u B free / %u B largest)",
                              (unsigned)free_internal, (unsigned)largest_internal);
                     push_arm_now();

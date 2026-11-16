@@ -338,7 +338,13 @@ static void draw_status_page(uint8_t* fb) {
         y = ui_draw_section(fb, y + UI_SECTION_GAP, "固件 Firmware");
         snprintf(line, sizeof(line), "%s", desc->version);
         y = ui_draw_row(fb, y, "主机 Host", line);
-        snprintf(line, sizeof(line), "%s %s", desc->date, desc->time);
+        // 可复现构建下 esp_app_desc 的 date/time 是空串（IDF 会把编译时刻从镜像里抹掉），
+        // 这里回落到注入的固定戳，保证「构建 UTC 时间」这一行永远有值且同源即同值。
+        // With a reproducible build esp_app_desc carries an empty date/time, so fall back to
+        // the injected fixed stamp: the row always has a value, and the same source yields it.
+        const char* build_date = desc->date[0] ? desc->date : PICO_BUILD_DATE;
+        const char* build_time = desc->time[0] ? desc->time : PICO_BUILD_TIME;
+        snprintf(line, sizeof(line), "%s %s", build_date, build_time);
         const char* build_label = "构建 UTC 时间";
         int build_px = UI_PX_VALUE;
         while (build_px > 20 && ttf_text_width_px(build_px, build_label) +

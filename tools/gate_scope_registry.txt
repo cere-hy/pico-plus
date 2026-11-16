@@ -1,0 +1,66 @@
+# 门禁资产登记簿（门禁体检批 ① / §13.12 挂账落地）
+#
+# 一行一个「总入口之外」的测试型文件。**没有这一行** = 孤儿 = `check_gate_inventory.py` 报红。
+# 这不是审批表，是**决定的落点**：每个留在门外的文件，都要有人写下为什么。
+#
+# 状态只有两种，别发明第三种：
+#   out-ok   有意留在外面，理由成立（外部依赖 / 一次性工具 / 结构上不能进）
+#   out-gap  应该进总入口、但现在进不去 —— **这是洞，不是豁免**，必须挂账
+#
+# 格式：路径<TAB>状态<TAB>理由（三个字段，TAB 分隔）
+# 文件被删除或改名后，这一行会变成「陈旧条目」并报红；移进总入口后会变成
+# 「表与门禁矛盾」并报红。两头都有牙，中间不会悄悄过期。
+
+tools/.ab_norm_run_display_host_test.sh	out-ok	一次性 A/B 归一化对照脚本（隐藏文件），历史工具，不是门禁资产
+tools/.ab_norm_run_water_turn_host_test.sh	out-ok	一次性 A/B 归一化对照脚本（隐藏文件），历史工具，不是门禁资产
+tools/.ab_norm_run_wifi_qr_host_test.sh	out-ok	一次性 A/B 归一化对照脚本（隐藏文件），历史工具，不是门禁资产
+tools/acrylic_dither_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/ai_detail_wiring_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/ai_detail_wiring_mutations.py	out-gap	变异脚本未接入总入口
+tools/avatar_async_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/book_cover_resample_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/boot_panel_actions_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/cover_disk_cache_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/cover_jobs_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/dashboard_clock_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/home_preferences_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/ota_release_host_test.c	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/packed_fill_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/quick_layer_raster_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_background_flow_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_idle_prefetch_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_prefetch_map_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_refresh_release_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_stability_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reader_weight_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/reading_settings_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/run_26910_vocab_mutations.sh	out-ok	变异脚本先查工作区是否干净（自指），出包门禁内必然脏，结构上不能进
+tools/run_apk_host_tests.sh	out-ok	需 Android SDK / javac 工具链，固件门禁环境不具备
+tools/run_boot_order_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_clock_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_d3_constant_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_dict_popup_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_dualgesture_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_gen2664_mutations.sh	out-ok	26.6.4 / 26.6.5 版本窗口的一次性变异，靶点已被后续重构取代
+tools/run_gen2665_mutations.sh	out-ok	26.6.4 / 26.6.5 版本窗口的一次性变异，靶点已被后续重构取代
+tools/run_heapdiag_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_hold_mutations.py	out-gap	变异脚本未接入总入口
+tools/run_hotplug_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_scene_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_scene_view_mutations.sh	out-gap	变异脚本未接入总入口
+tools/run_tts_mutations.sh	out-gap	变异脚本未接入总入口
+tools/settings_entry_clock_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/settings_layout_font_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/shelf_categories_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/shelf_cover_batch_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/shelf_guard_cache_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/sleep_power_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/test_fatfs_filenames.py	out-gap	独立测试脚本，未被总入口调用
+tools/test_image_files.py	out-gap	独立测试脚本，未被总入口调用
+tools/test_wifi_qr_decode.py	out-gap	独立测试脚本，未被总入口调用
+tools/time_service_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/vertical_number_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/vertical_punctuation_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/wallpaper_cache_host_test.py	out-gap	单文件宿主用例，未被任何 runner 编译或调用
+tools/run_tier1_first_red.sh	out-ok	Tier 1 先红验证工具（19 条各打掉一条断言必须见红）。要改产品源码再回滚，只适合接入批/复验时跑，不适合常驻门禁；日常门禁只跑「跑得起来」那一半
+tools/run_p11_first_red.sh	out-ok	P1-1 / B42 先红验证（6 条各打掉一处语义必须见红）。改产品码再还原，回滚锚点是注入前文件内容而非 HEAD，只适合复验时跑

@@ -36,6 +36,8 @@
 
 #include "app.h"
 #include "app_content_open.h"
+// 26.11.17 手势批：空白 / 双指上滑 / 长按归属三个判定在这里，页面只做接线。
+#include "home_gesture.h"
 #include "app_transfer_mode.h"
 #include "boot_state.h"
 #include "app_registry.h"
@@ -106,6 +108,12 @@ static int64_t s_clock_minute=-2;
 static uint32_t s_reading_days[31];
 static struct tm s_date;
 static enum { HOME_ROOT,HOME_COMPONENT,HOME_GOAL,HOME_TIME } s_view;
+// 判定模块按 int 收视图号；顺序若被谁改了，这里编译当场红，而不是真机上「某视图误触发」。
+// The decider takes the view as int; reordering either side fails the build here
+// instead of showing up on hardware as "some view fires when it should not".
+_Static_assert((int)HOME_VIEW_ROOT==(int)HOME_ROOT&&(int)HOME_VIEW_COMPONENT==(int)HOME_COMPONENT&&
+               (int)HOME_VIEW_GOAL==(int)HOME_GOAL&&(int)HOME_VIEW_TIME==(int)HOME_TIME,
+               "home_gesture view ids must match the page's enum");
 static app_home_component_t s_component_browse;
 static bool s_component_pending;
 static const app_home_component_t s_components[]={APP_HOME_MOON,APP_HOME_CLOCK,APP_HOME_KEHAI,APP_HOME_CAT,APP_HOME_DALI,APP_HOME_ASTERISK,APP_HOME_HOUSE,APP_HOME_FOLDER};
@@ -131,13 +139,15 @@ static bool s_avatar_ready,s_avatar_pending;
 static char s_avatar_path[288];
 static EpdRect s_pressed;
 static bool s_press_pending;
+// 双指序列去重（26.11.17）：一条接触序列只开一次页面，RETRACT 是边界。
+static home_dual_seq_t s_dual_seq;
 static EpdRect continue_card_rect(void) { return (EpdRect){36,184,612,378}; }
 // gen24.3 问题 1：命中区下沿 574 → 566，与推流卡命中区在 y=566 干净相邻。
 // 原两命中矩形在 [558,574) 重叠 16px，该带点按被当开书（误触）。
 // gen24.3 problem 1: the hit area's lower edge moves 574 -> 566 so it abuts the
 // push card's hit area exactly at y=566. The two hit rects used to overlap by
 // 16px in [558,574), where a tap was taken for "open book" (a mis-tap).
-static EpdRect continue_card_hit_rect(void) { return (EpdRect){24,172,636,394}; }
+static EpdRect continue_card_hit_rect(void) { return HOME_HIT_CONTINUE; }   // 单源：与空白判定同一常量
 static bool continue_card_pressed(void) { return s_press_pending && s_pressed.height == 378; }
 // gen18（M1.5 案1）：首页推流状态卡。渲染源直接读 push_sink_state()——射频事实，
 // 不是武装意图；点按只跳传书页，绝不静默武装（裁决③）。卡带 = 继续阅读卡与
@@ -150,7 +160,7 @@ static bool continue_card_pressed(void) { return s_press_pending && s_pressed.he
 // gen24.3 问题 1：命中区上沿 558 → 566，与继续卡命中区（下沿 566）零重叠。
 // gen24.3 problem 1: the hit area's upper edge moves 558 -> 566, leaving zero
 // overlap with the continue card's hit area (lower edge 566).
-#define PUSH_CARD_HIT  ((EpdRect){24,566,636,74})
+#define PUSH_CARD_HIT  HOME_HIT_PUSH   // 单源：同上
 static EpdRect push_card_rect(void) { return PUSH_CARD_RECT; }
 static bool push_card_pressed(void) { return s_press_pending && s_pressed.height == 64; }
 static EpdRect control_feedback_area(EpdRect control) {
@@ -1085,13 +1095,54 @@ static EpdRect control(int x,int y) {
     }
     return(EpdRect){0};
 }
+// 传书页跳转（原为推送卡 tap 分支的内联两行，26.11.17 提出来给长按空白复用）。
+// gen18 裁决③：只跳传书页，绝不静默武装。
+// Jump to the transfer page (was inline in the push card's tap branch; lifted out in
+// 26.11.17 for the blank long press). gen18 ruling 3: jump only, never arm silently.
+static void open_transfer_page(app_ctx_t *ctx) {
+    extern const app_desc_t app_transfer;
+    app_transfer_request_method_picker();
+    ctx->request_app = &app_transfer;
+}
+static app_redraw_t on_dual_gesture(app_ctx_t *ctx,const ui_dual_event_t *ev) {
+    if(home_dual_wants_push((int)s_view,&s_dual_seq,ev)) {
+        struct stat st;
+        bool ready=stat(PUSH_TEXT_PATH,&st)==0&&S_ISREG(st.st_mode)&&st.st_size>0;
+        if(home_push_route(ready)==HOME_PUSH_OPEN&&app_book_request_open_clean(PUSH_TEXT_PATH)) {
+            ui_nav_request(ctx,1);
+            return APP_REDRAW_NONE;
+        }
+        // 诚实失败：推件箱为空（或打不开）就送到能推书的地方，绝不静默。
+        // Honest failure: an empty or unreadable inbox goes where one can push.
+        open_transfer_page(ctx);
+        return APP_REDRAW_NONE;
+    }
+    if(ev->type==UI_DUAL_EVT_RETRACT&&s_press_pending) {
+        // 双指成立即撤销：主循环已 cancel_gesture，页面这边收回按下装饰，不留残影。
+        // Two fingers established revokes the press: the loop cancels the recognizer,
+        // the page takes back its press decoration so nothing is left behind.
+        s_press_pending=false;
+        s_area=control_feedback_area(s_pressed);
+        return APP_REDRAW_AREA;
+    }
+    return APP_REDRAW_NONE;
+}
 static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
     if(ev->type==UI_GESTURE_PRESS) {s_pressed=control(ev->x0,ev->y0);s_press_pending=s_pressed.width>0;if(s_press_pending){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}return APP_REDRAW_NONE;}
     bool restore=s_press_pending;
     if(ev->type==UI_GESTURE_MOVE) {if(s_press_pending&&!hit(continue_card_pressed()?continue_card_hit_rect():push_card_pressed()?PUSH_CARD_HIT:s_pressed,ev->x,ev->y)){s_press_pending=false;s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}return APP_REDRAW_NONE;}
     s_press_pending=false;
-    if(ev->type==UI_GESTURE_LONG_PRESS&&s_view==HOME_ROOT&&hit((EpdRect){24,640,320,365},ev->x0,ev->y0)) {
-        s_component_browse=app_settings_home_component();s_view=HOME_COMPONENT;s_save_error=false;return APP_REDRAW_PAGE;
+    if(ev->type==UI_GESTURE_LONG_PRESS) {
+        // 热区优先、空白兜底：判定在 home_gesture.c，这里只分派动作。
+        // Hot zones first, blank as fallback: the decision lives in home_gesture.c,
+        // this only dispatches the action.
+        switch(home_long_decide((int)s_view,ev->x0,ev->y0)) {
+            case HOME_LONG_COMPONENT:
+                s_component_browse=app_settings_home_component();s_view=HOME_COMPONENT;s_save_error=false;return APP_REDRAW_PAGE;
+            case HOME_LONG_TRANSFER:
+                open_transfer_page(ctx);return APP_REDRAW_NONE;
+            default: break;
+        }
     }
     if(s_view==HOME_COMPONENT&&ev->y0>=250&&ev->y0<970){
         int direction=ev->type==UI_GESTURE_SWIPE_L?1:ev->type==UI_GESTURE_SWIPE_R?-1:0;
@@ -1161,9 +1212,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
             // silently arm - arming stays a deliberate tap on the transfer
             // page's phone-push entry. If the sink is background-alive (18-a),
             // the transfer page's on_enter lands straight on the arm view.
-            extern const app_desc_t app_transfer;
-            app_transfer_request_method_picker();
-            ctx->request_app = &app_transfer;
+            open_transfer_page(ctx);
             return APP_REDRAW_NONE;
         }
         if(hit((EpdRect){588,88,60,60},x,y)){ui_nav_request(ctx,3);return APP_REDRAW_NONE;}
@@ -1173,10 +1222,15 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
 static app_redraw_t on_key(app_ctx_t *ctx,int key) {(void)ctx;(void)key;if(s_view!=HOME_ROOT){s_view=HOME_ROOT;s_press_pending=false;return APP_REDRAW_PAGE;}return APP_REDRAW_NONE;}
 static bool no_menu_handle(app_ctx_t *ctx) {(void)ctx;return false;}
 static bool main_page_visible(app_ctx_t *ctx) {(void)ctx;return s_view==HOME_ROOT;}
+// 首页整屏先填 0xFF（render 入口），状态栏底色就是白。子视图各有自己的底色，
+// 首版只让主视图参与——与「空白长按只在主视图启用」同一条最小切口。
+// The home page fills 0xFF first, so the bar sits on white. Sub-views carry their own
+// backgrounds; only the root view takes part in v1, the same minimal-cut rule as gestures.
+static int status_bar_bg(app_ctx_t *ctx) {(void)ctx;return s_view==HOME_ROOT?0xFF:-1;}
 static EpdRect area_hint(app_ctx_t *ctx) {(void)ctx;return s_area;}
 static void home_exit(app_ctx_t *ctx){(void)ctx;book_cover_jobs_cancel(s_cover_generation);s_cover_generation=0;}
 const app_desc_t app_dashboard={
     .title="首页 Home",.detail="继续阅读与月阅读记录",.enter_full=false,.owns_keys=true,.menu_handle_enabled=no_menu_handle,
-    .main_page_visible=main_page_visible,.on_enter=on_enter,.on_exit=home_exit,.on_media_lost=on_media_lost,.on_media_ready=on_media_ready,
-    .render=render,.present=present,.on_tick=on_tick,.on_gesture=on_gesture,.on_key=on_key,.area_hint=area_hint,
+    .main_page_visible=main_page_visible,.status_bar_bg=status_bar_bg,.self_clock_tick=true,.on_enter=on_enter,.on_exit=home_exit,.on_media_lost=on_media_lost,.on_media_ready=on_media_ready,
+    .render=render,.present=present,.on_tick=on_tick,.on_gesture=on_gesture,.on_dual_gesture=on_dual_gesture,.on_key=on_key,.area_hint=area_hint,
 };

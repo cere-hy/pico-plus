@@ -12,9 +12,14 @@ cd "$(dirname "$0")/.."
 # first, then build the C host - a protocol round-trip must use the peer's real
 # frame, never this side's buffer size (that was D-1's blind spot).
 bash tools/gen_apk_frame_fixture.sh
-gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -g -fsanitize=address,undefined \
+# commit 5：存储层单独编，带 PUSH_PART_HOST_TEST 才有短写钩子与可配置目录。
+# Commit 5: the storage layer builds separately; PUSH_PART_HOST_TEST enables the
+# short-write hook and the configurable directory.
+gcc -std=c11 -D_POSIX_C_SOURCE=200809L -DPUSH_PART_HOST_TEST -Wall -Wextra -Werror -g \
+    -fsanitize=address,undefined \
     -Icomponents/push_sink/include -Ibuild/book-tests \
     tools/push_sink_host_test.c \
+    components/push_sink/src/push_part.c \
     components/push_sink/src/push_proto.c \
     components/push_sink/src/push_session.c \
     components/push_sink/src/ai_ridealong.c \
@@ -22,3 +27,8 @@ gcc -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -g -fsanitize=addre
     components/push_sink/src/push_tts.c \
     -o /tmp/push_sink_test
 /tmp/push_sink_test
+
+# 判决行（契约）：只有全绿才走到这里（set -e）；门禁按它断言「跑到底了」，不是「跑了」。
+# Verdict line (a contract): reached only when everything passed; the gate asserts it to tell
+# "finished" from "truncated".
+echo "JUDGEMENT: PUSH_SINK PASS"

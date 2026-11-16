@@ -7,9 +7,10 @@ idf_component_register(
         "src/push_proto.c"
         "src/push_session.c"
         "src/push_sink.c"
+        "src/push_part.c"
         "src/ai_ridealong.c"
         "src/ai_segasm.c"
         "src/push_tts.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash esp_timer esp_hw_support read_pico_pmu
+    REQUIRES bt nvs_flash esp_timer esp_hw_support read_pico_pmu pico_heapdiag
 )

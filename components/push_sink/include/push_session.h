@@ -116,6 +116,27 @@ void push_session_adopt(push_session_t *s, const push_begin_t *begin, uint32_t r
 /// 窗口剩余毫秒；0 表示无超时或已不在窗口。/ Milliseconds left in the window; 0 means no timeout or not in a window.
 uint32_t push_session_window_left_ms(const push_session_t *s, uint32_t now_ms);
 
+/// 三拍封送（quiesce）的「推送已停」判据：**按有没有在动介质判，不按有没有连接判**。
+///
+/// 26.11.5 修的是这条判据的原形 `state == PUSH_STATE_IDLE`：手机连着（APK 常驻、
+/// BLE 长连，CONNECTED）却没在传时，原判据把「连着」当成「没停」——quiesce 永不
+/// 返回 true → 永不卸载 → 卷永远非空 → 插回被 `stale card` 拒 → 闩锁等一个永远
+/// 不会来的边沿。真机 26.11.4 日志里 `state=3` 连打 4 次、三个零（0 probe start /
+/// 0 remount / 0 latch 释放）就是它的签名。
+///
+/// 握介质的是 RECEIVING / PROCESSING（.part 写句柄、CRC 读句柄），CONNECTED /
+/// WINDOW / ARMED / COOLDOWN 只握着链路或倒计时。所以判据是「不在传输态」而不是
+/// 「等于 IDLE」，且**必须与 live_files == 0 合取**——只看状态会放过一个还开着的
+/// 第三方 FILE*（B51 的教训）。
+///
+/// The quiesce predicate: "has the push stopped touching the medium", not "is the
+/// link idle". The original `state == PUSH_STATE_IDLE` treated a connected-but-idle
+/// phone (the normal case: the APK stays connected) as "still running", so quiesce
+/// never returned true, the volume was never unmounted, and a reinserted card was
+/// refused as stale. Only RECEIVING/PROCESSING hold the medium; CONNECTED/WINDOW/
+/// ARMED/COOLDOWN hold a link or a countdown. The file count stays conjunctive.
+bool push_quiesce_idle(push_state_t state, bool pending_arm, unsigned live_files);
+
 #ifdef __cplusplus
 }
 #endif

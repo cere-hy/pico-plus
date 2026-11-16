@@ -5,5 +5,5 @@ idf_component_register(
     SRCS "src/ble_page_turner.c"
           "src/ble_pt_mem.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash esp_timer read_pico push_sink
+    REQUIRES bt nvs_flash esp_timer read_pico push_sink pico_heapdiag
 )

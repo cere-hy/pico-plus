@@ -199,10 +199,10 @@ int ui_font_text_width_px(int px, const char *text) {
     return width;
 }
 
-static void draw_text_px(uint8_t *fb, int x, int baseline, int px,
+static int draw_text_px(uint8_t *fb, int x, int baseline, int px,
                           const char *text, enum EpdFontFlags align,
                           uint8_t fg, uint8_t bg, unsigned threshold) {
-    if (!fb || !text || !ready()) return;
+    if (!fb || !text || !ready()) return x;
     int cursor = x;
     if (align & EPD_DRAW_ALIGN_CENTER) cursor -= ui_font_text_width_px(px, text) / 2;
     else if (align & EPD_DRAW_ALIGN_RIGHT) cursor -= ui_font_text_width_px(px, text);
@@ -220,17 +220,18 @@ static void draw_text_px(uint8_t *fb, int x, int baseline, int px,
             }
         cursor += g->advance;
     }
+    return cursor;
 }
 
-void ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px,
-                          const char *text, enum EpdFontFlags align,
-                          uint8_t fg, uint8_t bg, bool black_white) {
-    draw_text_px(fb, x, baseline, px, text, align, fg, bg, black_white ? 128 : 0);
+int ui_font_draw_text_px(uint8_t *fb, int x, int baseline, int px,
+                         const char *text, enum EpdFontFlags align,
+                         uint8_t fg, uint8_t bg, bool black_white) {
+    return draw_text_px(fb, x, baseline, px, text, align, fg, bg, black_white ? 128 : 0);
 }
 
 void ui_font_draw_title_px(uint8_t *fb, int x, int baseline, int px,
                           const char *text, enum EpdFontFlags align) {
     // 和补充位图生成器的96门限一致，避免同一行出现不同笔画深度。
     // Match the supplement generator's threshold of 96 to keep stroke weight consistent within a line.
-    draw_text_px(fb, x, baseline, ui_font_title_px(px, text), text, align, 0, 15, 96);
+    (void)draw_text_px(fb, x, baseline, ui_font_title_px(px, text), text, align, 0, 15, 96);
 }

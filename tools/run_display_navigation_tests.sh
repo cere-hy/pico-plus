@@ -21,10 +21,7 @@ cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
     main/display_main_waveform.c main/ui/ui_image_dither.c main/ui/ui_gray_lut.c -lm -o build/book-tests/navigation-waveform
 build/book-tests/navigation-waveform
 
-cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
-    -Imain -Itools/waveform_host_stubs -Icomponents/epdiy/include -Icomponents/epdiy/src \
-    -Icomponents/e0470_epaper_waveform/include -Icomponents/e0470_epaper_waveform/waveforms \
-    tools/reader_waveform_host_test.c main/display_reader_waveform.c \
-    components/e0470_epaper_waveform/e0470_epaper_waveform.c \
-    components/e0470_epaper_waveform/e0470_waveform_trim.c -o build/book-tests/reader-waveform
-build/book-tests/reader-waveform
+# 26.11.7：reader-waveform 这一段随 display_reader_waveform 模块一起退休。那张表只为
+# GL16 排相序（白底补不回来），S1 换成 E0470 的 GC16 之后没有调用方，测它等于给一个
+# 不存在的模块站岗。/ 26.11.7: the reader-waveform block retired with the module it
+# tested - the table was ordered for GL16 only, and S1 left it without a caller.

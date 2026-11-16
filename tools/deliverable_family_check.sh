@@ -29,6 +29,11 @@
 #                          此前五件不覆盖该副本，故分叉两代无人红。
 #                          (release copy must be byte-identical to the build
 #                          output - it drifted two generations unnoticed)
+#   7. 固件自证版本串（26.9.6 立，审计裁定③每版必修）：main/app_main.c 必须打印
+#      `fw: <PROJECT_VER>`，且本代验收 README 的**判据第一条**必须钉住这行串。
+#      由来：round-3 复验因固件不自证而无法归因（详见脚本内第 7 项注释）。
+#      (the firmware must state its own version, and this generation's
+#      acceptance README must pin that string as its FIRST item)
 #
 # 单一真相源：版本串取 CMakeLists.txt 的 PROJECT_VER，哈希/尺码取实物文件。
 # Single source of truth: the version string comes from CMakeLists.txt's
@@ -95,8 +100,120 @@ else
   bad "apk/ReadPicoPush.apk missing or differs from build output $APK (release copy stale)"
 fi
 
+# --- 7. 固件自证版本串 + 验收 README 判据第一条（26.9.6 起，审计裁定③每版必修）---
+# 由来：PROJECT_VER 此前只活在 CMakeLists.txt，固件运行期无处可查，round-3 复验因此
+# 无法区分「新版在跑但修复无效」与「旧版还在跑」——两者在日志上行为完全一致，结论
+# 只能停在「未改善、不可归因」，白花一轮推理。此后每版必须自证，并与 APK 的 0x09
+# 装锚对齐：先证明基线，再谈行为。
+# Why: PROJECT_VER used to live only in CMakeLists.txt with nothing printing it, so the
+# round-3 re-verification could not tell "the new build runs but the repair does not work"
+# from "the old build is still running" - identical in the log, so the honest verdict was
+# "no improvement, not attributable" and a whole round went to reasoning. Every release
+# must now state itself, mirroring the APK's 0x09 anchor: prove the baseline first.
+grep -q '"fw: %s"' main/app_main.c \
+  || bad "main/app_main.c does not print the fw: version line (firmware must self-identify)"
+grep -q 'esp_app_get_description()' main/app_main.c \
+  || bad "main/app_main.c does not read the app version (esp_app_get_description)"
+SHORT=${VER##*pico}
+README=${ACCEPTANCE_README:-"../README-${SHORT}.md"}
+# 26.9.7：一次性广播有窗口期（本轮那句正好落在启动突发里丢了），所以每行日志自带
+# 短码前缀；门禁同检查「代码里还在打」与「README 里钉住了这个短码」。
+# 26.9.7: a one-shot broadcast has a window (this round's line drowned in the boot
+# burst), so every line now carries the short code; the gate checks both that the code
+# still emits it and that this generation's README pins that code.
+TAGBODY=${SHORT#26.}
+# 26.9.10：短码 = minor*10+patch（与 fw_tag 同款定点编码；26.9.10→100，26.9.9→99）。
+# 旧的 "${TAGBODY//./}" 字符串拼接在 patch 两位时会得 910，与 fw_tag 的数值编码不符。
+# 26.9.10: code = minor*10+patch (same fixed-point encoding as fw_tag; 26.9.10->100).
+# The old "${TAGBODY//./}" concat yielded 910 for a two-digit patch, diverging from fw_tag.
+CODE="[$(( ${TAGBODY%%.*} * 10 + ${TAGBODY##*.} ))]"
+# 26.9.7 补洞（审计裁定②-2）：fw_tag() 解析 PROJECT_VER 失败会打印 `[??]`，每行日志
+# 失去身份——那是假绿入口。门禁必须证明 PROJECT_VER 能被 fw_tag() 同款 sscanf
+# (`%*[^-]-pico%d.%d.%d`) 解析出 minor.patch，且解析出的短码正好等于 CODE。解析不出
+# 直接判红：不允许「不明就看起来不明」的构建出货。
+# 26.9.7 hole-closer (adjudication 2-2): if fw_tag() cannot parse PROJECT_VER it prints
+# `[??]` and every line loses its identity - a fake-green entry. The gate must prove
+# PROJECT_VER parses to minor.patch under fw_tag()'s own sscanf, and that the parsed
+# code equals CODE; a parse failure fails outright - no "looks-unknown-on-purpose" build
+# may ship.
+PV=$(sed -n 's/.*set(PROJECT_VER "\([^"]*\)").*/\1/p' CMakeLists.txt | tail -1)
+[ -n "$PV" ] || bad "CMakeLists.txt has no literal PROJECT_VER (fw_tag would emit [??] on every line)"
+# 复刻 fw_tag 的解析：取 -pico 之后的 minor.patch，按**数值** minor*10+patch 得短码数字。
+# Reproduce fw_tag's parse: take minor.patch after -pico and encode it numerically as
+# minor*10+patch (the same fixed-point form fw_tag prints).
+PM=$(printf '%s' "$PV" | sed -n 's/.*-pico[0-9]*\.\([0-9]*\)\.\([0-9]*\).*/\1/p')
+PP=$(printf '%s' "$PV" | sed -n 's/.*-pico[0-9]*\.\([0-9]*\)\.\([0-9]*\).*/\2/p')
+[ -n "$PM" ] && [ -n "$PP" ] || bad "PROJECT_VER '$PV' does not parse under fw_tag()'s sscanf (would ship [??])"
+PARSED=$((PM * 10 + PP))
+CODE_INNER=${CODE#[}; CODE_INNER=${CODE_INNER%]}   # [97] -> 97
+[ "$PARSED" = "$CODE_INNER" ] || bad "PROJECT_VER '$PV' parses to [$PARSED], not $CODE (fw_tag mismatch -> [??] would ship)"
+note "  fw_tag parses PROJECT_VER '$PV' -> $CODE (no [??] can ship)"
+grep -q '"%s dual:' main/app/app_loop.c \
+  || bad "main/app/app_loop.c no longer prefixes the dual line with the fw short code"
+grep -q 'fw_tag()' main/app/app_loop.c \
+  || bad "main/app/app_loop.c lost fw_tag() (the per-line firmware identity)"
+# 26.9.7 观测件 schema 锚定（审计裁定②）：验收要靠这些字段读判，任一被悄悄改名/删除，
+# 真机日志就读不出结论。门禁钉住格式串里的关键 token——去掉即红，不靠自觉。
+# **先剥注释再查**：这些 token 在解释性注释里也会出现（`lift0=1` 就踩过——裸 grep 命中
+# 注释、删了代码仍报绿，是「锚点不唯一」的同类假绿）。剥注释后只查真正的代码。
+# 26.9.7 observation schema anchor (adjudication 2): acceptance reads these fields, so
+# a silent rename/removal would make the device log unreadable. The gate pins the key
+# tokens in the format strings - remove one and it goes red.
+# **Strip comments first**: these tokens also appear in explanatory comments (`lift0=1`
+# bit us - a bare grep matched the comment and stayed green after the code was deleted,
+# the same fake-green as a non-unique anchor). Check only real code.
+if python3 - <<'EOF'
+import re, pathlib, sys
+s = pathlib.Path('main/app/app_loop.c').read_text()
+code = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+code = '\n'.join(re.sub(r'//.*$', '', l) for l in code.split('\n'))
+toks = ['dual abort: reason=', 'saw_zero=', 'freeze_n=', '" lift0=1"', 'end=%s']
+miss = [t for t in toks if t not in code]
+if miss:
+    print('FAIL: main/app/app_loop.c lost observation token(s) ' + ', '.join(repr(m) for m in miss) + ' (acceptance cannot read the log)')
+    sys.exit(1)
+sys.exit(0)
+EOF
+then
+    note "  observation schema: dual / dual abort + reason/end/saw_zero/freeze_n/lift0 all present (comments stripped)"
+else
+    fail=1
+fi
+# 26.9.9 诊断取证 schema：0x07 解码后的 word/def、点词缓存命中与否必须可读——这两行是
+# 「错配在 APK 还是设备解码」的唯一现场；改掉任一字段名就等于把证据删了。同样先剥注释。
+# 26.9.9 diagnostics schema: the decoded word/def of 0x07 and the tap cache verdict are
+# the only scene separating "the APK sent it wrong" from "the device decoded it wrong".
+if python3 - <<'EOF'
+import re, pathlib, sys
+s = pathlib.Path('components/push_sink/src/push_sink.c').read_text()
+code = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+code = '\n'.join(re.sub(r'//.*$', '', l) for l in code.split('\n'))
+toks = ['ai rx: op=07 len=', 'decode=FAIL head=', 'wlen=', 'dlen=', 'def_head=',
+        'ai tap: cache=HIT', 'ai tap: cache=MISS', 'klen=']
+miss = [t for t in toks if t not in code]
+if miss:
+    print('FAIL: components/push_sink/src/push_sink.c lost diagnostic token(s) '
+          + ', '.join(repr(m) for m in miss) + ' (0x07 attribution evidence gone)')
+    sys.exit(1)
+sys.exit(0)
+EOF
+then
+    note "  ai diag schema: rx(len/decode/wlen/word/dlen/def_head) + tap(cache/klen/key) present (comments stripped)"
+else
+    fail=1
+fi
+if [ -f "$README" ]; then
+  grep -q "fw: $VER" "$README" \
+    || bad "$README acceptance item 1 does not pin the boot string \"fw: $VER\""
+  grep -qF "$CODE dual:" "$README" \
+    || bad "$README does not pin the per-line short code \"$CODE dual:\""
+  note "  7/7 firmware self-id: fw: $VER + $CODE prefix, $README pins both"
+else
+  bad "acceptance README not found: $README (set ACCEPTANCE_README to override)"
+fi
+
 if [ "$fail" -eq 0 ]; then
-  note "deliverable family check: PASS (6/6 in sync)"
+  note "deliverable family check: PASS (7/7 in sync)"
 else
   note "deliverable family check: FAIL (see above) - 出包/重锚前必须全绿 / must be all green before packaging or re-anchoring"
 fi

@@ -42,5 +42,7 @@ int ui_text_reader_advance_px(int px, uint32_t codepoint);
 bool ui_text_reader_uses_ttf(const char* text);
 int ui_text_reader_cap_px(int px);
 void ui_hairline(uint8_t* framebuffer, int y, int x, int w, uint8_t color);
+// M3-B：情景卡引用条的底色/竖条用它填充。/ M3-B: the quote strip's wash and bar.
+void ui_fill_rect_fast(EpdRect rect, uint8_t gray, uint8_t* framebuffer);
 void ui_clear_page(uint8_t* framebuffer);
 void ui_nav_status(uint8_t* fb);

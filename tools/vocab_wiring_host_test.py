@@ -285,47 +285,107 @@ def main() -> int:
     ):
         if needle not in popup:
             failures.append(f'dict_popup.c: missing {label} ({needle!r})')
-    if 'inner_w - DICT_POPUP_SAVE_W' not in popup:
+    if not re.search(r'reserved\s*=.*DICT_POPUP_SAVE_W', popup):
         failures.append('dict_popup.c: the header width does not reserve room for the chip')
 
-    # 7. gen26.5 M2 Step8：AI 交互词落库接线。/ AI-word logging wiring.
-    #    判据一：queue 恰好两次（miss + AI chip），且每次都在 tap_word_ctx 之后。
-    #    Criterion 1: exactly two queue calls (miss + AI chip), each after a
-    #    push_sink_ai_tap_word_ctx().
-    #    判据二：纯词典命中路径不落——dict_popup_open() 到 found 判定之间没有 queue。
-    #    Criterion 2: the pure dictionary-hit path never queues - no queue call
-    #    between dict_popup_open() and the found decision.
+    # 7. 26.9.5：AI 交互词落库接线（**语义已随入口卡改写**）。
+    #    26.9.5 起点：点词不再自动发 0x17 —— 本地无释义时先给入口卡，用户点
+    #    「AI 释义 ›」才转 pending 并发送。故 tap_word_ctx 与 queue 全部搬到
+    #    TAP_AI 分支（恰好各一处），点词路径两者皆无。
+    #    26.9.5 之前的判据是「两处 queue（miss + AI chip）」，本次起作废：那不是
+    #    数量微调，而是「谁该发起查询」的语义变化——用户在通知里会看到卡片先出现、
+    #    再点才查，所以落库时机必须同步后移，否则记的是「点过但没查」的词。
+    #    gen26.5 M2 Step8 的原意（「与 AI 交互过的词才落」）在新链路上更强了：
+    #    交互的唯一入口就是那颗 chip。
+    # 7. 26.9.5: AI-word logging wiring (semantics rewritten with the entry card).
+    # From 26.9.5 a tap no longer fires 0x17 by itself - with no local definition an
+    # entry card opens first and the user taps "AI 释义 ›" to switch to pending and
+    # send. So tap_word_ctx and queue both live in the TAP_AI branch (exactly one
+    # each) and the tap path has neither. The pre-26.9.5 criterion ("two queue calls:
+    # miss + AI chip") is void - that was not a count tweak but a change in WHO
+    # starts the query, and the logging moment must move with it or it records words
+    # that were tapped but never looked up. gen26.5's intent ("only AI-interacted
+    # words log") is in fact stronger here: the chip is the only interaction.
     lookup_body = function_body(book, 'static app_redraw_t start_dict_lookup(')
     panel_body = function_body(book, 'static app_redraw_t reader_panel_action(')
     if not lookup_body or not panel_body:
         failures.append('start_dict_lookup()/reader_panel_action(): not found '
                         '(cannot check the AI logging wiring)')
     else:
-        if book.count('vocab_log_ai_queue(') != 2:
-            failures.append('app_book.c: expected exactly 2 vocab_log_ai_queue() calls '
-                            '(miss path + AI chip), got %d' % book.count('vocab_log_ai_queue('))
-        for name, body in (('start_dict_lookup', lookup_body),
-                           ('reader_panel_action', panel_body)):
-            tap_at = body.find('push_sink_ai_tap_word_ctx(')
-            queue_at = body.find('vocab_log_ai_queue(')
-            if tap_at < 0 or queue_at < 0:
-                failures.append('%s(): the AI path is missing tap_word_ctx or queue' % name)
-            elif queue_at < tap_at:
-                failures.append('%s(): queues the word before the query goes out' % name)
-        # 纯词典命中不落：found 判定窗口。/ The pure dictionary-hit path never queues.
-        # 窗口右界是 miss 分支本身——那里的 queue 是**正确**的（miss 词要落），
-        # 所以判据只看 dict_popup_open() 到 miss 分支之间。
-        # The window's right edge is the miss branch itself - a queue in there is
-        # CORRECT (a miss word must log), so the check only covers the span from
-        # dict_popup_open() to the miss branch.
-        open_at = lookup_body.find('dict_popup_open(')
-        found_at = lookup_body.find('if (hit && english && !found)')
-        if open_at < 0 or found_at < 0:
-            failures.append('start_dict_lookup(): cannot locate the dict-hit window '
-                            '(dict_popup_open / the miss branch)')
-        elif 'vocab_log_ai_queue(' in lookup_body[open_at:found_at]:
-            failures.append('start_dict_lookup(): queues a word on a pure dictionary hit '
-                            '(adjudicated: only AI-interacted words log)')
+        if book.count('vocab_log_ai_queue(') != 1:
+            failures.append('app_book.c: expected exactly 1 vocab_log_ai_queue() call '
+                            '(the AI-chip path), got %d' % book.count('vocab_log_ai_queue('))
+        tap_at = panel_body.find('push_sink_ai_tap_word_ctx(')
+        queue_at = panel_body.find('vocab_log_ai_queue(')
+        if tap_at < 0 or queue_at < 0:
+            failures.append('reader_panel_action(): the AI-chip path is missing '
+                            'tap_word_ctx or queue')
+        elif queue_at < tap_at:
+            failures.append('reader_panel_action(): queues the word before the query goes out')
+        # 点词路径必须两者皆无：有任何一个 = 26.9.5 的「用户确认才查」被改回去了。
+        # The tap path must have neither: either one means the 26.9.5 "the user
+        # confirms before we query" rule was reverted.
+        for needle, what in (('push_sink_ai_tap_word_ctx(', 'fires 0x17 on tap'),
+                             ('vocab_log_ai_queue(', 'queues the word on tap')):
+            if needle in lookup_body:
+                failures.append('start_dict_lookup(): still %s (26.9.5 moved both '
+                                'to the AI-chip path)' % what)
+
+    # 7c. 26.9.5 入口卡接线：拆掉 `english` 总闸后，三道接线缺一即退回「中文静默
+    #     不响应」——这正是本版要根治的缺陷，所以每条都要有牙。
+    #     ① app_book 真的开入口卡；② show_entry 置 s_entry 且**不**置 s_pending
+    #     （否则没发请求却被 0x07 认领）；③ reset 清 s_entry（生命周期唯一出口）；
+    #     ④ 入口卡不画保存 chip 也不响应（有释义才可存）；⑤ 顺序：先 reset 再置位
+    #     （反了会留上一张卡的残影，与 gen26.4 别名 bug 同族）。
+    # 7c. 26.9.5 entry-card wiring: with the `english` master gate gone, a missing
+    # link puts Chinese back into silent non-response - the very defect this version
+    # exists to kill - so every link needs teeth: (1) app_book really opens the
+    # entry card; (2) show_entry sets s_entry and NOT s_pending (or an unsent card
+    # gets claimed by 0x07); (3) reset clears s_entry (the single lifecycle exit);
+    # (4) no save chip drawn or hit (only a definition may be saved); (5) order -
+    # reset first, then set the flags (reversed leaves the previous card's ghost,
+    # the same family as the gen26.4 aliasing bug).
+    if 'dict_popup_show_entry(' not in lookup_body:
+        failures.append('start_dict_lookup(): never calls dict_popup_show_entry() - '
+                        'Chinese taps would go silent again (the 26.9.5 defect returns)')
+    if 'if (hit && !found' not in lookup_body:
+        failures.append('start_dict_lookup(): the entry branch (`hit && !found`) is gone')
+    entry_fn = function_body(popup, 'bool dict_popup_show_entry(')
+    if not entry_fn:
+        failures.append('dict_popup.c: dict_popup_show_entry() not found')
+    else:
+        if 's_entry = true' not in entry_fn:
+            failures.append('dict_popup_show_entry(): never sets s_entry')
+        if 's_pending = false' not in entry_fn:
+            failures.append('dict_popup_show_entry(): does not pin s_pending = false '
+                            '(an unsent card would be claimed by 0x07)')
+        if entry_fn.find('dict_popup_reset()') > entry_fn.find('s_entry = true'):
+            failures.append('dict_popup_show_entry(): sets s_entry before reset '
+                            '(ghost flags from the previous card survive)')
+    reset_fn = function_body(popup, 'void dict_popup_reset(')
+    if not reset_fn or 's_entry = false' not in reset_fn:
+        failures.append('dict_popup_reset(): does not clear s_entry (the entry state '
+                        'would leak into the next card)')
+    if 'if (s_entry) return DICT_POPUP_TAP_MISSED;' not in popup:
+        failures.append('dict_popup.c: an entry card still answers the save chip '
+                        '(a definition-less card must not save an empty shell)')
+    if 'const bool save_chip = !s_entry;' not in popup:
+        failures.append('dict_popup.c: an entry card still draws the save chip')
+    # 7d. 开关顺序：reset 会清 s_ai_on / s_scene_on（开卡第一步就是 reset），所以
+    #     set_*_enabled 必须在**开卡之后**。写反了 AI 与情景 chip 一起消失，而宿主
+    #     用例照产品顺序写，抓不到——这正是「桩与产品调用一一对表」要补的一格。
+    # 7d. Switch order: reset clears s_ai_on / s_scene_on (opening resets first), so
+    # set_*_enabled must come AFTER the card opens. Reversed, both the AI and the
+    # scene chip vanish, and the host tests cannot see it (they follow the product
+    # order) - exactly the gap the "stub vs call-site table" is meant to cover.
+    set_at = lookup_body.find('dict_popup_set_ai_enabled(')
+    show_at = lookup_body.find('dict_popup_show_entry(')
+    if set_at < 0 or show_at < 0:
+        failures.append('start_dict_lookup(): cannot locate the entry card or the AI '
+                        'switch call')
+    elif set_at < show_at:
+        failures.append('start_dict_lookup(): sets the AI switch before opening the card '
+                        '(reset clears s_ai_on, so the AI chip would disappear)')
 
     # 7b. gen26.6 裁定：补查机制整体移除——设备端断连 miss 词不得再入搭车队列。
     #     push_sink.c 若重新出现 ai_raloc_enqueue 调用，说明补查回潮（「错过的词

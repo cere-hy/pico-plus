@@ -11,8 +11,12 @@
 #include <stddef.h>
 
 static inline void vocab_log_ai_queue(const char* word) { (void)word; }
+// M3-B：计数供「情景答案不进生词批」断言用（定义在 harness 里）。
+// M3-B: counted so the harness can assert a scene answer never enters the batch.
+extern int vocab_stub_set_def_calls;
 static inline void vocab_log_ai_set_def(const char* word, const char* def) {
     (void)word; (void)def;
+    ++vocab_stub_set_def_calls;
 }
 static inline void vocab_log_ai_flush(void) {}
 static inline bool vocab_log_autosave_enabled(void) { return true; }

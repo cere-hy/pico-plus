@@ -38,7 +38,6 @@
 #include <string.h>
 #include "esp_heap_caps.h"
 #include "display_main_waveform.h"
-#include "display_reader_waveform.h"
 #include "ui/ui_nav_layout.h"
 
 static const char* TAG = "read_pico";

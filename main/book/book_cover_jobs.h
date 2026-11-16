@@ -26,5 +26,10 @@ bool book_cover_jobs_submit(unsigned generation,unsigned slot,const book_cover_j
 /// 0 pending,1 transfers pixels,-1 failed; missing artwork renders its glyphs only on the UI thread.
 int book_cover_jobs_take(unsigned generation,unsigned slot,book_cover_result_t *result);
 void book_cover_jobs_cancel(unsigned generation);
+/// 作废当前代次的结果，**不等待解码器**。插拔/换页这类「只要旧结果消失」的场合用它；
+/// `quiesce(0)` 不是它的替代——那是「宣布收口却不等」，B42 牙咬死这种写法。
+/// / Drop the current generation's results without joining the decoder. Use this when
+/// stale results must simply disappear; `quiesce(0)` is not a substitute.
+void book_cover_jobs_discard(void);
 /// 仅卸载/睡眠前收齐文件句柄，导航不等待。/ Join handles only before unmount/sleep; navigation never waits.
 bool book_cover_jobs_quiesce(unsigned timeout_ms);

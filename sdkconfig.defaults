@@ -152,3 +152,47 @@ CONFIG_RTC_CLK_CAL_CYCLES=8190
 CONFIG_LIBC_TIME_SYSCALL_USE_RTC_HRT=y
 CONFIG_LWIP_SNTP_MAX_SERVERS=3
 CONFIG_LWIP_SNTP_STARTUP_DELAY=n
+
+# ── 可复现构建（26.9.11 审计裁定）───────────────────────────────────────────
+# 同一份源码 + 同一个 SOURCE_DATE_EPOCH，必须得到逐字节相同的 bin。
+# 这一项会 select COMPILER_HIDE_PATHS_MACROS（把 __FILE__ 里的绝对路径折叠成 "."），
+# 并让 APP_COMPILE_TIME_DATE / BOOTLOADER_COMPILE_TIME_DATE 因 depends 失效而自动关闭，
+# esp_app_desc 的 date/time 变为空串。构建时刻改由 CMakeLists.txt 里的
+# SOURCE_DATE_EPOCH → PICO_BUILD_DATE/PICO_BUILD_TIME 固定注入，仍能在界面显示。
+# Reproducible build: same source + same SOURCE_DATE_EPOCH must yield a byte-identical
+# image. This selects COMPILER_HIDE_PATHS_MACROS (folds absolute paths in __FILE__ to ".")
+# and turns off the *_COMPILE_TIME_DATE options via their depends, leaving esp_app_desc
+# date/time empty. The build instant is injected as a fixed PICO_BUILD_DATE/TIME instead.
+CONFIG_APP_REPRODUCIBLE_BUILD=y
+
+# ── prep 栈进 PSRAM（26.9.19 审计裁定，推翻 26.9.13「永不启用」）──────────────
+# 26.9.18 真机的 boot-post 块表证明：6,144 B 的 prep 栈后面紧跟着一个 100 B 常驻块，
+# 关书归还后无法与后面 13,632 B 的空闲块合并，largest 永远停在 13,312（< 面板红线
+# 15,360），用户长期看到「内存不足，请重启」。该栈峰值只用 2,788 B（45%）。
+# 把栈搬进 PSRAM，池 A 从构造上就不再付这 6,144 B。
+# 回滚条件：真机在 cache 关闭窗口（NVS 提交 / OTA 写 flash）崩溃 → 改走缩栈方案 (b)。
+# The 26.9.18 boot-post block table proved the 6,144-byte prep stack can never merge back:
+# a permanent 100-byte block sits behind it. Moving the stack to PSRAM removes that hole
+# from pool A by construction. Roll back to shrink-to-3,584 on any cache-off-window crash.
+CONFIG_BOOK_PREP_STACK_PSRAM=y
+
+# ── 任务栈反查（26.9.20 S13）────────────────────────────────────────────────
+# boot-post 块表里那个 8,192 B 的已分配块后面紧跟 100 B 块，把 21,564 B 的空闲块切成
+# 两半——只要它在，largest 就永远上不了 20,480，面板也就永远转不了绿。块表能说「多大、
+# 挨着谁」，说不出「谁的」。打开 FreeRTOS 的任务枚举（只读、不改调度），用
+# heap_caps_get_allocated_size(pxStackBase) 反查每个任务栈的真实块大小即可点名。
+# 代价：每个任务多几个字节的记录开销，`uxTaskGetSystemState` 约 1 KB 代码。
+# The 8,192 B allocated block in the boot-post table has a 100 B block right behind it and
+# splits the 21,564 B free block in two; while it exists largest can never reach 20,480.
+# The table cannot name the owner, but the task list can: a stack is "stack + adjacent TCB",
+# and heap_caps_get_allocated_size(pxStackBase) gives its real block size. Read-only.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# 26.11.4 B 线：AI 键点亮（框选动作栏「AI解析」从灰变亮）。放进 defaults 是必须的——
+# sdkconfig 本身被 .gitignore 排除，只改本地 sdkconfig 的话，仓库里就没有「这一版是开着的」
+# 这个事实，别人 clone 出来一编又是灰键。开关的凭证与复测义务见 docs/PROTOCOL.md §五
+# （bit2 行日期/版本 + 联调 FAIL 即回滚 n），B33 牙照旧咬住。
+# 26.11.4 B line: turn the box-selection AI key on. This belongs in defaults because
+# sdkconfig itself is gitignored - a local-only flip would leave no trace in the repo and
+# the next clone would build a greyed key again. Credentials live in docs/PROTOCOL.md §5.
+CONFIG_PICO_EXCERPT_AI_SEND=y

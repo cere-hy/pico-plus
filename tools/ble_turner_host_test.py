@@ -102,9 +102,15 @@ static struct {ble_pt_raw_t items[RAW_RING_LEN];uint8_t head,tail;}s_raws;
 static int64_t clock_us;
 static int64_t esp_timer_get_time(void){return clock_us;}
 static void vTaskDelay(unsigned ms){clock_us+=(int64_t)ms*1000;}
-static size_t free_internal=150*1024,largest_internal=60*1024,free_psram=2*1024*1024;
+static size_t free_internal=150*1024,largest_internal=60*1024,free_psram=2*1024*1024,largest_psram=2*1024*1024;
 static size_t heap_caps_get_free_size(int c){return c==MALLOC_CAP_SPIRAM?free_psram:free_internal;}
-static size_t heap_caps_get_largest_free_block(int c){(void)c;return largest_internal;}
+static size_t heap_caps_get_largest_free_block(int c){return c==MALLOC_CAP_SPIRAM?largest_psram:largest_internal;}
+// 26.9.24：start_locked 拒绝路径的取证调用在此无操作（真行为由整机构建覆盖）。
+// 这条桩补上后 KI-004 的「陈旧桩 FAIL」在 ble_turner 宿主上销号。
+// 26.9.24: the evidence call on start_locked's refusal path is inert here (the real
+// behaviour is covered by the full-tree build). With this stub the KI-004 stale-stub
+// FAIL is retired on the ble_turner host.
+static void pico_heap_dump(const char *site,const char *who){(void)site;(void)who;}
 static int init_count,deinit_count,stop_count,task_count,init_error,task_error,stop_error;
 static esp_err_t nimble_port_init(void){++init_count;return init_error;}
 static esp_err_t nimble_port_deinit(void){++deinit_count;return ESP_OK;}
@@ -314,13 +320,19 @@ int main(void){
  reset_input();s_has_keyboard_page=false;s_preferred_byte=0xFF;
  report(8,0,0x4b);s_connected=false;s_ble_learning=1;
  assert(!ble_receive_feedback()&&s_ble_learning==1);
- // 内存不够时不进入 NimBLE；任务失败完整回收。/ Reject before NimBLE on low memory; unwind a failed host task.
- for(int kind=0;kind<3;kind++){
-  free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;
-  if(kind==0)free_internal=55*1024;if(kind==1)largest_internal=19*1024;if(kind==2)free_psram=255*1024;
+ // 内存不够时不进入 NimBLE；任务失败完整回收。26.9.24：闸门两层四参，四个
+ // 失败面各测一个——内部 free / 内部 largest（15K，低于 16K 实证值）/ PSRAM free /
+ // PSRAM largest（63K，低于 64K 数据层下限）。
+ // Reject before NimBLE on low memory; unwind a failed host task. Since 26.9.24 the
+ // gate is two layers of four terms - one failure face each: internal free, internal
+ // largest (15K, below the 16K proven value), PSRAM free, PSRAM largest (63K).
+ for(int kind=0;kind<4;kind++){
+  free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;largest_psram=2*1024*1024;
+  if(kind==0)free_internal=55*1024;if(kind==1)largest_internal=15*1024;
+  if(kind==2)free_psram=255*1024;if(kind==3)largest_psram=63*1024;
   int before=init_count;assert(ble_pt_start()==ESP_ERR_NO_MEM && !s_running && init_count==before);
  }
- free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;
+ free_internal=150*1024;largest_internal=60*1024;free_psram=2*1024*1024;largest_psram=2*1024*1024;
  task_error=1;assert(ble_pt_start()==ESP_ERR_NO_MEM && !s_running && task_count==1 && deinit_count==1);
  task_error=0;assert(ble_pt_start()==ESP_OK && s_running);
  stop_error=1;assert(ble_pt_network_acquire()==ESP_FAIL && atomic_load(&s_network_users)==0 && s_running);

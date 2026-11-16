@@ -56,16 +56,19 @@
 
 #include "app.h"
 
-/// 词与释义的截断上限。释义按字节存：0x08 重组上限 1024B，留余量给截断保护。
-/// Truncation caps. The definition is stored in bytes: the 0x08 reassembly
-/// cap is 1024B, with headroom for the truncation guard.
+/// 词与释义的截断上限。释义按字节存，**按协议传输槽同数**——详解/情景/选段
+/// 三个视图共用这一具会话缓冲，段落解析（bit2）也要完整落进来，任何低于传输槽
+/// 的取值都会让答案在最后一跳缩水。
+/// Truncation caps. The definition is stored in bytes and matches the transport
+/// slot: the detail, scene and passage views share this one session buffer, and a
+/// passage answer must land whole - anything under the slot shrinks it at the last hop.
 #define AI_READER_WORD_MAX 48
-#define AI_READER_DEF_MAX 1200
+#define AI_READER_DEF_MAX 8192
 #define AI_READER_TITLE_MAX 96
 
-/// 页表上限。1024B 释义按最坏情况（全 ASCII、每行 20 字）也就几十页。
-/// Page-map cap. A 1024B definition in the worst case (all ASCII, 20 chars
-/// per line) is a few dozen pages.
+/// 页表上限。8,192B 释义按最坏情况（全 ASCII、每行 20 字）约 400 行 ≈ 25 页，
+/// 64 页仍有一倍余量。/ Page map: 8,192B worst case is ~400 lines ~= 25 pages;
+/// 64 still doubles it.
 #define AI_READER_MAX_PAGES 64
 
 /// 来源书页快照句柄：关闭详解时校验并重呈现原书当前页；会话期间原书状态
@@ -84,6 +87,116 @@ typedef struct {
 /// Open a detail session. An empty word or definition opens nothing (false;
 /// the caller keeps the card path).
 bool ai_reader_open(const char* word, const char* def, const ai_reader_source_t* source);
+
+/* ---------------- M3-B 情景视图 / M3-B scene view ---------------- */
+
+/// 会话形态。DEF = 详解（整屏、词标题、来源页脚）；SCENE = 情景卡（上延、
+/// 引用条代替标题、页脚标「情景」）。**同一套分页与装行**，只有几何与外框不同。
+/// Session form. DEF = detail (full screen, word title, source footer); SCENE =
+/// the scene card (extended upward, a quote strip instead of the title, a scene
+/// footer). One pagination/wrap engine, only the geometry and chrome differ.
+typedef enum {
+    AI_READER_MODE_DEF = 0,
+    AI_READER_MODE_SCENE = 1,
+} ai_reader_mode_t;
+
+/// 版心几何（设备像素）。top/bottom 是正文可用区间，left/width 是行盒。
+/// 详解用缺省值（236 .. h-72）；情景卡由 app_book 注入（上沿 236、下沿扣动作栏）。
+/// Body geometry in device pixels: top/bottom bound the text band, left/width the
+/// line box. DEF uses the built-in default (236 .. h-72); the scene card is
+/// injected by app_book (top 236, bottom above the action bar). NULL restores the
+/// default - the detail path stays pixel-identical.
+typedef struct {
+    int top;
+    int bottom;
+    int left;
+    int width;
+} ai_reader_geom_t;
+
+/// 情景卡正文上沿（设备像素）。情景卡是**整屏视图**（自己清屏 + 画状态栏），
+/// 等价于「全屏非沉浸」阅读页——其正文顶就是 `body_rect_for_tracking()` 的 96
+/// （状态栏下）。**不是**详解的 236：236 的语义是「标题区之后」，情景卡没有标题区，
+/// 照抄就会留下 0..236 的白板。命名常量把值与它的语义锚绑在一起。
+/// Scene card body top (device px). The card is a full-screen view (it clears the
+/// panel and draws the status bar), equivalent to a "fullscreen, non-immersive"
+/// reading page, whose body top is 96 (the reader's own anchor, under the status
+/// bar). NOT the detail view's 236 - 236 means "after the title zone", and the
+/// scene card has no title zone; copying it left 0..236 blank white. The named
+/// constant binds the value to its anchor.
+#define AI_READER_SCENE_TOP 96
+
+/// 注入版心几何；NULL 恢复详解缺省。只影响绘制与分页，不影响会话内容。
+/// Inject the body geometry; NULL restores the detail default. Affects painting
+/// and pagination only, never the session content.
+void ai_reader_set_geometry(const ai_reader_geom_t* g);
+
+/// 引用条整句上限（UTF-8 字节）。M3-A 的上下文是 1024B，引用条只取「词所在这
+/// 一句」，超过上限时保词居中截断。
+/// Quote-sentence cap in UTF-8 bytes. The M3-A context is 1024B; the strip only
+/// shows the sentence around the word, truncating around the word past the cap.
+#define AI_READER_QUOTE_MAX 384
+
+/// 引用条浅底与目标词墨色（8 位灰、仅高 4 位有效：值越大越亮）。0xE0 量化后为
+/// nibble 14（≈93% 白），是仍非纯白的最高档（0xF0+ 归纯白）；既标出「来自书里」
+/// 的分区，又不与正文黑字抢对比度。曾被误当「极浅底」的 0x0A 量化后其实是纯黑
+/// ——「黑底黑字」事故的直接来源。宿主守卫与绘制共用这两个常量，避免裸数值漂移。
+/// Quote-strip wash and target-word ink (8-bit gray, high nibble only: larger is
+/// lighter). 0xE0 quantises to nibble 14 (~93% white), the lightest value still
+/// not pure white (0xF0+ collapses to white). A light provenance zone that never
+/// fights the black body text. The 0x0A once mistaken for a light wash actually
+/// quantises to pure black - the direct cause of the black-on-black incident. The
+/// host guard and the painter share these two, so no bare value can drift.
+#define UI_QUOTE_BAND_BG 0xE0
+#define UI_QUOTE_WORD_INK 0x00
+
+/// 打开情景会话。text 是四节分析正文（0x08 回流），quote/off/len 是引用条来源
+/// （M3-A 的上下文快照与词偏移——**与 0x1A 发出时同一份数据**，不重新取）。
+/// 空词或空正文不开（false，调用方保留词卡）。
+/// Open a scene session. text is the four-section analysis (the 0x08 return);
+/// quote/off/len feed the quote strip from the M3-A context snapshot and word
+/// offset - the very same data that was sent in 0x1A, never re-derived. Empty
+/// word or text opens nothing (false; the caller keeps the card).
+bool ai_reader_open_scene(const char* word, const char* text,
+                          const char* quote, size_t quote_word_off, size_t quote_word_len,
+                          const ai_reader_source_t* source);
+
+/// 打开**整段选文**会话（bit2）：title 是「选段」，quote 是整段选文（不做句界
+/// 取景、不高亮词——引用条就从选段抬头开始铺，装不下的尾部由 tail_cut 标出）。
+/// 与词条共用同一套会话/版面，差别只在取景与标题：段落分析也是四节正文。
+/// Open a whole-passage session (bit2): the title is 选段 and the strip holds the
+/// selection itself - no sentence extraction, no word highlight, with the tail cut
+/// flagged. Same session and layout as the word case; only framing and title differ.
+bool ai_reader_open_excerpt(const char* title, const char* text, const char* quote,
+                            const ai_reader_source_t* source);
+
+/// 当前形态；无会话时为 DEF。/ Current form; DEF when no session is active.
+ai_reader_mode_t ai_reader_mode(void);
+
+/// 引用条纯函数：在 ctx 里以 [word_off, word_off+word_len) 为锚向两侧扩到句界
+/// （。！？；!?;\n 或 ctx 边界），超过 max_chars 时保词居中截断；返回句长，
+/// out_off/out_len 是 ctx 内字节区间。句界找不到时退回「词前后各 N 字」并把
+/// *fallback 置 true（NULL 允许）。
+/// Quote-sentence pure function: anchor [word_off, word_off+word_len) inside ctx,
+/// expand both ways to a sentence boundary (。！？；!?;\n or the ctx edge), and
+/// truncate around the word past max_chars. Returns the sentence length;
+/// out_off/out_len are the byte span inside ctx. When no boundary is found it
+/// falls back to N chars on each side and sets *fallback (NULL allowed).
+size_t ai_reader_quote_sentence(const char* ctx, size_t ctx_len,
+                                size_t word_off, size_t word_len,
+                                size_t max_chars, size_t* out_off, size_t* out_len,
+                                bool* fallback);
+
+/// 情景卡底部「存生词 ›」chip 的矩形（绘制与命中共用）；非情景会话返回零矩形。
+/// The scene card's bottom "save word" chip rect (shared by paint and hit-test);
+/// a zero rect outside a scene session.
+EpdRect ai_reader_scene_save_rect(void);
+
+/// 标记当前情景词的生词本状态（开卡时由调用方按 vocab_log_contains 置初值，
+/// 存成功后置 true）。只改 chip 文案，不写任何记录——写库是调用方的事。
+/// Mark whether the scene word is in the vocabulary book (the caller seeds it from
+/// vocab_log_contains when opening and sets true after a successful save). Only the
+/// chip label changes; nothing is written here - persisting is the caller's job.
+void ai_reader_set_scene_saved(bool saved);
 
 /// 关闭会话并清空状态。/ Close the session and clear its state.
 void ai_reader_close(void);
@@ -115,6 +228,28 @@ int ai_reader_page_count(void);
 const char* ai_reader_word(void);
 const ai_reader_source_t* ai_reader_source(void);
 
+/// 26.11.4：本会话是不是**整段选文**（bit2）会话。/ Whether this is a passage session.
+///
+/// 为什么需要它：段落视图的保存动作与词卡不是一回事——词卡存「词 + 词典释义」进
+/// 生词本，段落存「对照那一节」进摘抄本。同一个 chip 位置，两种语义；不区分就会
+/// 让第二个死键长出来（第一版的「存生词」在段落页点了 6 次、0 次落库）。
+/// Why it exists: saving a card and saving a passage are different acts in the same
+/// chip slot. Not distinguishing them is exactly how the dead key was born.
+bool ai_reader_is_excerpt(void);
+
+/// 会话里的解析正文全文（详解/情景/选段通用，NUL 结尾）。整段视图的「存摘抄」
+/// 要在这里面找【原文对照】一节，所以它必须整篇给出，不是分页后的可见片段。
+/// The whole answer text of the session. The passage view's save looks for the
+/// 原文对照 section inside it, so it needs the full text, not the current page.
+const char* ai_reader_def(void);
+
+/// 整段会话的**选段原文全文**（非整段会话返回空串）。引用条只有 384B，装不下
+/// 一段 963B 的英文；摘抄的中文兜底要存原文，读的就是这里。
+/// The full selection of a passage session (empty otherwise). The strip buffer is
+/// 384 B and cannot hold a 963 B English paragraph; the Chinese fallback saves the
+/// original, and this is where it reads from.
+const char* ai_reader_excerpt_text(void);
+
 /// 详解页的排版样式：**全部取自当前阅读正文**，不另立一套度量。
 /// 字号 = 阅读设置字号；行距 = 字号 × 行距% / 100（与 book_layout 同一公式）；
 /// left/width = 正文版心（body_rect，已按整字格收齐）。app_book 每次绘制前注入。
@@ -132,6 +267,15 @@ typedef struct {
 /// 注入排版样式；NULL 取消注入（回落到内置安全默认，仅调试/宿主场景）。
 /// Inject the style; NULL clears it (falls back to a safe default, debug/host only).
 void ai_reader_set_style(const ai_reader_style_t* style);
+
+/// 情景卡版心：上沿 AI_READER_SCENE_TOP、下沿扣 48px 动作栏，左右与版心取注入
+/// 样式。app_book 用它构造注入几何；宿主测试直接调它——注入规则因此可被变异命中
+/// （若把规则留在 app_book 里，宿主测试根本碰不到，变异就是假门禁）。
+/// Scene geometry: top AI_READER_SCENE_TOP, bottom above the 48px action bar,
+/// left/measure from the injected style. app_book builds the injected geometry
+/// from it, and the host test calls it directly - so the rule is mutation-visible.
+/// (Kept in app_book it would never be reached by the host test: a fake gate.)
+ai_reader_geom_t ai_reader_scene_geom(const ai_reader_style_t* style, int screen_h);
 
 /// 版面参数（正文版心像素宽、正文字号、每页行数）。render 每次绘制前按当前
 /// 方向实算后设置；turn/页码查询用同一组参数保证分页与所见一致。参数变化才重排。
