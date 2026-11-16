@@ -110,13 +110,17 @@ with tempfile.TemporaryDirectory(prefix='pico-vertical-number-') as directory:
     for name, text in HEADERS.items():
         (work / name).write_text(text, encoding='utf-8')
     (work / 'assets.c').write_text(ASSETS, encoding='utf-8')
-    (work / 'test.c').write_text(UNIT, encoding='utf-8')
+    # ttf_font.c 现在依赖排版开关与仿生阅读状态机；宿主侧只钉开关值，不引 NVS 实现。
+    stub = '\nbool app_typography_enhanced(void) { return true; }\n'
+    (work / 'test.c').write_text(UNIT + stub, encoding='utf-8')
     flags = ['cc', '-std=gnu11', '-Wall', '-Wextra', # GCC 13 会把 ttf_font.c 里既有的 snprintf 告警升级成错误。
              '-Wno-error=format-truncation',
              '-I' + str(work), '-I' + str(ROOT / 'main/font'), '-I' + str(ROOT / 'main/ui'),
              '-I' + str(ROOT / 'main'), '-I' + str(ROOT / 'tools/ui_gesture_stubs')]
     subprocess.run(flags + [str(work / 'test.c'), str(work / 'assets.c'),
                             str(ROOT / 'main/font/ttf_font.c'),
+                            str(ROOT / 'main/font/kern_pairs.c'),
+                            str(ROOT / 'main/ui/ui_bionic.c'),
                             str(ROOT / 'main/ui/ui_gray_lut.c'), '-lm',
                             '-o', str(work / 'test')], check=True)
     subprocess.run([str(work / 'test')], check=True)

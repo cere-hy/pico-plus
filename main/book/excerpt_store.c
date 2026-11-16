@@ -482,7 +482,7 @@ static bool ex_parse_head(char *line, char **title, uint32_t *p, uint32_t *t,
     *has_t = false;
     if (!strncmp(cur, "p=", 2)) *p = (uint32_t)strtoul(cur + 2, NULL, 10);
     cur = strchr(cur, '\t');
-    if (!cur) { *body = ""; return true; }
+    if (!cur) { *body = line + strlen(line); return true; }  /* 行尾 NUL 即可写空串，避免字面量丢 const */
     ++cur;
     if (!strncmp(cur, "t=", 2)) {
         *has_t = true;
@@ -491,7 +491,7 @@ static bool ex_parse_head(char *line, char **title, uint32_t *p, uint32_t *t,
         (void)strtoul(cur + 1, NULL, 10); // #序号：接受但不编时间 / accepted, never a date
     }
     cur = strchr(cur, '\t');
-    *body = cur ? cur + 1 : "";
+    *body = cur ? cur + 1 : line + strlen(line);
     return true;
 }
 
