@@ -58,7 +58,7 @@ typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {int unused;} app_ctx_t;
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE} app_redraw_t;
 enum {READER_PANEL_NONE,READER_PANEL_REFRESH_SETTINGS,READER_PANEL_TURN_SETTINGS,READER_PANEL_KEY_SETTINGS};
-static int s_reader_panel, s_turns, invalidates, toggles[9], full_pages = 10, effect;
+static int s_reader_panel, s_turns, invalidates, toggles[11], full_pages = 10, effect;
 static int two_column;
 static bool ui_rect_hit(EpdRect r,unsigned x,unsigned y){return x>=(unsigned)r.x&&x<(unsigned)(r.x+r.width)&&y>=(unsigned)r.y&&y<(unsigned)(r.y+r.height);}
 static unsigned app_settings_reader_full_pages(void){return full_pages;}
@@ -67,7 +67,7 @@ static unsigned app_settings_reader_turn_effect(void){return effect;}
 static void app_settings_set_reader_turn_effect(unsigned n){effect=n;}
 // 归因：我方行表有四个开关行（多出「横屏阅读」kind=3）。/ Attribution: our table has
 // four toggle rows (the extra one is 横屏阅读, kind 3).
-static app_redraw_t apply_reader_option(app_ctx_t *ctx,int i){(void)ctx;assert(i>=0&&i<9&&i!=4&&i!=5&&i!=6&&i!=7);++toggles[i];return APP_REDRAW_PAGE;}
+static app_redraw_t apply_reader_option(app_ctx_t *ctx,int i){(void)ctx;assert(i>=0&&i<11&&i!=4&&i!=5&&i!=6&&i!=7);++toggles[i];return APP_REDRAW_PAGE;}
 bool app_settings_reader_two_column(void){return two_column!=0;}
 void app_settings_set_reader_two_column(bool on){two_column=on?1:0;}
 static void invalidate_prep(void){++invalidates;}
@@ -81,37 +81,38 @@ unit+='static unsigned app_settings_system_font_size(void){return 100;}\n'
 # too, where upstream used literals and an ordinal mapping for three toggle rows; extract
 # the table itself.
 for name in ('READING_ROW_KEYS', 'READING_ROW_FULL', 'READING_ROW_WAVE', 'READING_ROW_TURN',
-             'READING_ROW_COUNT', 'READING_ROW_COLS'):
+             'READING_ROW_COUNT', 'READING_ROW_COLS', 'READING_ROW_GAP', 'READING_ROW_HEIGHT'):
     unit += define(src, name)+'\n'
 unit += declaration(src, 'typedef enum {', '} reading_cell_t;')+'\n'
 unit += declaration(src, 'typedef struct {', '} reading_row_t;')+'\n'
 unit += initializer(src, 'static const reading_row_t s_reading_rows')+'\n'
-for name in ('reader_ui_extra', 'reading_settings_top', 'reading_setting_rect',
+for name in ('reader_ui_extra', 'reading_row_height', 'reading_settings_top', 'reading_setting_rect',
              'reading_toggle_rect', 'reading_row_count', 'reading_settings_action'):
     unit += function(name, source)+'\n'
 unit += r'''
 int main(void){
     app_ctx_t ctx={0};
-    // 9个控件位于半屏内、不重叠（第 4 步起两列五行）；按键控制严格在翻页模式下一行。
-    // Nine controls stay inside the half sheet without overlap (two columns x five rows
-    // from step 4); key controls sit directly below turn mode.
+    // 11 个控件位于半屏内、不重叠（26.11.15 仿生阅读起两列六行）；按键控制严格在翻页模式下一行。
+    // Eleven controls stay inside the half sheet without overlap (two columns x six rows
+    // since the bionic-reading slot); key controls sit below turn mode.
     for(int i=0;i<reading_row_count();++i){
         EpdRect a=reading_setting_rect(i);assert(a.x>=36&&a.x+a.width<=648&&a.y>=702&&a.y+a.height<=1122);
         for(int j=i+1;j<reading_row_count();++j){EpdRect b=reading_setting_rect(j);assert(a.x+a.width<=b.x||b.x+b.width<=a.x||a.y+a.height<=b.y||b.y+b.height<=a.y);}
     }
     EpdRect mode=reading_setting_rect(2),keys=reading_setting_rect(4);
-    // 第 4 步 5 行几何：行高 76+extra、间距 10、首行 702——行距 86，槽 2 在 788、槽 4 在 874。
-    // Step-4 five-row geometry: 76+extra rows, 10px gaps, first row at 702 — an 86 pitch,
-    // slot 2 at 788 and slot 4 at 874.
-    assert(keys.x==mode.x&&keys.y>mode.y&&keys.y==874);
+    // 六行几何由 reading_setting_rect 单一出口给出，探针一律取矩形中心，不再写死坐标。
+    // Six-row geometry comes from one source; probes take rect centres instead of literals.
+    assert(keys.x==mode.x&&keys.y>=mode.y+mode.height);
+    const int c0x=reading_setting_rect(0).x+60, c0y=reading_setting_rect(0).y+30;
+    const int c1x=reading_setting_rect(1).x+60, c1y=reading_setting_rect(1).y+30;
     const unsigned expected[]={15,30,0,5,10};
-    for(unsigned i=0;i<5;++i){s_turns=100;assert(reading_settings_action(&ctx,120,750)==APP_REDRAW_PAGE);assert(full_pages==(int)expected[i]&&!s_turns);}
-    full_pages=77;reading_settings_action(&ctx,120,750);assert(full_pages==5);
-    for(unsigned i=0;i<6;++i){reading_settings_action(&ctx,450,750);assert(effect==(int)((i+1)%2));}
+    for(unsigned i=0;i<5;++i){s_turns=100;assert(reading_settings_action(&ctx,c0x,c0y)==APP_REDRAW_PAGE);assert(full_pages==(int)expected[i]&&!s_turns);}
+    full_pages=77;reading_settings_action(&ctx,c0x,c0y);assert(full_pages==5);
+    for(unsigned i=0;i<6;++i){reading_settings_action(&ctx,c1x,c1y);assert(effect==(int)((i+1)%2));}
     s_reader_panel=READER_PANEL_REFRESH_SETTINGS;
-    reading_settings_action(&ctx,120,820);assert(s_reader_panel==READER_PANEL_TURN_SETTINGS);
+    { EpdRect a=reading_setting_rect(2);assert(reading_settings_action(&ctx,a.x+60,a.y+30)==APP_REDRAW_PAGE);assert(s_reader_panel==READER_PANEL_TURN_SETTINGS); }
     s_reader_panel=READER_PANEL_REFRESH_SETTINGS;
-    reading_settings_action(&ctx,120,910);assert(s_reader_panel==READER_PANEL_KEY_SETTINGS);
+    { EpdRect a=reading_setting_rect(4);assert(reading_settings_action(&ctx,a.x+60,a.y+30)==APP_REDRAW_PAGE);assert(s_reader_panel==READER_PANEL_KEY_SETTINGS); }
     // 归因：reading_toggle_rect 现在按槽位直编，开关槽由行表的 cell 字段给出。
     // Attribution: reading_toggle_rect is slot-indexed now; the table's cell field
     // tells which slots are toggles.
@@ -122,9 +123,11 @@ int main(void){
     }
     s_reader_panel=READER_PANEL_REFRESH_SETTINGS;int before=invalidates;
     assert(reading_settings_action(&ctx,342,760)==APP_REDRAW_NONE);
-    // 惰性间隙随 5 行几何更新：行距 86、行高 76 → 间隙 778..788（取 783）。
-    // Inert gaps follow the five-row geometry: 86 pitch over 76 height -> the gap at 778..788 (783 probed).
-    assert(reading_settings_action(&ctx,120,783)==APP_REDRAW_NONE);
+    // 惰性间隙随六行几何更新：取第 0 行底与第 1 行顶之间的中线。
+    // Inert gaps follow the six-row geometry: probe the midpoint between row 0's bottom
+    // and row 1's top.
+    { int gap_y=(reading_setting_rect(0).y+reading_setting_rect(0).height+reading_setting_rect(2).y)/2;
+      assert(reading_settings_action(&ctx,120,gap_y)==APP_REDRAW_NONE); }
     assert(reading_settings_action(&ctx,120,1130)==APP_REDRAW_NONE);
     assert(s_reader_panel==READER_PANEL_REFRESH_SETTINGS&&invalidates==before);
     reading_settings_action(&ctx,342,1170);assert(s_reader_panel==READER_PANEL_NONE);

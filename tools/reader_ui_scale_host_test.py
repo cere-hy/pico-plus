@@ -102,6 +102,8 @@ static bool app_settings_reader_hide_images(void){return false;}
 // Attribution: our table's eighth slot is 横屏阅读; reading_row_on reads its state.
 static bool app_settings_reader_landscape(void){return false;}
 static bool app_settings_reader_two_column(void){return false;}  /* 第 4 步行表新增引用的桩 / stub for the step-4 row-table reference */
+static bool app_typography_enhanced(void){return true;}
+static bool app_settings_bionic(void){return false;}  /* 26.11.15 第 11 槽 / bionic slot */
 '''
 unit+=function('ui_text_box',kit).replace('void ui_text_box(', 'static void actual_text_box(')+'\n'
 unit+=r'''
@@ -117,14 +119,14 @@ unit+=function('draw_sheet',book)+'\n'
 # the drawing functions reference the row-table triple plus reading_row_on/reading_row_count,
 # so extract those too — the macros and the table must precede the functions using them.
 for name in ('READING_ROW_KEYS','READING_ROW_FULL','READING_ROW_WAVE','READING_ROW_TURN',
-             'READING_ROW_COUNT','READING_ROW_COLS'):
+             'READING_ROW_COUNT','READING_ROW_COLS','READING_ROW_GAP','READING_ROW_HEIGHT'):
     unit+=re.search(r'^#define '+name+r' .*',s,re.M)[0]+'\n'
 unit+=declaration(s,'typedef enum {','} reading_cell_t;')+'\n'
 unit+=declaration(s,'typedef struct {','} reading_row_t;')+'\n'
 unit+=initializer(s,'static const reading_row_t s_reading_rows')+'\n'
 for name in ('reading_row_count','reading_row_on'):
     unit+=function(name,book)+'\n'
-for name in ('fit_fixed_text','reader_ui_extra','reader_font_top','reader_font_card','reader_slider_rect',
+for name in ('fit_fixed_text','reader_ui_extra','reading_row_height','reader_font_top','reader_font_card','reader_slider_rect',
              'draw_pill_slider','draw_font_pair','reading_setting_rect','reading_settings_top',
              'reading_toggle_rect','draw_reading_switch','draw_reading_card','draw_reading_toggle'):
     unit+=function(name,book)+'\n'
@@ -142,7 +144,7 @@ int main(void){uint8_t fb[1]={0};
    draw_font_settings(fb);draw_reading_settings(fb);
    for(int i=0;i<6;++i){EpdRect a=reader_font_card(i);assert(a.y>=reader_font_top()+100&&a.y+a.height<1141);for(int j=0;j<i;++j)assert(!overlap(a,reader_font_card(j)));}
    EpdRect slider=reader_slider_rect(0);assert(slider.y>reader_font_top()+100&&slider.y+slider.height<reader_font_card(0).y);
-   for(int i=0;i<8;++i){EpdRect a=reading_setting_rect(i);assert(a.y>=reading_settings_top()+100&&a.y+a.height<1141);for(int j=0;j<i;++j)assert(!overlap(a,reading_setting_rect(j)));}
+   for(int i=0;i<reading_row_count();++i){EpdRect a=reading_setting_rect(i);assert(a.y>=reading_settings_top()+100&&a.y+a.height<1141);for(int j=0;j<i;++j)assert(!overlap(a,reading_setting_rect(j)));}
    for(int i=0;i<9;++i){EpdRect a=reader_font_pick_rect(i);assert(a.y>reader_font_picker_top()+120&&a.y+a.height<1141);for(int j=0;j<i;++j)assert(!overlap(a,reader_font_pick_rect(j)));}
    for(int edit=0;edit<2;++edit){s_bookmark_edit=edit;assert(bookmark_rows()>=3);for(int row=0;row<bookmark_rows();++row){EpdRect a=bookmark_row_rect(row);assert(a.y+a.height<=560+(edit?520:600));if(row)assert(!overlap(a,bookmark_row_rect(row-1)));}}
  }

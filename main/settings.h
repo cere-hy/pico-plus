@@ -117,6 +117,12 @@ void app_settings_set_reader_turn_effect(uint8_t effect);
 /// 阅读正文里短按电源键翻下一页；默认关闭。/ Short power press turns forward only in reader body; off by default.
 bool app_settings_reader_power_turn(void);
 void app_settings_set_reader_power_turn(bool on);
+/// 排版增强：两端对齐 + 音节断词 + 字距；关掉 = 回到 26.9 的经典左对齐态。
+/// 默认开启，NVS 键 `typo_enh`。三条路径必须同开同关——半开态没有历史基线可比。
+/// Enhanced typography (justify + hyphenation + kerning); off = classic ragged right.
+/// One switch for all three paths: a half-off state has no baseline to compare against.
+bool app_typography_enhanced(void);
+void app_settings_set_typography_enhanced(bool on);
 /// 沉浸全屏时隐藏阅读状态栏。/ Hide the reader status bar in immersive full screen.
 bool app_settings_reader_immersive(void);
 void app_settings_set_reader_immersive(bool on);
@@ -133,6 +139,13 @@ void app_settings_set_book_fonts(bool on);
 /// body layout and illustration pagination are affected.
 bool app_settings_book_vertical(void);
 void app_settings_set_book_vertical(bool on);
+/// 仿生阅读：英文词首固定 50% 伪加粗；默认关，NVS 键 `bk_bionic`。
+/// 只作用英文词，中文与 CJK 直通；打开后当前书页即时重排（伪加粗不改字宽）。
+/// Bionic reading: the first 50% of each English word in faux bold; off by default.
+/// English words only, CJK passes through, and the current page repaints at once
+/// because the faux bold never changes advances.
+bool app_settings_bionic(void);
+void app_settings_set_bionic(bool on);
 typedef enum {
     APP_READER_KEY_PREV, ///< 上一页 / Previous page
     APP_READER_KEY_NEXT, ///< 下一页 / Next page
@@ -167,6 +180,20 @@ void app_settings_set_reader_landscape(bool on);
 /// Two-column typesetting (step 4): only effective with landscape reading on; off by default.
 bool app_settings_reader_two_column(void);
 void app_settings_set_reader_two_column(bool on);
+/// gen30 伴读案 · 步 3 接线（格 4 终裁 A 案，键名钉死）：模式编号 u8（默认 0=外语原著）
+/// 与听书闭环自动翻页 bool（默认关）。两键只读设备偏好，组件层不查询（R0 拍板格 5
+/// 设备端自治）；MODE_SET 的 source 语义与 TTS_DONE 消费在产品侧接线，模式值按
+/// push_proto.h 的 PUSH_RIDE_MODE_COUNT 归一化。
+/// gen30 read-along step 3 (ruling grid 4 plan A, keys pinned): a u8 mode id
+/// (default 0 = foreign original) and a bool read-aloud-loop auto page-turn
+/// (off by default). Device-side preferences only - the component never queries
+/// them (R0 ruling 5: device autonomy). MODE_SET source semantics and TTS_DONE
+/// consumption are wired on the product side; the mode is normalized against
+/// PUSH_RIDE_MODE_COUNT from push_proto.h.
+uint8_t app_settings_companion_mode(void);
+void app_settings_set_companion_mode(uint8_t mode);
+bool app_settings_companion_turn(void);
+void app_settings_set_companion_turn(bool on);
 /// 书架排序偏好重启后保持。/ Persist the shelf's recent-reading sort across restarts.
 bool app_settings_shelf_recent_sort(void);
 void app_settings_set_shelf_recent_sort(bool on);

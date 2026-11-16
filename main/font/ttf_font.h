@@ -90,12 +90,19 @@ int ttf_ascender_px(int pixel_height);
 /// Convert a design em size to the active face's native raster height without bitmap scaling.
 int ttf_em_height_px(int em_size);
 
+#include "ttf_justify.h"
+#include "ttf_kern.h"
+
 void ttf_draw_text(
     uint8_t* framebuffer, int x, int y, int size, const char* text,
     enum EpdFontFlags align, uint8_t fg, uint8_t bg
 );
 
-void ttf_draw_text_px(
+/// 返回绘制结束时的笔位（不是墨迹右缘）。度量与绘制同源由 `tools/typography_gate1.py`
+/// 用这个返回值做**零差值**断言——改成 void 就等于把门 1 的眼睛蒙上。
+/// Returns the pen position after the last glyph (not the ink edge). Gate 1 asserts
+/// measure == this value with zero tolerance; making it void blinds that gate.
+int ttf_draw_text_px(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     enum EpdFontFlags align, uint8_t fg, uint8_t bg
 );
@@ -104,15 +111,29 @@ void ttf_draw_text_px(
 bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
                       int baseline, int pixel_height, const char *text);
 /// 从左向右绘制，并在相邻字符之间加入固定像素间距。/ Draw left-aligned text with extra pixels between adjacent characters.
-void ttf_draw_text_px_spaced(
+/// 同 `ttf_draw_text_px`，但相邻字之间加入固定间距；返回结束笔位。
+/// Like `ttf_draw_text_px` with fixed inter-glyph tracking; returns the end pen position.
+int ttf_draw_text_px_spaced(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     int tracking_px, uint8_t fg, uint8_t bg
 );
 /// 在汉字间均摊行尾余量；标点溢出时可小幅压缩字距。/ Distribute spare width across CJK gaps or slightly compress for hanging punctuation.
-void ttf_draw_text_px_fitted(
+/// 在字间均摊行尾余量；返回结束笔位（对齐成功时应恰为 `x + target_width`）。
+/// Spreads the line's slack between words; returns the end pen position, which must be
+/// exactly `x + target_width` when the fit succeeds.
+int ttf_draw_text_px_fitted(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     int tracking_px, int target_width, uint8_t fg, uint8_t bg
 );
+/// 仿生阅读：开启后，英文词首按 50% 做等宽伪加粗（右移 1 px 的等价并集落墨），
+/// 字符前进宽度、字距、断行一律不变；CJK 与标点直通。/ Bionic reading: bold the
+/// first 50% of each English word with an advance-preserving faux bold; tracking and
+/// line breaking stay untouched.
+void ttf_draw_set_bionic(bool on);
+/// 清空本页加粗段计数（每页绘制前调用）。/ Reset the per-page bold-segment counter.
+void ttf_bionic_reset(void);
+/// 本页已加粗的英文词段数（取证暗号 seg=N）。/ Bold English word segments drawn this page.
+int ttf_bionic_segments(void);
 /// 覆盖率过半才落墨，像素只有 fg/bg。/ Ink only when coverage is over half; pixels are fg/bg only.
 void ttf_draw_text_px_bw(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,

@@ -60,6 +60,7 @@
 #define NVS_KEY_READER_TURN "rd_turn"
 #define NVS_KEY_POWER_TURN "rd_power"
 #define NVS_KEY_IMMERSIVE "rd_immersive"
+#define NVS_KEY_TYPO_ENHANCED "typo_enh"
 #define NVS_KEY_HIDE_IMAGES "rd_no_image"
 #define NVS_KEY_HOLD_REFRESH "rd_hold_full"
 #define NVS_KEY_HOLD_ACTION "rd_key_hold"
@@ -67,6 +68,13 @@
 #define NVS_KEY_VERTICAL_TURN "rd_vertical"
 #define NVS_KEY_LANDSCAPE "rd_landscape"
 #define NVS_KEY_TWO_COLUMN "rd_2col"
+/* gen30 伴读案 · 步 3 接线（格 4 终裁 A 案，键名钉死）：模式编号默认 0=外语原著；
+   听书闭环自动翻页默认关。两键只读设备偏好，组件层不查询（R0 拍板格 5 设备端自治）。
+   gen30 read-along step 3 (ruling grid 4 plan A, keys pinned): mode id defaults to
+   0=foreign original; read-aloud-loop auto page-turn defaults off. Device-side
+   preferences only - the component never queries them (R0 ruling 5: device autonomy). */
+#define NVS_KEY_COMPANION_MODE "rd_companion_mode"
+#define NVS_KEY_COMPANION_TURN "rd_companion_turn"
 #define NVS_KEY_BLE_TURNER "ble_turn"
 #define NVS_KEY_FLIGHT "flight"
 #define NVS_KEY_SHELF_RECENT "shelf_recent"
@@ -84,6 +92,10 @@
 #define NVS_KEY_FONTS_DIR "fonts_dir"
 #define NVS_KEY_BOOK_FONTS "bk_fonts"
 #define NVS_KEY_BOOK_VERTICAL "bk_vert"
+// 仿生阅读开关（26.11.16 v2 备案）：英文词首固定 50% 伪加粗，默认关。
+// Bionic reading switch (rule v2): 50% faux bold on English word
+// heads, off by default.
+#define NVS_KEY_BIONIC "bk_bionic"
 // gen26 预留：AI 设置位键名（reserved, not implemented——启用前不读写此键，
 // 登记只为占号防撞；配套备份位与 API 形态见 settings.h 的 gen26 注释块）。
 // Gen26 reservation: the AI settings bit's key name (registered, not
@@ -122,6 +134,8 @@ static uint8_t s_reader_turn_effect;
 static uint8_t s_book_line = 130, s_book_para = 50, s_book_margin = 24;
 static bool s_reader_power_turn;
 static bool s_reader_immersive;
+// 排版增强默认开：关掉等于回到 [122] 的经典左对齐态（见 typography_switch.h）。
+static bool s_typography_enhanced = true;
 static bool s_reader_hide_images;
 static bool s_reader_hold_refresh;
 static const char *s_reader_key_names[] = {"rd_key_l", "rd_key_m", "rd_key_r"};
@@ -130,6 +144,16 @@ static uint8_t s_reader_keys[3] = {APP_READER_KEY_PREV, APP_READER_KEY_TOOLS, AP
 static bool s_reader_vertical_turn;
 static bool s_reader_landscape;
 static bool s_reader_two_column;
+/* gen30 伴读案 · 步 3 接线（格 4 终裁 A 案）：两键只读设备偏好，组件层不查询。
+   模式编号默认 0=外语原著；听书闭环自动翻页默认关。合法性由产品侧按
+   push_proto.h 的 PUSH_RIDE_MODE_COUNT 归一化（单一真源），settings 层只做 u8 存取。
+   gen30 read-along step 3 (ruling grid 4 plan A): device-side preferences only,
+   never queried by the component. Mode defaults to 0=foreign original; the
+   read-aloud-loop auto page-turn defaults off. The product side normalizes the
+   mode against PUSH_RIDE_MODE_COUNT (single source of truth); this layer only
+   stores/loads a raw u8. */
+static uint8_t s_companion_mode;
+static bool s_companion_turn;
 static bool s_ble_turner;
 static bool s_flight_mode;
 static bool s_shelf_recent_sort;
@@ -141,6 +165,9 @@ static bool s_book_fonts = true;
 // Vertical setting defaults off: only readers who want it turn it on, and horizontal type is
 // untouched.
 static bool s_book_vertical;
+// 仿生阅读默认关：只有主动打开的英文阅读者才需要，中文页完全不受影响。
+// Bionic reading defaults off; only readers who ask for it are affected.
+static bool s_bionic;
 static uint8_t s_book_tracking = 2, s_book_reading_line, s_book_rule_offset = 4;
 static uint8_t s_book_indent = 2;
 static uint8_t s_book_indent_adjust = 20;
@@ -279,6 +306,9 @@ void app_settings_init(void) {
     if (nvs_get_u8(h, NVS_KEY_POWER_TURN, &power_turn) == ESP_OK) s_reader_power_turn = power_turn == 1;
     uint8_t immersive = 0;
     if (nvs_get_u8(h, NVS_KEY_IMMERSIVE, &immersive) == ESP_OK) s_reader_immersive = immersive == 1;
+    // 缺键 = 默认开；只有明确写入 0 才关（升级上来的设备自动获得增强排版）。
+    uint8_t typo = 0;
+    if (nvs_get_u8(h, NVS_KEY_TYPO_ENHANCED, &typo) == ESP_OK) s_typography_enhanced = typo != 0;
     uint8_t hold_refresh = 0;
     if (nvs_get_u8(h, NVS_KEY_HOLD_REFRESH, &hold_refresh) == ESP_OK) s_reader_hold_refresh = hold_refresh == 1;
     for (unsigned i = 0; i < 3; ++i) {
@@ -303,7 +333,19 @@ void app_settings_init(void) {
     // 横屏双栏偏好（第 4 步）：默认关（决策①）。/ Two-column preference (step 4); off by default.
     uint8_t two_column = 0;
     if (nvs_get_u8(h, NVS_KEY_TWO_COLUMN, &two_column) == ESP_OK) s_reader_two_column = two_column == 1;
+    // gen30 伴读两键：缺键走默认（模式 0 / 自动翻页关）；脏值由产品侧按
+    // PUSH_RIDE_MODE_COUNT 归一化，不在此层夹逼，也不引组件头依赖。
+    // gen30 companion keys: a missing key keeps the defaults (mode 0 / auto-turn
+    // off); a stale value is normalized by the product side against
+    // PUSH_RIDE_MODE_COUNT - no clamping here and no component header dependency.
+    uint8_t companion_mode = 0;
+    if (nvs_get_u8(h, NVS_KEY_COMPANION_MODE, &companion_mode) == ESP_OK)
+        s_companion_mode = companion_mode;
+    uint8_t companion_turn = 0;
+    if (nvs_get_u8(h, NVS_KEY_COMPANION_TURN, &companion_turn) == ESP_OK)
+        s_companion_turn = companion_turn == 1;
     uint8_t hide_images = 0, recent_sort = 0, ble_turner = 0, book_fonts = 1, book_vertical = 0;
+    uint8_t bionic = 0;
     if (nvs_get_u8(h, NVS_KEY_HIDE_IMAGES, &hide_images) == ESP_OK) s_reader_hide_images = hide_images == 1;
     if (nvs_get_u8(h, NVS_KEY_BLE_TURNER, &ble_turner) == ESP_OK) s_ble_turner = ble_turner == 1;
     uint8_t flight = 0;
@@ -311,6 +353,7 @@ void app_settings_init(void) {
     if (nvs_get_u8(h, NVS_KEY_SHELF_RECENT, &recent_sort) == ESP_OK) s_shelf_recent_sort = recent_sort == 1;
     if (nvs_get_u8(h, NVS_KEY_BOOK_FONTS, &book_fonts) == ESP_OK) s_book_fonts = book_fonts == 1;
     if (nvs_get_u8(h, NVS_KEY_BOOK_VERTICAL, &book_vertical) == ESP_OK) s_book_vertical = book_vertical == 1;
+    if (nvs_get_u8(h, NVS_KEY_BIONIC, &bionic) == ESP_OK) s_bionic = bionic == 1;
     uint8_t tracking = 2, reading_line = 0, rule_offset = 4, indent = 2, indent_adjust = 20;
     if (nvs_get_u8(h, NVS_KEY_BOOK_TRACK, &tracking) == ESP_OK && tracking <= 4)
         s_book_tracking = tracking;
@@ -637,6 +680,12 @@ void app_settings_set_reader_power_turn(bool on) {
     s_reader_power_turn = on;
     nvs_put_u8(NVS_KEY_POWER_TURN, on ? 1 : 0);
 }
+bool app_typography_enhanced(void) { return s_typography_enhanced; }
+void app_settings_set_typography_enhanced(bool on) {
+    if (s_typography_enhanced == on) return;
+    s_typography_enhanced = on;
+    nvs_put_u8(NVS_KEY_TYPO_ENHANCED, on ? 1 : 0);
+}
 bool app_settings_reader_immersive(void) { return s_reader_immersive; }
 void app_settings_set_reader_immersive(bool on) {
     if (s_reader_immersive == on) return;
@@ -660,6 +709,12 @@ void app_settings_set_book_vertical(bool on) {
     if (s_book_vertical == on) return;
     s_book_vertical = on;
     nvs_put_u8(NVS_KEY_BOOK_VERTICAL, on ? 1 : 0);
+}
+bool app_settings_bionic(void) { return s_bionic; }
+void app_settings_set_bionic(bool on) {
+    if (s_bionic == on) return;
+    s_bionic = on;
+    nvs_put_u8(NVS_KEY_BIONIC, on ? 1 : 0);
 }
 bool app_settings_ble_turner(void) { return s_ble_turner; }
 app_reader_key_action_t app_settings_reader_key_action(unsigned key) {
@@ -728,6 +783,25 @@ void app_settings_set_reader_two_column(bool on) {
     if (s_reader_two_column == on) return;
     s_reader_two_column = on;
     nvs_put_u8(NVS_KEY_TWO_COLUMN, on ? 1 : 0);
+}
+/* gen30 伴读案 · 步 3 接线（格 4 终裁 A 案）：模式编号与自动翻页开关的读写 helper。
+   体例同 app_settings_reader_two_column：去重 + nvs_put_u8；模式值不夹逼，产品侧
+   按 PUSH_RIDE_MODE_COUNT 归一化后写回，避免两处真源。
+   gen30 read-along step 3 (ruling grid 4 plan A): getters/setters for the mode id
+   and the auto page-turn flag. Same shape as the two-column pair: dedupe + write;
+   the mode is not clamped here - the product normalizes it against
+   PUSH_RIDE_MODE_COUNT before storing, keeping a single source of truth. */
+uint8_t app_settings_companion_mode(void) { return s_companion_mode; }
+void app_settings_set_companion_mode(uint8_t mode) {
+    if (s_companion_mode == mode) return;
+    s_companion_mode = mode;
+    nvs_put_u8(NVS_KEY_COMPANION_MODE, mode);
+}
+bool app_settings_companion_turn(void) { return s_companion_turn; }
+void app_settings_set_companion_turn(bool on) {
+    if (s_companion_turn == on) return;
+    s_companion_turn = on;
+    nvs_put_u8(NVS_KEY_COMPANION_TURN, on ? 1 : 0);
 }
 void app_settings_set_reader_hold_refresh(bool on) {
     if (s_reader_hold_refresh == on) return;

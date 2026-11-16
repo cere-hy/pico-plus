@@ -15,6 +15,10 @@
  */
 
 #include "ttf_font.h"
+#include "ttf_kern.h"
+#include "typography_switch.h"
+#include "ui_bionic.h"
+#include "kern_pairs.h"
 #include "ttf_stroke_filter.h"
 #include "ui_gray_lut.h"
 
@@ -2044,13 +2048,45 @@ static void warm_text_io(int pixel_height, const char* text, const char* end) {
     io_flush_touches();
 }
 
+// 相邻字形对的额外推进。**三端共用**：度量、绘制、布局累加。
+// 表是离线展平的（tools/gen_kern_table.py），键是内置字体的字形 id——所以非内置字体
+// 一律返回 0（静默无 kern，[124] 细则 1），绝不能让别的字体按错的 id 去调字距。
+// One kern function for measure, draw and layout. The table is keyed by the builtin
+// face's glyph ids, hence any other face returns 0 (silent no-kern, [124] rule 1).
+int ttf_kern_px(int pixel_height, uint32_t left_cp, uint32_t right_cp) {
+    // 开关关掉 = 三端同时无字距：这是「同尺」的另一半——不是把绘制侧关掉、度量侧留着。
+    // Switch off means no kerning on all three consumers at once, not on one side only.
+    if (!app_typography_enhanced()) return 0;
+    if (!font_ready || left_cp == 0 || right_cp == 0) return 0;
+    if (!ttf_font_path_is_builtin(font_path)) return 0;
+    const int left_gid = stbtt_FindGlyphIndex(&font_info, (int)left_cp);
+    const int right_gid = stbtt_FindGlyphIndex(&font_info, (int)right_cp);
+    if (left_gid <= 0 || right_gid <= 0) return 0;
+    const uint32_t key = ((uint32_t)left_gid << KERN_GID_BITS) | (uint32_t)right_gid;
+    int lo = 0, hi = KERN_PAIR_COUNT - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) >> 1;
+        const uint32_t k = kern_pair_keys[mid];
+        if (k == key) {
+            const float scale =
+                stbtt_ScaleForPixelHeight(&font_info, (float)clamp_px(pixel_height));
+            return (int)lroundf((float)kern_pair_values[mid] * scale);
+        }
+        if (k < key) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
 static int measure_width(int pixel_height, const char* text) {
     int width = 0;
+    uint32_t prev_cp = 0;
     float scale = stbtt_ScaleForPixelHeight(&font_info, (float)pixel_height);
     const char* cursor = text;
     while (*cursor != '\0') {
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) width += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
         const glyph_entry_t* glyph = cache_lookup(cp, pixel_height);
         if (glyph != NULL) {
             width += glyph->advance_x;
@@ -2599,6 +2635,57 @@ static uint8_t mix_ink(uint8_t alpha, uint8_t fg, uint8_t bg) {
     return (uint8_t)(bg + ui_gray_lut_map(alpha) * ((int)fg - (int)bg) / 255);
 }
 
+/* ---- 仿生阅读 / Bionic reading ----
+ * 定版：英文词首固定 50%（前半截），只作用 A-Za-z0-9，CJK 直通。伪加粗采用「右移 1 px 重绘」
+ * 的等价并集：每个像素只落墨一次，覆盖率取原位与右移一位的较大者，因此既不越出
+ * 字身框，也不会让第二遍把第一遍的抗锯齿边缘冲淡。字符前进宽度完全没动——行宽、
+ * 换行、字距不受影响，Flash 不新增字库。
+ * Pinned 50% (leading half) on English words only. The faux bold is the union of the glyph and a
+ * 1 px right-shifted copy, written once per pixel with the stronger coverage, so it
+ * never widens the advance. No bold face and no extra flash. */
+static bool s_bionic;
+static int s_bionic_segments;
+
+void ttf_draw_set_bionic(bool on) { s_bionic = on; }
+void ttf_bionic_reset(void) { s_bionic_segments = 0; }
+int ttf_bionic_segments(void) { return s_bionic_segments; }
+
+static void blit_glyph(uint8_t* fb, const glyph_entry_t* glyph, int x, int y,
+                       uint8_t fg, uint8_t bg, bool bold) {
+    if (!glyph || !glyph->bitmap || glyph->width <= 0 || glyph->height <= 0) return;
+    if (!bold) {
+        for (int gy = 0; gy < glyph->height; ++gy) {
+            const int yy = y - glyph->top + gy;
+            for (int gx = 0; gx < glyph->width; ++gx) {
+                const uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
+                if (alpha) epd_draw_pixel(x + glyph->left + gx, yy,
+                                          mix_ink(alpha, fg, bg) << 4, fb);
+            }
+        }
+        return;
+    }
+    const int w = glyph->width;
+    for (int gy = 0; gy < glyph->height; ++gy) {
+        const int yy = y - glyph->top + gy;
+        const uint8_t* row = glyph->bitmap + gy * w;
+        for (int gx = 0; gx <= w; ++gx) {
+            uint8_t alpha = gx < w ? row[gx] : 0;
+            if (gx > 0 && row[gx - 1] > alpha) alpha = row[gx - 1];
+            if (alpha) epd_draw_pixel(x + glyph->left + gx, yy,
+                                      mix_ink(alpha, fg, bg) << 4, fb);
+        }
+    }
+}
+
+/* 喂一个码点并返回是否处于加粗段；新词计入本页段数。*/
+static bool bionic_bold(br_bold_state_t* st, uint32_t cp, const char* after) {
+    if (!s_bionic) return false;
+    bool fresh = false;
+    const bool bold = br_bold_feed(st, cp, after, &fresh);
+    if (fresh) ++s_bionic_segments;
+    return bold;
+}
+
 void ttf_draw_text(
     uint8_t* framebuffer, int x, int y, int size, const char* text,
     enum EpdFontFlags align, uint8_t fg, uint8_t bg
@@ -2606,15 +2693,16 @@ void ttf_draw_text(
     ttf_draw_text_px(framebuffer, x, y, size_to_px(size), text, align, fg, bg);
 }
 
-void ttf_draw_text_px(
+int ttf_draw_text_px(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     enum EpdFontFlags align, uint8_t fg, uint8_t bg
 ) {
-    if (!font_ready || framebuffer == NULL || text == NULL) return;
+    if (!font_ready || framebuffer == NULL || text == NULL) return x;
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
 
     int cursor_x = x;
+    br_bold_state_t bold_st = {0, 0};
     if (align & EPD_DRAW_ALIGN_CENTER) {
         cursor_x = x - measure_width(pixel_height, text) / 2;
     } else if (align & EPD_DRAW_ALIGN_RIGHT) {
@@ -2622,26 +2710,21 @@ void ttf_draw_text_px(
     }
 
     const char* cursor = text;
+    uint32_t prev_cp = 0;
     while (*cursor != '\0') {
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) cursor_x += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
+        /* 先喂状态机再看字形：缺字也不能让词边界错位。/ Feed the state machine
+           before the glyph lookup so a missing glyph cannot shift word boundaries. */
+        const bool bold = bionic_bold(&bold_st, cp, cursor);
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
         if (glyph == NULL) continue;
-
-        if (glyph->bitmap != NULL) {
-            for (int gy = 0; gy < glyph->height; gy++) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; gx++) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha == 0) continue;
-                    epd_draw_pixel(
-                        cursor_x + glyph->left + gx, yy, mix_ink(alpha, fg, bg) << 4, framebuffer
-                    );
-                }
-            }
-        }
+        blit_glyph(framebuffer, glyph, cursor_x, y, fg, bg, bold);
         cursor_x += glyph->advance_x;
     }
+    return cursor_x;
 }
 
 bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
@@ -2651,8 +2734,12 @@ bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     const char *cursor = text;
+    uint32_t prev_cp = 0;
     while (*cursor) {
-        const glyph_entry_t *glyph = get_glyph(decode_utf8(&cursor), pixel_height);
+        const uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) x += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
+        const glyph_entry_t *glyph = get_glyph(cp, pixel_height);
         if (!glyph) return false;
         for (int gy = 0; glyph->bitmap && gy < glyph->height; ++gy) {
             int yy = baseline - glyph->top + gy;
@@ -2670,38 +2757,35 @@ bool ttf_text_mask_px(uint8_t *mask, unsigned width, unsigned height, int x,
     return true;
 }
 
-void ttf_draw_text_px_spaced(
+int ttf_draw_text_px_spaced(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     int tracking_px, uint8_t fg, uint8_t bg
 ) {
     if (!tracking_px) {
-        ttf_draw_text_px(framebuffer, x, y, pixel_height, text, EPD_DRAW_ALIGN_LEFT, fg, bg);
-        return;
+        return ttf_draw_text_px(framebuffer, x, y, pixel_height, text, EPD_DRAW_ALIGN_LEFT, fg, bg);
     }
-    if (!font_ready || framebuffer == NULL || text == NULL) return;
+    if (!font_ready || framebuffer == NULL || text == NULL) return x;
     pixel_height = clamp_px(pixel_height);
     warm_runs(pixel_height, text);
     int cursor_x = x;
+    br_bold_state_t bold_st = {0, 0};
     const char* cursor = text;
+    uint32_t prev_cp = 0;
     while (*cursor != '\0') {
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) cursor_x += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
+        /* 先喂状态机再看字形：缺字也不能让词边界错位。/ Feed the state machine
+           before the glyph lookup so a missing glyph cannot shift word boundaries. */
+        const bool bold = bionic_bold(&bold_st, cp, cursor);
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
         if (glyph == NULL) continue;
-        if (glyph->bitmap != NULL) {
-            for (int gy = 0; gy < glyph->height; gy++) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; gx++) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha == 0) continue;
-                    epd_draw_pixel(cursor_x + glyph->left + gx, yy,
-                                   mix_ink(alpha, fg, bg) << 4, framebuffer);
-                }
-            }
-        }
+        blit_glyph(framebuffer, glyph, cursor_x, y, fg, bg, bold);
         cursor_x += glyph->advance_x;
         if (*cursor) cursor_x += tracking_px;
     }
+    return cursor_x;
 }
 
 // 竖排里要转 90° 的字符：拉丁字母数字、括号、横向的破折号与波浪号、弯引号与省略号。
@@ -2961,9 +3045,8 @@ int ttf_draw_text_px_vertical(
     return cell;
 }
 
-static bool cjk_spacing_point(uint32_t cp) {
-    return (cp >= 0x2e80 && cp <= 0xffef) || (cp >= 0x2018 && cp <= 0x201d);
-}
+// 汉字间隙判据已收进 ttf_font.h（ttf_cjk_gap_point），绘制/命中/门 1 共用一份。
+// The CJK gap predicate now lives in ttf_font.h and is shared by draw, hit-test and gate 1.
 
 // 竖排列高：与 ttf_draw_text_px_vertical 的推进一致，不落墨，供排版预留位置。
 // Vertical column height: the same advance ttf_draw_text_px_vertical produces, without inking,
@@ -2982,64 +3065,63 @@ int ttf_vertical_text_height_px(int pixel_height, const char* text, int tracking
     return total;
 }
 
-void ttf_draw_text_px_fitted(
+int ttf_draw_text_px_fitted(
     uint8_t* framebuffer, int x, int y, int pixel_height, const char* text,
     int tracking_px, int target_width, uint8_t fg, uint8_t bg
 ) {
-    if (!font_ready || !framebuffer || !text || !*text) return;
+    if (!font_ready || !framebuffer || !text || !*text) return x;
     pixel_height = clamp_px(pixel_height);
+    // 经典态：不做两端对齐，直接按自然宽逐字画（ragged right）。这是「关掉 = 回到
+    // [122]」在绘制侧的唯一落点——留在这里而不是在调用方，才不会漏掉别的调用点。
+    // Classic mode: ragged right, no gap distribution, straight through the spaced path.
+    if (!app_typography_enhanced())
+        return ttf_draw_text_px_spaced(framebuffer, x, y, pixel_height, text, tracking_px, fg, bg);
     warm_runs(pixel_height, text);
-    int glyph_count = 0, cjk_gaps = 0;
-    const char* cursor = text;
-    uint32_t previous = 0;
-    while (*cursor) {
-        uint32_t cp = decode_utf8(&cursor);
-        if (glyph_count && (cjk_spacing_point(previous) || cjk_spacing_point(cp))) ++cjk_gaps;
-        previous = cp;
-        ++glyph_count;
+
+    // 分配计划来自 ttf_font.h 的**唯一一份**实现：绘制、点词命中、宿主门三处共用。
+    // natural 含 tracking——少这一项，用户一开字距预算就系统性错算。
+    // The plan lives once in ttf_font.h and is shared by drawing, hit-testing and the host
+    // gate. `natural` includes tracking; omitting it makes a non-zero setting misfit.
+    int glyphs = 0;
+    for (const char *p = text; *p;) { (void)ttf_plan_cp(&p); ++glyphs; }
+    const int natural = measure_width(pixel_height, text) + tracking_px * (glyphs - 1);
+    ttf_justify_t plan;
+    ttf_justify_plan(text, natural, target_width, pixel_height, &plan);
+    if (!plan.fitted) {
+        return ttf_draw_text_px_spaced(framebuffer, x, y, pixel_height, text, tracking_px, fg, bg);
     }
-    int gaps = glyph_count - 1;
-    int natural = measure_width(pixel_height, text) + tracking_px * gaps;
-    int delta = target_width - natural;
-    bool compress = delta < 0;
-    int adjustable = compress ? gaps : cjk_gaps;
-    if (adjustable < 2 || (compress && -delta > adjustable * 3) ||
-        (!compress && delta > adjustable * 12)) {
-        ttf_draw_text_px_spaced(framebuffer, x, y, pixel_height, text, tracking_px, fg, bg);
-        return;
-    }
-    int quotient = delta / adjustable;
-    int remainder = delta % adjustable;
+
     int adjusted = 0, cursor_x = x;
-    cursor = text;
+    br_bold_state_t bold_st = {0, 0};
+    const char *cursor = text;
+    uint32_t prev_cp = 0;
     while (*cursor) {
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) cursor_x += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
+        const bool bold = bionic_bold(&bold_st, cp, cursor);
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
-        if (glyph && glyph->bitmap) {
-            for (int gy = 0; gy < glyph->height; ++gy) {
-                int yy = y - glyph->top + gy;
-                for (int gx = 0; gx < glyph->width; ++gx) {
-                    uint8_t alpha = glyph->bitmap[gy * glyph->width + gx];
-                    if (alpha) epd_draw_pixel(cursor_x + glyph->left + gx, yy,
-                                              mix_ink(alpha, fg, bg) << 4, framebuffer);
-                }
-            }
-        }
+        if (glyph) blit_glyph(framebuffer, glyph, cursor_x, y, fg, bg, bold);
         if (glyph) cursor_x += glyph->advance_x;
         if (*cursor) {
             const char* peek = cursor;
             uint32_t next = decode_utf8(&peek);
             cursor_x += tracking_px;
-            if (compress || cjk_spacing_point(cp) || cjk_spacing_point(next)) {
-                int step = quotient;
-                if (remainder > 0 && adjusted < remainder) ++step;
-                if (remainder < 0 && adjusted < -remainder) --step;
+            // 与计划同一个间隙判据：西文只在词间空格上摊，汉字在汉字相邻处摊；
+            // 压缩时每个间隙都参与（字距压缩本来就是逐字收紧）。
+            // Same gap predicate as the plan: word spaces for Latin, CJK adjacency for
+            // CJK; compression touches every gap.
+            if (plan.compress || ttf_justify_gap(cp, next)) {
+                int step = plan.step;
+                if (plan.remainder > 0 && adjusted < plan.remainder) ++step;
+                if (plan.remainder < 0 && adjusted < -plan.remainder) --step;
                 cursor_x += step;
                 ++adjusted;
             }
         }
     }
+    return cursor_x;
 }
 
 void ttf_draw_text_px_bw(
@@ -3058,9 +3140,12 @@ void ttf_draw_text_px_bw(
     }
 
     const char* cursor = text;
+    uint32_t prev_cp = 0;
     while (*cursor != '\0') {
         run_apply((size_t)(cursor - text));
         uint32_t cp = decode_utf8(&cursor);
+        if (prev_cp != 0) cursor_x += ttf_kern_px(pixel_height, prev_cp, cp);
+        prev_cp = cp;
         const glyph_entry_t* glyph = get_glyph(cp, pixel_height);
         if (glyph == NULL) continue;
 

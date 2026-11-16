@@ -45,13 +45,13 @@ STREAM = HERE / 'reader_settings_panel_stream.txt'
 # reading_setting_rect(); the table gained the FULL/WAVE/TURN non-toggle slot constants.
 MODEL_DEFINES = ['READING_ROW_KEYS', 'READING_ROW_FULL', 'READING_ROW_WAVE',
                  'READING_ROW_TURN', 'READING_ROW_COUNT', 'READING_ROW_COLS',
-                 'READING_ROW_HEIGHT']
+                 'READING_ROW_HEIGHT', 'READING_ROW_GAP']
 # 归因：draw_reading_keys_row / draw_reading_rows / reading_done_rect 随上游卡片壳移除
 # （按键控制改为卡片槽、「完成」改回固定矩形），补上新壳的四个槽位绘制函数。
 # Attribution: draw_reading_keys_row / draw_reading_rows / reading_done_rect went away with
 # upstream's card shell (the keys entry became a slot and Done a fixed rect); the shell's
 # slot-drawing functions take their place.
-EXTRACT = ['reading_row_count', 'reading_row_on', 'reading_setting_rect',
+EXTRACT = ['reading_row_count', 'reading_row_on', 'reading_row_height', 'reading_setting_rect',
            'reading_settings_top', 'reading_toggle_rect',
            'draw_reading_card', 'draw_reading_toggle', 'draw_sheet',
            'draw_reading_settings', 'reading_settings_action']
@@ -303,6 +303,10 @@ void app_settings_set_reader_two_column(bool on) { test_two_column = on ? 1 : 0;
 bool app_settings_reader_immersive(void) { return test_immersive; }
 bool app_settings_reader_hide_images(void) { return test_hide_images; }
 bool app_settings_reader_landscape(void) { return test_landscape; }
+static bool test_bionic;
+bool app_typography_enhanced(void) { return true; }
+bool app_settings_bionic(void) { return test_bionic; }
+void app_settings_set_bionic(bool on) { test_bionic = on ? 1 : 0; }
 void app_settings_set_reader_full_pages(uint8_t pages) { test_full_pages = pages; }
 void app_settings_set_reader_turn_effect(uint8_t effect) { test_turn_effect = effect; }
 '''
@@ -408,7 +412,7 @@ static int behavior_cases(void) {
     /* 行间间隙（行底那一像素）→ 无动作。/ The 1px gap below a row hits nothing. */
     {
         EpdRect row = reading_toggle_rect(0);
-        if (reading_settings_action(&ctx, 36, (uint16_t)(row.y + READING_ROW_HEIGHT)) != APP_REDRAW_NONE)
+        if (reading_settings_action(&ctx, 36, (uint16_t)(row.y + row.height)) != APP_REDRAW_NONE)
             return fail("row gap must be inert");
     }
 
@@ -538,6 +542,10 @@ def main():
         # Digest is red (draw stream diverged from the frozen value): this is a
         # stop-and-report anomaly, but the behavior rc is still scene info and must
         # be surfaced too — do not swap "behavior-masked-digest" for "digest-masked-behavior".
+        # 判决行（契约）：稳定前缀 + 两个值一行到齐，人能读、牙能 grep。
+        # 26.11.5 的教训：只打业务散文的失败步骤，在关键字扫描里等于不存在。
+        # Verdict line (a contract): stable prefix plus both values, greppable.
+        print('PANEL_STREAM: CHANGED golden=%s now=%s' % (golden.split('=', 1)[-1], digest))
         print('reader settings panel draw stream CHANGED: golden %s, now %s' % (golden, digest))
         print('--- current stream (run with --regen only after an intentional panel change) ---')
         print(stream)
@@ -549,9 +557,11 @@ def main():
     # Digest passed; if the C unit still exited non-zero (behavior / on-screen case
     # failed), surface it now instead of letting it mask the digest comparison.
     if rc != 0:
+        print('PANEL_STREAM: DIGEST-OK/BEHAVIOR-FAIL digest=%s' % digest)
         print('reader_settings_panel: digest OK (%s) but behavior/on-screen case FAILED' % digest)
         print(err)
         raise SystemExit(1)
+    print('PANEL_STREAM: OK digest=%s' % digest)
     print('reader_settings_panel: PASS (%s)' % digest)
 
 

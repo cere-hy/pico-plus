@@ -109,15 +109,18 @@
 #include <unistd.h>
 
 #include "app.h"
+#include "app_companion_state.h"
 #include "app_content_open.h"
 #include "boot_state.h"
 #include "app_registry.h"
 #include "ble_page_turner.h"
 #include "book_layout.h"
+#include "book_select.h"
 #include "book_id.h"
 #include "book_cover.h"
 #include "book_cover_jobs.h"
 #include "ai_reader.h"
+#include "scene_req.h"
 #include "book_lock_collage.h"
 #include "book_epub.h"
 #include "book_policy.h"
@@ -125,8 +128,32 @@
 #include "book_title.h"
 #include "book_ticket.h"
 #include "book_excerpt.h"
+#include "pico_heapdiag.h"
 #include "book_toc.h"
 #include "app_font_context.h"
+
+// M5-A 框选：实现块在文件后半段，这些前置声明让早于它的消费者（双指、按键、
+// 绘制、任务边界）能引用；全部 static，不扩大任何外部接口。
+// M5-A selection: the implementation sits later in this file, so these forward
+// declarations let earlier consumers (two-finger, keys, drawing, task boundaries)
+// reach it. All static; no external surface grows.
+static bool boxsel_active(void);
+static void boxsel_reset(void);
+static void boxsel_draw(uint8_t* fb);
+static void boxsel_boundary_reset(void);
+static bool boxsel_single_finger_priority(app_ctx_t* ctx);
+// S26-2 出口声明制：任何离开框选态的路径都必须报名字，所以早期调用点（双指、按键）
+// 调的是这一个带标签的出口，而不是裸 boxsel_reset()。
+// S26-2 exit declaration: anything leaving box-select must name itself, so early call sites
+// (two-finger, keys) call this labelled exit rather than a bare boxsel_reset().
+typedef enum {
+    BOXSEL_EXIT_SAVE = 0, BOXSEL_EXIT_AI, BOXSEL_EXIT_CANCEL,
+    BOXSEL_EXIT_TAP_OUT, BOXSEL_EXIT_DUAL, BOXSEL_EXIT_TIMEOUT,
+    BOXSEL_EXIT_KEY,          ///< 短按：先退出框选，再把键交给常规处理 / short key: leave first, then handle the key
+    BOXSEL_EXIT_KEY_LONG,     ///< 长按 / long key
+    BOXSEL_EXIT_BOUNDARY,     ///< 行列边界失效后的清场（换书/熄屏等，非用户出口）/ cleared after a reflow or book switch
+} boxsel_exit_t;
+static app_redraw_t boxsel_exit(boxsel_exit_t why);
 #include "book_source.h"
 #include "book_store.h"
 #include "book_shelf_categories.h"
@@ -145,12 +172,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#if CONFIG_BOOK_PREP_STACK_PSRAM
+// 26.9.13 P0-a（实验开关）：带内存属性的任务创建/删除。只在开关打开时引入。
+// 26.9.13 P0-a (experiment switch): memory-caps task create/delete, only when enabled.
+#include "freertos/idf_additions.h"
+#endif
 #include "read_pico_init.h"
 #include "read_pico_sd.h"
 #include "read_pico_transfer.h"
 #include "read_pico_search.h"
 #include "settings.h"
 #include "book/book_reader_input.h"
+#include "book/excerpt_store.h"   // 26.9.26 S26-2：摘抄落盘（只剩入队 API 可用，见 B32'）/ excerpt storage (enqueue API only, see B32-prime)
+#include "book/excerpt_section.h" // 26.11.4：段落解析切节（只取【原文对照】）/ section cut for passage answers
+#include "esp_attr.h"              // 26.11.4：EXT_RAM_BSS_ATTR（切节缓冲落 PSRAM）
 #include "ttf_font.h"
 #include "ui_kit.h"
 #include "ui_text_input.h"
@@ -158,6 +193,7 @@
 #include "ui_image_dither.h"
 #include "ui_reader_background.h"
 #include "ui_gesture.h"
+#include "ui_dualgesture.h"
 #include "ui_menu.h"
 #include "ui_nav.h"
 #include "ui_click_feedback.h"
@@ -240,6 +276,31 @@ static book_view_t s_view;
 static int s_presented_view = -1;
 static bool s_reader_image_refresh_pending;
 static bool s_reader_turn_pending;
+// 26.11.6：这一拍是不是「页码前进」（正文翻页 / AI 解析页翻页）。
+// 由调用侧显式置位，present 不靠几何猜——翻页的面积永远等于正文区，没有几何签名。
+// 忘置位时兜底是整屏 full：灰账安全、闪账爆炸，所以宿主真值表逐条枚举 READING 的
+// 每一条 PAGE 路径，断言各自落的分支，不许有路径靠兜底活着。
+// 26.11.6: is this frame a page advance (body turn or AI detail turn)? The caller sets
+// it explicitly; present never guesses from geometry - a turn's area always equals the
+// body, so there is no geometric signature. Forgetting it falls back to a full refresh
+// (ghost-safe, flash-hostile), which is why the host truth table enumerates every
+// READING PAGE path and asserts the branch each one lands in.
+static bool s_reader_body_turn;
+// 26.11.7 S2：这一拍是不是**页码前进**（正文翻页 / AI 解析页 / 全屏翻页）。
+// 26.11.6 的计数散在两处（turn_page 与 reader_ai_turn 各调一次 reader_note_turn），
+// 于是「记了多少页」与「实际播了几屏」是两条线：中途被 request_app 截走的拍、
+// 走了整屏清底的拍，都可能数错。这里只留一个标记，账统一在 present 里结。
+// 26.11.7 S2: is this frame a page advance? 26.11.6 counted in two places, so
+// "pages counted" and "screens actually presented" were two separate lines. Only a
+// flag here; the ledger settles in present(), once.
+static bool s_reader_page_advance;
+// 26.11.6 T3：上一页有灰阶内容、这一页没有 —— 正文区整区清底一次。
+// Last frame carried grayscale, this one does not: clean the body area once.
+static bool s_reader_clear_from_image;
+// T3 的「上一页」不能在翻页后从 s_page 反推（它已经变了），所以翻页开始时先记下来。
+// The "previous page" for T3 cannot be recovered from s_page after the turn, so the
+// turn records it before advancing.
+static bool s_reader_frame_had_image;
 // 只记录成功推屏的纯正文基准，避免跨章或退出插图时误用文字波形。
 // Track only successfully presented text-only bodies, protecting chapter and image transitions.
 static bool s_reader_text_frame;
@@ -354,6 +415,36 @@ static size_t s_tts_last_chapter = SIZE_MAX, s_tts_last_page = SIZE_MAX;
 // (switch turned off while disconnected -> on reconnect, re-push an empty
 // page so the peer stops the read-aloud).
 static bool s_tts_link_was_up = false;
+/* gen30 伴读案 · 步 3：进/出伴读只置 pending，置位与重排由 on_tick 同批原子完成，
+   与 s_fonts_reload_pending 同款（触摸回调栈太深，一章排下来会穿栈）。
+   gen30 read-along step 3: enter/exit only set a pending flag; the state flip and
+   the reflow happen atomically in one on_tick batch - same shape as the font
+   reload pending (a reflow inside a touch callback overruns the main task stack). */
+static bool s_companion_enter_pending, s_companion_exit_pending;
+/* 伴读案 30 批 · 步 4：右栏摘要显示层（R0 冻结件 2/3，步 2 回执 §6 格 3）。
+   冻结件 2：摘要按「发送帽」在设备侧做码点硬截二次截断，不依赖 APK 自觉；
+   冻结件 3：右栏独立计数，累积 12 次 DU 局部刷做一次右栏区域 GC16 清残影。
+   占位三态「等待连接／摘要生成中…／本次未生成」与侧栏 padding 亦属本步。
+   计数器独立于正文 s_du_count（R0 明定「右栏独立计数」，不复用、不改其账）。
+
+   修复轮二轮（现场第二轮回执）：发送帽 56 → 192 字；字号不再写死 21 px，改为
+   在内框里取「整段放得下的最大字号」（18..34），短摘要自动放大、长摘要自动收到
+   能容下的字号，既不留白也不挤成一条线。几何仍守 70/30，改档只动本节常量。
+
+   修复轮三轮（07:37 篇幅扩充令）：帽 192 → 250 字，下限 18 → 22 px。下限抬到
+   22 是硬要求——右栏宁可末尾截断补省略号，也不许为了塞下更多字把字号压到
+   看不清。实测几何（内框 301x618，34 px 时 131 汉字排 12 行）反推：22 px 每行
+   约 17 字，250 字约 15 行、行高约 33 px，总计约 495 px，装得下；正常输出
+   180~220 字会落在 22~24 px，比二轮的 34 px 略收但仍远高于「蚂蚁」。 */
+#define READER_COMPANION_SUMMARY_CAP 250
+#define READER_COMPANION_TEXT_MAX_PX 34
+#define READER_COMPANION_TEXT_MIN_PX 22
+#define READER_COMPANION_GC16_EVERY 12u
+#define READER_COMPANION_PAD 14
+static char s_companion_summary[READER_COMPANION_SUMMARY_CAP * 4 + 1];
+static uint8_t s_companion_summary_idx, s_companion_summary_total;
+static bool s_companion_summary_has;
+static unsigned s_companion_du_count;
 static char s_book_title[128];
 static char s_chapter_heading_title[128], s_chapter_heading_label[32];
 static size_t s_chapter_lead_skip;
@@ -396,6 +487,51 @@ static size_t s_page_images_for = SIZE_MAX;
 static uint32_t s_page_images_generation;
 static size_t s_block_count;
 static size_t s_text_len, s_chapter, s_page;
+
+/// M3 情景释义：点词时的定位快照（页 + 词在整章字节流中的区间）。点卡上的
+/// 「情景解读 ›」时 s_text/s_page 必须仍指向同一页，否则放弃（ctx_fail）。
+/// 上下文缓冲 static：1024B 放栈会重演 gen26.6.4 的栈教训（主任务栈 12KB）。
+/// M3 scene lookup: the tap snapshot (page + word byte range in the chapter).
+/// When "情景解读 ›" is tapped, s_text/s_page must still point at the same page,
+/// else the request is abandoned (ctx_fail). The 1024B buffer is static - putting
+/// it on the stack repeats the gen26.6.4 lesson (12KB main-task stack).
+static size_t s_scene_page;
+static size_t s_scene_start, s_scene_end;
+static bool s_scene_valid;
+static char s_scene_ctx[PUSH_SCENE_CTX_MAX + 1];
+
+/// M3-B 情景请求待命态：0x1A 发出后等 0x08 回流。**关联键 = 词 + 发起页 +
+/// 期限**——0x08 帧里没有「这是情景答案」的标记（协议零改动），设备只能靠这三
+/// 者互认；任何一项对不上就不认，宁可不做。状态机本体在 scene_req.c（纯函数，
+/// 宿主可逐条断言）。
+/// 引用条直接复用 s_scene_ctx（同一份上下文，不另开缓冲）；新点词会把
+/// s_scene_valid 清零，此处同步清 armed，旧请求自然作废。
+/// M3-B scene-request pending state: armed when 0x1A goes out, waiting for 0x08.
+/// The correlation key is word + originating page + deadline - the 0x08 frame
+/// carries no "this is a scene answer" mark (zero protocol change), so the device
+/// can only match on those three. The state machine lives in scene_req.c (pure,
+/// asserted line by line on the host). The quote strip reuses s_scene_ctx (the very
+/// same context, no second buffer); a new tap clears s_scene_valid and disarms
+/// here, so the stale request dies by itself.
+static scene_req_t s_scene_req;
+/// 等 0x08 的时限：与 APK 的请求超时（15s）同量级，略长，让 APK 先放弃。
+/// The 0x08 wait: same order as the APK's request timeout (15s) and slightly
+/// longer, so the APK gives up first.
+#define SCENE_REQ_TIMEOUT_MS 16000
+
+/// 26.11.3-C2（审计第三刀：设备侧等待窗）：**整段解析的窗口不能被词卡的窗口管着**。
+/// 词卡是 8-10 s 生成，16 s 够；段落是 2,000+ 字、40-70 s 生成 + 50 帧回传，仍在
+/// 16 s 上等的后果是**设备先超时销号、0x08 回来无人认领**——用户等到一篇完整解析却
+/// 落在空处，比慢更糟。窗口按「生成上界 + 回传上界 + 余量」算：70 + 3 + 17 = 90 s。
+/// 90 s 与 APK 的 120 s 读取超时同向（设备先放弃，杜绝僵尸态）。
+/// 26.11.3-C2 (audit knife 3, the device-side wait window): the passage window must
+/// not be governed by the word-card window. A word answer takes 8-10 s, so 16 s is
+/// fine; a passage is 2,000+ characters - 40-70 s to generate plus 50 frames back -
+/// and waiting 16 s means the DEVICE expires first and the returning 0x08 is claimed
+/// by nobody. The window is generation + return + slack: 70 + 3 + 17 = 90 s, which
+/// sits under the APK's 120 s read timeout so the device still gives up first.
+#define EXCERPT_REQ_TIMEOUT_MS 90000
+
 static size_t s_selected_toc = SIZE_MAX;
 static bool s_toc_jump_open, s_toc_jump_drag;
 static int s_toc_jump_percent;
@@ -415,6 +551,13 @@ static uint32_t s_recent_days[30];
 static bool s_recent_days_valid;
 static char s_reader_notice[64];
 static int64_t s_reader_notice_until;
+// 26.11.3-C2 等待期提示：整段解析发出后补的第二条气泡。「AI 已发」只回答
+// 「发出去了吗」，2 s 后自然消失；40-70 s 的安静期需要一句「还在算」，
+// 否则用户以为死机。0 = 无待发。
+// 26.11.3-C2 wait notice: the second toast after a passage request. "AI 已发"
+// answers "did it go out" and expires in 2 s; the 40-70 s of silence needs one
+// "still working" line or the wait reads as a hang. 0 = nothing scheduled.
+static int64_t s_ai_wait_notice_at_ms;
 static int s_bookmark_page;
 static bool s_bookmark_edit, s_bookmark_delete_confirm, s_bookmark_delete_error;
 static uint32_t s_bookmark_selected;
@@ -446,6 +589,29 @@ static bool s_open_full_once;
 // finale; consumed once.
 static bool s_push_first_open_once;
 static bool s_reader_footer_pending;
+// ---- 31b 第 2 条 B′：掉盘阅读态 -------------------------------------------
+// 拔卡时不再 `s_view = SHELF`（那是「跳书架」），而是留在阅读器、按**字节偏移**
+// 重排当前页：正文与已解码位图都在 RAM，卡没了照样能读这一章。
+// 跨章（任何要读卡的动作）一律被拦住，给「存储卡已移除」——静默失败比拒绝更坏。
+// 26.9.31a 收口里被挂账的「拔卡瞬间跳书架」就在这里结清。
+//
+// B′: the reader no longer bounces to the shelf on card removal. It stays put and
+// re-typesets the current page from a **byte offset**; body text and decoded bitmaps
+// live in RAM, so this chapter stays readable without the card. Anything that needs
+// the card (any chapter load) is refused with "存储卡已移除" - a silent failure is worse
+// than an honest refusal.
+static bool s_media_offline;
+// 掉盘快照：`book_close()` 会 memset 书籍元数据，章数与字节基准必须在这之前留下。
+// Offline snapshot: book_close() zeroes the book metadata, so chapter count and byte
+// bases must be captured before the handle is closed.
+static size_t s_off_chapters;
+static uint32_t s_off_total_bytes;
+static uint32_t s_off_chapter_offset;
+// 页脚文案（B′ 条件 2 的固定位）：掉盘时左端恒为这两条之一，不随章节名让位。
+// Footer copy (B′ condition 2, fixed slot): the left end is always one of these two
+// while offline; it never yields to the chapter title.
+#define READER_OFFLINE_NOTE "TF 卡已移除"
+#define READER_OFFLINE_TAIL "存储卡已移除"
 static bool s_water_turn_pending;
 static e0470_turn_dir_t s_water_turn_dir;
 static int s_pressed_control = -1;
@@ -509,19 +675,45 @@ static void copy_text(char* dst, size_t cap, const char* src);
 static void fit_text(char* text, int px, int width);
 static void free_book(void);
 static void save_progress(void);
+// B′：load_chapter_at 的掉盘闸在函数定义之前使用，声明前移（定义在阅读器尾部）。
+// B′: the offline gate in load_chapter_at uses this before its definition.
+static void reader_offline_refuse(void);
+// commit 3 的读者释放要在 lock_draw/unlock_draw 定义之前试取绘制锁（不阻塞）。
+// Commit 3's reader release try-takes the draw lock before those helpers are defined.
+static void unlock_draw(void);
 static void prep_task_request_stop(const char *why); // gen25：让路链要提前停机 / gen25: the yield chain needs to stop prep early
 static void invalidate_prep(void);
+// 26.11.7 S2：账在 present() 里结，定义在阅读器尾部（计数逻辑与翻页语义同处）。
+// 26.11.7 S2: the ledger settles in present(); the definition lives at the reader's tail.
+static bool reader_note_turn(void);
 static void prepare_inline_image(void);
 static void release_page_images(void);
 static void sort_shelf(app_ctx_t* ctx);
 static void prepare_covers(app_ctx_t* ctx);
 static app_redraw_t toggle_reader_fullscreen(app_ctx_t* ctx);
 static app_redraw_t toggle_reader_landscape(app_ctx_t* ctx);
+static app_redraw_t resize_text(app_ctx_t* ctx, int dir);
+/* gen30 伴读案 · 步 3：伴读态判据与门槛判据定义在文件中部（步 2 落的
+   s_reader_companion 处），听书面板绘制更早，故在此前置声明；两个 pending 由
+   on_tick 同批原子消费，触摸回调只置位（重排不落深栈）。
+   gen30 read-along step 3: the companion predicate and the 0x19 gate predicate
+   are defined mid-file (next to step 2's state), while the TTS panel draws
+   earlier - hence the forward declarations. The two pending flags are consumed
+   atomically in on_tick; a touch callback only sets them (no reflow in a deep stack). */
+static bool reader_companion_active(void);
+static bool reader_tts_active(void);
 bool app_book_request_open(const char* path) {
     if (!path || !path[0] || strnlen(path, sizeof(s_requested_open)) >= sizeof(s_requested_open)) return false;
     copy_text(s_requested_open, sizeof(s_requested_open), path);
     s_requested_open_home = false;
     s_requested_fullscreen = true;
+    // 26.11.5：这里**不**无条件置 s_open_full_once。开书首屏的整屏 GC16 由 present 的
+    // 视图边沿判据负责（书架/文件页/首页卡/推送五条入口都跨视图，边沿一定成立）；
+    // 在这里再置一次只会让「同视图重绘」也白付一次全刷，而边沿判据比「每次开书都多刷」
+    // 更准。gen25 的推送首开标记照旧按条件消费。
+    // 26.11.5: no unconditional s_open_full_once here - present's view-edge rule already
+    // covers every entry (all five cross a view), and a blanket flag would charge an extra
+    // full refresh to same-view repaints. The gen25 push first-open flag is unchanged.
     // gen25：让路收官留下的推送内容首开标记在这里消费——B 的第一次手动打开
     // 也享受一次整屏 GC16，避免「被让路推来的书第一次打开有残影」。
     // Gen25: the yield finale's first-open flag is consumed here - B's first
@@ -662,6 +854,129 @@ bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen) {
     return true;
 }
 void app_book_request_manage(void) { s_requested_manage = true; }
+
+/* ---- 26.9.30 commit 3：读者句柄释放（机制二）/ releasing the reader's handle ---- */
+// 提交侧的三个动作是 rename(push.txt→push.bak)、rename(part→push.txt)、
+// remove(push.bak)。读者若正读着 push.txt，book_txt_open() 留在 s_book.file 的
+// FILE* 依然指向那一串簇；最后那步 remove 把簇还给 FAT，此后每次 fread 都落在
+// 已释放的簇上——现场表现为乱码页、0x101、或直接崩。这是「机制二」，与提交段的
+// 封送（commit 2）是两件事：封送只保证四拍不跑在 BLE 栈上，不保证读者脚下没句柄。
+// The commit side runs rename(push.txt->push.bak), rename(part->push.txt) then
+// remove(push.bak). A reader sitting on push.txt still holds the FILE* left in
+// s_book.file; the last remove hands those clusters back to FAT, so every later
+// fread reads freed clusters - garbage pages, 0x101, or a crash. That is
+// mechanism #2, and it is separate from commit 2: offloading the four beats keeps
+// them off the BLE stack, not out from under the reader's feet.
+//
+// 「只关句柄、保留阅读态」是假修复：book_close() 会把 s_book memset 成 0，
+// 翻页立刻 fread(NULL) 变成半死阅读器。所以这里走**完整关书**（free_book()），
+// 代价是阅读位置与页缓存一起没——反正随后的提交就是要把这本书换掉。
+// "Close the handle but keep the reader state" is a fake fix: book_close()
+// memsets s_book, so the next turn freads NULL and the reader half-dies. This
+// goes through a full close (free_book()) instead; the reading position and page
+// cache go with it, which is fine - the commit is about to replace this very book.
+
+// noinline 的理由与 render_context.h 那条同族：这是「持有判据」的唯一出处，
+// 内联进 release_hold 之后二进制里就没有这个符号了，送审按符号核对时判据与实现
+// 之间的链会断（看着像没落码）。保留一个独立出口，代价是一条 3 字节的跳转。
+// noinline for the same reason as render_context.h: this is the only home of the
+// "does the reader hold this path" predicate, and inlining it into release_hold
+// would erase the symbol - the review's symbol check would then see a chain with
+// a missing link. One extra 3-byte jump is the price.
+__attribute__((noinline)) bool app_book_holds_path(const char *path) {
+    return path && path[0] && s_text && s_path[0] && strcmp(s_path, path) == 0;
+}
+
+uint32_t app_book_hold_busy(void) {
+    if (!s_text || !s_path[0]) return 0;   // 无书 = 无占用 / no book, nothing held
+    uint32_t busy = 0;
+    // ① prep 任务：它的行循环每行都读 s_text；free_book() 只**请求**停机，超时不强删
+    //    （prep_task_request_stop 的注释：强删会漏内存）。所以「它还在」就是硬阻。
+    //    Bit 0: the prep task's row loop reads s_text every row; free_book() only
+    //    *requests* a stop and never force-deletes, so "still alive" is a hard block.
+    if (s_prep_task) busy |= BOOK_HOLD_PREP;
+    // ② 绘制锁有人持有 = 有渲染在飞（与 lock_draw 的自检同源：非递归互斥量下
+    //    「已有人持有」只有渲染这一种合法来源）。
+    //    Bit 1: the draw lock has a holder = a render is in flight (same source of
+    //    truth as lock_draw's self-check; a non-recursive mutex has one owner).
+    if (s_draw_lock && xSemaphoreGetMutexHolder(s_draw_lock) != NULL) busy |= BOOK_HOLD_DRAW;
+    // ③ 正文翻页/正文帧排期：free_book() 在释放 text 之前先清这两个标志，说明它们
+    //    在书的生命周期内会被置位——置位期间排期队列里握着页偏移。
+    //    Bit 2: free_book() clears both flags before releasing text, which proves
+    //    they can be up during a book's life; while up, the queue holds page offsets.
+    if (s_reader_turn_pending || s_reader_text_frame) busy |= BOOK_HOLD_TURN;
+    // ④ 水墨翻页在飞：波形切换正在用屏缓冲，此时清场会把半帧留在屏上。
+    //    Bit 3: a water-mode turn owns the panel buffer; clearing mid-wave leaves half a frame.
+    if (s_water_turn_pending) busy |= BOOK_HOLD_WATER;
+    // ⑤ 页脚刷新排期：页脚要重绘当前页文案，重绘时读 s_text。
+    //    Bit 4: the footer repaint reads the current page's text.
+    if (s_reader_footer_pending) busy |= BOOK_HOLD_FOOTER;
+    // ⑥ 框选：选区偏移 (off_start/off_end) 直接索引 s_text，清场后失效。
+    //    Bit 5: the selection's byte offsets index s_text directly.
+    if (boxsel_active()) busy |= BOOK_HOLD_BOXSEL;
+    // ⑦ 阅读面板：词典/详解覆盖层引用当前页文本与卡上词典，属于「看得见这本书」。
+    //    Bit 6: the dict/detail overlay references this page and the card's dictionary.
+    if (s_reader_panel != READER_PANEL_NONE) busy |= BOOK_HOLD_PANEL;
+    return busy;
+}
+
+bool app_book_release_hold(const char *path) {
+    if (!app_book_holds_path(path)) return true;   // 不持有 = 已无占用 / not held: nothing to release
+    const uint32_t busy = app_book_hold_busy();
+    // 硬阻只有两位：都是「别的执行体正在用 s_text」，清不掉，只能等它自己走完。
+    // 这里**非阻塞**地请求停机就把本拍让出去——等 1 s 会把主循环钉住，
+    // 与 gen25 接线裁定 #1（页面不能有「按下去 1 秒没反应」）同一条纪律。
+    // Only two bits are hard blocks: other executors are using s_text and cannot be
+    // cleared, only out-waited. The stop is *requested* non-blockingly and this
+    // frame is handed back - waiting the 1 s here would pin the main loop, the same
+    // discipline as gen25 wiring ruling #1.
+    if (busy & BOOK_HOLD_PREP) {
+        app_book_request_prep_stop();   // 只置位 + 唤醒，它自己走完 / flag + notify only
+        ESP_LOGI(TAG, "hold: prep alive, stop requested; retry next frame");
+        return false;
+    }
+    if (busy & BOOK_HOLD_DRAW) {
+        ESP_LOGI(TAG, "hold: draw lock held; retry next frame");
+        return false;
+    }
+    // 软项就地清：书都要换了，丢一帧、丢一次翻页、收一个面板都不算代价。
+    // Soft bits are cleared in place: the book is being replaced, so a dropped
+    // frame, a dropped turn and a closed panel cost nothing.
+    boxsel_boundary_reset();
+    if (s_reader_panel != READER_PANEL_NONE) dict_popup_reset();
+    s_reader_panel = READER_PANEL_NONE;
+    s_reader_slider = -1;
+    s_reader_tap.pending = false;
+    s_reader_turn_pending = s_reader_text_frame = false;
+    s_water_turn_pending = false;
+    s_reader_footer_pending = false;
+    s_clear_confirm = s_batch_confirm = false;
+    s_pressed_control = -1;
+    // 试取而不是死等：位 1 的检查与取锁之间有竞态窗口（prep 可能刚抢到），
+    // 拿不到就把本拍让出去，绝不 portMAX_DELAY 钉住主循环。
+    // Try-take rather than wait: prep may have won the window between bit 1 and
+    // here; giving the frame back beats pinning the loop on portMAX_DELAY.
+    const bool locked = s_draw_lock != NULL;
+    if (locked && xSemaphoreTake(s_draw_lock, 0) != pdTRUE) {
+        ESP_LOGI(TAG, "hold: draw lock lost the race; retry next frame");
+        return false;
+    }
+    save_progress();
+    free_book();   // 完整关书：text/blocks/runs/images/page_images + book_close() 关句柄
+    if (locked) unlock_draw();
+    // 预绘缓冲与编辑封面都引用旧页内容，随书一起释放（book_on_exit 同款）。
+    free(s_next_fb); s_next_fb = NULL;
+    free(s_editor_cover); s_editor_cover = NULL;
+    // 视图必须离开 READING：s_text 已经没了，任何正文绘制都会踩空。
+    // 回书架后由提交成功侧的 ui_post_open 打开新书（中间可能闪一帧书架，可接受）。
+    s_view = SHELF;
+    s_shelf_cache_valid = false;   // push.txt 内容要换，标题/封面/进度重扫
+    s_scan_pending = true;
+    ESP_LOGI(TAG, "hold: reader released on %s (busy=0x%02x)", path,
+             (unsigned)busy);
+    return true;
+}
+
 static void draw_control(uint8_t* fb, EpdRect rect, const char* label, int id) {
     if (id == 112 && s_query[0]) {
         ui_fill_round_rect(fb, rect, UI_BTN_RADIUS, UI_GRAY_BLACK);
@@ -924,6 +1239,64 @@ void app_book_cover_mode_changed(void) { invalidate_covers(); }
 //   in place with the panel unchanged: a differential local refresh, no second
 //   full repaint. A different word never updates (the card moved on to another
 //   word; gate A still applies).
+// M3-B：情景答案回流。**必须在 app_book_ai_def_ready 之前**被调用——0x08 帧
+// 没有「这是情景答案」的标记（协议零改动），先由待命态认领；认领失败才回落到
+// 普通释义卡的双门路径。认领是一次性的：认了无论成败都销号，避免同一条答案
+// 既开视图又落卡。
+// M3-B: the scene answer coming back. MUST run before app_book_ai_def_ready -
+// the 0x08 frame carries no scene mark (zero protocol change), so the pending
+// state claims it first; only an unclaimed frame falls through to the ordinary
+// card's double-gate path. The claim is one-shot: claimed means disarmed whether
+// or not the view opens, so one answer can never both open a view and land a card.
+bool app_book_scene_def_ready(const char* word, const char* def) {
+    // 认领：词 + 发起页 + 期限三重匹配，成功即销号（scene_req.c 的纯状态机）。
+    // Claim: word + originating page + deadline, one-shot on success (the pure
+    // state machine in scene_req.c).
+    if (!scene_req_claim(&s_scene_req, word, s_page, esp_timer_get_time() / 1000)) return false;
+    if (!def || !*def) {
+        ESP_LOGW(TAG, "scene empty answer: word=\"%s\"", s_scene_req.word);
+        return false;
+    }
+    // 页面必须还是发起时那一页：翻过页说明用户在读别处，硬开视图等于把 A 页的
+    // 分析贴到 B 页上。宁可不做。（页不配的情况已在认领里销号。）
+    // The page must still be the one the request came from: after a turn the user
+    // is reading elsewhere, and opening the view would pin page A's analysis onto
+    // page B. Better nothing. (A page mismatch was already disarmed by the claim.)
+    if (s_view != READING || !s_text || s_page != s_scene_req.page) {
+        ESP_LOGW(TAG, "scene drop: view=%d has_text=%d page=%u req_page=%u",
+                 (int)s_view, (int)(s_text != NULL), (unsigned)s_page,
+                 (unsigned)s_scene_req.page);
+        return false;
+    }
+    ai_reader_source_t src;
+    memset(&src, 0, sizeof(src));
+    src.chapter = s_chapter;
+    src.page = reader_visual_index(s_page);      // 视觉页号（页脚展示）/ visual page for the footer
+    src.page_start_offset = s_page;              // 逻辑页索引（锚点兜底）/ logical page index
+    copy_text(src.title, sizeof(src.title), s_book_title[0] ? s_book_title : s_title);
+    // 26.11.3-C：整段请求开「选段」视图（整段引用条、不高亮词）；点词请求照旧开词条
+    // 情景视图。分流的依据只有发起时记下的 excerpt 位——0x08 自己没有这个标记。
+    // A passage request opens the 选段 view (whole-selection strip, no word highlight);
+    // a word request opens the word scene view. Only the mark recorded at send time can
+    // tell them apart: the 0x08 frame itself carries no such bit.
+    const bool excerpt = s_scene_req.excerpt;
+    const bool opened = excerpt
+        ? ai_reader_open_excerpt("选段", def, s_scene_ctx, &src)
+        : ai_reader_open_scene(s_scene_req.word, def, s_scene_ctx,
+                               s_scene_req.word_off, s_scene_req.word_len, &src);
+    if (!opened) {
+        return false;
+    }
+    dict_popup_reset();
+    s_reader_panel = READER_PANEL_NONE;
+    ai_reader_set_scene_saved(vocab_log_contains(s_scene_req.word));
+    invalidate_prep();
+    ESP_LOGI(TAG, "scene view opened: word=\"%s\" def=%u quote=%u off=%u excerpt=%d",
+             s_scene_req.word, (unsigned)strlen(def), (unsigned)strlen(s_scene_ctx),
+             (unsigned)s_scene_req.word_off, (int)excerpt);
+    return true;
+}
+
 bool app_book_ai_def_ready(const char* word, const char* def) {
     if (s_view != READING || !s_text) return false;
     if (s_reader_panel == READER_PANEL_NONE) {
@@ -1013,6 +1386,53 @@ static app_redraw_t ai_reader_close_full(void) {
     ai_reader_close();
     s_ai_def_full = false;
     return APP_REDRAW_FULL;
+}
+
+// M4-A：静默撤销——双指成立瞬间，把单指可能刚打开的浮层收回去。
+// 只撤「词卡」与「详解会话」这两类单指点词的结果；工具栏、字体选择等用户主动
+// 打开的面板不动。不触发查词、不落生词本——撤销本身不写任何记录。
+// M4-A: silent retract - the moment two fingers are established, take back what
+// the single finger may just have opened. Only the lookup card and the detail
+// session qualify (both are results of one tap); panels the user opened on
+// purpose (toolbar, font picker) stay. No lookup runs and no vocab entry is
+// written - a retract records nothing.
+static app_redraw_t dual_retract(app_ctx_t* ctx) {
+    (void)ctx;
+    if (ai_reader_active()) return ai_reader_close_full();
+    if (s_reader_panel == READER_PANEL_DICT) {
+        dict_popup_reset();
+        s_reader_panel = READER_PANEL_NONE;
+        return APP_REDRAW_PAGE;
+    }
+    return APP_REDRAW_NONE;
+}
+
+// M4-A：双指意图出口。三个动作全部复用既有实现，不新造第二条路径：
+// 方向切换走 toggle_reader_landscape（render 按设置项同步面板方向），字号走
+// resize_text（一档 = BOOK_PX_STEP，越界时它自己返回 NONE，等于天然钳位），
+// 撤销走上面的 dual_retract。
+// M4-A: two-finger intent outlet. All three actions ride existing paths instead
+// of inventing a second one: orientation through toggle_reader_landscape (render
+// syncs the panel from the setting), font through resize_text (one step =
+// BOOK_PX_STEP; out-of-range makes it return NONE, which is the clamp), retract
+// through dual_retract above.
+static app_redraw_t dual_gesture_event(app_ctx_t* ctx, const ui_dual_event_t* ev) {
+    // 双指在框选态一律只当「退出」：不翻页、不换横竖、不调字号（E6/R2）。
+    // In the selection mode a two-finger gesture means exit only: no page turn, no
+    // orientation flip and no font step (E6/R2).
+    if (boxsel_active()) { return boxsel_exit(BOXSEL_EXIT_DUAL); }
+    if (ev == NULL) return APP_REDRAW_NONE;
+    switch (ev->type) {
+        case UI_DUAL_EVT_RETRACT:
+            return dual_retract(ctx);
+        case UI_DUAL_EVT_ORIENT:
+            return s_view == READING ? toggle_reader_landscape(ctx) : APP_REDRAW_NONE;
+        case UI_DUAL_EVT_FONT_STEP:
+            return (s_view == READING && ev->steps != 0) ? resize_text(ctx, ev->steps)
+                                                         : APP_REDRAW_NONE;
+        default:
+            return APP_REDRAW_NONE;
+    }
 }
 static uint8_t* load_cover_gray(const char* source, const char* title, const char* author,
                                 bool decode, bool* pending) {
@@ -1391,13 +1811,58 @@ static int leaves(void) {
 }
 static EpdRect shelf_manage_rect(void) { return (EpdRect){442, 94, 97, 54}; }
 static EpdRect shelf_import_rect(void) { return (EpdRect){551, 94, 97, 54}; }
-static void draw_shelf_header_button(uint8_t *fb, EpdRect r, bool importing) {
-    bool pressed = s_pressed_control == (importing ? 115 : 114);
+// P0-5（26.11.2）入口甲：摘抄按钮 + 三处命中矩形的编译期互斥。标题预算 230（36..266）、
+// 下拉箭头 293..319、摘抄按钮 333..430、管理按钮 442 起——谁改布局谁改这套断言。
+// P0-5 entrance A: the excerpt button plus compile-time mutual exclusion of the three
+// header hit rectangles. Change the layout, change these asserts.
+static EpdRect shelf_excerpt_rect(void) { return (EpdRect){333, 94, 97, 54}; }
+/// 26.11.3：分类下拉的**感应区**（点标题/箭头弹菜单），不是弹开后的菜单框。
+/// 它曾是匿名裸字面量 `{24,79,388,74}`——右界 412 默默盖住摘抄按钮 81.4% 面积，
+/// 26 天无人发现，因为那块在加按钮前本就是没人点的空白。提成命名矩形 + 右界 333
+/// （零重叠），让"谁盖住谁"能被断言看见。
+/// 26.11.3: the dropdown's SENSING rect (tap the title/chevron), not the opened menu.
+/// It used to be an anonymous `{24,79,388,74}` whose right edge at 412 silently ate
+/// 81.4% of the excerpt button. Named now, right edge pinned to 333: zero overlap.
+static EpdRect shelf_category_tap_rect(void) { return (EpdRect){24, 79, 309, 74}; }
+_Static_assert(36 + 230 + 27 == 293, "P0-5: dropdown arrow must start right after the 230px title budget");
+_Static_assert(333 > 319, "P0-5: excerpt button must clear the dropdown arrow (293..319)");
+_Static_assert(333 + 97 <= 442, "P0-5: excerpt button must not overlap the manage button (442..)");
+// 26.11.3：跨矩形关系——原来缺的就是这一条。感应区右界必须让开按钮左界（零重叠，
+// 不设缓冲：留余量等于留重叠，手感问题归行为层不归几何层）。
+// 26.11.3: the cross-rectangle relation that was missing. The sensing rect's right edge
+// must clear the button's left edge - zero overlap, no fudge margin.
+_Static_assert(24 + 309 <= 333, "26.11.3: category sensing rect must not reach the excerpt button");
+_Static_assert(36 + 230 + 27 + 26 <= 333, "26.11.3: dropdown arrow at full title budget stays left of the button");
+/// 26.11.3 第三层：命中优先级不变式。几何会腐烂（有人在上面几条断言之外再动一手），
+/// 但"按钮永远优先"这条路由层的不变式兜底。
+/// Third layer: the routing invariant. Geometry can rot; "buttons always win" cannot.
+static bool shelf_header_button_hit(int x, int y) {
+    return ui_rect_hit(shelf_excerpt_rect(), x, y) || ui_rect_hit(shelf_manage_rect(), x, y)
+        || ui_rect_hit(shelf_import_rect(), x, y);
+}
+/// P1-2（26.11.2）：队列非空时按钮就是全局出口的徽标——「摘抄 N」，N 是待落盘真值。
+/// 缓冲由调用方给（栈上）——本批 bss 目标 0，不许为一行标签长静态量。
+/// 26.11.3：三个按钮共用一个字号，所以文案必须放得下——全角间隔符 20px 会让
+/// 「摘抄·10」溢出 73px 可用宽，改空格分隔；队列封顶 EXCERPT_QUEUE_MAX，真值永远
+/// 有两位数位置，「9+」收敛分支随之删除（少一个特例）。
+/// P1-2 (26.11.2): a non-empty queue turns the button into the global exit badge
+/// "excerpt N". 26.11.3: one font size across the three buttons means the label must
+/// fit - a full-width separator pushes "excerpt 10" past the 73px budget, so a space
+/// it is; the queue caps at EXCERPT_QUEUE_MAX, the true count always fits, and the
+/// "9+" clamp branch goes away with it.
+static const char *shelf_excerpt_label(char *buf, size_t cap) {
+    const unsigned n = excerpt_store_pending();
+    if (!n) copy_text(buf, cap, "摘抄");
+    else snprintf(buf, cap, "摘抄 %u", n);
+    return buf;
+}
+static void draw_shelf_header_button(uint8_t *fb, EpdRect r, int id, const char *label, int font) {
+    bool pressed = s_pressed_control == id;
     ui_fill_round_rect(fb, r, 18, UI_GRAY_WHITE);
     ui_draw_control_frame(fb, r, 18, 0x70);
     if (pressed) ui_draw_pressed_round_rect(fb, r, 18);
-    ui_text_vc(fb, r.x + r.width / 2, r.y + r.height / 2 + (pressed ? 2 : 0), 20,
-               importing ? "+ 导入" : "管理", EPD_DRAW_ALIGN_CENTER, false);
+    ui_text_vc(fb, r.x + r.width / 2, r.y + r.height / 2 + (pressed ? 2 : 0), font,
+               label, EPD_DRAW_ALIGN_CENTER, false);
 }
 static EpdRect shelf_page_arrow_rect(int direction) {
     return (EpdRect){direction < 0 ? 168 : 444, 1008, 72, 60};
@@ -1503,6 +1968,16 @@ static size_t reader_page_offset(size_t page) {
 static size_t reader_visual_count(void);
 static size_t reader_visual_index(size_t logical);
 static unsigned percent(size_t page) {
+    // 掉盘：书籍元数据已随句柄关闭，百分比只能用快照算。章内偏移仍是内存版面的真值，
+    // 所以这一页的进度和拔卡前逐位一致——不是估的。
+    // Offline: the book metadata left with the handle, so the percentage comes from the
+    // snapshot. The in-chapter offset is still the real one from the in-memory layout, so
+    // this page's progress matches the pre-removal value exactly - it is not an estimate.
+    if (s_media_offline) {
+        if (!s_off_total_bytes) return 0;
+        uint64_t off = (uint64_t)s_off_chapter_offset + reader_page_offset(page);
+        return (unsigned)(off * 100 / s_off_total_bytes);
+    }
     uint32_t total = book_total_bytes();
     if (!total) return 0;
     if (s_chapter + 1 == book_chapter_count() &&
@@ -1515,6 +1990,277 @@ static pending_progress_t* pending_find(const char* path) {
     for (pending_progress_t* p = s_pending; p; p = p->next) if (!strcmp(p->path, path)) return p;
     return NULL;
 }
+
+// ---- 26.9.26 S26-2：摘抄回执走页脚（审计钉死项 1/2）----------------------
+// 26.9.26 S26-2: excerpt receipts live on the footer (audit items one and two).
+//
+// 为什么是页脚：48px 动作栏随 EXIT 的整页刷新消失，「按钮行原地提示」是空头支票。
+// 页脚每页都在、普通翻页必刷新，「待落盘 N」的常显由载体本身兑现。
+// Why the footer: the 48 px action bar vanishes with the EXIT repaint, so a hint there is a
+// promise nobody can see. The footer is on every page and refreshes on every ordinary turn,
+// so "pending N" stays visible by construction.
+//
+// 双状态并存规则（钉死项 2，写代码前定死）：**并列，不覆盖**。回执（瞬时）在前、
+// 警示（持久）在后，两者同时为真时同屏显示 —— 隐藏任何一条都是撒谎。
+// Dual-state rule (item two, fixed before coding): SHOW BOTH, never overwrite. The receipt
+// (transient) comes first, the warning (persistent) second; when both are true they appear
+// together, because hiding either one would be a lie.
+static char s_excerpt_hint[32];       // 单发回执 / one-shot receipt text
+static size_t s_excerpt_hint_page;    // 回执只对这一页有效（翻页即作废）/ valid on this page only
+static bool s_excerpt_footer_pending; // 局部刷页脚的 pending 标志（照 reader_clock_tick 范式）/ footer-only refresh flag
+// 26.11.1 真机轮第 2 回执：队列深度变化必须**跨拍**比对。
+// 入队发生在两次 tick 之间，tick 内采的 `before` 永远等于 `after`——队列从 0 涨到 3，
+// 页脚一次都没重画。基线因此存在模块静态里：谁改深度谁就欠一次重绘，跟 tick 的时序无关。
+// The queue-depth baseline must live across ticks. An enqueue happens between ticks, so a
+// `before` sampled inside the tick always equals `after` - the count went 0 -> 3 and the
+// footer never repainted once. Whoever changes the depth now owes one repaint.
+static unsigned s_excerpt_footer_seen;
+// 回执等级（S26-4 收口账 5）：坏消息不被好消息顶掉。/ Receipt class: bad news outranks good.
+typedef enum {
+    EXCERPT_HINT_INFO = 0,  // 已存 ✓ / AI 已发 —— 顺耳的那类 / the pleasant kind
+    EXCERPT_HINT_ALERT = 1, // 未发送 / 摘抄已满 / 内存不足 / [截] —— 要用户决定的那类
+} excerpt_hint_class_t;
+static uint8_t s_excerpt_hint_class;  // 槽里那条的等级 / class of the text in the slot
+
+static void excerpt_hint_set(const char *text, excerpt_hint_class_t cls) {
+    // 异常优先（S26-4 收口账 5）：同一拍里两条都真时，说坏的那条——它才是用户要处理的
+    // 事。反过来的顶替（`已存 ✓` 盖掉 `未发送`）在 y 口径下是积压场景的常态，不是窄窗口。
+    // Alert-first: when both are true in the same beat, keep the bad one - it is the thing
+    // the user has to act on. The reverse overwrite was routine, not a narrow race.
+    if (s_excerpt_hint[0] && s_excerpt_hint_page == s_page &&
+        s_excerpt_hint_class == (uint8_t)EXCERPT_HINT_ALERT &&
+        cls == EXCERPT_HINT_INFO)
+        return;
+    copy_text(s_excerpt_hint, sizeof(s_excerpt_hint), text);
+    s_excerpt_hint_page = s_page;
+    s_excerpt_hint_class = (uint8_t)cls;
+}
+
+/// 尽力时间戳（细化账 2/4）：拿不到可信 UTC 就返回 0，由 excerpt_store 退化为当次开机
+/// 递增序号 `#n`——不扫文件、不承诺跨掉电连续。门槛取 2020-01-01：未校时的 RTC/新 `time()`
+/// 起点（1970 附近、或被清成极小值）一律当作「不知道」，绝不写假时间戳。
+/// Best-effort timestamp (items two and four): without a credible UTC we return 0 and let
+/// excerpt_store fall back to the per-boot `#n` sequence - no file scan, no cross-power
+/// continuity promise. The floor is 2020-01-01: an unset RTC or a fresh epoch start reads
+/// as "unknown" rather than as a fabricated date.
+static uint32_t book_now_unix(void) {
+    const time_t now = time(NULL);
+    return (now >= (time_t)1577836800) ? (uint32_t)now : 0u;
+}
+
+/// 页脚前缀：`未保存 · 回执 · 待落盘 N · `（各段可缺），按像素预算逐档降级。
+/// Footer prefix, e.g. "未保存 · receipt · pending 3 · ", degraded step by step against a
+/// pixel budget.
+///
+/// S26-3 细化账「多警示并存先算宽度」：三种警示（未保存 / 瞬时回执 / 待落盘）同屏时，
+/// 全量前缀在 24 px 字号下的模型宽度是 **96 + 102 + 126 = 324 px**（CJK 24 px、ASCII
+/// 半宽）；页脚可用宽度 = 728 − 进度串（最坏 ≈270）− 16 ≈ 442 px，扣掉章节名至少
+/// 6 个全宽字（144 px）后，前缀预算 ≈298 px —— **放不下**。于是定死降级顺序：
+///   L0 `未保存 · 回执 · 待落盘 N · `（324）
+///   L1 `未保存 · 回执 · 待N · `（276，队列号改紧凑写法）
+///   L2 `未保存 · 待落盘 N · `（222，丢瞬时回执）
+///   L3 `未保存 · 待N · `（174）
+/// **未保存与待落盘在任何一档都不丢**——它们是「卡上到底有没有」的唯一屏幕证据；
+/// 回执只对本页负责，先让位。宽度用真实字宽现算，不靠上面的模型猜。
+/// The hard facts (unsaved progress, queued excerpts) survive every level; the transient
+/// receipt yields first. Widths are measured with the real face, not assumed from the model.
+static bool excerpt_footer_fits(int width, int budget_px) {
+    return budget_px <= 0 || width <= budget_px;
+}
+
+static void excerpt_footer_prefix(char *dst, size_t cap, int px, int budget_px) {
+    dst[0] = 0;
+    if (cap == 0) return;
+    const bool hint_valid = s_excerpt_hint[0] && s_excerpt_hint_page == s_page;
+    const unsigned pending = excerpt_store_pending();
+    const char *unsaved = s_save_failed ? "未保存 · " : "";
+    const int w_unsaved = ui_text_fixed_width_px(px, unsaved);
+
+    char hint[40] = {0};
+    int w_hint = 0;
+    if (hint_valid) {
+        copy_text(hint, sizeof(hint), s_excerpt_hint);
+        strncat(hint, " · ", sizeof(hint) - strlen(hint) - 1);
+        w_hint = ui_text_fixed_width_px(px, hint);
+    }
+    // 32/24：`%u` 最坏 10 位（"待落盘 4294967295 · " = 23B+NUL），编译器按最坏值算。
+    // Sized for a ten-digit %u: the compiler assumes the worst case, and so do we.
+    char warn_full[32] = {0}, warn_short[24] = {0};
+    int w_full = 0, w_short = 0;
+    if (pending) {
+        snprintf(warn_full, sizeof(warn_full), "待落盘 %u · ", pending);
+        snprintf(warn_short, sizeof(warn_short), "待%u · ", pending);
+        w_full = ui_text_fixed_width_px(px, warn_full);
+        w_short = ui_text_fixed_width_px(px, warn_short);
+    }
+
+    // 降级只走一条路：先压队列号，再丢回执，最后只留硬信息。
+    // One ladder only: compact the count, then drop the receipt, then keep the hard facts.
+    bool use_hint = hint_valid, use_warn = pending != 0, compact = false;
+    if (use_warn &&
+        !excerpt_footer_fits(w_unsaved + (use_hint ? w_hint : 0) + w_full, budget_px))
+        compact = true;
+    if (use_hint &&
+        !excerpt_footer_fits(w_unsaved + w_hint + (use_warn ? (compact ? w_short : w_full) : 0),
+                             budget_px))
+        use_hint = false;
+    if (use_warn && !compact &&
+        !excerpt_footer_fits(w_unsaved + (use_hint ? w_hint : 0) + w_full, budget_px))
+        compact = true;
+
+    snprintf(dst, cap, "%s%s%s", unsaved, use_hint ? hint : "",
+             use_warn ? (compact ? warn_short : warn_full) : "");
+}
+
+/// 页脚文字带（不含进度条），从 draw_reader 抽出以便异步回执单独重绘这一段。
+/// The footer text band (without the progress bar), extracted from draw_reader so an
+/// asynchronous receipt can repaint just this strip.
+static void reader_footer_band_paint(uint8_t *fb, size_t page) {
+    EpdRect track = progress_rect();
+    // ---- B′ 条件 2：掉盘页脚，固定位 ----------------------------------------
+    // 左端恒为「TF 卡已移除 [· 待落盘 N]」，不再是章节名。为什么固定：拔卡后章节名
+    // 来源（书内导航 / 章节标题）都在卡上，拿不到就会退化成「未命名章节」——那是在
+    // 用一个假标题盖住「卡没了」这个真事实。N 取 excerpt_store_pending()（唯一真值，
+    // 不是估的），掉盘时摘抄照样入队、tick 失败留队，所以这个数会诚实地涨。
+    // Fixed left slot while offline: chapter names come from the card, so falling back to
+    // "untitled" would hide the real fact behind a fake title. N is the store's only truth;
+    // excerpts still enqueue while the card is gone, so the count honestly grows.
+    if (s_media_offline) {
+        char left[64];
+        const unsigned pending = excerpt_store_pending();
+        if (pending) snprintf(left, sizeof(left), READER_OFFLINE_NOTE " · 待落盘 %u", pending);
+        else copy_text(left, sizeof(left), READER_OFFLINE_NOTE);
+        char offline_progress[48];
+        // 掉盘不显示「全书 x%」：总字节是快照，百分比只在页脚右侧留页码，宁可少说一句。
+        // No whole-book percentage while offline: keep the page numbers, say less.
+        snprintf(offline_progress, sizeof(offline_progress), "%u/%u",
+                 (unsigned)reader_visual_index(page) + 1, (unsigned)reader_visual_count());
+        fit_fixed_text(left, 24, track.width - ui_text_fixed_width_px(24, offline_progress) - 16);
+        ui_text_fixed(fb, track.x, track.y + 35, 24, left, EPD_DRAW_ALIGN_LEFT, false);
+        ui_text_fixed(fb, track.x + track.width, track.y + 35, 24,
+                      offline_progress, EPD_DRAW_ALIGN_RIGHT, false);
+        return;
+    }
+    char chapter_name[72] = {0};
+    reader_footer_chapter_name(chapter_name, sizeof(chapter_name));
+    const int footer_px = 24;
+    char progress[48];
+    // 页码按视觉页计：双栏时一屏两页，总数不再"书变厚了"。
+    // Page numbers count visual pages: two columns halve the total instead of fattening the book.
+    snprintf(progress, sizeof(progress), "%u/%u · 全书 %u%%",
+             (unsigned)reader_visual_index(page) + 1, (unsigned)reader_visual_count(), percent(page));
+    char chapter_line[208];
+    char excerpt_prefix[64];
+    // 宽度预算（S26-3）：先扣掉右侧页码串，再给章节名留 6 个全宽字，剩下的才是前缀额度。
+    // Width budget: subtract the right-aligned progress, reserve six full-width glyphs for
+    // the chapter title, and give the rest to the prefix.
+    const int avail_px = track.width - ui_text_fixed_width_px(footer_px, progress) - 16;
+    const int chapter_min_px = footer_px * 6;
+    const int prefix_budget = avail_px > chapter_min_px ? avail_px - chapter_min_px : avail_px;
+    excerpt_footer_prefix(excerpt_prefix, sizeof(excerpt_prefix), footer_px, prefix_budget);
+    snprintf(chapter_line, sizeof(chapter_line), "%s%s", excerpt_prefix, chapter_name);
+    fit_fixed_text(chapter_line, footer_px, avail_px);
+    // 页码和全书进度靠右固定，长章节名仅截短左侧；字号不跟随正文设置。
+    // Keep page and book progress right-aligned; trim only long chapter titles and ignore body font settings.
+    ui_text_fixed(fb, track.x, track.y + 35, footer_px, chapter_line, EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_fixed(fb, track.x + track.width, track.y + 35, footer_px,
+                  progress, EPD_DRAW_ALIGN_RIGHT, false);
+}
+
+/// 顶部气泡的几何（画在 {(ui_w()-248)/2, 160, 248, 48}）：擦除/回执共用一个矩形，
+/// 不许再写死坐标——26.11.1 实测：擦除矩形是竖屏时代硬编码的 {208,150,268,68}，
+/// 横屏下气泡中心随 ui_w() 右移，硬编码擦不到，气泡只能等翻页陪葬。
+/// One geometry for paint/erase/receipt. Portrait (684-248)/2-10 = 208, byte-identical
+/// to the old constant; landscape follows ui_w(), where the constant missed entirely.
+static EpdRect reader_notice_area(void) {
+    return (EpdRect){(ui_w() - 248) / 2 - 10, 150, 268, 68};
+}
+
+/// 气泡的唯一写入口（26.11.4 B63：show/hide 各一行 log）。
+/// 26.11.1 的教训是「视觉子句无日志出证」——用户说看见了、日志里一个字都没有，
+/// 复盘只能靠记忆。show 在这里、hide 在主 tick 的擦除分支，两头都带方向与原文。
+/// The single writer for the toast (26.11.4 B63: one log line on show AND on hide).
+/// 26.11.1's lesson: a visual clause with no log trail can only be replayed from memory.
+static void reader_notice_set(const char *text, uint32_t ms) {
+    copy_text(s_reader_notice, sizeof(s_reader_notice), text);
+    s_reader_notice_until = esp_timer_get_time() / 1000 + ms;
+    ESP_LOGI(TAG, "notice: show \"%s\" %u ms", text, (unsigned)ms);
+}
+
+/// 回执的唯一可靠载体是**顶部气泡**。26.11.1 实测（toast 回执）：当前产品的全部
+/// 开书入口都落 `s_requested_fullscreen = true`（281 行静态默认 + 各调用方全传 true），
+/// 全屏不画页脚带——挂在页脚的「已存 ✓」= 构造上不可见。气泡在到期时由主 tick
+/// 的擦除分支移除（同一几何），横竖屏都成立。
+/// The toast is the only carrier that is visible by construction: every known open
+/// path lands full-screen, and the full-screen reader never paints the footer band.
+static bool excerpt_notice(app_ctx_t *ctx, const char *text) {
+    if (s_view != READING || !s_text) return false;
+    reader_notice_set(text, 2000);
+    // 先整帧重画进气泡，再只推气泡区域——照主 tick 擦除分支的既有范式。
+    // Render with the toast in, then drive only the toast region - the expiry path's pattern.
+    render(ctx, ctx->fb);
+    s_area = reader_notice_area();
+    s_mode = MODE_GL16;
+    return true;
+}
+
+/// 家务片驱动的一次落盘 + 回执。**页脚变化时返回 true**（调用方据此请求一次局部刷新），
+/// 没有变化就什么都不做——不为一帧墨水屏多花一次 DU。
+/// One flush driven by the housekeeping slot, plus the receipt. Returns true when the footer
+/// changed (the caller asks for one local refresh); otherwise nothing happens - no extra DU
+/// for a frame nobody asked for.
+static bool excerpt_footer_tick(app_ctx_t *ctx) {
+    // E-2（§19.4）：让行的观测点就放在**写卡前一行**。
+    //
+    // 挂载发生在 `sd_probe` 任务里，`poll_media` 最早下一拍才知道；而家务片每片都在跑。
+    // 把「读代号 + 写让行」压在这里，观测与写卡之间没有别的事情可插——窗口物理上为 0，
+    // 比「同一循环片内」更强。幂等由被调方守，与 poll_media 那一处重复调用是设计。
+    // E-2: observe the epoch on the line right before the write attempt. The mount happens
+    // on another task, so poll_media can be a tick late; the housekeeping slot runs every
+    // turn. Observation and write end up adjacent - a zero-width window, stronger than
+    // "same loop turn". The duplicate call with poll_media is intentional; the callee is
+    // idempotent.
+    excerpt_store_mount_yield(read_pico_sd_mount_epoch(), ctx->now_ms);
+    const excerpt_flush_t r = excerpt_store_tick(ctx->now_ms);
+    if (r == EXCERPT_FLUSH_IDLE) return false; // 无事可做 / nothing queued
+
+    if (r == EXCERPT_FLUSH_OK) {
+        // 「已存 ✓」的唯一来源：fsync 已经返回 0（先写后亮）。
+        // The one source of "saved": fsync already returned 0 (write first, tick second).
+        (void)excerpt_store_take_saved();
+        excerpt_hint_set("已存 ✓", EXCERPT_HINT_INFO);
+        ESP_LOGI(TAG, "excerpt: flushed, pending=%u", excerpt_store_pending());
+        // 回执必须同时上顶部气泡：hint 槽只在页脚带消费，全屏不可达（见 excerpt_notice）。
+        // The receipt must also hit the toast: the hint slot is footer-only, unreachable full-screen.
+        if (excerpt_notice(ctx, "已存 ✓")) return true;
+    } else if (r == EXCERPT_FLUSH_DROPPED) {
+        // 26.9.29：卡上已有半行，这条被弃。**必须亮红**——静默丢用户数据比丢数据更坏。
+        // 26.9.29: half a line is already on the card and this entry was dropped. It must go
+        // red: silently losing a user's excerpt is worse than losing it.
+        excerpt_hint_set("存储失败", EXCERPT_HINT_ALERT);
+        ESP_LOGE(TAG, "excerpt: dropped after a partial write (%u so far), pending=%u",
+                 excerpt_store_dropped(), excerpt_store_pending());
+        // 丢数据比存数据更响：气泡同样要亮，且 2 s 不够就被用户下次操作顶掉。
+        // Losing data must be louder than saving it: the toast fires here too.
+        if (excerpt_notice(ctx, "存储失败")) return true;
+    } else if (r == EXCERPT_FLUSH_FAILED) {
+        ESP_LOGW(TAG, "excerpt: flush failed, keeping %u queued", excerpt_store_pending());
+    }
+    if (s_view != READING || !s_text || s_reader_fullscreen) return false;
+    // 判据从「tick 内前后是否相等」改成「屏幕上的数是不是这个数」。
+    // 旧写法漏的正是入队：深度在两次 tick 之间变了，`before == after` 恒成立，
+    // 2050 行当场 `return false`，页脚永远停在旧数字（真机 3 次入队 / 0 次刷新）。
+    // The test is no longer "did the count change inside this tick" but "is the number on
+    // screen still this number". The old form missed enqueues by construction.
+    if (r != EXCERPT_FLUSH_OK && excerpt_store_pending() == s_excerpt_footer_seen) return false;
+    // 只重绘页脚这一条带（照 reader_clock_tick 的范式：fb 局部涂抹 + pending 标志）。
+    // Repaint only the footer strip (the reader_clock_tick pattern: patch fb locally, flag pending).
+    lock_draw(); reader_footer_band_paint(ctx->fb, s_page); unlock_draw();
+    s_excerpt_footer_seen = excerpt_store_pending();
+    s_excerpt_footer_pending = true;
+    return true;
+}
+
 static int layout_name(uint8_t* fb, const char* name, int y, bool draw);
 static EpdRect manage_panel(void) {
     int height = layout_name(NULL, s_managed.name, 0, false) + 495;
@@ -2637,9 +3383,10 @@ static void draw_layout_settings(uint8_t* fb) {
 #define READING_ROW_FULL   5   ///< 自动全刷值循环卡片 / auto full-refresh cycling card
 #define READING_ROW_WAVE   6   ///< 翻页效果卡片 / page-turn effect card
 #define READING_ROW_TURN   7   ///< 翻页模式：进子面板 / turn mode: opens the turn sub-panel
-#define READING_ROW_COUNT  9   ///< 槽位数（第 4 步新增横屏双栏）/ slot count (step 4 adds the two-column slot)
+#define READING_ROW_COUNT  11  ///< 槽位数（仿生阅读新增第 11 槽）/ slot count (bionic adds the 11th)
 #define READING_ROW_COLS   2   ///< 每行槽位数 / slots per row
-#define READING_ROW_HEIGHT 76  ///< 标准槽位高（与 reading_setting_rect 的 76+extra 同口径；第 4 步 reflow 改为均匀 pitch，末行不再 footer 收缩）/ standard slot height (matches reading_setting_rect's 76+extra; step 4 reflow uses a uniform pitch, the last row no longer shrinks per footer)
+#define READING_ROW_HEIGHT 76  ///< 标准槽位高上限（6 行时按可用高度收窄）/ upper bound of a slot; six rows narrow it to the available height
+#define READING_ROW_GAP    6   ///< 行间距（6 行重排后收紧）/ row gap after the six-row reflow
 
 typedef enum {
     READING_CELL_TOGGLE,  ///< 开关槽：走 apply_reader_option(kind) / toggle: apply_reader_option(kind)
@@ -2666,6 +3413,12 @@ static const reading_row_t s_reading_rows[READING_ROW_COUNT] = {
     /* kind=8：开关 kind 0-3 与子面板槽 READING_ROW_*(4-7) 之后顺延，避开命名空间。
        kind 8: toggle kinds 0-3 then past the non-toggle READING_ROW_* markers (4-7). */
     {8,                READING_CELL_TOGGLE, "横屏双栏",     "横屏时正文分两栏"},
+    /* kind=9：排版增强总开关（[124] 开关批）。关掉 = 回到 26.9 的经典左对齐态：
+       无两端对齐、不断词、无字距。三条路径同开同关，半开态没有基线可比。 */
+    {9,                READING_CELL_TOGGLE, "排版增强",     "关掉退回经典左对齐"},
+    /* kind=10：仿生阅读（26.11.16 备案 v2）。50% 前半截、无档位；只作用英文词，CJK 直通。
+       伪加粗不改 advance，切换后当前页即时重绘、不重排。 */
+    {10,               READING_CELL_TOGGLE, "仿生阅读",     "英文词首加粗 50%"},
 };
 
 static int reading_row_count(void) { return READING_ROW_COUNT; }
@@ -2677,27 +3430,32 @@ static bool reading_row_on(int index) {
         case 2: return app_settings_reader_hide_images();
         case 3: return app_settings_reader_landscape();
         case 8: return app_settings_reader_two_column();
+        case 9: return app_typography_enhanced();
+        case 10: return app_settings_bionic();
         default: return false; // 非开关槽没有开关状态 / non-toggle cells carry no state
     }
 }
 
-// 槽位几何（第 4 步重排为 5 行）：两列，行高 76+extra、间距 10，首行顶 = 面板顶+122
-// （标题区 92px + 30px 间隙，任意系统字号下与 4 行时代同式）；5 行总高随 extra 伸缩，
-// 末行底恒停在 1122——「完成」(y=1141) 之上约 19px，与 8 槽时代逐位一致。9 槽为奇数，
-// 第 9 槽独占末行左半格。fit-check：所有槽位矩形 + 完成矩形在竖屏屏界内（宿主测试
-// 逐字号断言）。
-// Slot geometry (step 4 reflows to five rows): two columns, 76+extra card height, 10px
-// gaps, first row's top at panel top + 122 (92px title zone + 30px gap, the same shape
-// as the four-row era at every system font size); the five rows stretch with extra and
-// the last row's bottom rests at 1122 — ~19px above Done (y=1141), matching the 8-slot
-// era exactly. Nine slots is odd, so slot 9 sits alone in the last row's left half.
-// Fit check: every slot rect plus the Done rect stay inside the portrait screen (host
-// test asserts per font size).
+// 槽位几何（26.11.15 仿生阅读新增第 11 槽后重排为 6 行）：两列，首行顶恒为 702（面板顶
+// 580 + 122），末行底恒为 1122（「完成」y=1141 之上 19px）。行高取「可用高度按 6 行均分」
+// 与「76+extra 上限」的较小值：100% 字号 65px、150% 82px、200% 99px，任意字号都不越界。
+// 11 槽为奇数，第 11 槽独占末行左半格。
+// Six rows after the 11th slot (bionic reading). The first row's top is always 702
+// (panel top 580 + 122) and the last row's bottom always 1122, 19px above Done. Row
+// height is the smaller of "available height split across six rows" and the 76+extra
+// cap: 65px at 100%, 82px at 150%, 99px at 200%. Eleven slots is odd, so slot 11 sits
+// alone in the last row's left half.
+static int reading_row_height(void) {
+    const int top = 702 - reader_ui_extra(204);
+    const int rows = (READING_ROW_COUNT + READING_ROW_COLS - 1) / READING_ROW_COLS;
+    const int share = (1122 - top - (rows - 1) * READING_ROW_GAP) / rows;
+    const int cap = READING_ROW_HEIGHT + reader_ui_extra(41);
+    return share < cap ? share : cap;
+}
 static EpdRect reading_setting_rect(int index) {
-    int extra = reader_ui_extra(41);
     if (index < 0 || index >= READING_ROW_COUNT) return (EpdRect){0, 0, 0, 0};
     int col = index % READING_ROW_COLS, row = index / READING_ROW_COLS;
-    int height = 76 + extra, pitch = height + 10;
+    int height = reading_row_height(), pitch = height + READING_ROW_GAP;
     return (EpdRect){36 + col * 314, 702 - reader_ui_extra(204) + row * pitch, 298, height};
 }
 static int reading_settings_top(void) { return 580 - reader_ui_extra(204); }
@@ -2716,9 +3474,13 @@ static void draw_reading_card(uint8_t *fb, int index, const char *title,
     EpdRect card = reading_setting_rect(index);
     ui_fill_round_rect(fb, card, 20, UI_GRAY_WHITE);
     ui_draw_control_frame(fb, card, 20, 0x68);
-    ui_text_box(fb,(EpdRect){card.x+21,card.y+6,card.width-42,card.height/2-12},23,title,EPD_DRAW_ALIGN_LEFT,false);
+    // 标题区按卡高比例取：6 行重排后卡高 65px，标题仍保留 23px，正文行不被挤没。
+    // The title band scales with the card: after the six-row reflow a 65px card still
+    // keeps a 23px title, so the value line is never squeezed out.
+    const int title_h = (card.height - 12) * 45 / 100;
+    ui_text_box(fb,(EpdRect){card.x+21,card.y+6,card.width-42,title_h},23,title,EPD_DRAW_ALIGN_LEFT,false);
     char shown[48]; copy_text(shown,sizeof(shown),value);
-    ui_text_box(fb,(EpdRect){card.x+21,card.y+card.height/2,222,card.height/2-8},26,shown,EPD_DRAW_ALIGN_LEFT,false);
+    ui_text_box(fb,(EpdRect){card.x+21,card.y+8+title_h,222,card.height-title_h-14},26,shown,EPD_DRAW_ALIGN_LEFT,false);
     ui_draw_icon(fb,card.x+272,card.y+3*card.height/4,26,
                  cycle ? UI_ICON_ROTATE_CW : UI_ICON_CHEVRON_RIGHT, 0x38);
 }
@@ -2731,12 +3493,13 @@ static void draw_reading_toggle(uint8_t *fb, int index) {
     bool on = reading_row_on(index);
     ui_fill_round_rect(fb, row, 20, UI_GRAY_WHITE);
     ui_draw_control_frame(fb, row, 20, 0x68);
-    ui_text_box(fb,(EpdRect){row.x+21,row.y+6,row.width-42,row.height/2-16},23,r->title,EPD_DRAW_ALIGN_LEFT,false);
+    const int title_h = (row.height - 12) * 45 / 100;
+    ui_text_box(fb,(EpdRect){row.x+21,row.y+6,row.width-42,title_h},23,r->title,EPD_DRAW_ALIGN_LEFT,false);
     char shown[48];
     if (r->detail) copy_text(shown,sizeof(shown),r->detail);
     else copy_text(shown,sizeof(shown),on?"开启":"关闭");
-    ui_text_box(fb,(EpdRect){row.x+21,row.y+row.height/2,row.width-108,row.height/2-8},19,shown,EPD_DRAW_ALIGN_LEFT,false);
-    draw_reading_switch(fb,(EpdRect){row.x+row.width-88,row.y+row.height/2-19,69,39},on);
+    ui_text_box(fb,(EpdRect){row.x+21,row.y+8+title_h,row.width-108,row.height-title_h-14},19,shown,EPD_DRAW_ALIGN_LEFT,false);
+    draw_reading_switch(fb,(EpdRect){row.x+row.width-88,row.y+(row.height-39)/2,69,39},on);
 }
 static void draw_reading_settings(uint8_t* fb) {
     draw_sheet(fb, reading_settings_top(), "阅读设置");
@@ -2747,7 +3510,18 @@ static void draw_reading_settings(uint8_t* fb) {
     // 值循环卡片取设置值，标题与子面板卡片取值都来自行表。
     // Cycling cards read the settings; titles and the sub-page card's value come from the table.
     draw_reading_card(fb, 0, s_reading_rows[0].title, interval, true);
-    draw_reading_card(fb, 1, s_reading_rows[1].title, app_settings_reader_turn_effect() ? "水波纹" : "普通", true);
+    // 26.11.5 裁决 (c)：水波纹是显式选择，**代价亮在门口**——开启即接受「动画 +
+    // 收尾清底」的单次约 0.9 s，不许用户翻两页自己发现。默认关：清晰是默认。
+    //
+    // 26.11.7 W3：门口那句话跟着 W1 改口径。原来写「0.9秒/页」，说的是时间；真机
+    // 让人不适的不是那 0.9 s，是**整屏**黑一下白一下。W1 把收尾收到正文区之后，
+    // 该亮在门口的就是范围：闪的只是正文，状态栏和页脚不动。时间量级没变（收尾
+    // 仍是全像素 GC16，约 0.45 s，加动画约 0.44 s），但它是第二位的。
+    // Ruling (c) keeps the cost at the door. 26.11.7 W3 restates it for W1: what hurt
+    // was the screen-wide flash, not the 0.9 s. After W1 the flash is confined to the
+    // body; the clock is unchanged, so it is stated second.
+    draw_reading_card(fb, 1, s_reading_rows[1].title,
+                      app_settings_reader_turn_effect() ? "水波纹 仅正文区" : "普通（全刷）", true);
     draw_reading_card(fb, 2, s_reading_rows[2].title, app_settings_reader_vertical_turn() ? "上下翻页" : "左右翻页", false);
     draw_reading_card(fb, 4, s_reading_rows[4].title, s_reading_rows[4].detail, false);
     for (int i = 0; i < reading_row_count(); ++i)
@@ -2847,6 +3621,32 @@ static void draw_tts(uint8_t *fb) {
     ui_text_box(fb, (EpdRect){toggle.x + 21, toggle.y + toggle.height / 2, toggle.width - 108, toggle.height / 2 - 8},
                 19, on ? "开启" : "关闭", EPD_DRAW_ALIGN_LEFT, false);
     draw_reading_switch(fb, (EpdRect){toggle.x + toggle.width - 88, toggle.y + toggle.height / 2 - 19, 69, 39}, on);
+    /* 伴读案 30 批 · 步 4（② 面板正式排版与占位文案）：步 3 的「最小热区 + 纯数字
+       状态回显」升级为正式两行排版——标题行（恒定）+ 状态／模式名行（运行时取值）。
+       命中框几何 {36,780,612,96} / {36,900,612,96} 与 tap 侧硬编码逐个对齐、一字节
+       不改；既有状态卡 370 / 开关卡 650 / 提示 1051 / 完成键 1141 亦零动。模式名逐字
+       取自 push_proto.h 四模式在案口径（外语原著／小说网文／社科非虚构／古文诗词），
+       不自造。副标题为占位文案，不预写任何链路／真机结论。
+       Step-4 finished panel: two-line cards (title + live state/mode). Hit-box geometry
+       stays byte-identical to the tap side; mode names come verbatim from push_proto.h. */
+    static const char *const k_companion_mode_names[PUSH_RIDE_MODE_COUNT] = {
+        "外语原著", "小说网文", "社科非虚构", "古文诗词"
+    };
+    const uint8_t mode_now = (uint8_t)(app_settings_companion_mode() % PUSH_RIDE_MODE_COUNT);
+    const bool comp_on = reader_companion_active();
+    EpdRect companion_box = {36, 780, 612, 96};
+    EpdRect mode_box = {36, 900, 612, 96};
+    ui_fill_round_rect(fb, companion_box, 20, UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, companion_box, 20, 0x68);
+    ui_fill_round_rect(fb, mode_box, 20, UI_GRAY_WHITE);
+    ui_draw_control_frame(fb, mode_box, 20, 0x68);
+    ui_text_box(fb, (EpdRect){57, 787, 560, 34}, 19, "伴读模式", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){57, 821, 560, 44}, 23,
+                comp_on ? "已开启 · 右栏显示摘要" : "未开启 · 点此进入",
+                EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){57, 907, 560, 34}, 19, "朗读模式", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text_box(fb, (EpdRect){57, 941, 560, 44}, 23,
+                k_companion_mode_names[mode_now], EPD_DRAW_ALIGN_LEFT, false);
     reader_panel_text_vc(fb, 342, 1051, 21, "朗读由手机完成 · 翻页自动跟随", EPD_DRAW_ALIGN_CENTER, false);
     ui_fill_round_rect(fb, (EpdRect){36, 1141, 612, 58}, 20, UI_GRAY_BLACK);
     reader_panel_text_vc(fb, 342, 1170, 26, "完成", EPD_DRAW_ALIGN_CENTER, true);
@@ -2967,6 +3767,55 @@ static void draw_font_picker(uint8_t* fb) {
     if (!count) reader_panel_text_vc(fb, 342, 780, 24, "所选字体目录中没有可用字体", EPD_DRAW_ALIGN_CENTER, false);
 }
 
+/* ---- 伴读案 30 批 · 步 2：伴读态 + 70/30 分栏几何（判据定稿 R0 · 分栏路径 A） ----
+ * 冻结口径：伴读态视觉页 = 主栏 1 个正文逻辑页 + 右栏摘要覆盖层（非逻辑页）；
+ * 右栏宽 =（版心宽 − gutter）× 0.30、主栏 × 0.70，gutter 沿用 reader_column_gutter()
+ * 现值。本步射程止于「状态 + 栏几何 + 页语义换轨 + 覆盖层区域」：不接菜单/协议/NVS/
+ * 刷新波形，重排由置位方同批经 reader_relayout() 触发（步 3 进/出伴读动作）。
+ * 关态（s_reader_companion == false）下栏几何、栏数、页地图、寻址与旧路径逐位一致。
+ * Companion case batch 30 step 2: companion state + 70/30 column geometry (frozen R0,
+ * path A). A companion visual page is one body logical page in the main column plus a
+ * non-logical summary overlay on the right; the gutter keeps its current value. Step 2
+ * stops at state/geometry/page-semantics/overlay area: no menu, protocol, NVS or refresh
+ * wiring; the setter's caller must reflow through reader_relayout() in the same batch.
+ * With the state off, every geometry/count/map/addressing result is bit-identical. */
+static bool s_reader_companion;                 /* 新增静态量 1 B；默认关 / +1 B, default off */
+static bool reader_companion_active(void) { return s_reader_companion; }
+/* 步 3 进/出伴读动作的落点。置位后必须同批重排：建版矩形随栏几何变为 70% 主栏宽，
+   页地图随伴读态按 1 建，两处失步时 reader_prep_slice 的切片宽守卫会拒画闭环，绝不
+   静默错栏。/ Step 3 entry point; the caller must reflow in the same batch. */
+void reader_companion_set(bool on) { s_reader_companion = on; }
+
+/* gen30 伴读案 · 修复轮（23:31 终裁）：0x19 页面文本的推送门槛。
+ *
+ * 重要：这个判据管的是「推不推页文本」，**不是「念不念」**。23:31 终裁把朗读与摘要
+ * 解耦后，两者分属不同机制：
+ *   - 推送门槛（本函数）：伴读态恒推（恒真是为了摘要链恒通，翻页即 0x1C+0x19）；
+ *     非伴读态随听书开关，退化为 tts_switch_on()，逐位不变。
+ *   - 朗读执行：听书开关经 TTS_ENABLE(0x1D) 传到手机端，由手机决定念不念。
+ * 因此「伴读态下关掉听书开关」仍会推页文本（摘要照常生成），只是手机不发声——
+ * 这正是现场异议要求的「只看不听」。函数体沿用原式，语义由「朗读归伴读管」
+ * 改写为「摘要链恒通」，一行未动。
+ *
+ * gen30 repair round (23:31 final ruling): the 0x19 page-text push gate. Note this
+ * gates PUSHING, not SPEAKING. After decoupling, pushing stays companion-always
+ * (so the summary chain is always live: every page turn airs 0x1C+0x19) and follows
+ * the listening switch off-companion, degenerating to tts_switch_on() unchanged.
+ * Playback is decided on the phone via TTS_ENABLE(0x1D). Turning the switch off in
+ * companion mode therefore keeps pushing text (summaries keep coming) and only
+ * silences the phone - exactly the "watch without listening" the field asked for.
+ * The expression is unchanged; only its meaning was restated. */
+static bool reader_tts_active(void) {
+    return tts_switch_on() || reader_companion_active();
+}
+
+/* 与 app_transfer.c 的 PUSH_ENTRY_WINDOW_MS 同款（30 分钟开窗），不跨 TU 引头文件；
+   进伴读「未武装才开窗」复用该同款窗口（格 2 终裁 A + 复用）。
+   Same 30-minute window as app_transfer.c's PUSH_ENTRY_WINDOW_MS; no cross-TU
+   header dependency. Entering companion reuses this window only when unarmed
+   (ruling grid 2 plan A + reuse). */
+#define READER_COMPANION_ARM_WINDOW_MS (30u * 60u * 1000u)
+
 // 栏几何：版心按栏数切条，栏间留 gutter。count<=1 时宽/偏移/矩形全部恒等（逐位返回
 // 联合区），关形态不改变任何上游可观测行为。右栏绘制 x 与右栏命中减法同出
 // reader_column_offset——横屏坑②配方，两边各写一遍必烂；rect 建在 offset 之上，
@@ -2987,16 +3836,31 @@ static int reader_column_gutter(void) {
 }
 static int reader_column_width(EpdRect area, int count) {
     if (count <= 1) return area.width;
-    return (area.width - reader_column_gutter()) / count;
+    const int avail = area.width - reader_column_gutter();
+    if (reader_companion_active()) {
+        /* 70/30 扣 gutter：主栏取整 70%，右栏在 reader_column_rect 里取余量（和恰为
+           avail，零 1px 空洞）。/ Main column takes 70% of avail; the right takes the
+           remainder in reader_column_rect, so the two sum to avail with no gap. */
+        return avail * 70 / 100;
+    }
+    return avail / count;
 }
 static int reader_column_offset(EpdRect area, int count, int i) {
     if (count <= 1 || i <= 0) return 0;
-    return i * (reader_column_width(area, count) + reader_column_gutter());
+    const int step = reader_column_width(area, count) + reader_column_gutter();
+    if (reader_companion_active())
+        return step;    /* 伴读态只有两栏：右栏起点 = 主栏宽 + gutter；i>=2 不生成第三栏 */
+    return i * step;
 }
 static EpdRect reader_column_rect(EpdRect area, int count, int i) {
     if (count <= 1) return area;
-    return (EpdRect){area.x + reader_column_offset(area, count, i), area.y,
-                     reader_column_width(area, count), area.height};
+    const int offset = reader_column_offset(area, count, i);
+    int width = reader_column_width(area, count);
+    if (reader_companion_active() && i > 0) {
+        /* 右栏宽 = avail − 主栏宽（30% 余量）；与 offset 同源，两者和恰为 avail。 */
+        width = area.width - reader_column_gutter() - width;
+    }
+    return (EpdRect){area.x + offset, area.y, width, area.height};
 }
 
 /* ---- 视觉页地图 / Visual page map ---- */
@@ -3176,6 +4040,12 @@ static int reader_visual_mode(size_t visual) {
 static void reader_logical_pages(size_t visual, size_t* left, size_t* right) {
     size_t start = reader_visual_start(visual);
     if (left) *left = start;
+    if (reader_companion_active()) {
+        /* R0：伴读态返回 1 —— 右栏是摘要覆盖层、不占逻辑页；主栏恒为视觉页起始页。
+           显式短路，不依赖建图栏数，双保险（关态逐位不变）。 */
+        if (right) *right = SIZE_MAX;
+        return;
+    }
     size_t next = SIZE_MAX;
     size_t n = book_layout_page_count();
     if (n && s_page_map_columns > 1 && reader_visual_mode(visual) == READER_VISUAL_MODE_COLUMNS2) {
@@ -3349,6 +4219,7 @@ static void draw_reader_bookmarks(uint8_t* fb) {
 // batch through the reader_relayout single exit — one snapshot inside the exit drives
 // both the columnized build rect and rebuild_page_map, so they can never drift apart.
 static int reader_column_count(void) {
+    if (reader_companion_active()) return 2;  /* 伴读态：几何两栏 70/30，页地图按 1 建（见 relayout 出口） */
     int cols = app_settings_reader_landscape() && app_settings_reader_two_column() ? 2 : 1;
     return cols < 1 ? 1 : cols;
 }
@@ -3393,7 +4264,9 @@ static bool reader_relayout_cols(const char *text, size_t len, blk_t *blocks, si
     book_layout_set_image_bleed_width(cols <= 1 ? UI_LOCK_WIDTH : build_rect.width);
     if (!book_layout_build_blocks(text, len, blocks, count, build_rect, px))
         return false;
-    reader_rebuild_page_map(cols);
+    /* 伴读态：右栏是摘要覆盖层（非逻辑页），视觉页恒 1 个正文逻辑页 → 地图按 1 建；
+       建版矩形仍是 70% 主栏宽（本出口同批发布，两处不失步）。关态逐字不变。 */
+    reader_rebuild_page_map(reader_companion_active() ? 1 : cols);
     return true;
 }
 static bool reader_relayout(EpdRect body) {
@@ -3830,24 +4703,7 @@ static void draw_reader_outer(uint8_t *fb,size_t page) {
         ui_fill_round_rect(fb, bar, 5, UI_GRAY_LIGHT);
         bar.width = bar.width * (int)percent(page) / 100;
         if (bar.width) ui_fill_round_rect(fb, bar, 5, UI_GRAY_BLACK);
-        char chapter_name[72] = {0};
-        reader_footer_chapter_name(chapter_name, sizeof(chapter_name));
-        const int footer_px = 24;
-        char progress[48];
-        // 页码按视觉页计：双栏时一屏两页，总数不再"书变厚了"。
-        // Page numbers count visual pages: two columns halve the total instead of fattening the book.
-        snprintf(progress, sizeof(progress), "%u/%u · 全书 %u%%",
-                 (unsigned)reader_visual_index(page) + 1, (unsigned)reader_visual_count(), percent(page));
-        char chapter_line[192];
-        snprintf(chapter_line, sizeof(chapter_line), "%s%s",
-                 s_save_failed ? "未保存 · " : "", chapter_name);
-        fit_fixed_text(chapter_line, footer_px,
-                       track.width - ui_text_fixed_width_px(footer_px, progress) - 16);
-        // 页码和全书进度靠右固定，长章节名仅截短左侧；字号不跟随正文设置。
-        // Keep page and book progress right-aligned; trim only long chapter titles and ignore body font settings.
-        ui_text_fixed(fb, track.x, track.y + 35, footer_px, chapter_line, EPD_DRAW_ALIGN_LEFT, false);
-        ui_text_fixed(fb, track.x + track.width, track.y + 35, footer_px,
-                      progress, EPD_DRAW_ALIGN_RIGHT, false);
+        reader_footer_band_paint(fb, page);
     }
     if (s_reader_notice[0]) {
         // 气泡跟随屏幕宽度居中：竖屏(684)与原坐标一致，横屏阅读时仍在视觉中心。
@@ -3859,6 +4715,78 @@ static void draw_reader_outer(uint8_t *fb,size_t page) {
     }
     draw_reader_panel(fb);
 }
+/* 伴读案 30 批 · 步 4（① 右栏摘要显示层）：步 2 只立「区域可见性」外框，本步接
+   摘要数据、码点硬截二次截断、占位三态与侧栏 padding。刷新波形（DU 局部刷 /
+   N=12 区域 GC16）由 companion_summary_poll() 在 on_tick 侧驱动，本函数只画帧
+   缓冲。字号由 ui_text_block_fit 在内框里运行时取最大可容纳值——A/B（页眉页脚
+   是否收进主栏）已裁 A 案，字号上限因此可写在本节常量里。
+   Step-4 right column: frame + data + codepoint clip + three placeholder states +
+   pad. Refresh (DU / every-12th GC16) lives in the tick-side poll; type size is
+   chosen at runtime by ui_text_block_fit. */
+static size_t reader_companion_clip_cap(const char *src, char *dst, size_t cap) {
+    size_t n = 0, chars = 0;
+    while (src[n] && chars < READER_COMPANION_SUMMARY_CAP) {
+        const unsigned char c = (unsigned char)src[n];
+        size_t step = c < 0x80 ? 1u : (c & 0xe0) == 0xc0 ? 2u
+                    : (c & 0xf0) == 0xe0 ? 3u : (c & 0xf8) == 0xf0 ? 4u : 1u;
+        size_t k = 1;
+        while (k < step && src[n + k] && ((unsigned char)src[n + k] & 0xc0) == 0x80) ++k;
+        if (k < step) step = 1u;   /* 截断／非法序列按单字节收，绝不越界或切半个字 */
+        if (n + step >= cap) break;
+        memcpy(dst + n, src + n, step);
+        n += step;
+        ++chars;
+    }
+    dst[n] = 0;
+    return n;
+}
+static void reader_companion_overlay(uint8_t* fb, EpdRect right_rect) {
+    ui_draw_control_frame(fb, right_rect, 8, 0x48);
+    EpdRect inner = {right_rect.x + READER_COMPANION_PAD,
+                     right_rect.y + READER_COMPANION_PAD,
+                     right_rect.width - 2 * READER_COMPANION_PAD,
+                     right_rect.height - 2 * READER_COMPANION_PAD};
+    if (inner.width <= 0 || inner.height <= 0) return;
+    /* A2（14:26 裁定）：三态判据抽到 app_companion_state.h 的纯函数，app_book.c 与
+       宿主测试调用同一份真实代码——守卫面 ④ 断言「has=false → 摘要生成中…上屏」
+       测的就是这里，不是复制品。文案与逐字口径不变。 */
+    const char *text = companion_placeholder(push_sink_link_up(),
+                                             s_companion_summary_has,
+                                             s_companion_summary);
+    /* 修复轮（真机故障一）：这里原来调 ui_text_box——单行自适应缩放控件，把整段
+       文字当一行量宽、塞不进就按比例缩字号。56 字摘要放进右栏内宽时字号被压到
+       1~3 px，现场「挤成一条线、字体极小无法识别」正是这一语义的必然结果，与
+       70/30 几何无关（几何经实拍量测成立）。改块排版：按码点断行、固定行高、
+       行数受内框高度约束、溢出截断，字号有 14 px 下限。
+       二轮（第二轮回执）：现场要求「字再大、字再多」。字号改由 fit 在 18..34 内
+       取能完整放下整段的最大值——短摘要直接到 34，长摘要自动退到放得下的档；
+       发送帽同步放宽到 192 字（多帧拼装，见 push_sink 与 APK 分片）。
+       Repair round (field fault #1): ui_text_box is a single-line auto-shrink
+       control - it measures the paragraph as one line and scales the font down
+       until it fits, driving 56 CJK characters to 1-3 px inside this column.
+       That is the structural cause of "squeezed into one line, unreadably
+       small", not the 70/30 geometry (verified correct by on-device measurement).
+       Round 2: ui_text_block_fit picks the largest size in 18..34 that fits the
+       whole string, so short summaries get large type and long ones step down
+       just enough; the send cap is lifted to 192 chars via frame sharding.
+       12:24 字体发糊归因：字数/字号/换行都对了，但中文笔画仍团成一团。根因是
+       块排版原先逐行调 ui_text_fixed —— 阅读页 s_system_ttf=false 使它恒走内建
+       点阵 + 24px 补充位图放大路径（1-bit 位图插值再经覆盖率抬升），而清晰的
+       情景释义卡走 ui_text_reader（矢量 TTF 轮廓 + 灰阶抗锯齿）。此处改调
+       ui_text_block_fit_reader，把量宽/行高/绘制整套切到同源 reader 链路。
+       同屏左栏英文正文也是 TTF 轮廓、且同为 DU 快刷却清晰，故波形非分水岭，
+       R0 冻结件 3 的 DU/GC16 计数一律零动。 */
+    int used_px = 0;
+    const int lines = ui_text_block_fit_reader(fb, inner, READER_COMPANION_TEXT_MAX_PX,
+                                               READER_COMPANION_TEXT_MIN_PX, text, 6, &used_px);
+    /* 现场判读用：右栏最终用了多大字号、排了几行、走哪条字体后端。
+       12:24 字体发糊修复后的在机判别就靠 face=reader —— 只出现 face=bitmap
+       说明跑的还是旧固件（或现场无字体卡），不必再靠照片量像素倒推。 */
+    ESP_LOGI(TAG, "companion: text px=%d lines=%d box=%dx%d face=%s",
+             used_px, lines, inner.width, inner.height,
+             ttf_font_ready() ? "reader" : "bitmap");
+}
+
 static void draw_reader(uint8_t *fb,size_t page) {
     // 先同步方向再取正文矩形：翻横屏/开合面板后的第一帧就在这里重排。
     // Sync the orientation before taking the body rect: the first frame after an
@@ -3892,7 +4820,13 @@ static void draw_reader(uint8_t *fb,size_t page) {
         if (cols > 1 && right != SIZE_MAX)
             book_layout_draw_page(fb, right, reader_column_rect(area, cols, 1), s_px);
     }
+    /* 伴读态：右栏不画第二个逻辑页（reader_logical_pages 返 1），只叠覆盖层区域。
+       插图页同样走 else 分支——地图按 1 建时 mode 恒 COLUMNS2、JOINT 分支不可达；
+       出血宽随本出口发布为主栏宽，页内插图 band 天然收在主栏内，右栏不被盖。 */
+    if (reader_companion_active())
+        reader_companion_overlay(fb, reader_column_rect(area, cols, 1));
     draw_reader_outer(fb, page);
+    boxsel_draw(fb);
 }
 // 预渲染目标解析：给定当前逻辑页，求「下一视觉页」的左右逻辑页。
 // Resolve the prefetch target: from the current logical page, the next visual page's
@@ -4002,7 +4936,26 @@ static void prep_task_self_stop(void) {
     // delete self.
     s_prep_task = NULL;
     if (s_prep_done) xSemaphoreGive(s_prep_done);
+#if CONFIG_BOOK_PREP_STACK_PSRAM
+    // 26.9.13 P0-a：栈是用 xTaskCreatePinnedToCoreWithCaps 建的（静态缓冲，内核不会
+    // 替你回收），必须走配套的 vTaskDeleteWithCaps，且**传自己的句柄**才能命中它的
+    // 自删分支。用 vTaskDelete(NULL) 会漏掉 6 K 的 PSRAM 栈与 TCB——恰好把这项开关的
+    // 全部收益赔回去，而且漏得无声无息。
+    // 代价（写在这里，免得下一个人以为是免费的）：IDF 的自删分支会临时建一个
+    // configMINIMAL_STACK_SIZE 的**内部 RAM** 清理任务，建不出来就 abort。当前内部
+    // 可用 ~32 K / 最大块 ~14 K，够；但这一条是实验开关默认关闭的又一个理由。
+    // 26.9.13 P0-a: the stack came from xTaskCreatePinnedToCoreWithCaps (static buffers the
+    // kernel will not reclaim), so it must go through vTaskDeleteWithCaps **with its own
+    // handle** to hit the self-delete branch. A plain vTaskDelete(NULL) would quietly leak
+    // the 6 K PSRAM stack and the TCB - giving back exactly the win this switch buys.
+    // The cost, recorded so nobody assumes it is free: IDF's self-delete branch creates a
+    // temporary configMINIMAL_STACK_SIZE cleanup task in INTERNAL RAM, and aborts if that
+    // allocation fails. Internal free is ~32 K / largest ~14 K today, so it fits - and it
+    // is one more reason this stays an experiment switch, off by default.
+    vTaskDeleteWithCaps(xTaskGetCurrentTaskHandle());
+#else
     vTaskDelete(NULL);
+#endif
 }
 
 // 外部停机请求：置位 → 唤醒 → 等任务自删；**超时从不强删**，只记日志保留任务
@@ -4058,7 +5011,60 @@ static bool kick_prep(void) {
     if(!s_draw_lock)s_draw_lock=xSemaphoreCreateMutex();
     if(!s_prep_done)s_prep_done=xSemaphoreCreateBinary();
     if(!s_prep_task&&s_draw_lock&&s_prep_done&&
+#if CONFIG_BOOK_PREP_STACK_PSRAM
+       // 26.9.19 起**默认开启**（审计裁定，推翻 26.9.13「永不启用」）。当年关掉的理由是
+       // 「有风险且没到绝境」；26.9.18 真机的 boot-post 块表把绝境摆到了台面上：这 6,144 B
+       // 后面紧跟着一个 100 B 的常驻块，关书归还后与后面 13,632 B 的空闲块**不相邻、
+       // 不合并**，largest 永远停在 13,312 < 面板红线 15,360，而这块栈峰值只用 2,788 B。
+       // 26.9.19 ships this ON (audit ruling, overruling 26.9.13's "never"). The 26.9.18
+       // boot-post table made the corner plain: a permanent 100-byte block sits right behind
+       // these 6,144 bytes, so the returned stack never merges into the 13,632-byte free
+       // block behind it; largest sticks at 13,312, under the panel's 15,360 red line, while
+       // this stack's peak use is only 2,788 B.
+       // 26.9.13 P0-a：栈落 PSRAM。
+       // 为什么可以推翻 app_book.c 里「任务栈是每帧热路径，不可搬 PSRAM」那条冷热纪律
+       // （00:4707 附近，原文保留在原处不删）：prep **不是每帧路径**，它是翻页预排——
+       // 一次只跑几十到几百毫秒，晚一拍用户看不见；而它的重缓冲（字体 working 区、
+       // 预取页位图）本来就在 PSRAM，栈跟过去不改变任何访问局部性。
+       // 为什么这就是 P0 的根因解法：开书瞬间内部最大连续块 21,504 → 14,336，
+       // 差 7,168 = 6,144（栈）+ 1,024（TCB 及对齐），关书后栈已归还但洞合不回去。
+       // 把 6,144 从内部堆里**永久**拿走，这一代就再也不用为「开过书」付 7,168。
+       // 风险与守卫（审计裁定要求写明）：真正的危险是 cache 关闭窗口（NVS 提交 /
+       // OTA 写 flash）期间被调度——那时读 PSRAM 会崩。两条都不成立：
+       //   ① prep_task 的调用链只有 lock_draw/unlock_draw、book_layout_draw_slice、
+       //      字体栅格与 fb 写入，**一次性**核对过，不含 nvs_commit / esp_ota_* /
+       //      esp_flash_*；
+       //   ② flash 操作在关中断 + 另一核被 stall 的窗口里进行，窗口内不会发生任务切换，
+       //      PSRAM 栈任务只能在 cache 恢复之后才被恢复运行。
+       // 仍然保留开关而不是删掉：真机判据只有一行——
+       // `book: open start ... largest=` 应从 13,312 回到 19,456 左右（见 26.9.13 报告 §2.6、
+       // 26.9.18 真机账本）。19,456 仍低于 BLE 闸门 20,480，闸门放行不归本开关管。
+       // 26.9.13 P0-a (experiment, default off): the stack lives in PSRAM.
+       // Why this may overrule the hot/cold discipline at app_book.c:4707 ("a task stack is
+       // per-frame hot, never move it to PSRAM"), which stays where it is: prep is NOT a
+       // per-frame path - it pre-renders the next page over tens to hundreds of ms, and one
+       // tick of delay is invisible - and its heavy buffers (font working area, prefetched
+       // page bitmap) already live in PSRAM, so moving the stack changes no locality.
+       // Why this is the root-cause fix: opening a book drops the internal largest block
+       // from 21,504 to 14,336, exactly 7,168 = 6,144 (stack) + 1,024 (TCB/alignment), and
+       // closing never merges the hole back. Taking those 6,144 out of the internal heap
+       // for good means this boot generation never pays the 7,168 again.
+       // Risks and guards (required by adjudication): the real danger is being scheduled
+       // inside a cache-off window (NVS commit / OTA flash write), where touching PSRAM
+       // crashes. Neither applies: (1) prep_task's call chain is lock_draw/unlock_draw,
+       // book_layout_draw_slice, font raster and fb writes - checked line by line, no
+       // nvs_commit / esp_ota_* / esp_flash_*; (2) flash operations run with interrupts off
+       // and the other core stalled, so no task switch can happen inside the window and a
+       // PSRAM-stack task only resumes after the cache is back.
+       // It stays a switch rather than a new default because it is an inference, not a heap
+       // dump. The hardware verdict is one line: `book: open start ... largest=` should come
+       // back from 13,312 to about 19,456 (the 6,144 this stack used to eat). 19,456 still
+       // sits below the BLE gate of 20,480 - opening that gate is a later job, not this one.
+       xTaskCreatePinnedToCoreWithCaps(prep_task,"book_prep",BOOK_PREP_STACK_SZ,NULL,3,&s_prep_task,1,
+                                       MALLOC_CAP_SPIRAM)!=pdPASS)s_prep_task=NULL;
+#else
        xTaskCreatePinnedToCore(prep_task,"book_prep",BOOK_PREP_STACK_SZ,NULL,3,&s_prep_task,1)!=pdPASS)s_prep_task=NULL;
+#endif
     if(!s_prep_task)return false;
     xSemaphoreTake(s_prep_done,0);
     atomic_store_explicit(&s_prep_stop,false,memory_order_release);
@@ -4199,6 +5205,25 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
             .width = detail_body.width,
         };
         ai_reader_set_style(&detail_style);
+        // M3-B：情景卡是整屏视图，版心几何交给 ai_reader_scene_geom——上沿
+        // AI_READER_SCENE_TOP=96（= 阅读页全屏非沉浸正文顶，状态栏下），下沿扣
+        // 48px 动作栏。**不再是 236**：236 是详解「标题区之后」的正文顶，情景卡
+        // 没有标题区，照抄会留下 0..236 白板（26.9.2 修复）。详解不注入（NULL），
+        // 走自己的 236 / h-72，逐像素不变。
+        // M3-B: the scene card is a full-screen view; geometry comes from
+        // ai_reader_scene_geom - top AI_READER_SCENE_TOP=96 (the reader's
+        // fullscreen non-immersive body top, under the status bar), bottom above
+        // the 48px action bar. NOT 236 anymore: 236 is the detail view's
+        // "after-the-title-zone" top, and the card has no title zone, so copying
+        // it left 0..236 white (fixed in 26.9.2). The detail path injects nothing
+        // (NULL), keeps 236 / h-72 and stays pixel-identical.
+        if (ai_reader_mode() == AI_READER_MODE_SCENE) {
+            const ai_reader_geom_t scene_geom =
+                ai_reader_scene_geom(&detail_style, UI_LOCK_HEIGHT);
+            ai_reader_set_geometry(&scene_geom);
+        } else {
+            ai_reader_set_geometry(NULL);
+        }
         ai_reader_render(fb);
         unlock_draw();
         return;
@@ -4216,13 +5241,20 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     ui_nav_status(fb);
     char category_title[BOOK_STORE_PATH_MAX];
     copy_text(category_title,sizeof(category_title),s_category_selected ? shelf_category_name(s_category_selected) : "书架");
-    fit_text(category_title,52,326);
+    // P0-5（26.11.2）入口甲：书架第三按钮「摘抄」挤进标题行，标题预算 326 → 230。
+    // 三处命中矩形（标题 36..266 / 下拉箭头 293..319 / 摘抄按钮 333..430）由下方
+    // _Static_assert 编译期咬死，谁改一处谁改牙。
+    // P0-5 entrance A: the third header button squeezes the title budget to 230;
+    // the three hit rectangles are locked at compile time below.
+    fit_text(category_title,52,230);
     ui_text(fb, 36, 90, 52, category_title, EPD_DRAW_ALIGN_LEFT, false);
     int title_width=ui_text_fixed_width_px(ui_text_effective_px(52),category_title);
     ui_draw_icon(fb,36+title_width+27,120,26,
                  s_category_menu ? UI_ICON_CHEVRON_UP : UI_ICON_CHEVRON_DOWN,UI_GRAY_BLACK);
-    draw_shelf_header_button(fb, shelf_manage_rect(), false);
-    draw_shelf_header_button(fb, shelf_import_rect(), true);
+    char excerpt_label[24];
+    draw_shelf_header_button(fb, shelf_excerpt_rect(), 118, shelf_excerpt_label(excerpt_label, sizeof(excerpt_label)), 20);
+    draw_shelf_header_button(fb, shelf_manage_rect(), 114, "管理", 20);
+    draw_shelf_header_button(fb, shelf_import_rect(), 115, "+ 导入", 20);
     if (s_message[0] || s_shelf_warning[0])
         ui_text(fb, UI_MARGIN, 991, 17, s_message[0] ? s_message : s_shelf_warning,
                 EPD_DRAW_ALIGN_LEFT, false);
@@ -4248,7 +5280,7 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
     if (s_category_menu) draw_category_menu(fb);
     unlock_draw();
 }
-static EpdRect reader_status_area(void) { return (EpdRect){0,0,UI_LOCK_WIDTH,80}; }
+static EpdRect reader_status_area(void) { return (EpdRect){0,0,UI_LOCK_WIDTH,UI_STATUS_STRIP_H}; }
 static bool reader_status_visible(void) {
     return s_view==READING && s_text && !(s_reader_fullscreen && app_settings_reader_immersive());
 }
@@ -4279,6 +5311,17 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
             return true;
         }
     }
+    // 26.9.26 S26-2：摘抄回执只重画页脚这一条带（照上面的时钟范式）。
+    // 26.9.26 S26-2: the excerpt receipt repaints one footer strip, the same way the clock
+    // branch above repaints the status strip.
+    if (s_excerpt_footer_pending) {
+        s_excerpt_footer_pending = false;
+        if (redraw == APP_REDRAW_AREA && s_view == READING && s_text && !s_reader_fullscreen) {
+            guard_draw_result(ctx->hl, update_display_area_diff_with(
+                ctx->hl, &E0470_WAVEFORM, MODE_GL16, progress_rect()));
+            return true;
+        }
+    }
     // 输入不准备封面或正文；候选停顿只整理词栏，不累计整页清屏次数。
     // Input skips cover/body preparation; idle candidate settling affects only its strip and not whole-page cleanup counting.
     if (redraw == APP_REDRAW_AREA && (s_view == EDIT || s_view == SEARCH)) {
@@ -4293,8 +5336,50 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         s_du_count = 0;
         return true;
     }
-    if (redraw == APP_REDRAW_NONE || redraw == APP_REDRAW_DONE || ctx->request_app) return true;
+    if (redraw == APP_REDRAW_NONE || redraw == APP_REDRAW_DONE || ctx->request_app) {
+        s_reader_page_advance = false;      // 这一拍没播屏，不记账 / nothing presented, nothing booked
+        return true;
+    }
+    // 26.11.7 S2：页码前进的账只在这里结一次——全工程唯一的 s_turns 自增点。
+    //
+    // 为什么搬进来：26.11.6 的计数在 turn_page()/reader_ai_turn() 里自增，比实际播屏
+    // 早了一步。中间任何一条提前 return（request_app、摘抄回执带、输入态整理）都会
+    // 让「数了 5 页」和「闪了 5 次」对不上——而 26.11.6 的真机数正是对不上：设置 5、
+    // 62 次翻页、零次清底。账要跟着屏走，不能跟着意图走。
+    //
+    // `n &&` 不能省：N=0 是「不强制」档，语义是**永不因计数清底**。去掉 n 之后
+    // `++s_turns >= 0` 恒真，这一档会退化成每拍清底——正好是它要避免的那个结果。
+    // 宿主真值表 N=0 那一格的断言方向因此是「永不 cleanup」，不是「每拍 cleanup」。
+    // The `n &&` guard is load-bearing: n == 0 means "never clean by count". Without it
+    // `++count >= 0` is always true and the "off" setting becomes a per-turn full refresh;
+    // the host truth table asserts "never cleanup" for that row, not "cleanup every turn".
+    if (s_reader_page_advance && s_view == READING) {
+        const uint8_t full_pages = app_settings_reader_full_pages();
+        const bool due = reader_note_turn();
+        if (due) s_reader_cleanup = true;
+        // 灰账的出处：每拍一行，翻页次数与清底次数都能从这里数出来。
+        // The gray ledger's provenance: one line per turn, so both counts are countable here.
+        ESP_LOGI(TAG, "r_turn adv=1 n=%u turns=%d clean=%d", (unsigned)full_pages, s_turns, (int)due);
+    }
     if (s_presented_view != (int)s_view && redraw == APP_REDRAW_AREA) redraw = APP_REDRAW_PAGE;
+    // 26.11.5 刀 A：跨视图**进出阅读**一律整屏 GC16。
+    //
+    // 判据是视图边沿，不是「用户点了哪个按钮」——书架、文件页、首页卡、推送、
+    // resume 五条入口一次全覆盖。26.11.4 真机照片里的那层叠影正是这条：旧页的
+    // 字形留在第一屏上，因为进阅读走的是差分（只驱动变化像素），旧墨没人擦。
+    //
+    // 只用 AREA/PAGE 进来的这一层之前是 PAGE（整屏差分 GL16，37 帧），比整屏
+    // GC16（36 帧）还贵 15 ms 却不擦底——本批把它换成 FULL，不是「为清晰变慢」。
+    // 26.11.5 cut A: crossing into or out of the reader is a screen-wide GC16.
+    // The predicate is the view edge, not which button was tapped, so all five
+    // entry paths are covered at once. The 26.11.4 photo is exactly this: the old
+    // page's glyphs stay on the first screen because entering the reader went
+    // through a differential (changed pixels only) with nobody wiping the old ink.
+    // That path used to be PAGE (screen-wide GL16 diff, 37 frames) - 15 ms more
+    // expensive than a full GC16 (36 frames) and still without a white reset.
+    if (s_presented_view != (int)s_view &&
+        (s_view == READING || s_presented_view == READING))
+        redraw = APP_REDRAW_FULL;
     if ((s_view == SHELF || s_view == MANAGE) &&
         !(redraw == APP_REDRAW_AREA && (s_shelf_feedback_pending || s_cover_batch_present_pending))) {
         prepare_covers(ctx);
@@ -4340,6 +5425,7 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     // GC16 wipes the old base, so the first page is pure black on pure white.
     else if (redraw == APP_REDRAW_FULL || s_reader_cleanup || s_open_full_once) {
         s_open_full_once = false;
+        s_turns = 0;                        // 不变式：任何整屏清底后计数归零
         err = update_display_full(ctx->hl);
     }
     else if (redraw == APP_REDRAW_AREA && s_view == SHELF && s_shelf_feedback_pending) {
@@ -4353,16 +5439,68 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
         // Explicitly select fast pacing per turn and restore afterward, without leaking reader timing into main-page ripple.
         const int prior_tick = s_water_turn_pending ? e0470_page_turn_tick_us() : 0;
         if (s_water_turn_pending) e0470_page_turn_set_tick_us(E0470_TURN_FAST_TICK_US);
-        // 翻页动画与页脚刷新独立：全屏没有页脚，仍使用用户选择的水波纹。
-        // The turn effect is independent of the footer: full-screen turns still use the selected water effect.
-        err = s_water_turn_pending
-            ? update_display_water_turn(ctx->hl, s_area, s_water_turn_dir)
-            // 普通翻页与全屏阅读都只驱动变化像素；设置面板等局部绘制保留原路径。
-            // Ordinary turns and full-screen reading drive changed pixels only; other local UI keeps its path.
-            : (s_reader_fullscreen || s_reader_turn_pending) && s_mode == MODE_GL16
-                ? update_display_area_diff_with(ctx->hl,
-                    s_reader_turn_pending ? display_reader_text_waveform() : &E0470_WAVEFORM, s_mode, s_area)
-                : update_display_area_with(ctx->hl, &E0470_WAVEFORM, s_mode, s_area);
+        // 26.11.5 cut B 曾以「差分也不省时间」为由把这里换成 `_area_full` + GC16；
+        // 26.11.6 撤回，理由见下方 T0 分支的整段说明。历史保留一行，免得下一次
+        // 有人翻到旧结论又把它改回去。
+        // 26.11.5 cut B swapped this for `_area_full` + GC16 citing "diff is not
+        // cheaper"; 26.11.6 reverts it - see the T0 branch below for why.
+        if (s_water_turn_pending) {
+            err = update_display_water_turn(ctx->hl, s_area, s_water_turn_dir);
+            // 26.11.5 裁决 (c)：水波纹是**显式选择**，开启即接受「动画 + 收尾清底」
+            // 的代价，设置页写明。默认关——清晰是默认。只对真翻页补，菜单/气泡的
+            // AREA 不动。
+            //
+            // 26.11.7 W1：收尾从**整屏**收成**正文区**。26.11.6 真机报「每次翻页都
+            // 闪屏」，日志 1091 ms 里 `1091 − 643 = 448 ms` 就是那一记整屏 GC16——
+            // 动画本身只脏正文区（`dirty_lines`/`dirty_columns` 只标正文），把整屏
+            // 都擦一遍是裁决 (c) 方向对、范围错。收尾仍要 GC16 全像素：动画扫过的
+            // 那块必须重写成白底，差分补不回来。
+            // Ruling (c) stands, but 26.11.7 W1 narrows the closing wipe from the whole
+            // screen to the body area: the animation only dirties the body, and the
+            // 448 ms GC16 (1091 - 643 in the log) was what made every turn flash.
+            // Still GC16 full-pixel inside that area - the swept region must be rebuilt
+            // white, which a differential cannot do.
+            if (err == EPD_DRAW_SUCCESS && s_reader_turn_pending)
+                err = update_display_area_full_with(ctx->hl, &E0470_WAVEFORM, MODE_GC16, reader_area());
+        } else if (s_reader_clear_from_image) {
+            // 26.11.6 T3：上一页有灰阶、这一页纯文字 —— 正文区整区清一次。
+            //
+            // 判据是「灰阶内容离开了」，不是面积。面积在翻页上恒真（翻页的脏区
+            // 永远等于正文区），26.11.5 就是被这个恒真判据带着把所有翻页都判成
+            // 了「该整页重绘」。灰阶残影比文字难消，所以这一档值得一次区清；
+            // 图 → 图不触发，有图页是少数。
+            // 26.11.6 T3: the previous frame carried grayscale, this one is text only,
+            // so clean the whole body area once. The predicate is "grayscale left",
+            // not area - area is vacuously true for any turn, which is exactly how
+            // 26.11.5 ended up treating every turn as a whole-page repaint.
+            err = update_display_area_full_with(ctx->hl, &E0470_WAVEFORM, MODE_GC16, reader_area());
+        } else if (s_reader_turn_pending) {
+            // 26.11.8 ②：正文翻页＝上游同款「柔和波形 × 全覆盖」。
+            //   上游 `_area_full_with(display_reader_soft_turn_waveform(), GL16, s_area)`。
+            //
+            // 26.11.7 这里是 GC16 + 差分（36 相裁剪表），真机三档同时炸：
+            //   ① 每页整块闪（GC16 相序里黑相在前）；
+            //   ② 左缘竖带（单次「深→白」推进不足，少数列停在灰，约 4 页累积可见）；
+            //   ③ 反色停留（`s_inv_on` 的逐行过渡态推不过去，停住被看见）。
+            // 三者同源：**一张裁剪表在差分的单次推进里给不出足够的白**。
+            // 全像素刷能推白（B1 实测带消失），所以表不是坏的，缺的是推进量。
+            //
+            // kiko rc104 同屏同表同驱动，只换这一行：竖带消失、无反色、每页不闪。
+            // 上游那一格是「柔和波形 × 全覆盖」——取 GL16 的 37 相 LUT，砍尾部
+            // 无动作相，插 12 静止相 + 4 黑推相 = 48 相，白目标优先、黑相靠后。
+            //
+            // 26.11.8 ②: body turns use the upstream "soft waveform x full coverage"
+            // cell. 26.11.7 used GC16 + differential with the 36-phase trimmed table,
+            // and the panel showed all three symptoms at once: whole-block flash, the
+            // left-edge band, and inverted text holding mid-transition. One cause - a
+            // trimmed table cannot supply the white push a differential needs. The
+            // upstream 48-phase soft profile does, and kiko on the same panel showed
+            // none of the three.
+            err = update_display_area_full_with(ctx->hl, display_reader_soft_turn_waveform(),
+                                                MODE_GL16, s_area);
+        } else {
+            err = update_display_area_with(ctx->hl, &E0470_WAVEFORM, s_mode, s_area);
+        }
         if (s_water_turn_pending) e0470_page_turn_set_tick_us(prior_tick);
         if (s_reader_fullscreen && err == EPD_DRAW_SUCCESS) {
             // 百分比不变时差分直接跳过；变化时只驱动最底部的少量像素。
@@ -4378,9 +5516,37 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
             ESP_LOGI(TAG, "reader regions body_h=%d footer=diff pct=%u", s_area.height, percent(s_page));
         }
     }
-    else err = s_view == READING
-        ? update_display_mode_diff(ctx->hl, APP_PAGE_REFRESH_MODE)
-        : update_display_fast_page(ctx->hl);
+    else if (s_view == READING) {
+        // 26.11.6：阅读视图的整页出口拆成两路。
+        //
+        //   页码前进（AI 解析页翻页）→ 正文区差分，和正文翻页同一档；
+        //   进入 / 跳章 / 跳页 / 换书 → 整屏 GC16（T2）。
+        //
+        // 26.11.5 把两路并成一条整屏 GC16（刀 C），AI 页每翻一页闪一次——那是
+        // 第二个闪源。判据用 `s_reader_body_turn`，由调用侧显式置位：这里没有
+        // 几何签名可猜，翻页的脏区永远等于正文区。
+        // 26.11.6: the reader's whole-page exit splits in two - page advances (AI detail
+        // turns) use the body differential, while entering a book, chapter/page jumps
+        // and book switches stay screen-wide GC16. 26.11.5 merged both into one full
+        // refresh (cut C), so every AI page flashed; that was the second flash source.
+        if (s_reader_cleanup) {
+            s_turns = 0;                    // 不变式：整屏清底后计数归零
+            err = update_display_full(ctx->hl);
+        } else if (s_reader_body_turn) {
+            // 26.11.9：AI 解析页翻页收编同款 ②——柔和波形 × 全覆盖，与正文一字不差。
+            // 26.11.7 让 AI 页走 GC16 + 差分（裁剪表），那正是造带的组合：差分的单次
+            // 「深→白」推进里，36 相裁剪表给不出足够的白。残影不看内容来源，波形也不该分。
+            // Same as the body turn since 26.11.9: soft waveform, full-pixel GL16. The old
+            // GC16 + diff path was the band-making combination, and ghosting does not care
+            // where the ink came from.
+            err = update_display_area_full_with(ctx->hl, display_reader_soft_turn_waveform(),
+                                                MODE_GL16, reader_area());
+        } else {
+            s_turns = 0;                    // T2 同为整屏清底，不变式一致
+            err = update_display_full(ctx->hl);
+        }
+    }
+    else err = update_display_fast_page(ctx->hl);
     int64_t displayed = esp_timer_get_time();
     reader_prefetch_end(prep);
     if (redraw == APP_REDRAW_AREA && s_mode == MODE_DU &&
@@ -4411,6 +5577,11 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     s_shelf_feedback_pending = false;
     s_cover_batch_present_pending = false;
     s_reader_turn_pending = false;
+    s_reader_body_turn = false;
+    s_reader_page_advance = false;
+    s_reader_clear_from_image = false;
+    s_reader_frame_had_image = err == EPD_DRAW_SUCCESS && s_view == READING && s_text &&
+        book_layout_page_image_count(s_page) > 0;
     s_mode = MODE_GL16;
     return true;
 }
@@ -4573,6 +5744,11 @@ static void free_book(void) {
     s_prep_cursor.started = false;
     book_close();
     s_path[0] = 0;
+    // 掉盘态随书一起结束：下一次开书走正常链路，不该继承上一条命的上一次事故。
+    // The offline state ends with the book: the next open takes the normal path and must
+    // not inherit the previous book's accident.
+    s_media_offline = false;
+    s_off_chapters = 0; s_off_total_bytes = 0; s_off_chapter_offset = 0;
     s_reader_favorite = false;
     s_book_title[0] = 0;
     app_font_activate_system();
@@ -4606,6 +5782,13 @@ static void release_page_images(void) {
     s_page_images_for = SIZE_MAX;
 }
 static void prepare_inline_image(void) {
+    // B′ 条件 4：掉盘时当前页位图已经解码在 PSRAM，**绝不再读卡**——这里的每一次
+    // 读取都会落到一个已卸载的卷上。缓存保持原样（重排后由 reader_offline_rebind_images
+    // 把页号与布局代次重新绑上），翻到别的页则自然不画（槽位不匹配），页脚有「卡已移除」。
+    // Offline, the current page's bitmaps are already decoded in PSRAM: never touch the card
+    // again here. The cache is kept as-is and re-bound after the reflow; other pages simply
+    // paint no illustration, with the footer already saying why.
+    if (s_media_offline) return;
     if (app_settings_reader_hide_images()) { release_page_images(); return; }
     uint32_t generation = book_layout_generation();
     if (s_page_images_for == s_page && s_page_images_generation == generation) return;
@@ -4677,7 +5860,8 @@ static void prepare_inline_image(void) {
                 free(encoded);
                 continue;
             }
-            if (book_image_grayscale(encoded, size, png, width, height, gray)) {
+            if (book_image_grayscale(encoded, size, png, width, height, gray,
+                                     2u * 1024u * 1024u)) {
                 s_page_images[i] = (reader_image_t){gray, width, height};
                 pixels_left -= pixels;
                 ++decoded;
@@ -4731,6 +5915,14 @@ static bool heading_text_matches(const char *text, const char *toc, const char *
 
 static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
                             bool last_page, const char *anchor, size_t source_offset) {
+    // ---- 掉盘闸（B′ 条件 3）------------------------------------------------
+    // 单一闸：**所有**跨章/重排路径都过这里（TOC、书签、跳转、字号重排、章末翻页），
+    // 所以只在这一处拒绝，就不会有第二条读卡的路漏过去。
+    // 拒绝要说出来：「静默失败」在墨水屏上是「按了没反应」，用户会以为机器坏了。
+    // One gate: every chapter/reflow path goes through here, so refusing at this single
+    // point cannot leave a second route that still reads the card. And it refuses out
+    // loud: on e-paper a silent failure reads as "the button is broken".
+    if (s_media_offline) { reader_offline_refuse(); return false; }
     bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX);
     html_text_t loaded = {0};
     size_t anchor_offset = 0;
@@ -4954,27 +6146,48 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     size_t reclaimed = ttf_font_cache_clear_all();
     size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "open start wifi=%d internal=%u/%u psram=%u/%u cache=%uK freed=%uK",
+    // 26.9.15 E3：加 blocks=free/alloc 两个字段。开书会让内部最大块掉 1,024 B
+    // （21,504 → 20,480），但「掉的是新分配」还是「又切了一刀」在 free/largest 上看不出来：
+    // 前者表现为 alloc 块数 +1，后者表现为 free 块数 −1。两个数字并列就能当场分辨。
+    // Add blocks=free/alloc. Opening a book costs 1,024 B of the largest internal block
+    // (21,504 -> 20,480), and free/largest alone cannot say whether that is a NEW allocation
+    // (alloc count +1) or another cut (free count -1). Side by side, they answer it on sight.
+    multi_heap_info_t bsi;
+    memset(&bsi, 0, sizeof(bsi));
+    heap_caps_get_info(&bsi, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "open start wifi=%d internal=%u/%u blocks=%u/%u psram=%u/%u cache=%uK freed=%uK",
              network.network_ready,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)bsi.free_blocks, (unsigned)bsi.allocated_blocks,
              (unsigned)psram_after,
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
              (unsigned)(reclaimed / 1024),
              (unsigned)((psram_after - psram_before) / 1024));
+    // 26.9.20 S10：每开一次书 largest 永久少 1,024 B，位置已缩到「open start 与
+    // close before 之间那 1 ms」。五个路标按执行顺序摆开，相邻两行的 `delta=` 直接
+    // 点名——本版**只加打点、不动手**（审计 26.9.18 的「先归因后动刀」仍然适用）。
+    // 26.9.20 S10: opening a book permanently costs 1,024 B of largest, narrowed to the
+    // 1 ms between `open start` and `close before`. Five landmarks in execution order;
+    // neighbouring `delta=` values name the culprit. Instrumentation only, no fix yet.
+    pico_heap_mark("reserve1");
     if (!pending_reserve(path)) {
         copy_text(s_message, sizeof(s_message), "内存不足，无法保留待保存进度");
         return false;
     }
     save_progress();
+    pico_heap_mark("save");
     free_book();
+    pico_heap_mark("free");
     s_reader_fullscreen = s_requested_fullscreen;
     app_font_activate_reading();
+    pico_heap_mark("font");
     if (!pending_reserve(path)) {
         copy_text(s_message, sizeof(s_message), "内存不足，无法打开图书");
         app_font_activate_system();
         return false;
     }
+    pico_heap_mark("reserve2");
     esp_err_t err = book_open(path);
     // 书源打开后再把书内字体开关接上：EPUB 才有效，TXT 是空操作。
     // Wire the embedded-face switch only after the source is open: it only applies to EPUB,
@@ -5122,6 +6335,38 @@ static app_redraw_t open_vocab_view(app_ctx_t* ctx, bool restore_position) {
         size_t target = page < pages ? page : (pages ? pages - 1 : 0);
         (void)load_chapter(ctx, chapter, book_layout_page_start_offset(target), false);
     }
+    invalidate_prep();
+    return APP_REDRAW_PAGE;
+}
+
+/* ---- 摘抄本虚拟书 / The excerpt-book virtual book (26.11.2 P0-5) ----
+ * excerpts.txt → 渲染（排序倒序 / 按月分章 / 坏行计数 / 待落盘节置顶）→ 复用阅读器。
+ * 与生词本同一套做法：open_book_impl() 而不是 open_book()——不写启动恢复记录，
+ * 下次开机不落到摘抄本。删除/编辑是 v2（成品路径四拍 + 半行判据交叉，单独立项）。
+ * Render excerpts.txt and open it with the existing reader, exactly like the
+ * vocabulary book; open_book_impl() keeps the view out of the boot-resume record.
+ */
+static app_redraw_t open_excerpt_view(app_ctx_t* ctx, bool restore_position) {
+    (void)restore_position; // v1 不做删除/编辑，文件不会前移，无需按页跳回 / v1 has no removal
+    size_t count = 0;
+    const char* notice = !excerpt_store_render_view(&count) ? "摘抄本视图生成失败"
+                       : count == 0 ? "还没有摘抄：读书时框选文字，点「存摘抄」"
+                       : NULL;
+    if (notice) {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), notice);
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        invalidate_prep();
+        return APP_REDRAW_PAGE;
+    }
+    dict_popup_reset();
+    s_reader_panel = READER_PANEL_NONE;
+    if (!open_book_impl(ctx, excerpt_store_view_path())) {
+        invalidate_prep();
+        return APP_REDRAW_PAGE;
+    }
+    // 路径推出来的书名是 "excerpt_view"，换成中文。
+    // The path-derived title is "excerpt_view"; use a readable one.
+    copy_text(s_book_title, sizeof(s_book_title), "我的摘抄本");
     invalidate_prep();
     return APP_REDRAW_PAGE;
 }
@@ -5505,6 +6750,26 @@ static bool shelf_backfill_read_books(bool* truncated) {
     return s_count != before;
 }
 
+// 26.9.21 S15：书架只读容量**快照**，绝不在扫描路径上现场扫表。
+// 26.9.20 的真账：`scan_shelf()` 里这句「TF余 X MB」调 `book_store_free_bytes()` →
+// `f_getfree()`，而 FSInfo 刚被挂载流程作废，于是整张 8 MB FAT 要重扫一遍、全程持卷锁。
+// 界面线程排在探测任务后面，书架就被压到 3.667 s——三轮方差 1 ms，因为它由表大小决定。
+// 现在分两件事：介质可用就列目录；空间没算完就写「统计中」，由后台回填后重画。
+// 26.9.21 S15: the shelf reads a capacity SNAPSHOT only. The "TF free X MB" string used to
+// call book_store_free_bytes() -> f_getfree() right after the FSInfo had been invalidated,
+// rescanning 8 MB while holding the volume lock - that is what held the shelf at 3.667 s.
+static void capacity_text(char* out, size_t cap, const book_store_root_t* root) {
+    const char* label = root->is_flash ? "内置余" : "TF余";
+    uint64_t free_bytes = 0;
+    // 26.9.21：字面量「统计中」而不是「0.0 MB」——0.0 MB 会被读成「卡满了」。
+    // Say "counting" rather than "0.0 MB": the latter reads as "the card is full".
+    if (!book_store_free_snapshot(root, &free_bytes)) {
+        snprintf(out, cap, "%s 统计中", label);
+        return;
+    }
+    snprintf(out, cap, "%s %.1f MB", label, free_bytes / 1048576.0);
+}
+
 static void scan_shelf(app_ctx_t* ctx) {
     const uint32_t progress_revision=book_progress_revision();
     shelf_category_init();
@@ -5526,9 +6791,9 @@ static void scan_shelf(app_ctx_t* ctx) {
     s_storage[0] = 0;
     for (int i = 0; i < n; ++i) {
         if (i == 0 || roots[i].is_flash || roots[i - 1].is_flash) {
-            char capacity[64];
-            snprintf(capacity, sizeof(capacity), "%s%s %.1f MB", s_storage[0] ? " · " : "",
-                     roots[i].is_flash ? "内置余" : "TF余", book_store_free_bytes(&roots[i]) / 1048576.0);
+            char capacity[64], one[48];
+            capacity_text(one, sizeof(one), &roots[i]);
+            snprintf(capacity, sizeof(capacity), "%s%s", s_storage[0] ? " · " : "", one);
             strncat(s_storage, capacity, sizeof(s_storage) - strlen(s_storage) - 1);
         }
         if (s_view == SHELF && app_poll_main_navigation(ctx)) break;
@@ -5632,8 +6897,9 @@ static void refresh_capacity(void) {
     book_store_roots(roots, &count);
     for (int i = 0; i < count; ++i) {
         if (i && !roots[i].is_flash && !roots[i - 1].is_flash) continue;
-        char line[64];
-        snprintf(line, sizeof(line), "%s%s %.1f MB", s_storage[0] ? " · " : "", roots[i].is_flash ? "内置余" : "TF余", book_store_free_bytes(&roots[i]) / 1048576.0);
+        char line[64], one[48];
+        capacity_text(one, sizeof(one), &roots[i]);
+        snprintf(line, sizeof(line), "%s%s", s_storage[0] ? " · " : "", one);
         strncat(s_storage, line, sizeof(s_storage) - strlen(s_storage) - 1);
     }
 }
@@ -5700,6 +6966,96 @@ static bool reader_turn_chrome(app_ctx_t *ctx) {
 // 词典只有英文词头；中文、标点、空格必然查不到，单独提示比「未收录」准确。
 // The dictionary holds English heads only; Chinese, punctuation and spaces can never hit,
 // so say so instead of claiming the word is missing.
+// ==== M3 情景释义：句界判定 + 上下文窗口（只读原文，不改排版）====
+// 句末标点：ASCII .!?; 与换行 + 中文 。！？；…（各 3 字节）。V1 不处理缩写点号。
+// Sentence terminators: ASCII .!?; and newline, plus the CJK marks (3 bytes each).
+// V1 does not special-case abbreviations.
+static size_t scene_term_at(const char* text, size_t pos, size_t len) {
+    if (!text || pos >= len) return 0;
+    const unsigned char c = (unsigned char)text[pos];
+    if (c == '.' || c == '!' || c == '?' || c == ';' || c == '\n') return 1;
+    if (pos + 3u <= len) {
+        const char* p = text + pos;
+        if (!memcmp(p, "。", 3) || !memcmp(p, "！", 3) || !memcmp(p, "？", 3) ||
+            !memcmp(p, "；", 3) || !memcmp(p, "…", 3)) return 3;
+    }
+    return 0;
+}
+
+static size_t scene_prev_cp(const char* text, size_t pos, size_t floor) {
+    if (pos == 0) return 0;
+    size_t p = pos - 1;
+    while (p > floor && ((unsigned char)text[p] & 0xC0u) == 0x80u) --p;
+    return p;
+}
+
+static size_t scene_next_cp(const char* text, size_t pos, size_t len) {
+    if (pos >= len) return len;
+    const unsigned char c = (unsigned char)text[pos];
+    size_t step = 1;
+    if ((c & 0xE0u) == 0xC0u) step = 2;
+    else if ((c & 0xF0u) == 0xE0u) step = 3;
+    else if ((c & 0xF8u) == 0xF0u) step = 4;
+    if (pos + step > len) step = 1;
+    return pos + step;
+}
+
+// 把 [ws,we) 扩成「本页±1 + 句界」的纯文本上下文，居中裁剪到 cap-1，输出词偏移。
+// 失败（跨页超界 / 无字符）返回 false —— 调用方降级普通 AI 释义并记 ctx_fail。
+// Expand [ws,we) into the "page +/-1 + sentence boundary" plain text, centre-clip
+// to cap-1 and report the word offset. False (page overflow / no text) makes the
+// caller fall back to the plain AI definition and log ctx_fail.
+static bool scene_build_context(size_t page, size_t ws, size_t we,
+                                char* out, size_t cap, uint16_t* word_off, uint8_t* flags) {
+    if (!out || cap < 2 || !s_text || s_text_len == 0) return false;
+    if (ws >= we || we > s_text_len) return false;
+    const size_t pages = book_layout_page_count();
+    if (page >= pages) return false;
+    size_t lo = book_layout_page_start_offset(page > 0 ? page - 1 : 0);
+    size_t hi = (page + 2 < pages) ? book_layout_page_start_offset(page + 2) : s_text_len;
+    if (lo > ws || hi < we || hi <= lo) return false;
+
+    size_t slo = lo, shi = hi;
+    for (size_t p = ws; p > lo;) {
+        const size_t prev = scene_prev_cp(s_text, p, lo);
+        const size_t n = scene_term_at(s_text, prev, hi);
+        if (n && prev + n <= ws) { slo = prev + n; break; }
+        if (prev >= p) break;
+        p = prev;
+    }
+    for (size_t q = we; q < hi;) {
+        const size_t n = scene_term_at(s_text, q, hi);
+        if (n) { shi = q + n; break; }
+        const size_t next = scene_next_cp(s_text, q, hi);
+        if (next <= q) break;
+        q = next;
+    }
+    // 任一侧不是句界（落在页界/窗口边）→ 句界回退，真机据此判断上下文完整性。
+    // Either side not closed by punctuation (page/window edge) marks the fallback.
+    if (slo == lo || shi == hi) *flags |= PUSH_SCENE_FLAG_SENTENCE_FALLBACK;
+
+    const size_t limit = cap - 1;
+    if (shi - slo > limit) {
+        *flags |= PUSH_SCENE_FLAG_CTX_TRUNCATED;
+        const size_t wlen = we - ws;
+        const size_t half = (limit > wlen) ? (limit - wlen) / 2 : 0;
+        slo = (ws > half) ? ws - half : 0;
+        shi = we + half;
+        if (shi > s_text_len) shi = s_text_len;
+        if (shi - slo > limit) shi = slo + limit;
+        // 两端退到 UTF-8 字符边界，绝不切半个汉字。
+        while (slo < ws && slo < s_text_len && ((unsigned char)s_text[slo] & 0xC0u) == 0x80u) ++slo;
+        while (shi > we && shi < s_text_len && ((unsigned char)s_text[shi] & 0xC0u) == 0x80u) --shi;
+        if (slo > ws || shi < we || shi <= slo) return false;
+    }
+    const size_t n = shi - slo;
+    if (n == 0 || n > limit) return false;
+    memcpy(out, s_text + slo, n);
+    out[n] = 0;
+    *word_off = (uint16_t)(ws - slo);
+    return true;
+}
+
 static bool word_is_english(const char* w) {
     bool alpha = false;
     for (const unsigned char* p = (const unsigned char*)w; *p; ++p) {
@@ -5715,6 +7071,13 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     char word[DICT_WORD_MAX] = {0};
     bool hit = false, english = false;
     size_t hit_start = 0, hit_end = 0;
+    s_scene_valid = false; // 每次点词重置：旧快照绝不能喂给新卡 / reset per tap
+    // M3-B：点新词即撤掉旧的情景待命——引用条与词偏移都跟着 s_scene_ctx 走，
+    // 旧请求的答案回来时会因词/页对不上被丢弃（宁可不做）。
+    // M3-B: a new tap disarms any pending scene request - the quote strip and the
+    // word offset follow s_scene_ctx, so a stale answer is dropped on the word
+    // and page check anyway (better nothing than the wrong thing).
+    scene_req_disarm(&s_scene_req);
     lock_draw();
     if (s_text && s_view == READING) {
         size_t start = 0, end = 0;
@@ -5754,6 +7117,14 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             hit_end = end;
             hit = true;
             english = word_is_english(word);
+            // M3：留住定位快照（页 + 整章字节区间），供词卡「情景解读 ›」取上下文。
+            // 点击 chip 时若 s_page/s_text 已变，scene_build_context 会拒答（ctx_fail）。
+            // M3: keep the tap snapshot (page + chapter byte range) for the scene
+            // entry. If the page/text moved by tap time, scene_build_context refuses.
+            s_scene_page = page;
+            s_scene_start = start;
+            s_scene_end = end;
+            s_scene_valid = true;
         }
     }
     unlock_draw();
@@ -5792,13 +7163,58 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     // card width at open time.
     EpdRect lookup_body = body_rect();
     dict_popup_set_anchor(x < lookup_body.x + lookup_body.width / 2 ? 0 : 1, false);
-    bool found = hit && english && dict_popup_open(word);
+    // 26.9.10 B-2：去掉入口的 `english` 总闸，语言中立——中文命中本地词典同样开卡。
+    // 摘抄本（M5-A 后）要支持中文长句，入口若仍以 english 拦截，中文连卡都弹不出。
+    // 26.9.10 B-2: drop the entry-level `english` gate; stay language-neutral - a
+    // Chinese word that hits the local dictionary opens the card too. The excerpt
+    // book (after M5-A) needs Chinese, and an english gate here would block it.
+    bool found = hit && dict_popup_open(word);
+    // 26.9.5 入口卡：拆掉 `english` 作为「开门」的总闸。本地没有释义时（英文未收录，
+    // 或根本是中文——本地词典只收英文），给一张**静态入口卡**：词头 + 状态行 +
+    // AI/情景入口 chip。它不挂超时、不被 0x07 认领（没发过请求），点「AI 释义 ›」
+    // 才转 pending 并居中发 0x17——入口卡是 pending 的**前态**，不是终态。
+    //
+    // 只在 AI 开着时弹：入口卡的全部价值就是那两个入口 chip，AI 关时 chip 全被
+    // 开关收起，弹出来只是一张说「点 AI 释义」却没有可点之物的空卡——那是骗人。
+    // AI 关仍走原来的 notice（不静默：提示照给）。
+    //
+    // 26.9.5 entry card: `english` stops being the master gate for "does a card
+    // open". When the dictionary holds nothing (English miss, or Chinese at all -
+    // the local dictionary is English-only) show a **static entry card**: head +
+    // status line + AI/scene entry chips. It has no timeout and 0x07 never claims
+    // it (nothing was requested); tapping "AI 释义 ›" switches to pending and
+    // sends 0x17. The entry card is the PREFIX state of pending, not a terminal one.
+    //
+    // Only with AI on: the card's entire value is those two chips, and with AI off
+    // both are hidden by their switches - opening it would show a card that says
+    // "tap AI" with nothing to tap, which is a lie. AI off keeps the old notice
+    // (never silent: the user is still told why).
+    bool entry = false;
+    if (hit && !found && push_sink_ai_enabled()) {
+        // 文案两态（审计裁定③）：中文说明**原因**（本地只收英文），英文未收录说明
+        // **结果**（本地没有）——两类用户各得其所，不共用一句糊弄话。
+        // Two wordings (adjudication 3): Chinese states the REASON (local dictionary
+        // is English-only), an English miss states the OUTCOME (not in the local
+        // dictionary) - each reader gets the truth, no shared hand-wave.
+        const char* notice = english ? "本地未收录 · 点 AI 释义"
+                                     : "本地词典仅收英文 · 点 AI 释义";
+        entry = dict_popup_show_entry(word, notice);
+    }
     // gen26.4：词典命中卡按 AI 开关显示「AI」入口 chip——点击可强制发起 AI 查询
     // （绕过 found 门，复用查询卡状态机）。miss/pending 卡不显示（查询态自带状态行）。
     // gen26.4: the dict-hit card shows the "AI" entry chip per the AI switch - a tap
     // forces an AI query (bypassing the found gate, reusing the querying state
     // machine). Miss/pending cards never show it (the querying state has its own line).
-    if (found) dict_popup_set_ai_enabled(push_sink_ai_enabled());
+    if (found || entry) {
+        dict_popup_set_ai_enabled(push_sink_ai_enabled());
+        // M3：情景入口 = AI 开 + 情景开 + 本次点词确有上下文快照。三者缺一不显示，
+        // 避免点了才报 ctx_fail。
+        // M3: the scene entry needs AI on, scene on, and a real tap snapshot. Any
+        // one missing hides it, so the user never taps into an immediate ctx_fail.
+        dict_popup_set_scene_enabled(push_sink_ai_enabled() && push_sink_scene_enabled() &&
+                                     push_sink_ai_scene_view_enabled() &&
+                                     s_scene_valid);
+    }
     ESP_LOGI(TAG, "dict tap word=\"%s\" hit=%d english=%d hittest=%lldms card=%lldms total=%lldms",
              word, (int)hit, (int)english, (long long)((t_hit - t_start) / 1000),
              (long long)((esp_timer_get_time() - t_hit) / 1000),
@@ -5816,29 +7232,19 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     // updates it in place (on a prefetch-cache hit the def is already in the UI
     // slot and the next poll tick, <=500ms, completes the update). The "not
     // collected" notice only fires when AI is off.
-    bool pending = false;
-    if (hit && english && !found) {
-        // gen26.5 Step6：带上书锚点 + 命中词在章内的字节偏移（hit_start，与
-        // vocab_log_capture 同坐标系）。帧格式由协商结果决定（未使能 → 66B legacy）。
-        // gen26.5 Step6: carry the book anchor and the hit word's byte offset in the
-        // chapter (hit_start, same coordinate space as vocab_log_capture). The frame
-        // format follows the negotiation (legacy 66B until enabled).
-        push_sink_ai_tap_word_ctx(word, book_id_from_path(s_path), hit_start);
-        // gen26.5 M2 Step8：miss 词 0x17 发出即入 AI 生词批（用户裁定语义：与 AI
-        // 交互过的词全落，纯词典命中不落）。只在 AI 真使能时入批——tap_word_ctx
-        // 内部对未使能是静默丢弃，那边没交互，这边就不该有记录。攒批写由
-        // vocab_log_ai_flush() 5s 后合批落盘（app_loop tick 驱动）。
-        // gen26.5 M2 Step8: a dictionary-miss word joins the AI vocabulary batch the
-        // moment its 0x17 goes out (adjudicated: every AI-interacted word logs, a
-        // pure dictionary hit never). Queued only when AI is really enabled -
-        // tap_word_ctx silently drops the word when it is not, and with no
-        // interaction there must be no record. vocab_log_ai_flush() lands the
-        // batch 5s later (driven by the app_loop tick).
-        if (push_sink_ai_enabled()) vocab_log_ai_queue(word);
-        ESP_LOGI(TAG, "ai feed \"%s\": dict miss", word);
-        if (push_sink_ai_enabled()) pending = dict_popup_show_pending(word);
-    }
-    if (found || pending) {
+    // 26.9.5：点词不再自动发 0x17 —— 英文未收录也先给入口卡，由用户点「AI 释义 ›」
+    // 触发（入口卡是 pending 的前态）。0x17 与 AI 生词批随之从「点词即发」后移到
+    // 「用户确认要查」：TAP_AI 分支里既有 push_sink_ai_tap_word_ctx + vocab_log_ai_queue
+    // 已覆盖，中文走同一条路（裁定②：中文与英文 miss 同批，AI 交互过的词才落）。
+    // 协议零改动：word[64] 注明明写 UTF-8，中文直接可发。
+    // 26.9.5: a tap no longer fires 0x17 by itself - even an English miss shows the
+    // entry card first and the user confirms via "AI 释义 ›" (the entry card is
+    // pending's prefix). 0x17 and the AI vocabulary batch move from "on tap" to "on
+    // the user asking": the TAP_AI branch already does push_sink_ai_tap_word_ctx +
+    // vocab_log_ai_queue, and Chinese takes that same path (adjudication 2: Chinese
+    // and English misses share one batch; only AI-interacted words are logged).
+    // Protocol untouched: word[64] is documented as UTF-8, so Chinese goes as-is.
+    if (found || entry) {
         s_reader_panel = READER_PANEL_DICT;
     } else {
         dict_popup_reset();
@@ -5853,6 +7259,50 @@ static app_redraw_t start_dict_lookup(app_ctx_t* ctx, uint16_t x, uint16_t y) {
     return APP_REDRAW_PAGE;
 }
 
+// T1：阅读页**每一次页码前进**都从这里过账——正文翻页、AI 解析页翻页、全屏翻页。
+// 返回 true 表示这一拍该整屏清底，且计数已经归零。
+//
+// 为什么要有这个函数：26.11.5 之前 `s_turns` 只在 turn_page() 里自增，AI 页翻页、
+// 跳页、全屏翻页都不经过它，于是「每 N 页清底」从来没数过那些路径——现成的旋钮
+// 转不动，用户看到的「设置是 5 却没生效」就是这条路。
+//
+// 26.11.7 S2：**调用点全工程只有 present() 一处**。26.11.6 在 turn_page/reader_ai_turn
+// 各调一次，数的是「意图」；搬到 present 之后数的是「真的播了这一屏」。谁调用它，
+// 谁就负责在整屏分支把 s_turns 归零——这条不变式由结构保证，不靠记忆。
+// 26.11.7 S2: present() is the only caller. 26.11.6 counted intent in two places;
+// counting after the frame is decided counts what was actually presented.
+//
+// 不变式：**任何整屏清底（T1/T2）之后 s_turns == 0**，于是「距上次整屏清底 ≤ N 页」
+// 全局成立，不需要逐案记。T3 是区清，不归零（页脚带没清，账照常记）。
+// Invariant: every screen-wide cleanup (T1/T2) resets s_turns, so "<= N pages since the
+// last screen-wide cleanup" holds globally. T3 is area-only and does not reset.
+static bool reader_note_turn(void) {
+    const uint8_t full_pages = app_settings_reader_full_pages();
+    if (!full_pages) { s_turns = 0; return false; }   // 「不强制」= 永不因计数清底
+    if (++s_turns < full_pages) return false;
+    s_turns = 0;
+    return true;
+}
+
+// 26.11.6：AI 解析页翻页也要过账、也要走局刷。
+//
+// 26.11.5 的刀 C 让 `ai_reader_turn()` 返回 PAGE，落进「阅读视图整页出口」的整屏
+// GC16——于是 AI 页每翻一页闪一次，这是第二个闪源。这里显式标记「这是一次页码
+// 前进」并过账，present 据此走正文区差分；**进入 / 退出** AI 页仍由 s_ai_def_full
+// 走整屏全刷（大动作，保留）。
+// 26.11.6: AI detail page turns count and use the local refresh too. Cut C routed
+// ai_reader_turn()'s PAGE into the reader's whole-page GC16, so every detail page
+// flashed - the second source. Here we mark the frame as a page advance and book it;
+// entering/leaving the detail view still goes through s_ai_def_full (a big action).
+static app_redraw_t reader_ai_turn(int dir) {
+    const int before = ai_reader_page();
+    app_redraw_t result = ai_reader_turn(dir);
+    if (result != APP_REDRAW_PAGE || ai_reader_page() == before) return result;
+    s_reader_body_turn = true;
+    s_reader_page_advance = true;        // 26.11.7 S2：账在 present 里结 / booked in present()
+    return result;
+}
+
 static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     if (!s_text || s_clear_confirm) return APP_REDRAW_NONE;
     // 页面图片表可能随跨章加载替换，旧页资格以实际成功显示的画面为准。
@@ -5864,12 +7314,27 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
         s_reader_panel = READER_PANEL_NONE;
     }
     bool changed = true;
+    // 26.11.6：跨章要强制整屏清底（用户裁决：换章节全刷），计数随之归零。
+    // 26.11.6: a chapter crossing forces a screen-wide cleanup, and the counter resets.
+    const size_t chapter_before = s_chapter;
+    // T3 的上一页资格必须取「上一次成功呈现的帧」，不能读 s_page——它马上要变，
+    // 而且翻页失败时根本不会变。/ T3 reads the last successfully presented frame,
+    // not s_page: it is about to move, and on a failed turn it does not move at all.
+    const bool page_had_image = s_reader_frame_had_image;
     // 翻页语义视觉页化：一次翻页跨过整个视觉页（双栏时一次两栏）；跨章分支不变。
     // Turns advance by visual pages: one turn crosses a whole visual page (both columns
     // when two-column); the cross-chapter branches are unchanged.
     size_t visual = reader_visual_index(s_page);
     if (dir > 0 && visual + 1 < reader_visual_count()) s_page = reader_visual_start(visual + 1);
     else if (dir < 0 && visual) s_page = reader_visual_start(visual - 1);
+    // ---- B′ 条件 3：翻到本章末尾 -------------------------------------------
+    // 卡不在，下一章读不出来。此处必须**明说**并留在这一页——若放它走到下面的
+    // load_chapter，失败分支会 `set_reader_view(TOC)`，用户看到的是「一翻页就跳目录」，
+    // 比没反应更像故障。章内翻页不受影响（版面在内存里）。
+    // B′ condition 3: the next chapter needs the card. Say so and stay on this page;
+    // letting it reach load_chapter would jump to the TOC on failure, which looks more
+    // like a fault than a dead key. In-chapter turns are unaffected (the layout is in RAM).
+    else if (s_media_offline) { reader_offline_refuse(); return APP_REDRAW_PAGE; }
     else if (dir > 0 && s_chapter + 1 < book_chapter_count()) { save_progress(); changed = load_chapter(ctx, s_chapter + 1, 0, false); }
     else if (dir < 0 && s_chapter) { save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true); }
     else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
@@ -5884,19 +7349,39 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     s_last_turn_ms = s_stats_activity_ms = ctx->now_ms;
     ++s_stats_pending_turns;
     ++s_session_turns;
-    uint8_t full_pages = app_settings_reader_full_pages();
-    if (full_pages) ++s_turns;
-    else s_turns = 0;
-    s_reader_cleanup = full_pages > 0 && s_turns >= full_pages;
-    if (s_reader_cleanup) s_turns = 0;
+    // T1：所有页码前进共用一本账（正文、跨章、全屏）；跨章额外强制清底。
+    // 26.11.7 S2 把自增搬进 present()：这里只置标记，不再自己数。
+    // T1: every page advance shares one counter; a chapter crossing also forces cleanup.
+    // 26.11.7 S2 moved the increment into present(); only the flag is set here.
+    const bool chapter_changed = s_chapter != chapter_before;
+    s_reader_page_advance = true;
+    s_reader_cleanup = chapter_changed;     // 整屏分支负责把计数归零 / the full branch resets it
     if (s_unsaved < 8) ++s_unsaved;
     if (s_unsaved >= 8 && !s_save_failed) save_progress();
     ESP_LOGI(TAG, "turn chapter=%u page=%u/%u pct=%u", (unsigned)s_chapter, (unsigned)reader_visual_index(s_page) + 1, (unsigned)reader_visual_count(), percent(s_page));
+    /* A2（14:26 裁定）翻页即清：所有成功翻页分支在此汇合（失败/边界分支均在上方
+       return，s_page 未变故不清）。置 has=false + 清旧摘要缓冲首字节，让紧随其后的
+       paint_reading 整帧重画把「摘要生成中…」一并画进右栏——上一页旧字绝不滞留到
+       新页框。借既有整帧重画上屏，不新增独立区域刷：R0 冻结件 3 的 DU/GC16 计数、
+       波形、发送帽、分帧一律零动（裁定 §二第 3 条：A2 不构成判据修订）。
+       与既有三处 has 写入点语义正交：enter/exit 管会话边界、poll 管收帧、此处管
+       翻页瞬间；只对伴读态生效，不污染非伴读态。清空动作抽到 app_companion_state.h
+       纯函数，宿主守卫 ④ 测的就是同一份真实被调代码。 */
+    if (reader_companion_active()) {
+        companion_turn_clear(&s_companion_summary_has,
+                             s_companion_summary, sizeof(s_companion_summary));
+    }
     // 预渲染未命中时也使用 GL16；到达设定页数后在本次翻页整屏全刷。
     // A cache miss still uses GL16; the selected turn count triggers a full-screen refresh on this turn.
     app_redraw_t redraw = paint_reading(ctx, MODE_GL16);
     s_reader_turn_pending = !chrome_changed && redraw == APP_REDRAW_AREA && from_text_frame &&
         book_layout_page_image_count(s_page) == 0 && !app_settings_book_background_path()[0];
+    // 26.11.6 T3：图 → 文字才算「灰阶离开」。图 → 图不触发（用户裁决），
+    // 那一点边缘残留由 T1 的窗口兜底。
+    // 26.11.6 T3: only image -> text is "grayscale left". Image -> image does not fire
+    // (ruled); its edge residue is covered by the T1 window.
+    s_reader_clear_from_image = !s_reader_cleanup && page_had_image &&
+        book_layout_page_image_count(s_page) == 0;
     s_water_turn_pending = !chrome_changed && redraw == APP_REDRAW_AREA && !s_reader_cleanup &&
                            app_settings_reader_turn_effect() == 1 && from_text_frame &&
                            book_layout_page_image_count(s_page) == 0 && !app_settings_book_background_path()[0];
@@ -6043,6 +7528,16 @@ static app_redraw_t apply_reader_option(app_ctx_t* ctx, int kind) {
     }
     if (kind == 3) return toggle_reader_landscape(ctx);
     if (kind == 8) {
+        /* gen30 步 3：伴读态内引发重排的设置变更一律「先出伴读再切」（哨位裁定
+           §三格 1，实现形态按成本自选＝引导，不改设置、不自动改用户动作）。
+           gen30 step 3: any reflow-inducing settings change inside companion mode
+           must leave companion first (sentinel ruling section 3 grid 1; the chosen
+           low-cost form is a hint - no automatic setting flip). */
+        if (reader_companion_active()) {
+            copy_text(s_reader_notice, sizeof(s_reader_notice), "请先退出伴读再切换");
+            s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+            return APP_REDRAW_PAGE;
+        }
         // 横屏双栏开关（第 4 步，kind=8——0-3 是既有开关、4-7 是 READING_ROW_* 子面板
         // 槽标记，命名空间顺延）：只翻设置并保存位置，重排由 draw_reader 的
         // ensure_body_orientation 惰性同步——建版矩形（栏宽）与地图栏数在其单出口
@@ -6057,8 +7552,18 @@ static app_redraw_t apply_reader_option(app_ctx_t* ctx, int kind) {
         if (s_text) save_progress();
         return APP_REDRAW_PAGE;
     }
-    if (!s_text || (kind != 1 && kind != 2)) return APP_REDRAW_NONE;
-    bool previous = kind == 1 ? app_settings_reader_immersive() : app_settings_reader_hide_images();
+    if (kind == 10) {
+        /* 仿生阅读：伪加粗不改 advance，行宽/断行/字距全不变，因此只翻开关 + 重绘本页，
+           不触发重排（当前页阅读位置天然保持）。/ Bionic reading never moves an advance,
+           so the switch only repaints this page; no reflow, and the reading position is
+           preserved by construction. */
+        app_settings_set_bionic(!app_settings_bionic());
+        return APP_REDRAW_PAGE;
+    }
+    if (!s_text || (kind != 1 && kind != 2 && kind != 9)) return APP_REDRAW_NONE;
+    bool previous = kind == 1 ? app_settings_reader_immersive()
+                  : kind == 2 ? app_settings_reader_hide_images()
+                              : app_typography_enhanced();
     // 重新开启插图时，先补齐尺寸；文件读取必须在绘制锁外。
     // Probe missing dimensions before re-enabling images, outside the drawing lock.
     if (kind == 2 && previous) for (size_t i = 0; i < s_block_count; ++i) {
@@ -6075,6 +7580,7 @@ static app_redraw_t apply_reader_option(app_ctx_t* ctx, int kind) {
     size_t off = book_layout_page_start_offset(s_page);
     invalidate_prep();
     if (kind == 1) app_settings_set_reader_immersive(!previous);
+    else if (kind == 9) app_settings_set_typography_enhanced(!previous);
     else {
         app_settings_set_reader_hide_images(!previous);
         book_layout_set_images_visible(previous);
@@ -6083,6 +7589,7 @@ static app_redraw_t apply_reader_option(app_ctx_t* ctx, int kind) {
     if (ok) s_page = reader_visual_start(reader_visual_for_offset(off));
     else {
         if (kind == 1) app_settings_set_reader_immersive(previous);
+        else if (kind == 9) app_settings_set_typography_enhanced(previous);
         else {
             app_settings_set_reader_hide_images(previous);
             book_layout_set_images_visible(!previous);
@@ -6200,6 +7707,16 @@ static app_redraw_t toggle_reader_fullscreen(app_ctx_t* ctx) {
 
 static app_redraw_t toggle_reader_landscape(app_ctx_t* ctx) {
     (void)ctx;
+    /* gen30 步 3：伴读态内横屏切换会引发重排，一律「先出伴读再切」（哨位裁定
+       §三格 1）；双指手势与阅读设置两条入口都经本函数，故守卫落在这里。
+       gen30 step 3: a landscape flip inside companion mode triggers a reflow, so
+       it must leave companion first (sentinel ruling section 3 grid 1). Both the
+       two-finger gesture and the reading-settings row route through here. */
+    if (reader_companion_active()) {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "请先退出伴读再切换");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        return APP_REDRAW_PAGE;
+    }
     // 只翻设置并保存阅读位置(字节偏移与方向无关，重排后按偏移映射回同一处)；
     // 方向切换由 render() 在面板关闭时一次完成，重排由 draw_reader 的
     // ensure_body_orientation() 按版面尺寸惰性同步，这里不做临时旋转。
@@ -6393,6 +7910,60 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
         // complete). The three dots ARE the entry (its hit zone used to be glyph-wide:
         // unhittable on hardware, and a near-miss closed the card as MISSED). Geometry
         // and hit-testing live in dict_popup; this only opens the session.
+        // M3 情景解读入口：点词快照 → 句界窗口 → 0x1A（M3-A 只验链路，
+        // 情景视图留 M3-B）。取不到上下文就降级普通 AI 释义并记 ctx_fail，
+        // 用户无感（回退矩阵第 2 行）。
+        // M3 scene entry: tap snapshot -> sentence window -> 0x1A (M3-A verifies
+        // the link only; the view lands in M3-B). A failed window falls back to
+        // the plain AI definition and logs ctx_fail - invisible to the user.
+        if (tap == DICT_POPUP_TAP_SCENE) {
+            char wbuf[DICT_WORD_MAX];
+            copy_text(wbuf, sizeof(wbuf), dict_popup_word());
+            uint8_t flags = 0;
+            uint16_t word_off = 0;
+            bool ctx_ok = s_scene_valid && s_page == s_scene_page;
+            if (ctx_ok) {
+                ctx_ok = scene_build_context(s_scene_page, s_scene_start, s_scene_end,
+                                             s_scene_ctx, sizeof(s_scene_ctx),
+                                             &word_off, &flags);
+            }
+            const size_t ctx_len = ctx_ok ? strlen(s_scene_ctx) : 0;
+            if (ctx_len && push_sink_ai_scene_send(wbuf, s_scene_ctx, ctx_len,
+                                                   word_off, flags)) {
+                // M3-B：置待命态 + 卡片转「情景解读中…」。答案到了由
+                // app_book_scene_def_ready 开情景视图；等不到由 on_tick 的超时清态，
+                // 卡片照既有 pending 超时降级为失败提示（不无限期假活）。
+                // M3-B: arm the pending state and switch the card to "reading the
+                // scene...". The answer opens the scene view via
+                // app_book_scene_def_ready; if it never comes, on_tick disarms and
+                // the existing pending timeout degrades the card - never a card
+                // that fakes life forever.
+                scene_req_arm(&s_scene_req, wbuf, word_off,
+                              (uint8_t)strnlen(wbuf, SCENE_REQ_WORD_MAX - 1),
+                              s_scene_page, ctx->now_ms + SCENE_REQ_TIMEOUT_MS);
+                if (dict_popup_show_pending_scene(wbuf)) {
+                    s_reader_panel = READER_PANEL_DICT;
+                }
+                ESP_LOGI(TAG, "scene request sent: word=\"%s\" off=%u flags=0x%02x ctx=%u",
+                         wbuf, (unsigned)word_off, (unsigned)flags, (unsigned)ctx_len);
+                invalidate_prep();
+                return APP_REDRAW_PAGE;
+            }
+            scene_req_disarm(&s_scene_req); // 没发出去就不该等 / nothing sent, nothing to wait for
+            ESP_LOGW(TAG, "ctx_fail: word=\"%s\" page=%u tap=%u start=%u end=%u valid=%d ctx=%u",
+                     wbuf, (unsigned)s_page, (unsigned)s_scene_page,
+                     (unsigned)s_scene_start, (unsigned)s_scene_end,
+                     (int)s_scene_valid, (unsigned)ctx_len);
+            push_sink_ai_tap_word_ctx(wbuf, book_id_from_path(s_path), s_scene_start);
+            if (push_sink_ai_enabled() && dict_popup_show_pending(wbuf)) {
+                s_reader_panel = READER_PANEL_DICT;
+            } else {
+                dict_popup_reset();
+                s_reader_panel = READER_PANEL_NONE;
+                invalidate_prep();
+            }
+            return APP_REDRAW_PAGE;
+        }
         if (tap == DICT_POPUP_TAP_MORE) {
             const char* full = dict_popup_full_text();
             if (!full) { // 全文缓冲分配失败：不静默吞点击，照旧关卡片
@@ -6634,25 +8205,65 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
         } else if (ui_rect_hit((EpdRect){36, 650, 612, 96}, x, y)) {
             const bool on = tts_switch_on();
             tts_switch_set(!on);
-            // 打开即重置哨兵：当前页无条件首推——哪怕它与上一本书记录的同一
-            // (章,页) 撞了（关书时清过哨兵，这里是双保险）。/ Turning on resets
-            // the sentinel: the current page always gets a first push - even if
-            // it collides with the last book's (chapter,page) (closing the book
-            // clears it; this is the belt-and-braces path).
-            if (!on) s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
-            else {
-                // 关闭：推一帧 len=0 的 0x19 空页帧，对端按「空串=静默」语义
-                // 立即停止朗读。这与 tts_follow_poll 对插画页「不推空页」是两码
-                // 事——那里是版面无字、不该打断在念的句子；这里是用户明确关开关，
-                // 必须主动停。链接断开时跳过（断线期间关开关由 D2B 重连补发兜底）。
-                // Turning off: push a len=0 0x19 empty-page frame so the peer
-                // stops the read-aloud via its empty-string=silence semantics.
-                // Distinct from tts_follow_poll's "never air an empty page" rule
-                // (that one is for illustration-only pages where silence must
-                // not cut the current sentence); here the user explicitly turned
-                // the switch off, so an active stop is required. Skip when the
-                // link is down (D2B resends the empty page on reconnect).
+            /* gen30 修复轮 · 故障二终裁（23:31 裁定）：听书开关只管声音，摘要链在伴读态恒通。
+             *
+             * 23:18 首裁曾把「关朗读＝停摘要」当作可接受后果，被项目所有者以三条产品事实
+             * 推翻：视听分离（图书馆里只看右栏卡片是正当需求）、架构归因（摘要与朗读同挂
+             * 0x19 是既成通道复用、不是产品约束）、体验判断（关听书即断摘要更新，伴读价值
+             * 坍塌）。终裁：开关只控制声音；翻页即推 0x1C+0x19，AI 摘要照常生成、右栏照常
+             * 更新，不受开关影响。
+             *
+             * 解耦靠新增的 TTS_ENABLE(0x1D) 轻量帧：设备把「开关状态」作为独立事实告诉手机，
+             * 0x19 从此只承载文本。手机端收到页文本一律请求摘要，只有使能位为开时才朗读。
+             * 因此这里的两个动作与是否伴读无关，统一执行：
+             *   开到关 → 先发使能位=0（此后页文本静音）+ 再发空页帧（立即停当前这句）；
+             *   关到开 → 先发使能位=1 + 重置哨兵让当前页重推（恢复朗读；摘要走同页去重）。
+             * 非伴读态的可见行为与旧版逐位一致：开关关本就不推流，空页帧语义不变。
+             *
+             * gen30 repair round, fault #2 final ruling (23:31): the listening switch
+             * controls sound only; the summary chain stays live in companion mode. The
+             * earlier ruling treated "switch off = no summary" as acceptable and was
+             * overruled on three product facts (see the ruling text). Decoupling rides
+             * on TTS_ENABLE(0x1D): the device states the switch separately, 0x19 carries
+             * text only, and the phone always requests a summary but speaks only when
+             * enabled. Both actions below therefore run regardless of companion state;
+             * off-state visible behaviour stays bit-identical to the old build. */
+            /* 分支判据用「切换前」的 on：on==true 表示这一下是「开到关」。
+               首版写成 if (!on)，把两个分支对调了——现场因此出现「关是朗读、
+               开是闭嘴」的反向行为（第二轮回执坏消息 1），此处按语义钉死。 */
+            if (on) {
+                /* 开到关：先禁读，再立即停当前句。断线时跳过空页帧（D2B 重连补发兜底）；
+                   使能位即便断线也尝试一次，未投递则下次变化重发。 */
+                (void)push_sink_tts_enable_send(false);
                 if (push_sink_link_up()) push_sink_tts_send_page("", 0);
+            } else {
+                /* 关到开：先允许朗读，再重置哨兵让当前页重推——恢复朗读当前句；
+                   摘要请求同页同模式去重，不会因此重复生成。 */
+                (void)push_sink_tts_enable_send(true);
+                s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+            }
+        } else if (ui_rect_hit((EpdRect){36, 780, 612, 96}, x, y)) {
+            /* gen30 步 3 接线 2/4：进/出伴读只置 pending，置位 + 重排 + 武装复用 +
+               FAIR 闩锁 + 0x1B/0x1C/0x19 由 on_tick 同批原子执行。关面板回到正文，
+               让 70/30 版面可见。/ Enter/exit only sets a pending flag; the atomic
+               batch (state flip + reflow + arm reuse + FAIR latch + frame stream)
+               runs in on_tick. Close the panel so the 70/30 layout is visible. */
+            if (reader_companion_active()) s_companion_exit_pending = true;
+            else s_companion_enter_pending = true;
+            s_reader_panel = READER_PANEL_NONE;
+        } else if (ui_rect_hit((EpdRect){36, 900, 612, 96}, x, y)) {
+            /* gen30 步 3 接线 5：模式循环 → NVS 记录 → 0x1B(source=0) → 重发当前页
+               （重置哨兵，本 tick 的 tts_follow_poll 自然重推 0x1C+0x19 流）。未连接仅
+               NVS 记录，连接后首个 PAGE_BEGIN 自然同步（PAGE_BEGIN 帧体带 mode）。
+               gen30 step 3 item 5: cycle the mode -> persist -> MODE_SET(source=DEVICE)
+               -> resend the current page (sentinel reset makes this tick's follow
+               poll re-air PAGE_BEGIN+0x19). Offline: NVS only; the first PAGE_BEGIN
+               after connect syncs the mode (the frame body carries mode). */
+            const uint8_t mode = (uint8_t)((app_settings_companion_mode() + 1u) % PUSH_RIDE_MODE_COUNT);
+            app_settings_set_companion_mode(mode);
+            if (push_sink_link_up()) {
+                (void)push_sink_companion_mode_set(mode, PUSH_MODE_SRC_DEVICE);
+                s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
             }
         } else {
             return APP_REDRAW_NONE;
@@ -7248,6 +8859,13 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             if (ui_rect_hit(shelf_page_arrow_rect(-1), x, y)) return shelf_turn_page(ctx, -1);
             if (ui_rect_hit(shelf_page_arrow_rect(1), x, y)) return shelf_turn_page(ctx, 1);
         }
+        if (s_view == SHELF && ui_rect_hit(shelf_excerpt_rect(), x, y)) {
+            // P1-2 / P0-5 入口甲：书架头部「摘抄」按钮——队列空是入口，队列非空是
+            // 全局出口的徽标（待落盘 N 在摘抄本顶部一节可见）。
+            // Entrance A: the header button opens the excerpt book; with pending
+            // entries it is the global exit and the pending section shows on top.
+            return open_excerpt_view(ctx, false);
+        }
         if (s_view == SHELF && ui_rect_hit(shelf_import_rect(), x, y)) {
             s_view = IMPORT;
             return APP_REDRAW_PAGE;
@@ -7380,6 +8998,27 @@ static void on_enter(app_ctx_t* ctx) {
 
 }
 static void book_on_exit(app_ctx_t* ctx) {
+    /* gen30 步 3 · 状态卫生（任务书 7 项之外的一格，回执报备）：离开阅读器即退伴读，
+       避免 s_reader_companion 与 FAIR 闩锁跨 app 残留（否则 BLE 会一直停在 15ms）。
+       不动 s_sess / 广播 / 连接（格 2 终裁），不重排（书即将释放）。
+       gen30 step 3 state hygiene (one extra item beyond the 7-item brief, reported
+       in the receipt): leaving the reader exits companion mode so neither the state
+       nor the FAIR latch survives across apps (otherwise BLE stays at 15 ms). No
+       session/advertising/connection teardown (grid 2); no reflow (book is leaving). */
+    s_companion_enter_pending = s_companion_exit_pending = false;
+    if (reader_companion_active()) {
+        reader_companion_set(false);
+        if (push_sink_link_up()) (void)push_sink_tts_send_page("", 0);
+        push_sink_companion_conn(false);
+        s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+    }
+    boxsel_boundary_reset();
+    // M3-B：离页即撤掉情景待命（第三个清零点，另两处是新点词与发送失败）。
+    // 留着的等待单会在别的页面收到答案，那时 s_page 已不代表用户眼前的内容。
+    // M3-B: leaving the page drops any pending scene request (the third clear point,
+    // alongside a new tap and a failed send). A request left waiting would claim an
+    // answer on some other page, where s_page no longer means what the user sees.
+    scene_req_disarm(&s_scene_req);
     book_cover_jobs_cancel(s_cover_generation);s_cover_generation=0;
     shelf_category_remember(ctx);
     s_category_menu=false;
@@ -7459,10 +9098,154 @@ static void book_on_exit(app_ctx_t* ctx) {
 }
 // 先停止使用旧卡句柄与字体预渲染，主循环随后切换内置字体。
 // Stop old-card handles and font preparation before the loop switches to the builtin font.
+// ---- 31b 第 2 条 B′：掉盘就地重排 ----------------------------------------
+// 三条不变量，后面每一行都服务其中一条：
+//   ① 锚点是**字节偏移**，不是页号——字面变了，页表全换，页号没有跨字面的意义；
+//   ② 页脚文案位固定，「TF 卡已移除 · 待落盘 N」不许被章节名挤掉；
+//   ③ 任何要读卡的动作在掉盘态一律拒绝并给出「存储卡已移除」，不静默失败。
+// Three invariants; every line below serves one:
+//   1) the anchor is a byte offset, not a page number - the face changes, the page table
+//      is rebuilt, and a page number carries no meaning across two typesettings;
+//   2) the footer slot is fixed and never yields to a chapter title;
+//   3) anything that reads the card is refused out loud, never silently.
+static void reader_offline_refuse(void) {
+    copy_text(s_reader_notice, sizeof(s_reader_notice), READER_OFFLINE_TAIL);
+    s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+}
+
+/// 重排把页表整张换掉，位图缓存要重新绑到新页号与新布局代次上，否则
+/// `draw_reader_images` 的代次守卫会一直拒绝——用户看到的是「图突然没了」。
+/// The reflow replaces the whole page table, so the bitmap cache is re-bound to the new
+/// page and layout generation; otherwise draw_reader_images' generation guard keeps
+/// refusing and the illustration silently disappears.
+static void reader_offline_rebind_images(void) {
+    if (!s_page_images || s_page_image_count <= 0) return;
+    if (reader_image_slots(s_page) <= 0) { release_page_images(); return; }
+    s_page_images_for = s_page;
+    s_page_images_generation = book_layout_generation();
+}
+
+/// 拔卡且正在阅读：留在阅读器，按字节偏移重排当前页。成功返回 true。
+/// Card gone while reading: stay in the reader and re-typeset the current page from its
+/// byte offset. Returns true when the reader stays up.
+static bool book_enter_offline(app_ctx_t *ctx) {
+    // 锚点必须最先取：重排一发生，旧页表就没了。
+    // The anchor comes first: once the reflow starts, the old page table is gone.
+    const size_t anchor = reader_page_offset(s_page);
+    // 快照必须早于 book_close()——那之后书籍元数据被 memset 清零。
+    s_off_chapters = book_chapter_count();
+    s_off_total_bytes = book_total_bytes();
+    s_off_chapter_offset = book_chapter_byte_offset(s_chapter);
+    lock_draw();
+    // 进度先记进内存 pending；落卡必然失败，`未保存` 的语义因此是诚实的。
+    save_progress();
+    invalidate_prep();
+    s_reader_tap.pending = false;
+    // 预排版任务等的是卡上的下一章，卡没了它只会空转失败；先请它退（只请求，不强删）。
+    prep_task_request_stop("media-lost");
+    s_prep_page = -1; s_next_page = -1; s_next_generation = 0;
+    memset(&s_prep_cursor, 0, sizeof(s_prep_cursor));
+    // 句柄必须在 app_loop 卸载卷之前关掉：顺序反了就是悬空句柄。
+    book_close();
+    // 卡上的字体已经读不到：切内置字面后再重排，否则排出来的是马上要换掉的字面。
+    // app_loop 在回调返回后也会调一次，那次将成为 no-op（幂等）。
+    if (ttf_font_ready() && !ttf_font_is_builtin()) ttf_font_open_builtin();
+    ui_text_set_system_font(false);
+    // 先置位再重排：重排链上任何一步想读卡都会被拦住。
+    s_media_offline = true;
+    bool ok = s_text && s_text_len && reader_relayout(body_rect());
+    if (!ok) {
+        // 内存不够重排：只能退回书架。这是 B′ 唯一允许跳书架的出口，必须留痕。
+        ESP_LOGE(TAG, "offline relayout failed (text=%p len=%u): falling back to the shelf",
+                 (void *)s_text, (unsigned)s_text_len);
+        s_media_offline = false;
+        release_page_images();
+        unlock_draw();
+        return false;
+    }
+    size_t count = book_layout_page_count();
+    size_t mapped = book_layout_page_for_offset(anchor);
+    if (count && mapped >= count) mapped = count - 1;
+    if (count) s_page = reader_clamp_visual_page(mapped);
+    s_jump_offset = SIZE_MAX;
+    reader_offline_rebind_images();
+    // 面板/词典/词汇索引都挂在卡上：一并收掉，避免留一个点到就崩的面板。
+    s_reader_panel = READER_PANEL_NONE;
+    dict_popup_reset();
+    dict_close();
+    vocab_log_invalidate();
+    s_reader_slider = -1;
+    s_clear_confirm = s_batch_confirm = false;
+    s_pressed_control = -1;
+    // 顶部消息不占正文：页脚已经承担了「卡没了」这件事，正文位置还给用户读书。
+    s_message[0] = 0;
+    copy_text(s_storage, sizeof(s_storage), READER_OFFLINE_NOTE);
+    ESP_LOGW(TAG, "offline reading: anchor=%u -> page %u/%u (chapter %u/%u)",
+             (unsigned)anchor, (unsigned)reader_visual_index(s_page) + 1,
+             (unsigned)reader_visual_count(), (unsigned)s_chapter + 1, (unsigned)s_off_chapters);
+    unlock_draw();
+    return true;
+}
+
+/// 插回卡：清掉盘态并把书重新打开到同一章同一字节偏移。
+/// Card back: clear the offline state and reopen the book at the same chapter and offset.
+static void book_leave_offline(app_ctx_t *ctx) {
+    if (!s_media_offline) return;
+    const size_t anchor = reader_page_offset(s_page);
+    s_media_offline = false;
+    release_page_images();
+    // 恢复用户字体选择（拔卡时被迫切了内置字面，不回切就是偷偷改了他的设置）。
+    // Restore the user's face: it was forced to the builtin on removal, and not switching
+    // back would quietly overwrite their choice.
+    app_font_activate_reading();
+    if (!s_path[0]) { s_view = SHELF; s_scan_pending = true; return; }
+    // ---- 书源必须**先重开**（26.11.1 真机「插卡被踢回书架」的根因）------------
+    // `book_enter_offline()` 在掉盘那一刻调了 `book_close()`——句柄不能跨卷卸载存活，
+    // 否则就是悬空 FILE*。它同时把 `s_book.file` 关掉、`s_book.count` 归零。这里若不
+    // 重开就直接 `load_chapter()`，`book_chapter_load()` 的 `!s_book.file` 立刻返回
+    // `ESP_ERR_INVALID_ARG`，于是走「加载失败 → set_reader_view(SHELF)」——用户看到的
+    // 就是插回卡的瞬间被踢回书架。
+    // 真机日志实证（26.11.1 merged，t=300679 / 139446 两次同形）：
+    //     sd: err=ESP_OK present=1 mounted=1   ← 挂载成功
+    //     book: chapter load failed: ESP_ERR_INVALID_ARG
+    //     book: shelf books=18 roots=2         ← 回书架重扫
+    // The source was closed on removal; reopening is a prerequisite, not an optimisation.
+    if (book_open(s_path) != ESP_OK) {
+        ESP_LOGE(TAG, "reopen after media-ready failed (%s): falling back to the shelf", s_path);
+        copy_text(s_message, sizeof(s_message), "存储卡内容已变化，请重新打开");
+        set_reader_view(SHELF);
+        s_scan_pending = true;
+        return;
+    }
+    // 换了一张卡 / 内容被改过：章节数或总字节对不上，锚点就失去意义——回该章开头，
+    // 不拿旧偏移去跳一本已经不是那本书的书。
+    // A different card (or an edited file) invalidates the anchor: restart the chapter.
+    size_t chapter = s_chapter;
+    if (chapter >= book_chapter_count())
+        chapter = book_chapter_count() ? book_chapter_count() - 1 : 0;
+    const bool same_book = s_off_chapters && book_chapter_count() == s_off_chapters &&
+                           book_total_bytes() == s_off_total_bytes;
+    if (!load_chapter(ctx, chapter, same_book ? anchor : 0, false)) {
+        set_reader_view(SHELF);
+        s_scan_pending = true;
+        return;
+    }
+    s_scan_pending = false;
+}
+
 static void book_on_media_lost(app_ctx_t* ctx) {
+    boxsel_boundary_reset();
     shelf_category_remember(ctx);
     s_category_menu=false;
     s_reader_tap.pending = false;
+    // ---- 出口 A：正在阅读 → B′ 就地重排（31b 第 2 条）----------------------
+    // 这里是「拔卡瞬间跳书架」的结清点：只要正文还在 RAM，就没有理由把用户踢出书。
+    // Exit A: still reading -> B′ re-typesets in place. This is where "card removal
+    // bounces you to the shelf" is settled: while the body text is in RAM there is no
+    // reason to throw the reader out of the book.
+    if (s_view == READING && s_text && s_text_len && book_enter_offline(ctx)) return;
+    // ---- 出口 B：其他视图 / 重排失败 → 原有清场 ---------------------------
+    // Exit B: any other view, or the reflow failed -> the original teardown.
     lock_draw();
     save_progress();
     free_book();
@@ -7487,13 +9270,20 @@ static void book_on_media_lost(app_ctx_t* ctx) {
     copy_text(s_message, sizeof(s_message), "TF 卡已移除");
 }
 static void book_on_media_ready(app_ctx_t* ctx) {
-    (void)ctx;
     s_shelf_cache_valid = false;
+    // B′：插回卡就把书重新打开到掉盘时读到的那一章、那一个字节偏移。
+    // 用户在这段时间里读过的页由 `s_page` 的版面位置给出，不是回到拔卡前的旧页。
+    if (s_media_offline) { book_leave_offline(ctx); return; }
     if (s_view == SHELF) s_scan_pending = true;
 }
 // 控件编号仅用于保持按下与抬起命中同一个目标。/ IDs pair a press with release on the same control.
 static int control_at(app_ctx_t* ctx, uint16_t x, uint16_t y, EpdRect* rect) {
-    if (s_view==SHELF && (s_category_menu || ui_rect_hit((EpdRect){24,79,388,74},x,y))) return -1;
+    // 26.11.3：这里也曾是同一个匿名框的副本——按下落在这块就拿不到控件号，
+    // 于是按钮"按下去没反应、抬起来去弹菜单"。同一个盒子两个副本，一起收口。
+    // 26.11.3: this was the same anonymous box's second copy - a press landing here got
+    // no control id, so the button "pressed nothing, released into the dropdown".
+    if (s_view==SHELF && (s_category_menu ||
+        (ui_rect_hit(shelf_category_tap_rect(),x,y) && !shelf_header_button_hit(x,y)))) return -1;
     if (s_view == BULK) return bulk_control_at(ctx, x, y, rect);
     if (s_view == MANAGE) {
         *rect = manage_back_rect();
@@ -7546,6 +9336,7 @@ static int control_at(app_ctx_t* ctx, uint16_t x, uint16_t y, EpdRect* rect) {
         *rect = ui_bar_rect(i, 3);
         if (ui_rect_hit(*rect, x, y)) return 100 + i;
     }
+    if (s_view == SHELF && ui_rect_hit(shelf_excerpt_rect(), x, y)) { *rect = shelf_excerpt_rect(); return 118; }
     if (s_view == SHELF && ui_rect_hit(shelf_manage_rect(), x, y)) { *rect = shelf_manage_rect(); return 114; }
     if (s_view == SHELF && ui_rect_hit(shelf_import_rect(), x, y)) { *rect = shelf_import_rect(); return 115; }
     if (s_view == SHELF) {
@@ -7575,11 +9366,27 @@ static app_redraw_t paint_control(app_ctx_t* ctx, EpdRect rect) {
         }
     }
     // 小按钮反馈只重画按钮，不重新绘制全部封面；其余装饰沿用原绘制路径。
-    // Repaint small header buttons alone rather than every cover; other decorations retain their path.
-    if (s_view == SHELF && !memcmp(&rect, &(EpdRect){442,94,97,54}, sizeof(rect)))
-        draw_shelf_header_button(ctx->fb, rect, false);
-    else if (s_view == SHELF && !memcmp(&rect, &(EpdRect){551,94,97,54}, sizeof(rect)))
-        draw_shelf_header_button(ctx->fb, rect, true);
+    // 26.11.3：三处矩形不再各写一份裸字面量——这是同一个盒子的第 4 个副本，
+    // 副本不同步正是本批两个缺陷的共同病根（绘制 16 / 命中 388 / 断言漏写）。
+    // Repaint small header buttons alone rather than every cover; other decorations retain
+    // their path. 26.11.3: no more raw literals here - a fourth copy of the same boxes is
+    // exactly how the two defects of this batch were born.
+    // 注意：这里的注释不许出现撇号——ui_refresh_feedback_host_test.py 的 function()
+    // 按引号配平提取函数体，注释里的 ' 会把后面整段吞成字符串（26.11.3 咬过一次）。
+    // Note: no apostrophes in this comment - the host test extracts function bodies with a
+    // quote-aware brace matcher, and a stray ' swallows the rest of the file.
+    const EpdRect ex_btn = shelf_excerpt_rect();
+    const EpdRect mg_btn = shelf_manage_rect();
+    const EpdRect im_btn = shelf_import_rect();
+    if (s_view == SHELF && !memcmp(&rect, &ex_btn, sizeof(rect))) {
+        char excerpt_label[24];
+        draw_shelf_header_button(ctx->fb, rect, 118,
+                                 shelf_excerpt_label(excerpt_label, sizeof(excerpt_label)), 20);
+    }
+    else if (s_view == SHELF && !memcmp(&rect, &mg_btn, sizeof(rect)))
+        draw_shelf_header_button(ctx->fb, rect, 114, "管理", 20);
+    else if (s_view == SHELF && !memcmp(&rect, &im_btn, sizeof(rect)))
+        draw_shelf_header_button(ctx->fb, rect, 115, "+ 导入", 20);
     else render(ctx, ctx->fb);
     s_mode = MODE_DU;
     s_shelf_feedback_pending = false;
@@ -7624,7 +9431,673 @@ static int reader_swipe_direction(ui_gesture_type_t type, bool vertical) {
     return direction;
 }
 
+// M3-B：情景卡「存生词 ›」。写入的**只有「词 + 本地词典释义」**——标准生词本
+// 形态；四节情景分析不进生词本（审计裁定的内容边界）。词典没收录就不写，如实
+// 留日志：宁可不做，也不写半条。
+// M3-B: the scene card's "save word". It writes ONLY the word plus its local
+// dictionary definition - the standard vocabulary shape. The four-section scene
+// analysis never enters the vocabulary book (the ruling's content boundary). A word
+// the dictionary does not hold is not written; the log says so: better nothing
+// than half an entry.
+static app_redraw_t scene_save_word(void) {
+    char w[DICT_WORD_MAX];
+    copy_text(w, sizeof(w), ai_reader_word());
+    if (!w[0]) return APP_REDRAW_NONE;
+    static char def[DICT_ENTRY_MAX]; // 1280B：同 dict_popup 的查询缓冲 / same as dict_popup's lookup buffer
+    if (!dict_lookup_word(w, def, sizeof(def)) || !def[0]) {
+        ESP_LOGW(TAG, "scene save \"%s\": not in dictionary, nothing written", w);
+        return APP_REDRAW_NONE;
+    }
+    const bool ok = vocab_log_save(w, def);
+    if (ok) ai_reader_set_scene_saved(true);
+    ESP_LOGI(TAG, "scene save \"%s\": dict def %u bytes ok=%d", w, (unsigned)strlen(def), (int)ok);
+    return ok ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
+}
+
+// ===================== 26.11.4 段落视图：存摘抄 =====================
+// 同一个 chip、两种语义：词卡存「词 + 词典释义」进生词本（上面那个函数，一字未改），
+// 段落存【原文对照】一节进摘抄本。第一版把段落也接到 scene_save_word 上，于是
+// 真机日志里留下 6 次 `scene save "选段": not in dictionary` —— 按钮能按、永远不成功。
+// One chip, two meanings: the card saves a word to the vocabulary book (unchanged
+// above); a passage saves its 原文对照 section to the excerpt book.
+
+/// 选段是不是中文。模板规定**只有英文选文**才出【原文对照】节，所以「没有这一节」
+/// 有两义：中文选段的正常形态，或英文模板坏了。按选段语言分流，不猜——猜错的代价
+/// 是给一篇没存下的段落亮「已存 ✓」。
+/// Whether the selection is Chinese. Only English selections carry the section, so a
+/// missing section is either normal (Chinese) or a broken template (English).
+static bool excerpt_is_mostly_cjk(const char *s) {
+    size_t cjk = 0, latin = 0;
+    for (const unsigned char *p = (const unsigned char *)s; p && *p; ++p) {
+        if (*p >= 0xE4 && *p <= 0xE9) ++cjk;                                  // CJK 首字节
+        else if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) ++latin;
+    }
+    return cjk > 0 && cjk >= latin;
+}
+
+/// 切节缓冲：正文帽 700 B（摘抄行的正文预算，不是行帽 1024——行里还有书名与前缀）。
+/// 放 PSRAM：内部 bss 只剩 8,720 B，为一个按钮的临时串吃 701 B 不值。
+/// The cut buffer is the excerpt body budget (700 B) and lives in PSRAM: 701 B of
+/// internal bss for one button's scratch string is a bad trade.
+static EXT_RAM_BSS_ATTR char s_passage_line[EXCERPT_TEXT_MAX + 1u];
+
+static app_redraw_t scene_save_passage(void) {
+    const char *def = ai_reader_def();
+    const char *quote = ai_reader_excerpt_text();
+    if (!def || !*def) return APP_REDRAW_NONE;
+
+    size_t n = 0;
+    bool cut = false;
+    const excerpt_section_status_t st =
+        excerpt_section_pick(def, strlen(def), s_passage_line, sizeof(s_passage_line), &n, &cut);
+    const char *body = s_passage_line;
+
+    if (st == EXCERPT_SECTION_NO_MARKER) {
+        if (!excerpt_is_mostly_cjk(quote)) {
+            // 英文选文本该有对照节：模板坏了，或模型没听话。**诚实失败**——
+            // 宁可说「无对照可存」，也不把一篇没有对照的答案存成摘抄。
+            // An English selection should have carried the section: the template is
+            // broken or the model ignored it. Fail loudly instead of saving a lie.
+            reader_notice_set("无对照可存", 2000);
+            ESP_LOGW(TAG, "scene save: no %s in an essay-length answer (def %u B, quote %u B)",
+                     EXCERPT_SECTION_MARKER, (unsigned)strlen(def), (unsigned)strlen(quote));
+            return APP_REDRAW_PAGE;
+        }
+        // 中文选段：模板不出对照节，兜底存选段原文（天然 ≤1,024 B，落盘按 700 截）。
+        // Chinese selection: save the passage itself, the template never had a section.
+        body = quote;
+        n = strlen(body);
+        cut = false;
+        if (!n) {
+            reader_notice_set("无可存内容", 2000);
+            return APP_REDRAW_PAGE;
+        }
+    } else if (st == EXCERPT_SECTION_EMPTY) {
+        reader_notice_set("无对照可存", 2000);
+        ESP_LOGW(TAG, "scene save: %s is present but empty", EXCERPT_SECTION_MARKER);
+        return APP_REDRAW_PAGE;
+    }
+
+    const ai_reader_source_t *src = ai_reader_source();
+    bool cut_by_line = false;
+    const excerpt_status_t q = excerpt_store_enqueue(
+        s_book_title[0] ? s_book_title : (src && src->title[0] ? src->title : "未知"),
+        src ? src->page : (size_t)reader_visual_index(s_page), book_now_unix(), body, &cut_by_line);
+    switch (q) {
+        case EXCERPT_OK:
+            ai_reader_set_scene_saved(true);
+            ESP_LOGI(TAG, "scene save excerpt: %s %u B (cut=%d, row_cut=%d) pending=%u",
+                     body == s_passage_line ? "section" : "original", (unsigned)n, (int)cut,
+                     (int)cut_by_line, excerpt_store_pending());
+            return APP_REDRAW_PAGE;
+        case EXCERPT_FULL:
+            reader_notice_set("摘抄待落盘已满 · 请稍候", 2500);
+            ESP_LOGW(TAG, "scene save excerpt: queue full (%u)", excerpt_store_pending());
+            return APP_REDRAW_PAGE;
+        case EXCERPT_NO_MEM:
+            reader_notice_set("内存不足 · 未存", 2000);
+            return APP_REDRAW_PAGE;
+        case EXCERPT_EMPTY:
+        default:
+            reader_notice_set("无可存内容", 2000);
+            return APP_REDRAW_PAGE;
+    }
+}
+
+/// 情景卡 / 段落卡的保存动作分派。词卡语义不动（R1 纪律：行为变化只发生在新路径上）。
+/// The save dispatcher. The word card's behaviour is untouched: the change is only
+/// on the new path.
+static app_redraw_t scene_save(void) {
+    return ai_reader_is_excerpt() ? scene_save_passage() : scene_save_word();
+}
+
+
+// ============================ M5-A 框选（单页 · 两次点按） ============================
+// 不变量：单页内选定；反色只在 book_layout 的 draw_page 那一次游走里发生；所有退出都走
+// boxsel_reset()。本文件不自己算行矩形，点按命中一律交给 book_layout_hit_test()。
+// Invariants: the range lives on one page, inversion happens inside book_layout's single
+// draw_page walk, and every exit funnels through boxsel_reset(). This file never computes
+// line geometry of its own; taps are resolved by book_layout_hit_test().
+static box_selection_t s_boxsel;
+
+static bool boxsel_active(void) {
+    return s_boxsel.state != BOX_STATE_OFF && s_view == READING && s_text;
+}
+
+static void boxsel_reset(void) {
+    box_select_cancel(&s_boxsel);
+    book_layout_set_invert_range(0, 0);
+}
+
+// 底部条：提示与动作栏共用同一条基线（R4：提示绝不放顶部，那里是控制中心下拉区）。
+// Bottom strip: the hint and the action bar share one baseline (R4: never at the top,
+// which belongs to the quick-layer pull gesture).
+static EpdRect boxsel_bar_rect(void) {
+    const int h = 64;
+    return (EpdRect){0, ui_h() - h, ui_w(), h};
+}
+
+static EpdRect boxsel_button_rect(int i) {
+    const EpdRect bar = boxsel_bar_rect();
+    const int pad = 14, gap = 10;
+    const int w = (bar.width - pad * 2 - gap * 2) / 3;
+    return (EpdRect){bar.x + pad + i * (w + gap), bar.y + 10, w, bar.height - 20};
+}
+
+// 进入框选：只有阅读正文、单栏横排、无面板/无详解/无清屏确认时才允许。
+// Enter: only the reading body, horizontal single column, with no panel, detail session or
+// clear-screen confirmation on top.
+static app_redraw_t boxsel_enter(app_ctx_t* ctx) {
+    if (s_view != READING || !s_text || s_reader_panel != READER_PANEL_NONE || s_toolbar ||
+        s_clear_confirm || book_layout_vertical() || ai_reader_active())
+        return APP_REDRAW_NONE;
+    box_select_begin(&s_boxsel, s_page, ctx ? ctx->now_ms : 0);
+    book_layout_set_invert_range(0, 0);
+    ESP_LOGI(TAG, "boxsel: enter page=%u", (unsigned)s_page);
+    return APP_REDRAW_PAGE;
+}
+
+static app_redraw_t boxsel_enter_cb(app_ctx_t* ctx) { return boxsel_enter(ctx); }
+
+// 动作栏一期只打日志（不落库、不发 0x07）。缓冲区放大到 768 并放到静态区：
+// 26.9.12 起选区是**整句**，一句四五行中文就是两三百字节，256 的栈缓冲会装不下——
+// 而 box_select_copy_text 的契约是「装不下就一个字不写」，于是一条真实的整句会退化成
+// `len=0 ""` 的空日志。那等于把「太长」伪装成「没内容」，与 26.9.9 那类「采不到装作
+// 没发生」是同一个毛病。这里的处理是：装不下就**明说截断**（truncated=1 + 真实长度），
+// 绝不悄悄少打一半。
+// The action bar only logs in phase one (no persistence, no 0x07). The buffer is 768 bytes
+// and lives in static storage: since 26.9.12 the range is a whole SENTENCE, and four or
+// five lines of Chinese run to two or three hundred bytes - a 256-byte stack buffer would
+// overflow, and box_select_copy_text's contract is "write nothing rather than a half copy",
+// so a real sentence would degrade into `len=0 ""`. That dresses "too long" up as "empty",
+// the same disease as 26.9.9's "cannot observe pretending nothing happened". The rule here:
+// when it does not fit, say so (truncated=1 plus the true length) - never silently log half.
+#define BOXSEL_ACTION_TEXT_CAP 768
+// 「存摘抄」与「AI解析」共用这一块：两条路径互斥（点一下就退出框选），共用不是省，
+// 是不给「开关一开就多 768 B」留口子。
+// One buffer for both actions: they are mutually exclusive (a tap exits), and sharing it
+// keeps flipping the switch from silently costing another 768 B of .bss.
+static char s_boxsel_text[BOXSEL_ACTION_TEXT_CAP];
+
+// 出口声明制（S26-2，B31 的结构前提）：**每一个离开框选态的出口都必须带标签**，
+// 且只能通过 boxsel_exit() 走——「点了没反应」和「点了但自己走了」必须能在日志里区分。
+// Exit declaration (S26-2, the premise of tooth B31): every exit from box-select carries a
+// label and goes through boxsel_exit() only - "the tap was swallowed" and "the user left on
+// their own" must be distinguishable in the log.
+static const char *boxsel_exit_name(boxsel_exit_t why) {
+    switch (why) {
+        case BOXSEL_EXIT_SAVE: return "save";
+        case BOXSEL_EXIT_AI: return "ai";
+        case BOXSEL_EXIT_CANCEL: return "cancel";
+        case BOXSEL_EXIT_TAP_OUT: return "tap-out";
+        case BOXSEL_EXIT_DUAL: return "dual";
+        case BOXSEL_EXIT_TIMEOUT: return "timeout";
+        case BOXSEL_EXIT_KEY: return "key";
+        case BOXSEL_EXIT_KEY_LONG: return "key-long";
+        case BOXSEL_EXIT_BOUNDARY: return "boundary";
+    }
+    return "?";
+}
+
+static app_redraw_t boxsel_exit(boxsel_exit_t why) {
+    boxsel_reset();
+    ESP_LOGI(TAG, "boxsel: exit (%s)", boxsel_exit_name(why));
+    return APP_REDRAW_PAGE;
+}
+
+// ---- S26-3：AI 解析上行（0x1A bit2）------------------------------------------
+// 形态定案（书面统一，替换 26.9.26 S26-2 的临时形态）：**置灰不可点**。开关
+// CONFIG_PICO_EXCERPT_AI_SEND 为 n 时，按钮画成浅灰、点了不消费（不退框选、不发帧）；
+// 为 y 时才成为真按钮。S26-2 交付的「可点 + 页脚『AI 解析未开放』」按偏离归档作废——
+// 一个按下去才有反应、反应还是「没有这个功能」的按钮，比不画它更糟。
+// The button form is fixed here: GREYED when the switch is n. The S26-2 stopgap (pressable,
+// then says "not available") is retired - a control whose only response is "no such feature"
+// is worse than no control.
+static bool excerpt_ai_enabled(void) {
+#if CONFIG_PICO_EXCERPT_AI_SEND
+    return true;
+#else
+    return false;
+#endif
+}
+
+/// UTF-8 前缀长度：返回 ≤n 的最大字符边界。/ Longest character boundary <= n.
+/// 发送与落盘共用：半个汉字上了 BLE 就是一条坏帧，写进文件就是一行坏文本。
+static size_t utf8_prefix_len(const char *s, size_t n) {
+    size_t i = 0, last = 0;
+    while (i < n) {
+        const unsigned char c = (unsigned char)s[i];
+        const size_t need = c < 0x80u ? 1u
+                          : (c & 0xE0u) == 0xC0u ? 2u
+                          : (c & 0xF0u) == 0xE0u ? 3u
+                          : (c & 0xF8u) == 0xF0u ? 4u : 1u;
+        if (i + need > n) break;
+        i += need;
+        last = i;
+    }
+    return last;
+}
+
+// 以下三件只在开关为 y 时编译：n 时按钮置灰、发送路径压根不存在，源码里也就不该有
+// 一段没人调用的死代码（`-Wunused-function` 会当场把它顶出来）。
+// The three helpers below compile only with the switch on; with n the send path does not
+// exist at all, so there is no dead code to rot.
+#if CONFIG_PICO_EXCERPT_AI_SEND
+/// 解一个码点（非法序列按 1 字节的 U+FFFD 前进）。/ Decode one code point.
+static size_t utf8_next_cp(const char *s, size_t n, uint32_t *cp) {
+    const unsigned char c = (unsigned char)s[0];
+    size_t need;
+    uint32_t v;
+    if (c < 0x80u) { *cp = c; return 1; }
+    if ((c & 0xE0u) == 0xC0u) { need = 2; v = c & 0x1Fu; }
+    else if ((c & 0xF0u) == 0xE0u) { need = 3; v = c & 0x0Fu; }
+    else if ((c & 0xF8u) == 0xF0u) { need = 4; v = c & 0x07u; }
+    else { *cp = 0xFFFDu; return 1; }
+    if (n < need) { *cp = 0xFFFDu; return 1; }
+    for (size_t i = 1; i < need; ++i) {
+        const unsigned char cc = (unsigned char)s[i];
+        if ((cc & 0xC0u) != 0x80u) { *cp = 0xFFFDu; return 1; }
+        v = (v << 6) | (cc & 0x3Fu);
+    }
+    *cp = v;
+    return need;
+}
+
+/// 词的断点：空白与常见中英标点。/ Word break: whitespace and common CJK/ASCII punctuation.
+static bool word_break_cp(uint32_t cp) {
+    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r') return true;
+    if (cp < 0x80u) return strchr(",.!?;:\"'()[]{}<>/\\|`~@#$%^&*-_=+", (int)cp) != NULL;
+    return (cp >= 0x3000u && cp <= 0x303Fu) ||  // CJK 标点与全角空格
+           (cp >= 0xFF01u && cp <= 0xFF20u) ||  // 全角 ！＂＃…＠
+           (cp >= 0x2010u && cp <= 0x2027u) ||  // 引号、破折号、省略号
+           (cp >= 0x300Au && cp <= 0x3011u) ||  // 《》「」『』【】
+           cp == 0x00B7u;
+}
+
+/// 选区首词（0x1A 的 word 字段）：跳过开头的空白/标点，取到下一个断点或 63B 为止，
+/// 按整字符收口。全篇无断点时取前 63B 的整字符前缀——word 不许为空，否则整条发不出。
+/// Leading word for the 0x1A word field: skip leading blanks/punctuation, stop at the next
+/// break or at 63 B, always on a character boundary. word is never empty: the request needs it.
+static void excerpt_first_word(const char *s, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!s || cap < 2) return;
+    const size_t limit = cap - 1u < 63u ? cap - 1u : 63u; // word ≤63B（与 PUSH_SCENE_WORD_MAX 同源）
+    const size_t n = strlen(s);
+    size_t i = 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        const size_t step = utf8_next_cp(s + i, n - i, &cp);
+        if (!word_break_cp(cp)) break;
+        i += step;
+    }
+    size_t w = 0;
+    while (i < n && w < limit) {
+        uint32_t cp = 0;
+        const size_t step = utf8_next_cp(s + i, n - i, &cp);
+        if (word_break_cp(cp) || w + step > limit) break;
+        i += step;
+        w += step;
+    }
+    if (!w) { // 全篇只有一个超长词（或开头就是断点）：退回最前面的整字前缀
+        w = utf8_prefix_len(s, limit);
+        if (w) memcpy(out, s, w);
+        out[w] = '\0';
+        return;
+    }
+    memcpy(out, s + (i - w), w);
+    out[w] = '\0';
+}
+
+/// 26.11.3-C 形态判的阈值：≤32 B 且无空白 = 一个词（点词路径），否则 = 一段话。
+/// 32 B 够放下英文最长单词（不含连字符组合的极端造词），也够放下一个中文词。
+/// Threshold for the shape test: <= 32 B and no whitespace means "one word" (tap-word
+/// path); anything else is a passage. 32 B holds the longest English word and a CJK term.
+#define BOXSEL_WORD_MAX 32
+
+/// 选段里有没有空白（空格/制表/换行）——「一个词」的形态判据。
+/// Whether the selection contains whitespace - the "one word" shape test.
+static bool boxsel_has_space(const char* s, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return true;
+    }
+    return false;
+}
+
+// 「AI解析」：复用 0x1A（零新帧），bit2 = PUSH_SCENE_FLAG_EXCERPT 分流到整段解析。
+// 三条纪律与「存摘抄」同源：点击只发一次、每个分支都 EXIT、提示只来自本次调用的返回值。
+//
+// 26.11.3-C 四笔（全部由 26.11.3-B 真机档② FAIL 照出来，逐笔都有日志证据）：
+//   ① 上下文改用 s_scene_ctx（1025 B）：旧的 768 B 框选缓冲把 879/925 B 的段落砍到
+//      767，用户拿到的是「半段被当成整段」的答案；
+//   ② 拒发门判在**复制之前**：先复制再判，门就成了装饰品，>1024 的选段永远先被截断；
+//   ③ 发出去必须 arm（scene_req_arm_excerpt）：只发不 arm，0x08 回来无人认领，答案
+//      落成词卡——「情境释义」变成「单词卡」的第二个原因；
+//   ④ 选段形态判：≤32 B 且无空白 = 一个词，走点词等价路径（0x17 + 词卡），不发 0x1A。
+//
+// Send the excerpt as one 0x1A with bit2 set. Four lessons from the 26.11.3-B hardware
+// failure: the context buffer must be the protocol's 1025 (not a 768 box-select buffer),
+// the over-cap refusal must run BEFORE the copy, a send must arm the scene state or its
+// answer lands as a word card, and a single-word selection goes down the tap-word path.
+static app_redraw_t boxsel_ai_send(void) {
+    // 26.11.3-C：整段请求的上下文就装在 s_scene_ctx 里——点词路径用的是同一个缓冲，
+    // 语义相同（「这一份要发出去的上下文」），不同源只会多一份迟早漂开的拷贝。
+    // The passage request lives in s_scene_ctx: the tap-word path uses the same buffer
+    // for the same meaning (the context about to go out); a second copy would drift.
+    char *const text = s_scene_ctx;
+    const size_t len = box_select_length(&s_boxsel);
+
+    // 26.11.4 裁决（审计三笔之一）：**> PUSH_SCENE_CTX_MAX 的选区拒发**，不静默截到 1024。
+    // 1024 是协议上界；把两屏文字悄悄砍掉一半再问 AI，答案会指着被砍掉的那段说话——
+    // 用户拿到的是一份「看起来完整」的错误答案。拒发 + 明说，比发一份残缺的强。
+    // A selection over the protocol cap is REFUSED, never silently cut to 1024: a truncated
+    // question gets an answer about the wrong half, and the user cannot tell the difference.
+    if (len > PUSH_SCENE_CTX_MAX) {
+        reader_notice_set("选段过长 · 请缩小范围", 2000);
+        excerpt_hint_set("选段过长 · 请缩小范围", EXCERPT_HINT_ALERT);
+        ESP_LOGW(TAG, "boxsel: ai refused page=%u len=%u over ctx max=%u",
+                 (unsigned)s_boxsel.page, (unsigned)len, (unsigned)PUSH_SCENE_CTX_MAX);
+        return boxsel_exit(BOXSEL_EXIT_AI);
+    }
+
+    const size_t n = box_select_copy_text(&s_boxsel, s_text, s_text_len, text,
+                                          sizeof(s_scene_ctx));
+    if (!n) {
+        // 过了上面那道门还能复制失败，只可能是选区与页文本对不上（翻页/重排）。
+        // Reaching here means the selection no longer matches the page text.
+        ESP_LOGI(TAG, "boxsel: ai nothing to send page=%u len=%u", (unsigned)s_boxsel.page, (unsigned)len);
+        excerpt_hint_set("无选中文本", EXCERPT_HINT_ALERT);
+        return boxsel_exit(BOXSEL_EXIT_AI);
+    }
+
+    // ④ 形态判（26.11.3-C 裁决，行为变更已申报）：一个词就按点词那条路走。
+    // 框选一个词的用户要的是词卡，不是「整段」四节——发 0x1A 会让手机端按段落解析
+    // 一个词，答案里三个小节只能编。这里省下的不只是一次误发，还有一次误解。
+    // A single word goes down the tap-word path: that user wants a word card, and asking
+    // the phone for a four-section passage analysis of one token only invites invention.
+    if (n <= BOXSEL_WORD_MAX && !boxsel_has_space(text, n)) {
+        char wbuf[PUSH_SCENE_WORD_MAX];
+        copy_text(wbuf, sizeof(wbuf), text);
+        // 单词路径不开情景视图：先撤掉可能还挂着的情景待命，免得旧单被这张卡认领。
+        // No scene view on the word path: drop any pending scene request first so an
+        // older request cannot claim this answer.
+        scene_req_disarm(&s_scene_req);
+        push_sink_ai_tap_word_ctx(wbuf, book_id_from_path(s_path), s_boxsel.off_start);
+        if (push_sink_ai_enabled() && dict_popup_show_pending(wbuf)) {
+            s_reader_panel = READER_PANEL_DICT;
+        } else {
+            dict_popup_reset();
+            s_reader_panel = READER_PANEL_NONE;
+        }
+        ESP_LOGI(TAG, "boxsel: ai word path page=%u len=%u word=\"%s\"",
+                 (unsigned)s_boxsel.page, (unsigned)len, wbuf);
+        invalidate_prep();
+        return boxsel_exit(BOXSEL_EXIT_AI);
+    }
+
+    char word[PUSH_SCENE_WORD_MAX];
+    excerpt_first_word(text, word, sizeof(word));
+    // 本地不再有任何截断 → bit0 恒为 0；协议上界由上面那道门守，回执不必再分档。
+    // No local truncation survives, so bit0 is always 0 and the receipt has one form.
+    const uint8_t flags = (uint8_t)PUSH_SCENE_FLAG_EXCERPT;
+    // word 恒为 ctx 的前缀 → word_off = 0（登记簿 docs/PROTOCOL.md 里写死这条语义）。
+    // word is always a prefix of ctx, hence word_off = 0 (fixed in docs/PROTOCOL.md).
+    const bool ok = push_sink_ai_scene_send(word, text, n, 0, flags);
+    // ③ 发出去就 arm：0x08 回流没有「这是段落答案」的位（协议零改动），只有发起时的
+    // 记忆能把它分到「选段」视图而不是词卡。时钟与 scene_req_claim 同源（esp_timer ms）。
+    // Arm on send: the returning 0x08 carries no "this is a passage" bit, so only the
+    // originating state can route it; the clock is the same one scene_req_claim uses.
+    if (ok) {
+        scene_req_arm_excerpt(&s_scene_req, word, 0, (uint8_t)strnlen(word, sizeof(word)),
+                              s_boxsel.page,
+                              esp_timer_get_time() / 1000 + EXCERPT_REQ_TIMEOUT_MS);
+    } else {
+        scene_req_disarm(&s_scene_req); // 没发出去就不该等 / nothing sent, nothing to wait for
+    }
+    // 回执只报「发了/没发」：四条前置门（AI 开关 / 情景开关 / APK 能力 / 链路订阅）
+    // 里哪条没过，这个 API 不告诉我们——猜一条写上去就是撒谎。
+    // 26.11.4：回执必须上**顶部气泡**。全屏阅读不画页脚带，只写 hint 槽等于没写。
+    // The receipt says sent or not and goes to the toast: full-screen reading paints no
+    // footer band, so a hint-only receipt is invisible (the 26.11.1 trap).
+    const char *receipt = ok ? "AI 已发" : "未发送";
+    // 26.11.3-C2：发出去了就排一条等待期气泡（2.2 s 后，等「AI 已发」退场）。
+    // 排了不一定会响：tick 到点时会再确认「这条整段请求还挂着」。
+    // 26.11.3-C2: on a successful send, schedule the wait notice 2.2 s out (after
+    // "AI 已发" has cleared). Scheduling is not showing: the tick re-checks that the
+    // passage request is still armed before anything is painted.
+    if (ok) s_ai_wait_notice_at_ms = esp_timer_get_time() / 1000 + 2200;
+    excerpt_hint_set(receipt, ok ? EXCERPT_HINT_INFO : EXCERPT_HINT_ALERT);
+    reader_notice_set(receipt, 2000);
+    ESP_LOGI(TAG, "boxsel: ai send page=%u len=%u copy=%u word=\"%s\" flags=0x%02x ok=%d",
+             (unsigned)s_boxsel.page, (unsigned)len, (unsigned)n, word,
+             (unsigned)flags, (int)ok);
+    return boxsel_exit(BOXSEL_EXIT_AI);
+}
+#endif
+
+static app_redraw_t boxsel_action(int which) {
+    char *const text = s_boxsel_text;
+
+    // 动作栏二期（S26-2）：**真实业务闭环**。一期只打日志，这一期把「存摘抄」接到
+    // excerpt_store。纪律三条：
+    // The action bar, phase two (S26-2): a real closed loop. Phase one only logged; this one
+    // wires the save button to excerpt_store. Three rules:
+    //   1. 点击只做入队，**落盘不在这里发生**（B32'：事件路径只准与队列 API 说话）。
+    //      A click only enqueues; the write never happens here (B32-prime).
+    //   2. 每个分支都 EXIT：文本再长也不许留框选——超长照常退出并按上限摘录 + 页脚明说
+    //      `[截]`，「例外迟早变漏洞」。
+    //      Every branch exits, even for over-long text: it is saved truncated with a footer
+    //      note, because an exception to the rule becomes a hole.
+    //   3. UI 的每条提示都来自本次调用的返回值，**不猜结果**（没有 EXCERPT_OK 就一个字
+    //      不许说已存）。Every hint comes from this call's return value - never a guess.
+    if (which == 2) return boxsel_exit(BOXSEL_EXIT_CANCEL);
+    if (which == 1) {
+#if CONFIG_PICO_EXCERPT_AI_SEND
+        return boxsel_ai_send();
+#else
+        // 正常不可达：置灰态在 boxsel_touch 的命中层就被挡下（不消费点击）。
+        // Unreachable by design: the greyed key is filtered at the hit-test layer.
+        ESP_LOGW(TAG, "boxsel: ai tapped while disabled (unreachable by design)");
+        excerpt_hint_set("AI 解析未开放", EXCERPT_HINT_ALERT);
+        return boxsel_exit(BOXSEL_EXIT_AI);
+#endif
+    }
+
+    const size_t len = box_select_length(&s_boxsel);
+    size_t n = box_select_copy_text(&s_boxsel, s_text, s_text_len, text, sizeof(s_boxsel_text));
+    bool truncated = false;
+    if (!n && len && s_text && s_boxsel.off_end <= s_text_len) {
+        const size_t head = utf8_prefix_len(s_text + s_boxsel.off_start,
+                                            len < sizeof(s_boxsel_text) - 1 ? len
+                                                : sizeof(s_boxsel_text) - 1);
+        if (head) {
+            memcpy(text, s_text + s_boxsel.off_start, head);
+            text[head] = '\0';
+            n = head;
+        }
+        truncated = true;
+    }
+    // 膨胀不再 bail out：取不到文本也照常退出，并把「没内容」如实说出去。
+    // No bail-out any more: even with no text we exit and say so.
+    ESP_LOGI(TAG, "boxsel: excerpt page=%u [%u,%u) len=%u copy=%u truncated=%d \"%s\"",
+             (unsigned)s_boxsel.page, (unsigned)s_boxsel.off_start, (unsigned)s_boxsel.off_end,
+             (unsigned)len, (unsigned)n, (int)truncated, n ? text : "");
+
+    bool cut_by_line = false;
+    const excerpt_status_t st = excerpt_store_enqueue(
+        s_book_title[0] ? s_book_title : s_title, (size_t)reader_visual_index(s_page),
+        book_now_unix(), n ? text : NULL, &cut_by_line);
+    switch (st) {
+        case EXCERPT_OK:
+            // 点击那一刻不许报喜——回执由 tick 的 f_sync 结果给出（先写后亮）。
+            // No cheering at click time: the receipt comes from the tick's f_sync (write first).
+            //
+            // 但「已入队」必须当场说，而且要走**顶部气泡**，不许只靠页脚：
+            // 26.11.1 真机轮第 2 回执——无卡连摘 3 条，屏幕上一个字都没有。页脚那条
+            // 24 px 前缀（离线时是「TF 卡已移除 · 待落盘 N」）是全屏阅读不画、离开
+            // READING 就失效、还得靠人低头去看的唯一载体；一个功能能不能被感知，
+            // 不该押在「用户会不会去看屏幕最下面那一行」。先写后亮约束的是「已存」，
+            // 不是「已入队」——说排队是实话，说存好才是撒谎。
+            // Saying "queued" is not cheering: it is the literal queue depth. The receipt
+            // "saved" still waits for f_sync. The toast exists because the footer is not
+            // drawn in full-screen reading and dies with the view.
+            {
+                char toast[64];
+                snprintf(toast, sizeof(toast), "已入队 · 待落盘 %u", excerpt_store_pending());
+                reader_notice_set(toast, 2000);
+            }
+            if (cut_by_line || truncated) excerpt_hint_set("[截] 已按上限摘录", EXCERPT_HINT_ALERT);
+            break;
+        case EXCERPT_FULL:
+            excerpt_hint_set("摘抄已满", EXCERPT_HINT_ALERT);
+            break;
+        case EXCERPT_NO_MEM:
+            excerpt_hint_set("内存不足", EXCERPT_HINT_ALERT);
+            break;
+        case EXCERPT_EMPTY:
+            excerpt_hint_set("无选中文本", EXCERPT_HINT_ALERT);
+            break;
+    }
+    ESP_LOGI(TAG, "boxsel: excerpt enqueue -> %d (pending=%u)", (int)st, excerpt_store_pending());
+    return boxsel_exit(BOXSEL_EXIT_SAVE);
+}
+
+// 框选态独占单指：滑动、长按、双击一律吞掉，只有 TAP 有语义。
+// The mode owns the single finger: swipes, long presses and double taps are swallowed and
+// only a TAP carries meaning.
+static app_redraw_t boxsel_touch(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
+    if (!boxsel_active() || ev->type != UI_GESTURE_TAP) return APP_REDRAW_NONE;
+    ctx->user_activity = true;
+    if (box_select_ready(&s_boxsel)) {
+        for (int i = 0; i < 3; ++i) {
+            if (!ui_rect_hit(boxsel_button_rect(i), ev->x0, ev->y0)) continue;
+            if (i == 1 && !excerpt_ai_enabled()) {
+                // 置灰键（S26-3 定案）：命中但**不消费**——不退框选、不发帧、不改状态，
+                // 只留一行日志，好让「点了没反应」在日志里是「点了，但那个键本来就按不动」。
+                // Greyed key: a hit is not consumed - no exit, no frame, no state change.
+                ESP_LOGI(TAG, "boxsel: tap ai (greyed, switch off) page=%u", (unsigned)s_page);
+                return APP_REDRAW_NONE;
+            }
+            return boxsel_action(i);
+        }
+        // READY 后点选区外 = 取消（E3）。ARM/TAIL 下点空则是「没点中」，不改状态（E-R5）。
+        // A tap outside the bar while READY cancels (E3); a miss while ARM/TAIL is simply
+        // "not a hit" and changes nothing (E-R5).
+        return boxsel_exit(BOXSEL_EXIT_TAP_OUT);
+    }
+    size_t ws = 0, we = 0;
+    // 26.9.14 D3：逐击日志。26.9.13 的真机日志里框选进了 5 次、只出 1 次摘抄，而这一
+    // 段代码**一声不响**——「点了没反应」和「点了但用户自己走了」在日志里长得一模一样，
+    // 这正是 P1 判不了的唯一原因。三句话覆盖三种结局：miss（没点中正文）/ ignored
+    // （点中了但状态机不收）/ ok（收下并改了选区）。有了这三句，「点 10 次响应 10 次」
+    // 才是可数的，而不是一句手感。
+    // D3: per-tap logging. The 26.9.13 log had five boxsel entries and one excerpt, and
+    // this code said nothing at all - "the tap was swallowed" and "the user moved on"
+    // look identical on the wire, which is the only reason P1 could not be judged. Three
+    // phrases cover three endings: miss (no text under the finger) / ignored (text hit,
+    // state machine declined) / ok (taken, range changed). With them, "10 taps, 10
+    // responses" becomes countable instead of a feeling.
+    if (!book_layout_hit_test(s_page, ev->x0, ev->y0, &ws, &we)) {
+        ESP_LOGI(TAG, "boxsel: tap (%d,%d) page=%u -> miss", (int)ev->x0, (int)ev->y0,
+                 (unsigned)s_page);
+        return APP_REDRAW_NONE;
+    }
+    // 按句吸附（26.9.12 P1-2）：首点向前找句首，尾点向后找句末。方向由**相对锚点的
+    // 位置**决定，不由点击次序决定——先点尾再点头时，第二点落在锚前、成为新的起点，
+    // 该向前拓；按次序定方向会把这种情况扩反。首次点按（ARM）没有锚点，默认向前。
+    // 吸附只改字节区间，反色仍按整行涂抹（R-S4/R-S5）：选区与视觉解耦，不必引入
+    // 逐字 x 区间，也就不会在墨水屏上制造局部刷新残影。
+    // Sentence snapping (26.9.12 P1-2): the head tap walks back to the sentence start, the
+    // tail tap forward to its end. The direction follows the tap's POSITION relative to the
+    // anchor, not the order of taps - tapping the tail first makes the second (earlier) tap
+    // the new start, which must extend backwards; going by order would extend it the wrong
+    // way. The first tap (ARM) has no anchor and defaults to backwards.
+    // Snapping changes the byte range only; inversion still paints whole lines (R-S4/R-S5),
+    // so the range and the visuals stay decoupled - no per-glyph x intervals, and none of
+    // the partial-refresh ghosting they would bring on this panel.
+    const size_t page_start = book_layout_page_start_offset(s_page);
+    size_t page_end = s_text_len;
+    if (s_page + 1 < book_layout_page_count()) page_end = book_layout_page_start_offset(s_page + 1);
+    const int dir = (s_boxsel.state == BOX_STATE_ARM || ws < s_boxsel.anchor_ws) ? -1 : 1;
+    size_t snap_s = ws, snap_e = we;
+    if (box_select_snap_sentence(s_text, s_text_len, page_start, page_end, ws, we, dir,
+                                 &snap_s, &snap_e)) {
+        ws = snap_s;
+        we = snap_e;
+    }
+    const bool took = box_select_tap(&s_boxsel, ws, we, ctx->now_ms);
+    ESP_LOGI(TAG, "boxsel: tap (%d,%d) page=%u word=[%u,%u) state=%d -> %s",
+             (int)ev->x0, (int)ev->y0, (unsigned)s_page, (unsigned)ws, (unsigned)we,
+             (int)s_boxsel.state, took ? "ok" : "ignored");
+    if (!took) return APP_REDRAW_NONE;
+    book_layout_set_invert_range(s_boxsel.off_start, s_boxsel.off_end);
+    return APP_REDRAW_PAGE;
+}
+
+static void boxsel_draw(uint8_t* fb) {
+    if (!boxsel_active()) return;
+    const EpdRect bar = boxsel_bar_rect();
+    ui_fill_rect_fast(bar, UI_GRAY_WHITE, fb);
+    ui_draw_separator(fb, bar.y, bar.x, bar.width, 0x38);
+    if (!box_select_ready(&s_boxsel)) {
+        const char* hint = s_boxsel.state == BOX_STATE_ARM ? "框选：点首字" : "再点尾字";
+        ui_text_vc(fb, bar.x + bar.width / 2, bar.y + bar.height / 2, 22, hint,
+                   EPD_DRAW_ALIGN_CENTER, false);
+        return;
+    }
+    static const char* labels[3] = {"存摘抄", "AI解析", "取消"};
+    for (int i = 0; i < 3; ++i) {
+        const EpdRect r = boxsel_button_rect(i);
+        const bool greyed = (i == 1) && !excerpt_ai_enabled();
+        // 置灰 = 边框与字一起浅下去（0x38 实心边框 + 黑字 → 0x90 边框 + 0x90 字）。
+        // Greying dims border and ink together, so the key reads as "there, but not pressable".
+        ui_draw_round_rect(fb, r, 10, greyed ? UI_GRAY_LIGHT : 0x38);
+        if (greyed)
+            ui_text_gray_vc(fb, r.x + r.width / 2, r.y + r.height / 2, 20, labels[i],
+                            EPD_DRAW_ALIGN_CENTER, UI_GRAY_LIGHT);
+        else
+            ui_text_vc(fb, r.x + r.width / 2, r.y + r.height / 2, 20, labels[i],
+                       EPD_DRAW_ALIGN_CENTER, false);
+    }
+}
+
+// 退出统一收口：任务边界（离页、丢卡、锁屏）+ 视图/页码漂移都回到这里。
+// One exit sink: task boundaries (leaving the page, media loss, lock) and any view or page
+// drift all land here.
+static void boxsel_boundary_reset(void) {
+    // 没有例外：连清场也要报名字，否则日志里又出现一笔「不知道为什么没选中了」。
+    // No exceptions: even a boundary clear names itself, or the log gains another
+    // "the selection vanished for no recorded reason".
+    if (s_boxsel.state != BOX_STATE_OFF) (void)boxsel_exit(BOXSEL_EXIT_BOUNDARY);
+}
+
+// 框选态要求**单指优先**（26.9.12 P1-1 的 B 方案，26.9.13 升成策略位）：这里两次
+// 精确点按是唯一输入，双指一旦把单指饿死就等于「点了没反应」，要等 30 s 超时才恢复；
+// 代价是双指落定那一瞬可能误选一个字，而双指会立刻退出框选，再点一次就纠正得回来。
+// 这个取舍已由审计裁定接受：**点不出来（卡死 30 s）的伤害远大于点错一个字**。
+// 26.9.13 起这一个位**同时**管住另一半：单指识别器遇 count>1 也不再取消 TAP
+// （见 ui_gesture_feed）。26.9.12 只接线了前半，于是按下与抬起之间插进一帧幻点，
+// 这次点按照样作废——用户说的「十次里有一两次没反应」就是那半条。
+// The box-selection mode requires **single-finger priority** (26.9.12 P1-1 plan B,
+// raised to a policy bit in 26.9.13): two precise taps are the only input here, and a
+// dual session swallowing the single finger reads as "taps do nothing" until the 30 s
+// timeout. The cost is one stray glyph the instant a pair lands - and a landed pair
+// exits the mode at once, so one more tap corrects it. Adjudicated and accepted:
+// **failing to respond for 30 s hurts far more than picking the wrong glyph once**.
+// Since 26.9.13 the same bit governs the other half as well: the single-finger
+// recognizer no longer cancels a TAP on count>1 (see ui_gesture_feed). 26.9.12 wired
+// only the first half, so a single phantom two-contact frame between press and release
+// still voided the tap - the "one in ten does nothing" the user reported.
+static bool boxsel_single_finger_priority(app_ctx_t* ctx) {
+    (void)ctx;
+    return boxsel_active();
+}
+
 static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
+    // 框选态独占输入（不变量 1）：单指只走框选，翻页/换页/点词一律到不了下面。
+    // The mode owns input (invariant 1): the single finger goes to the selection and
+    // never reaches page turns, panel switches or word lookup below.
+    if (boxsel_active()) return boxsel_touch(ctx, ev);
     // M2 Step9 铁律①：详解态手势语义隔离——沿用阅读翻页方向映射（左右/上下
     // 滑按设置）翻详解页，首/末页停滞不退出；点击/长按/其他手势不穿透到原书
     // （点词、工具栏、导航、设置滑杆在覆盖层下全部不可达）。
@@ -7638,11 +10111,27 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
                                                      app_settings_reader_vertical_turn());
         if (direction) {
             ctx->user_activity = true;
-            return ai_reader_turn(direction);
+            return reader_ai_turn(direction);
+        }
+        // M3-B：情景卡的「存生词 ›」是覆盖层上唯一可点的区域；其余点击/长按一律
+        // 不穿透（铁律①不变）。详解态没有 chip，矩形为零，这里自然不命中。
+        // M3-B: the scene card's "save word" chip is the ONLY tappable spot on the
+        // overlay; every other tap or long press still falls nowhere (law 1 intact).
+        // The detail view has no chip, so its rect is zero and never hits.
+        if (ev->type == UI_GESTURE_TAP && ai_reader_mode() == AI_READER_MODE_SCENE) {
+            const EpdRect chip = ai_reader_scene_save_rect();
+            if (chip.width > 0 && ui_rect_hit(chip, ev->x0, ev->y0)) return scene_save();
         }
         return APP_REDRAW_NONE;
     }
-    if (s_view==SHELF && (s_category_menu || ui_rect_hit((EpdRect){24,79,388,74},ev->x0,ev->y0)))
+    // 26.11.3：感应区收口到 shelf_category_tap_rect()（右界 333 零重叠），再加一层
+    // 按钮优先守卫——几何被别人改坏时，点击按钮也绝不落进分类手势。注意是收窄
+    // 条件让事件继续往下流到 action_at，不是在这里 return NONE（那会把点击吃掉）。
+    // 26.11.3: the sensing rect is named and stops at 333, plus a button-first guard so a
+    // future geometry edit cannot hand button taps to the dropdown. Narrowing the
+    // condition (not returning NONE) keeps the tap flowing to action_at.
+    if (s_view==SHELF && (s_category_menu ||
+        (ui_rect_hit(shelf_category_tap_rect(),ev->x0,ev->y0) && !shelf_header_button_hit(ev->x0,ev->y0))))
         return shelf_category_gesture(ctx,ev);
     if (s_view == READING && (s_reader_panel == READER_PANEL_BACKGROUND ||
         s_reader_panel == READER_PANEL_BACKGROUND_PREVIEW) &&
@@ -7827,7 +10316,21 @@ static app_redraw_t reader_key_action(app_ctx_t *ctx, app_reader_key_action_t ac
         default: return APP_REDRAW_NONE;
     }
 }
+static app_redraw_t on_key_impl(app_ctx_t* ctx, int key);
+// 框选态按键：先退出，再照常执行原键义（E5）；键本身不改页面时补一次重绘，
+// 免得反色留在屏上。
+// A key in the selection mode exits first and then does its usual job (E5); when the
+// key changes nothing we repaint once so no inverse band is left on screen.
 static app_redraw_t on_key(app_ctx_t* ctx, int key) {
+    if (boxsel_active()) {
+        const bool left = boxsel_exit(BOXSEL_EXIT_KEY) == APP_REDRAW_PAGE;
+        (void)left;
+        const app_redraw_t r = on_key_impl(ctx, key);
+        return r == APP_REDRAW_NONE ? APP_REDRAW_PAGE : r;
+    }
+    return on_key_impl(ctx, key);
+}
+static app_redraw_t on_key_impl(app_ctx_t* ctx, int key) {
     s_reader_tap.pending = false;
     s_pressed_control = -1;
     // M2 Step9 铁律①：详解会话期按键语义全隔离——KEY1/3 翻详解页（首/末页
@@ -7839,7 +10342,7 @@ static app_redraw_t on_key(app_ctx_t* ctx, int key) {
     // and settings panels are unreachable under the overlay.
     if (s_view == READING && ai_reader_active()) {
         if (key == UI_KEY_1 || key == UI_KEY_3) {
-            return ai_reader_turn(key == UI_KEY_1 ? -1 : 1);
+            return reader_ai_turn(key == UI_KEY_1 ? -1 : 1);
         }
         if (key == UI_KEY_2) return ai_reader_close_full();
         return APP_REDRAW_NONE;
@@ -7900,7 +10403,7 @@ static app_redraw_t on_power_short(app_ctx_t* ctx) {
     // path - pressed means pressed, never an exit).
     if (s_view == READING && ai_reader_active()) {
         if (!app_settings_reader_power_turn()) return APP_REDRAW_NONE;
-        app_redraw_t result = ai_reader_turn(1);
+        app_redraw_t result = reader_ai_turn(1);
         return result == APP_REDRAW_NONE ? APP_REDRAW_DONE : result;
     }
     if (s_view != READING || !s_text || s_clear_confirm ||
@@ -7909,7 +10412,20 @@ static app_redraw_t on_power_short(app_ctx_t* ctx) {
     app_redraw_t result = turn_page(ctx, 1);
     return result == APP_REDRAW_NONE ? APP_REDRAW_DONE : result;
 }
+static app_redraw_t on_key_long_impl(app_ctx_t* ctx, int key);
+// 框选态按键：先退出，再照常执行原键义（E5）；键本身不改页面时补一次重绘，
+// 免得反色留在屏上。
+// A key in the selection mode exits first and then does its usual job (E5); when the
+// key changes nothing we repaint once so no inverse band is left on screen.
 static app_redraw_t on_key_long(app_ctx_t* ctx, int key) {
+    if (boxsel_active()) {
+        (void)boxsel_exit(BOXSEL_EXIT_KEY_LONG);
+        const app_redraw_t r = on_key_long_impl(ctx, key);
+        return r == APP_REDRAW_NONE ? APP_REDRAW_PAGE : r;
+    }
+    return on_key_long_impl(ctx, key);
+}
+static app_redraw_t on_key_long_impl(app_ctx_t* ctx, int key) {
     s_reader_tap.pending = false;
     // M2 Step9 铁律①：详解态长按 KEY2 = 关闭详解回原书（不开工具栏、不返回
     // 主页——覆盖层只有一个出口）。其余长按忽略。/ M2 Step9 law 1: in a
@@ -7996,6 +10512,9 @@ static bool tts_page_range(size_t *start, size_t *end) {
     if (s_view != READING || !s_text || !s_text_len) return false;
     size_t left = 0, right = SIZE_MAX;
     reader_logical_pages(reader_visual_index(s_page), &left, &right);
+    /* 伴读态（R0 ⑤⑦）：reader_logical_pages 显式把 right 钉成 SIZE_MAX，
+       after = left + 1，区间恒为主栏当前逻辑页——页文本上行天然只取左 70% 主栏，
+       零分支、零新增拷贝（关态逐位不变）。 */
     const size_t begin = book_layout_page_start_offset(left);
     const size_t after = (right != SIZE_MAX ? right : left) + 1;
     size_t stop = after < book_layout_page_count() ? book_layout_page_start_offset(after)
@@ -8032,11 +10551,22 @@ static void tts_follow_poll(void) {
     // empty page couldn't air during the outage, so it is made up at reconnect.
     // Switch on falls through to the sentinel re-push below (current page first
     // push after reconnect), no empty page needed.
-    if (up && !s_tts_link_was_up && !tts_switch_on()) {
+    /* gen30 格 1：门槛改走 reader_tts_active() 单一判据（伴读态临时覆盖跟读开关）。
+       D2B 重连补发空页在伴读态必须跳过——伴读朗读归伴读管，重连不应把手机 TTS 静音；
+       关态（伴读未开）reader_tts_active() == tts_switch_on()，逐位不变。
+       gen30 ruling grid 1: the gate goes through the single reader_tts_active()
+       predicate. The D2B reconnect empty page is skipped in companion mode so a
+       reconnect never mutes the phone; off-state behaviour is bit-identical. */
+    if (up && !s_tts_link_was_up && !reader_tts_active()) {
         push_sink_tts_send_page("", 0);
     }
+    if (up && !s_tts_link_was_up) {
+        /* 修复轮解耦：重连时同步一次朗读使能位——手机端可能冷启（默认为开），
+           必须与设备侧开关对齐，否则「开关关着却开念」会复现。 */
+        (void)push_sink_tts_enable_send(tts_switch_on());
+    }
     s_tts_link_was_up = up;
-    if (!tts_switch_on() || s_view != READING || !s_text) return;
+    if (!reader_tts_active() || s_view != READING || !s_text) return;
     if (!up) return;
     if (s_chapter == s_tts_last_chapter && s_page == s_tts_last_page) return;
     char text[TTS_PAGE_TEXT_MAX];
@@ -8053,6 +10583,22 @@ static void tts_follow_poll(void) {
         s_tts_last_page = s_page;
         return;
     }
+    /* gen30 步 3 接线 3（翻页流）：0x1C PAGE_BEGIN 前置挂在全仓唯一 0x19 推送点上，
+       仅伴读态生效。对账基准先落再投递由组件层 push_sink_companion_page_begin() 完成
+       （同批清上一页未取回包），设备端只改调用侧；关态一字节不变。空页（n==0）不发
+       0x19，故也不发 0x1C，保证「0x1C+0x19」始终成对。0x19 失败时哨兵不动，下轮
+       同页重发，组件层清旧回包保证幂等。
+       gen30 step 3 item 3 (page stream): PAGE_BEGIN is prefixed onto the single 0x19
+       push point, companion only. The component drops the reconciliation base and
+       clears stale receipts in the same batch; the device side only changes the call
+       site. Off-state is byte-identical. An empty page (n==0) airs neither frame, so
+       PAGE_BEGIN+TTS_TEXT always travel as a pair. A failed 0x19 leaves the sentinel
+       untouched; the same page is re-aired next round, idempotent thanks to the
+       component clearing stale receipts. */
+    if (reader_companion_active()) {
+        const uint8_t mode = (uint8_t)(app_settings_companion_mode() % PUSH_RIDE_MODE_COUNT);
+        (void)push_sink_companion_page_begin((uint16_t)s_page, mode);
+    }
     if (push_sink_tts_send_page(text, n)) {
         s_tts_last_chapter = s_chapter;
         s_tts_last_page = s_page;
@@ -8061,7 +10607,178 @@ static void tts_follow_poll(void) {
     }
 }
 
+/* ---- gen30 伴读案 · 步 3 接线：进/出伴读动作 + TTS_DONE 消费（公主按板五格终局） ----
+ * 射程：产品码「谁在什么时机调用、按什么语义调用」。组件层 5 个 API 与方案 B 分派层
+ * 一字节不动；不动 s_sess / 广播 / 连接（格 2 终裁 A + 复用，延迟回收为已知边界）。
+ * Scope: product-side "who calls what, when, with which semantics". The component's
+ * five APIs and the plan-B dispatch layer stay untouched; s_sess / advertising /
+ * the connection are never torn down (ruling grid 2 plan A + reuse). */
+
+/* 接线 2：进伴读。横屏机械前置 → 置位 + reader_relayout() 同批原子 → 武装复用/开窗
+   → FAIR 闩锁 → 0x1B 初始广播(source=2)，随后本 tick 的 tts_follow_poll 发 0x1C+0x19。 */
+static void companion_enter(void) {
+    // 横屏机械前置：未开横屏只引导，不自动改设置（哨位裁定 §三格 1，尊重用户主动动作）。
+    // Landscape mechanical prerequisite: hint only, never auto-flip the setting.
+    if (!app_settings_reader_landscape()) {
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "请先开启横屏阅读");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        return;
+    }
+    if (reader_companion_active()) return;
+    // 同批原子：置位与重排连续完成，中间不渲染，不出现「置位先生效、重排后到」。
+    // One atomic batch: the state flip and the reflow run back-to-back with no frame
+    // in between; there is never a "state first, reflow later" intermediate state.
+    reader_companion_set(true);
+    if (!reader_relayout(body_rect())) {
+        // 失败回滚到关态并按旧几何重建（与 select_reading_font_item 同款体例）；
+        // 失步时既有切片宽守卫拒画亦为哨位裁定接受的可失败模式。
+        // Roll back on failure and rebuild at the old geometry (same shape as the
+        // font switch); a size-guard refusal is also an accepted failure mode.
+        reader_companion_set(false);
+        (void)reader_relayout(body_rect());
+        copy_text(s_reader_notice, sizeof(s_reader_notice), "伴读开启失败");
+        s_reader_notice_until = esp_timer_get_time() / 1000 + 2200;
+        return;
+    }
+    invalidate_prep();
+    // 格 2：已武装/已连接一律复用，未武装才开窗（PUSH_ENTRY_WINDOW_MS 同款 30 分钟）。
+    // Grid 2: reuse an armed/connected session; open the window only when unarmed.
+    if (!push_sink_armed()) (void)push_sink_arm(0, READER_COMPANION_ARM_WINDOW_MS);
+    // 格 3：FAIR 闩锁（组件层 conn_params_apply 抑制既有 session 驱动的 SLOW 回落）。
+    push_sink_companion_conn(true);
+    // 格 1：先发 0x1B 初始广播（source=2），再重置哨兵让本 tick 的轮询强制首推当前页。
+    // Grid 1: MODE_SET(init) first, then a sentinel reset forces the first page push.
+    const uint8_t mode = (uint8_t)(app_settings_companion_mode() % PUSH_RIDE_MODE_COUNT);
+    (void)push_sink_companion_mode_set(mode, PUSH_MODE_SRC_INIT);
+    /* 修复轮解耦：进伴读即同步一次朗读使能位。开关关着进伴读＝只看不听（摘要照常
+       生成、右栏照常更新）；开关开着＝边看边听。手机端只按这一位决定念不念，
+       页文本推送本身不再表达「念不念」的语义。 */
+    (void)push_sink_tts_enable_send(tts_switch_on());
+    s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+    s_companion_summary_has = false;   /* 步 4：进伴读从占位态起，不沿用上一会话摘要 */
+    s_companion_du_count = 0;
+}
+
+/* 接线 4：出伴读。四动作同批原子，顺序＝先停流后清档；不动 s_sess / 广播 / 连接。 */
+static void companion_exit(void) {
+    if (!reader_companion_active()) return;
+    // ① 停 0x1C 流 + 置位复位同批重排：置位为关后门槛失效，不再发 0x1C/0x19。
+    // Stop the stream + flip the state with one atomic reflow: the gate closes.
+    reader_companion_set(false);
+    if (!reader_relayout(body_rect())) {
+        // 失败回滚：保持伴读态，不发空页、不清档，避免「停了朗读却没退伴读」。
+        // 步 4 ④：清单轮「交互留滞」已知边界承接——补一句气泡反馈，不再静默留态。
+        reader_companion_set(true);
+        (void)reader_relayout(body_rect());
+        reader_notice_set("退出伴读失败 · 仍在伴读", 2200);
+        return;
+    }
+    invalidate_prep();
+    s_tts_last_chapter = s_tts_last_page = SIZE_MAX;
+    // ② 空页帧停手机 TTS（格 1 终裁，复用既有 0x19 len=0 静默语义）。
+    if (push_sink_link_up()) (void)push_sink_tts_send_page("", 0);
+    // ③ 清档：清 FAIR 闩锁 + 显式回 SLOW（组件层一次完成，格 2/格 3）。
+    push_sink_companion_conn(false);
+    s_companion_summary_has = false;   /* 步 4：出伴读清占位态与右栏 DU 计数 */
+    s_companion_du_count = 0;
+}
+
+/* 接线 6：TTS_DONE 按 NVS 设置消费（R0 拍板格 5 设备端自治，组件层不查询使能态）。
+   页号对账：组件层已按 PAGE_BEGIN 基准过滤，产品侧再核当前页——页面已翻走即丢弃。
+   仅 FINISHED 且 rd_companion_turn 开时自动翻页；ABORT/FAILED 与关态一律忽略。
+   Item 6: consume TTS_DONE from the NVS setting (device autonomy; the component
+   never queries the flag). The component already reconciled against PAGE_BEGIN;
+   the product re-checks the current page so a stale receipt is dropped. Only a
+   FINISHED receipt with auto-turn on advances one page; ABORT/FAILED and off are ignored. */
+static app_redraw_t companion_tts_done_poll(app_ctx_t* ctx) {
+    if (!reader_companion_active()) return APP_REDRAW_NONE;
+    uint16_t page_no = 0;
+    uint8_t status = 0;
+    if (!push_sink_take_companion_tts_done(&page_no, &status)) return APP_REDRAW_NONE;
+    if (page_no != (uint16_t)s_page) return APP_REDRAW_NONE;
+    if (!app_settings_companion_turn() || status != PUSH_TTS_DONE_FINISHED) return APP_REDRAW_NONE;
+    if (s_view != READING || !s_text || s_reader_panel != READER_PANEL_NONE) return APP_REDRAW_NONE;
+    return turn_page(ctx, 1);
+}
+
+/* 步 4 ①：SUMMARY 消费点 + 右栏区域刷新决策（R0 冻结件 2/3）。
+   组件层已按 PAGE_BEGIN 基准做页号对账，产品侧再核当前页（与 TTS_DONE 同款）；
+   取到的文本做 56 字码点硬截二次截断后落右栏缓冲。刷新走既有 s_area/s_mode +
+   APP_REDRAW_AREA 出口（同 excerpt_notice 范式：先整帧重画，再只推右栏区域）——
+   不改 present()，不触碰其翻页刷新主链与宿主守卫抽取面。冻结件 3 的计数与正文
+   s_du_count 完全独立；波形沿用 present() 通用出口，实际观感待真机十一格观察。
+   Step-4 SUMMARY consumption + right-column refresh decision; the DU counter is
+   deliberately independent of the body's s_du_count (R0 frozen item 3). */
+static app_redraw_t companion_summary_poll(app_ctx_t* ctx) {
+    if (!reader_companion_active() || s_view != READING || !s_text) return APP_REDRAW_NONE;
+    uint8_t mode = 0, idx = 0, total = 0;
+    uint16_t page_no = 0;
+    /* 769 B 不放栈：on_tick 链上已有重排与绘制调用，栈余量比这 0.5 KB 贵。
+       本函数只在主任务 on_tick 里跑，静态缓冲无重入。 */
+    static char raw[PUSH_SUMMARY_TOTAL_MAX + 1u];
+    if (!push_sink_take_companion_summary(&mode, &page_no, &idx, &total,
+                                          raw, sizeof(raw))) return APP_REDRAW_NONE;
+    (void)mode;
+    if (page_no != (uint16_t)s_page) return APP_REDRAW_NONE;
+    reader_companion_clip_cap(raw, s_companion_summary, sizeof(s_companion_summary));
+    s_companion_summary_idx = idx;
+    s_companion_summary_total = total;
+    s_companion_summary_has = true;
+    const bool gc16 = ++s_companion_du_count >= READER_COMPANION_GC16_EVERY;
+    if (gc16) s_companion_du_count = 0;
+    render(ctx, ctx->fb);
+    s_area = reader_column_rect(body_rect(), reader_column_count(), 1);
+    s_mode = gc16 ? MODE_GC16 : MODE_DU;
+    /* 修复轮 S2 低侵入插桩（23:18 裁定 §四，随修复件带上）：
+       打印右栏 DU 区域四元组与屏幕尺寸。故障三的三个待验证嫌疑之一是「右栏 DU
+       区域未做屏边界钳制」；若换书序列仍 panic，这行日志能直接证实/证伪越界，
+       省掉一轮专门刷插桩件的往返。低侵入：只在收到摘要时打一行，无分支改动。 */
+    /* 取证日志③（14:26 裁定 §二第 5 条）：补打 page_no，与 turn chapter/page
+       及手机侧「请求发起 page=」对齐，现场「前进三页退两页」据此逐页核对内容归属。 */
+    ESP_LOGI(TAG, "companion: summary page_no=%u idx=%u/%u gc16=%d len=%u area=(%d,%d %dx%d) scr=%dx%d",
+             (unsigned)page_no,
+             (unsigned)s_companion_summary_idx, (unsigned)s_companion_summary_total,
+             (int)gc16, (unsigned)strlen(s_companion_summary),
+             s_area.x, s_area.y, s_area.width, s_area.height,
+             epd_width(), epd_height());
+    return APP_REDRAW_AREA;
+}
+
 static app_redraw_t on_tick(app_ctx_t* ctx) {
+    /* gen30 步 3：本 tick 是否执行了进/出伴读同批原子动作——用于在本 tick 的
+       tts_follow_poll() 之后收口一次整页重绘，保证 0x1B 与 0x1C+0x19 仍同批发出。
+       gen30 step 3: whether this tick ran the atomic enter/exit batch; used to
+       close the tick with one full-page redraw AFTER the follow poll, so MODE_SET
+       and PAGE_BEGIN+TTS_TEXT still go out in the same batch. */
+    bool companion_batch = false;
+    // 框选超时 / 换页 / 换视图：三条路都收口到同一次复位（E4/E7）。
+    // Timeout, page drift and view drift all land in the same reset (E4/E7).
+    if (s_boxsel.state != BOX_STATE_OFF &&
+        (box_select_expired(&s_boxsel, ctx->now_ms) || s_view != READING ||
+         s_boxsel.page != s_page || !s_text)) {
+        return boxsel_exit(BOXSEL_EXIT_TIMEOUT);
+    }
+    // S26-2 家务片：一个循环片至多落一条摘抄（答辩书一.4：书架扫描永远插得进来）。
+    // 先写后亮：只有这里 f_sync 成功，页脚才许出现「已存 ✓」。
+    // S26-2 housekeeping slot: at most one excerpt per loop turn (answer one point four: the
+    // shelf scan always interleaves). Write first, tick second: only a successful f_sync
+    // here earns the footer its "saved" receipt.
+    if (excerpt_footer_tick(ctx)) return APP_REDRAW_AREA;
+    // M3-B：情景请求超时销号。等不到答案就撤——卡片由既有 pending 超时降级为
+    // 失败提示，这里只管 armed，杜绝「发了请求就永远在等」的僵尸态。
+    // M3-B: expire the scene request. No answer means disarm; the card degrades
+    // through the existing pending timeout, and this only owns `armed`, so a
+    // request can never sit waiting forever.
+    // 26.11.3-C2：日志不再打印常量。两条路径（词 16 s / 段落 90 s）各有窗口，
+    // 打印单一常量等于对其中一条撒谎；改报「哪条路径 + 到期时刻」。
+    // 26.11.3-C2: the log no longer prints the constant. Two paths have two windows
+    // (word 16 s, passage 90 s), so a single figure would lie about one of them; it
+    // reports the path and the expiry instant instead.
+    if (scene_req_expire(&s_scene_req, ctx->now_ms)) {
+        ESP_LOGW(TAG, "scene timeout: word=\"%s\" excerpt=%d deadline=%lldms",
+                 s_scene_req.word, (int)s_scene_req.excerpt,
+                 (long long)s_scene_req.deadline_ms);
+    }
     // gen18（18-a 自动切回）：读手机推来的虚拟书时，sink 在后台保活；手机宽限内
     // 直接再发（COOLDOWN→RECEIVING）时，自动切回传书页接客——它的泵现成，进度/状态/
     // 开书全走既有路径。用户零手动操作。
@@ -8132,6 +10849,20 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         invalidate_prep();
         return APP_REDRAW_PAGE;
     }
+    /* gen30 步 3：进/出伴读动作在 on_tick 执行（触摸回调只置 pending），置位与重排
+       同批原子。此处不 return——让本 tick 稍后的 tts_follow_poll() 把 0x1C+0x19 流
+       接在 companion_enter() 的 0x1B 之后，收口重绘放在轮询之后。
+       gen30 step 3: the atomic enter/exit batch runs here (touch callbacks only
+       set a pending flag). No return yet - this tick's follow poll must append
+       PAGE_BEGIN+TTS_TEXT after companion_enter()'s MODE_SET; the redraw follows
+       the poll. */
+    if (s_companion_enter_pending || s_companion_exit_pending) {
+        const bool enter = s_companion_enter_pending;
+        s_companion_enter_pending = s_companion_exit_pending = false;
+        companion_batch = true;
+        if (enter) companion_enter();
+        else companion_exit();
+    }
     // 字体开关留下的重排在这里做：触摸回调的栈太深，一章排下来会把主任务栈顶穿（实测溢出过）。
     // The font switch's re-typeset happens here: the touch callback runs too deep, and laying out a
     // chapter from there overran the main task stack (measured).
@@ -8157,7 +10888,22 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     // turn judgement: a turn that changed the page is picked up by the next
     // tick's poll (the sentinel compares (chapter,page)); this call only covers
     // the first push when the link or the switch just came up, plus resends.
+    /* gen30 步 3 接线 6：TTS_DONE 消费放在 0x19 轮询之前——若按 NVS 设置自动翻页，
+       本 tick 直接收口，新页由下一 tick 的哨兵自然首推，不会先推旧页再翻。
+       gen30 step 3 item 6: consume TTS_DONE before the 0x19 poll. If the NVS
+       setting drives an auto turn, this tick closes out and the new page gets its
+       first push from next tick's sentinel - the old page is never pushed first. */
+    {
+        const app_redraw_t done_redraw = companion_tts_done_poll(ctx);
+        if (done_redraw != APP_REDRAW_NONE) return done_redraw;
+    }
     tts_follow_poll();
+    // 进/出伴读的同批动作在 0x1B / 空页帧发出后收口一次整页重绘（70/30 版面可见）。
+    if (companion_batch) return APP_REDRAW_PAGE;
+    {
+        const app_redraw_t sum_redraw = companion_summary_poll(ctx);
+        if (sum_redraw != APP_REDRAW_NONE) return sum_redraw;
+    }
     track_ticket_stats(ctx);
     if (s_view == SEARCH || s_view == EDIT) {
         if (ctx->consumed) return APP_REDRAW_NONE;
@@ -8180,17 +10926,39 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             // M2 Step9 铁律①：BLE 遥控器翻页在详解态同样隔离——翻详解页，
             // 不到原书。/ M2 Step9 law 1: BLE remote turns are isolated too -
             // they turn detail pages, never the source book.
-            if (ai_reader_active()) return ai_reader_turn(ble_dir);
+            if (ai_reader_active()) return reader_ai_turn(ble_dir);
             return turn_page(ctx, ble_dir);
         }
     }
+    // 26.11.3-C2 等待期提示：到点且「整段请求仍挂着」才画。答案到了就销号
+    // （scene_req_claim 已 armed=false），这条自然不响——不用另写清理。
+    // 判据（复测卡）：等待期阅读可继续（只刷气泡区域，不重排正文）、卡到即弹、
+    // 无假死（90 s 内必有一边落地：答案或超时日志）。
+    // 26.11.3-C2 wait notice: paint only if the passage request is still armed when
+    // the timer fires. A delivered answer disarms it, so this simply never fires and
+    // needs no separate cleanup. Acceptance: reading stays usable (only the toast
+    // region refreshes, the body is not re-typeset), the card pops on arrival, and
+    // the wait never fakes life - within 90 s either the answer or the timeout lands.
+    if (s_ai_wait_notice_at_ms && ctx->now_ms >= s_ai_wait_notice_at_ms) {
+        s_ai_wait_notice_at_ms = 0;
+        if (s_view == READING && s_scene_req.armed && s_scene_req.excerpt) {
+            reader_notice_set("AI 解析中 · 最长约 1 分钟", 4000);
+            render(ctx, ctx->fb);
+            s_area = reader_notice_area();
+            s_mode = MODE_GL16;
+            return APP_REDRAW_AREA;
+        }
+    }
     if (s_reader_notice[0] && ctx->now_ms >= s_reader_notice_until) {
+        ESP_LOGI(TAG, "notice: hide \"%s\"", s_reader_notice); // B63：show/hide 两头留痕
         s_reader_notice[0] = 0;
         if (s_view == READING) {
             // 区域刷新不会自动重绘帧缓冲；先移除提示，再只更新提示所在区域。
             // Area refreshes do not rerender the framebuffer; erase the toast before updating its region.
+            // 几何与绘制处共用 reader_notice_area()：横屏下气泡中心随 ui_w() 移动，
+            // 旧硬编码 {208,150,268,68} 擦不到（26.11.1 toast 回执第 2 条）。
             render(ctx, ctx->fb);
-            s_area = (EpdRect){208, 150, 268, 68};
+            s_area = reader_notice_area();
             s_mode = MODE_GL16;
             return APP_REDRAW_AREA;
         }
@@ -8203,7 +10971,11 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     }
     app_redraw_t background = reader_background_tick();
     if (background != APP_REDRAW_NONE) return background;
-    if (s_scan_pending && ctx->now_ms - s_poll_ms >= 500) {
+    // 26.9.21：250 ms 而不是 500。挂载本身只要 0.36 s，剩下的全在等这一拍；
+    // 半秒的轮询把「秒出」卡在 0.9 s 的边缘上。`read_pico_sd_get_info()` 只读内存快照
+    // 加一次 CD 引脚采样，代价可以忽略。
+    // 26.9.21: 250 ms instead of 500. The mount takes 0.36 s; the rest was this poll.
+    if (s_scan_pending && ctx->now_ms - s_poll_ms >= 250) {
         s_poll_ms = ctx->now_ms;
         read_pico_sd_info_t info = {0};
         if (read_pico_sd_get_info(&info) == ESP_ERR_NOT_FINISHED) return APP_REDRAW_NONE;
@@ -8262,6 +11034,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     return clock;
 }
 static void before_lock(app_ctx_t* ctx) {
+    boxsel_boundary_reset();
     shelf_category_remember(ctx);
     s_category_menu=false;
     s_reader_tap.pending = false;
@@ -8281,16 +11054,27 @@ static bool main_page_visible(app_ctx_t* ctx) {
     (void)ctx;
     return s_view == SHELF && !s_clear_confirm && !s_batch_confirm;
 }
+// 状态栏电量差刷只认书架主视图。阅读页有自己的一分钟整条重绘，沉浸态根本没有
+// 状态栏——两条节拍同时开就会互相踩，所以这里一律 opt out。
+// Battery-area gate: shelf only. The reader already repaints the whole strip every
+// minute and hides it in immersive mode; two cadences on one strip step on each other.
+static int status_bar_bg(app_ctx_t* ctx) {
+    (void)ctx;
+    if (s_view != SHELF || s_clear_confirm || s_batch_confirm) return -1;
+    return app_settings_main_fast_refresh() ? 0xF0 : 0xE0;
+}
 
 const app_desc_t app_book = {
     .title = "图书 Books", .detail = "TF 卡 txt / epub 阅读", .enter_full = false, .owns_keys = true,
     .defer_middle_short = true,
     .menu_handle_enabled = menu_handle_enabled,
-    .main_page_visible = main_page_visible,
+    .main_page_visible = main_page_visible, .status_bar_bg = status_bar_bg,
     .render = render, .present = present, .on_enter = on_enter, .on_exit = book_on_exit,
     .on_media_lost = book_on_media_lost, .on_media_ready = book_on_media_ready,
     .on_before_lock = before_lock,
     .on_gesture = gesture_event, .on_key = on_key, .on_key_long = on_key_long,
-    .on_power_short = on_power_short,
+    .on_dual_gesture = dual_gesture_event,
+    .single_finger_priority = boxsel_single_finger_priority,
+    .on_power_short = on_power_short, .on_quick_box = boxsel_enter_cb,
     .on_tick = on_tick, .area_hint = area_hint,
 };

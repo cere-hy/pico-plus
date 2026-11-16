@@ -13,7 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "hyphen.h"
+#include "settings.h"
 #include "ttf_font.h"
+#include "../font/typography_switch.h"
+
+static const char *TAG __attribute__((unused)) = "book_layout";
 
 #define PAGE_MAX 4096u
 #define PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -469,6 +475,23 @@ static inline int justify_target_px(int line_width, int available, int rect_x, i
     if (hang > rect_x - 4) hang = rect_x - 4;
     return line_width > available ? available + hang : available;
 }
+// 一行的「实际着墨宽度」（相对行起点 x）。**绘制与反色底必须共用本函数**，否则两者
+// 必然错位：两端对齐会把文字拉伸到 available，反色底若仍按自然行宽 line_width 铺，
+// 就短掉一个拉伸量——一行二十来个字累积十几到几十像素，视觉上正是「右侧只盖住半个
+// 汉字」。反证同样干净：段末行不参与对齐，两个宽度恰好相等，所以它严丝合缝。
+// The line's real ink width (relative to the line origin). **Drawing and the inversion
+// box must share this function** or they drift apart by construction: justification
+// stretches the glyphs to `available`, so a fill sized to the natural line_width comes up
+// short by exactly the stretch - a dozen-plus pixels over a twenty-glyph line, which is
+// the user-visible "the right edge only covers half a character". The counter-proof is
+// just as clean: a paragraph's final line is not justified, both widths coincide, and it
+// is the one place the fill lined up.
+static inline int line_ink_width(bool heading, uint8_t align, bool final_line,
+                                 int line_width, int available, int rect_x, int line_px) {
+    return line_is_justified(heading, align, final_line, line_width, available)
+               ? justify_target_px(line_width, available, rect_x, line_px)
+               : line_width;
+}
 static inline int64_t advance_after_line(int64_t used, int line_height, bool paragraph_end,
                                          bool heading, int margin_after) {
     used += line_height;
@@ -522,6 +545,13 @@ static size_t visible_start(size_t off, size_t limit) {
 // use (0 vertically: a column has no bottom margin to hang into).
 // 行缓冲按实际UTF-8长度增长，包含零宽字符的长行仍可安全扩容；失败保留原指针。
 // Grow by actual UTF-8 line bytes, including long zero-width runs; failed growth keeps the old allocation.
+// 26.11.4：take_line 的按词断行要判「这一格是不是词内字符」，而 word_char 定义在
+// 文件后半（点词命中的那一套）。前置声明比把定义搬上来安全——搬动会连带它的注释与
+// 调用点，而这里只需要一个原型。
+// take_line's word wrapping needs to know whether a byte is word-internal; word_char
+// lives further down. A forward declaration is safer than moving the definition.
+static bool word_char(unsigned char c);
+
 static bool line_append(size_t at, const char *text, size_t bytes) {
     if (at > s_len || bytes > s_len - at) return false;
     size_t need = at + bytes + 1;
@@ -540,6 +570,42 @@ static bool line_append(size_t at, const char *text, size_t bytes) {
     s_line[at + bytes] = 0;
     return true;
 }
+// 一段文字在「同一行的字距规则」下的宽度：逐字取整后累加，第二个字起加字距。
+// 与 take_line 的累加完全同源（同一个 ttf_text_width_px、同一个 s_tracking_px），
+// 只用于断词时量「词首到断点」这一小段。
+// Width of a byte span under the row's own tracking rule, measured with the same
+// per-glyph call take_line uses; only ever called on the word being split.
+static uint32_t cp_before(size_t pos) {
+    if (pos == 0) return 0;
+    size_t start = pos - 1;
+    while (start > 0 && ((unsigned char)s_text[start] & 0xC0) == 0x80) --start;
+    const size_t n = codepoint_size(s_text + start, s_len - start);
+    return n ? codepoint_value(s_text + start, n) : 0;
+}
+
+static int span_width(size_t from, size_t to, size_t visible_off, int px) {
+    int w = 0;
+    // 段的第一个字要和**段前那个字**成对算 kern：调用方给的 word_start_width 正好止于
+    // 段首之前，所以那一对不能漏，否则断词判断会比实际窄 1–4 px。
+    // The span's first glyph must kern against the glyph before it: the caller's
+    // word_start_width stops just before, so that pair belongs to this span.
+    uint32_t prev = cp_before(from);
+    for (size_t i = from; i < to;) {
+        size_t n = codepoint_size(s_text + i, s_len - i);
+        if (!n) break;
+        char g[5];
+        memcpy(g, s_text + i, n);
+        g[n] = 0;
+        slot_select_for(i);
+        w += ttf_text_width_px(px, g) + (i > visible_off ? s_tracking_px : 0);
+        const uint32_t cp = codepoint_value(s_text + i, n);
+        if (prev) w += ttf_kern_px(px, prev, cp);
+        prev = cp;
+        i += n;
+    }
+    return w;
+}
+
 static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* next,
                       bool* paragraph_end, int* px, bool* heading,
                       int* line_width, int* indent, uint8_t* align,
@@ -598,6 +664,20 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
     int64_t width = 0;
     int64_t last_width = 0;
     int glyph_count = 0;
+    // 26.11.4 西文按词断行用的两个游标：当前词的起点（源码偏移）与该处已达的行宽。
+    // `word_start > visible_off` 才有退的余地；等于行首说明这个词比整行还长，只能硬切。
+    // 没有这两个游标就只能「断在哪算哪」，英文行尾会切在词中间（`informa-` / `tion`）。
+    // Two cursors for word-boundary wrapping: where the current word starts and the
+    // width already used there. Without them the break lands wherever the glyph budget
+    // runs out, which is how English lines end mid-word today.
+    size_t word_start = visible_off;
+    int64_t word_start_width = 0;
+    // 逐字累加必须带上「与上一字的 kern」，否则与 measure/绘制（[124] 三端共用一把尺）
+    // 差几个像素：行宽算得比画出来的窄，右缘就会溢出。
+    // Accumulate the kern against the previous glyph, or the row width measured here and the
+    // width painted by the font layer disagree — the right edge then overflows by a few pixels.
+    uint32_t prev_cp = 0;
+    bool line_has_space = false;
     s_line[0] = 0;
     *paragraph_end = false;
     while (end < limit && s_text[end] != '\r' && s_text[end] != '\n') {
@@ -614,10 +694,90 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
         // are untouched.
         slot_select_for(end);
         int64_t candidate = width + ttf_text_width_px(*px, glyph) +
+                            (prev_cp ? ttf_kern_px(*px, prev_cp, cp) : 0) +
                             (end > visible_off && !*heading ? s_tracking_px : 0);
         if (candidate < 0) return false;
         if (candidate > available) {
             if (end == visible_off) return false;
+            // [123] 先试音节断词：西文长词在行尾装不下时，在 Liang 断点上断开并补连字符。
+            // 这一刀同时承担两端对齐的「放弃前重排」——多断一个音节，行尾余量就少一截，
+            // 不至于逼出巨大的词间距。词必须是纯 ASCII 字母：表是 ASCII 的，混排词不猜。
+            // Syllable break first: it doubles as the re-layout that keeps justification from
+            // needing a huge word gap. Only pure-ASCII words are considered.
+            // 竖排不做英文断词：列内转 90° 的连字符是另一套字模与另一套规则，
+            // 本批（[123]）只负责横排正文。s_vertical 是布局期的权威开关。
+            // No hyphenation in vertical setting: a rotated hyphen is a different face and
+            // a different rule; [123] only covers horizontal body text.
+            // 经典态不断词：整块跳过，连 span_width 都不算。
+            // Classic mode skips hyphenation entirely — not just an empty point list:
+            // the block also costs a span_width sweep, which would be wasted work.
+            if (app_typography_enhanced() && !s_vertical && !*heading &&
+                word_char((unsigned char)s_text[end]) &&
+                word_char((unsigned char)s_text[end - 1])) {
+                size_t word_end = end;
+                while (word_end < limit && word_char((unsigned char)s_text[word_end])) ++word_end;
+                hyph_points_t pts;
+                if (word_end - word_start >= HYPH_LEFT_MIN + HYPH_RIGHT_MIN &&
+                    hyph_points(s_text + word_start, word_end - word_start, &pts)) {
+                    const int hyph_w = ttf_text_width_px(*px, "-") +
+                                       (word_start > visible_off ? s_tracking_px : 0);
+                    bool split = false;
+                    // 从最长的断点往下试：先装满行，再退回能装下的那个音节。
+                    // Try the longest split first: fill the line, then fall back one syllable.
+                    for (int k = (int)pts.count - 1; k >= 0 && !split; --k) {
+                        const size_t cut = word_start + pts.pos[k];
+                        if (cut <= word_start || cut >= end) continue;
+                        const uint32_t last_cp_before = cp_before(cut);
+                        const int need = word_start_width +
+                                         span_width(word_start, cut, visible_off, *px) + hyph_w +
+                                         (last_cp_before ? ttf_kern_px(*px, last_cp_before, '-') : 0);
+                        if (need > available) continue;
+                        if (!line_append(cut - visible_off, "-", 1)) return false;
+                        width = need;
+                        end = cut;
+                        split = true;
+                    }
+                    if (split) break; // 行已在音节处断开：跳出取字循环
+                                      // split landed: leave the glyph loop
+                }
+            }
+            // 26.11.4 西文按词断行（主刀）：断点落在**词中间**且本行已经装过空格时，
+            // 退到词首整词换行。三个条件缺一不可——
+            //   · 当前字是词内字符、且前一个字节也是（否则断点本来就落在词外）；
+            //   · 本行有空格可退（否则一个比行宽还长的词会退到死循环，必须保持硬切）；
+            //   · 词首不在行首（同上，`word_start == visible_off` 时无处可退）。
+            // 回退保留词前的空格在行尾：宽度因此是精确的（含那一个空格），下一行
+            // 从词首起排，行首不会多出空格——这正是「行首空格」那一项的病根。
+            // Word-boundary wrapping: back off to the word start when the break lands
+            // inside a word, the line already holds a space, and the word does not
+            // start the line. The space stays at the end of the line so the reported
+            // width stays exact and the next line begins at the word, never with a space.
+            if (word_char((unsigned char)s_text[end]) && end > visible_off &&
+                word_char((unsigned char)s_text[end - 1]) && line_has_space &&
+                word_start > visible_off && word_start < end) {
+                end = word_start;
+                s_line[end - visible_off] = 0;
+                width = word_start_width;
+                // 行尾空格没有墨，却会把两端对齐的目标吃掉一截——右边缘永远差一个空格。
+                // 从行缓冲与宽度里一起去掉（源码的 *next 不动，所以分页不变）。
+                // A trailing space carries no ink but eats part of the justification target;
+                // drop it from the buffer and the width, never from the source position.
+                // 经典态也不剔：这是 [123] 的第四块，off 必须是 [122] 全退，
+                // 只退三块会留下一个既不等于历史态、也不等于增强态的混搭态。
+                // Classic mode keeps the space too: off must equal the [122] state exactly.
+                if (app_typography_enhanced() && !s_vertical) { // 竖排不参与两端对齐，行尾空格不剔（列间断点靠它守恒）
+                    const int space_w = ttf_text_width_px(*px, " ");
+                    size_t keep = end;
+                    while (keep > visible_off && s_text[keep - 1] == ' ') {
+                        --keep;
+                        const uint32_t before_space = cp_before(keep);
+                        width -= space_w + ((!*heading && keep > visible_off) ? s_tracking_px : 0) +
+                                 (before_space ? ttf_kern_px(*px, before_space, ' ') : 0);
+                    }
+                    s_line[keep - visible_off] = 0;
+                }
+                break;
+            }
             // 优先让行尾正文对齐，再允许右标点小幅悬挂到留白；超出安全宽度才回退前一字。
             // Align the text edge first, hang a closing mark slightly into the margin, then roll back only if needed.
             if (prohibited_line_start(cp)) {
@@ -669,8 +829,19 @@ static bool take_line(size_t off, int advance_limit, int hang_margin, size_t* ne
         ++glyph_count;
         last_start = end;
         last_cp = cp;
+        prev_cp = cp;
+        if (cp == ' ') line_has_space = true;
         if (!line_append(end - visible_off, glyph, n)) return false;
         end += n;
+        // 词首游标：当前字是词内字符、而它的前一个字节不是——这一格就是词的起点，
+        // 此刻的 width 正好是「到词首为止」的宽度，退回来时直接用它。
+        // Word-start cursor: this glyph begins a word, and `width` is already the exact
+        // width up to that point, so backing off needs no recomputation.
+        if (word_char((unsigned char)s_text[end - 1]) &&
+            (end == visible_off + n || !word_char((unsigned char)s_text[end - n - 1]))) {
+            word_start = end - n;
+            word_start_width = last_width;
+        }
     }
     line_runs_build(block, visible_off, end);
     *line_width = (int)width;
@@ -1035,53 +1206,33 @@ static size_t hit_line_source_offset(size_t off, const char* line) {
     return off;
 }
 
-// 与 ttf_font.c 的 cjk_spacing_point 相同的判定；改那边时这里要同步。
-// Mirrors cjk_spacing_point in ttf_font.c; keep the two in step.
-static bool hit_cjk_point(uint32_t cp) {
-    return (cp >= 0x2e80 && cp <= 0xffef) || (cp >= 0x2018 && cp <= 0x201d);
-}
-
 // 复刻 ttf_draw_text_px_fitted 的字距分配；齐行中英混排时「点击到的字」才是「看到的字」。
-// Mirrors the fitted renderer's gap adjustments so the tapped glyph is the drawn glyph.
+// 26.11.13 起不再复刻：直接调 ttf_font.h 的 ttf_justify_plan——绘制与命中同一份计划，
+// 两边各写一遍正是「点到的字不是看到的字」的来源。
+// No longer a re-implementation: both drawing and hit-testing call ttf_justify_plan.
 typedef struct {
-    int tracking, quotient, remainder, adjusted;
+    int tracking, step, remainder, adjusted;
     bool fitted, compress;
 } hit_line_fit_t;
 
-static void hit_line_fit_init(hit_line_fit_t* f, const char* line, int natural, int target, int tracking) {
+static void hit_line_fit_init(hit_line_fit_t* f, const char* line, int natural, int target,
+                              int tracking, int px) {
+    ttf_justify_t plan;
+    ttf_justify_plan(line, natural, target, px, &plan);
     f->tracking = tracking;
-    f->quotient = f->remainder = f->adjusted = 0;
-    f->fitted = false;
-    f->compress = false;
-    if (target <= 0) return;
-    int glyph_count = 0, cjk_gaps = 0;
-    uint32_t previous = 0;
-    for (size_t pos = 0; line[pos];) {
-        size_t n = codepoint_size(line + pos, strlen(line + pos));
-        if (!n) break;
-        uint32_t cp = codepoint_value(line + pos, n);
-        if (glyph_count && (hit_cjk_point(previous) || hit_cjk_point(cp))) ++cjk_gaps;
-        previous = cp;
-        ++glyph_count;
-        pos += n;
-    }
-    int gaps = glyph_count - 1;
-    int delta = target - natural;
-    f->compress = delta < 0;
-    int adjustable = f->compress ? gaps : cjk_gaps;
-    if (adjustable < 2 || (f->compress && -delta > adjustable * 3) ||
-        (!f->compress && delta > adjustable * 12)) return; // 与绘制一样回退到自然字距。
-    f->fitted = true;
-    f->quotient = delta / adjustable;
-    f->remainder = delta % adjustable;
+    f->step = plan.step;
+    f->remainder = plan.remainder;
+    f->adjusted = 0;
+    f->fitted = plan.fitted;
+    f->compress = plan.compress;
 }
 
 static int hit_line_fit_step(hit_line_fit_t* f, uint32_t cp, uint32_t next, bool has_next) {
     if (!has_next) return 0;
     if (!f->fitted) return f->tracking;
     int extra = f->tracking;
-    if (f->compress || hit_cjk_point(cp) || hit_cjk_point(next)) {
-        int step = f->quotient;
+    if (f->compress || ttf_justify_gap(cp, next)) {
+        int step = f->step;
         if (f->remainder > 0 && f->adjusted < f->remainder) ++step;
         if (f->remainder < 0 && f->adjusted < -f->remainder) --step;
         extra += step;
@@ -1156,7 +1307,7 @@ bool book_layout_hit_test(size_t page, int x, int y, size_t* word_start, size_t*
             int target = 0;
             if (justify) target = justify_target_px(line_width, available, s_rect.x, line_px);
             hit_line_fit_t fit;
-            hit_line_fit_init(&fit, s_line, line_width, target, heading ? 0 : s_tracking_px);
+            hit_line_fit_init(&fit, s_line, line_width, target, heading ? 0 : s_tracking_px, line_px);
             size_t pos = 0, last_pos = 0, last_len = 0;
             int cx = x0;
             while (s_line[pos]) {
@@ -1177,8 +1328,12 @@ bool book_layout_hit_test(size_t page, int x, int y, size_t* word_start, size_t*
                 cx += gw;
                 if (s_line[pos + n]) {
                     size_t nnext = codepoint_size(s_line + pos + n, strlen(s_line + pos + n));
-                    cx += hit_line_fit_step(&fit, codepoint_value(s_line + pos, n),
-                                            codepoint_value(s_line + pos + n, nnext), true);
+                    const uint32_t cp_here = codepoint_value(s_line + pos, n);
+                    const uint32_t cp_next = codepoint_value(s_line + pos + n, nnext);
+                    // 字距也是笔位的一部分：漏了它，点词命中会整体偏几像素。
+                    // Kerning moves the pen too; skipping it shifts hit-testing by a few pixels.
+                    cx += ttf_kern_px(line_px, cp_here, cp_next);
+                    cx += hit_line_fit_step(&fit, cp_here, cp_next, true);
                 }
                 pos += n;
             }
@@ -1208,6 +1363,46 @@ bool book_layout_hit_test(size_t page, int x, int y, size_t* word_start, size_t*
     return true;
 }
 
+// ---- 框选反色（M5-A）：只在 draw_page 的那一次游走里生效，没有第二份行几何。----
+// Box-selection inversion (M5-A): applied inside draw_page's single walk, so there is no
+// second copy of the line geometry to drift.
+static size_t s_inv_a, s_inv_b;
+static bool s_inv_on;
+static bool s_inv_dirty_any;
+static EpdRect s_inv_dirty;
+
+void book_layout_set_invert_range(size_t off_a, size_t off_b) {
+    s_inv_a = off_a;
+    s_inv_b = off_b;
+    s_inv_on = off_b > off_a;
+    s_inv_dirty_any = false;
+    s_inv_dirty = (EpdRect){0, 0, 0, 0};
+}
+
+bool book_layout_take_invert_dirty(EpdRect* out) {
+    if (!out || !s_inv_dirty_any) return false;
+    *out = s_inv_dirty;
+    s_inv_dirty_any = false;
+    s_inv_dirty = (EpdRect){0, 0, 0, 0};
+    return true;
+}
+
+static void inv_dirty_add(EpdRect r) {
+    if (r.width <= 0 || r.height <= 0) return;
+    if (!s_inv_dirty_any) {
+        s_inv_dirty = r;
+        s_inv_dirty_any = true;
+        return;
+    }
+    int x0 = r.x < s_inv_dirty.x ? r.x : s_inv_dirty.x;
+    int y0 = r.y < s_inv_dirty.y ? r.y : s_inv_dirty.y;
+    int x1 = r.x + r.width > s_inv_dirty.x + s_inv_dirty.width
+                 ? r.x + r.width : s_inv_dirty.x + s_inv_dirty.width;
+    int y1 = r.y + r.height > s_inv_dirty.y + s_inv_dirty.height
+                 ? r.y + r.height : s_inv_dirty.y + s_inv_dirty.height;
+    s_inv_dirty = (EpdRect){x0, y0, x1 - x0, y1 - y0};
+}
+
 void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px) {
     if (!fb || page >= s_count || px != s_px || rect.width != s_rect.width ||
         rect.height != s_rect.height || rect.x < 0 || rect.y < 0 ||
@@ -1219,6 +1414,9 @@ void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px) {
     // text lays out alongside it.
     if (book_layout_page_image(page) >= 0 && book_layout_page_image_count(page) == 0) return;
     if (s_vertical) { draw_vertical_page(fb, page, rect); return; }
+    // 每页重新计数：seg 只统计本页落墨的英文词段（取证暗号 bionic=on cov=50% seg=N）。
+    // Restart the counter per page; seg counts only this page's bold English segments.
+    if (!s_idle_draw || !s_idle_draw->started) ttf_bionic_reset();
     size_t off = s_pages[page];
     size_t end = page + 1 < s_count ? s_pages[page + 1] : s_len;
     int64_t used = page == 0 ? s_lead_height : 0;
@@ -1274,30 +1472,61 @@ void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px) {
             // starts in and keep the line from floating.
             slot_select_for(off);
             int x = line_origin_x(rect.x, indent, available, line_width, align);
-            int baseline = rect.y + (int)used + ttf_ascender_px(line_px);
             const blk_t *line_block = block_at(off);
             bool final_line = line_is_final(paragraph_end, next, line_block);
+            // 着墨宽度：两端对齐后的真实右边界，绘制与反色底共用这一个值（line_ink_width）。
+            // 历史注释说「行框用 line_width，行尾留白不涂黑」——那句话在正文行上从来不成立，
+            // 因为正文行会被 justify 撑满 available，所谓留白并不存在；只有段末行真的留白，
+            // 而段末行不参与对齐、两个宽度本来就相等。26.9.12 起统一按着墨宽度铺底。
+            // The ink width: the true right edge after justification, shared by the glyph run
+            // and the inversion fill (line_ink_width). The old note claimed the box used
+            // line_width so "trailing slack stays uninked" - that was never true for a body
+            // line, which justification stretches to `available`; only a paragraph's final
+            // line really has slack, and it is not justified, so the two widths already
+            // coincide there. Since 26.9.12 both sides use the ink width.
+            const int ink = line_ink_width(heading, align, final_line, line_width, available,
+                                           s_rect.x, line_px);
+            // 反色判定与 hit_test 用同一个 base（hit_line_source_offset），因此「点了哪一行」
+            // 与「反色了哪一行」不可能分歧。
+            // The inversion test shares hit_test's base (hit_line_source_offset), so the line
+            // that was tapped and the line that inverts cannot disagree.
+            bool inv = false;
+            if (s_inv_on) {
+                size_t base = hit_line_source_offset(off, s_line);
+                inv = base < s_inv_b && base + strlen(s_line) > s_inv_a;
+            }
+            if (inv) {
+                EpdRect line_rect = {x, rect.y + (int)used, ink, line_height};
+                epd_fill_rect(line_rect, 0, fb);
+                inv_dirty_add(line_rect);
+            }
+            const uint8_t fg = inv ? 15 : 0;
+            const uint8_t bg = inv ? 0 : 15;
+            int baseline = rect.y + (int)used + ttf_ascender_px(line_px);
             // 绘制按 run 换字体：行宽、字距、两端对齐的算法一个字没动，只有取字形的槽跟着走。
             // Drawing follows the runs: width, tracking and justification math are untouched,
             // only the slot each glyph comes from changes.
             ttf_draw_set_runs(s_line_run_count ? s_line_runs : NULL, s_line_run_count);
+            // 仿生阅读只在这一行落墨期间打开：伪加粗不改 advance，行宽/断行/字距全不受影响。
+            // Bionic reading is on only while this line paints; the faux bold never moves an
+            // advance, so width, breaking and tracking are untouched.
+            ttf_draw_set_bionic(app_settings_bionic());
             if (line_is_justified(heading, align, final_line, line_width, available)) {
-                // 悬挂余量取建版矩形 s_rect：度量(take_line)与绘制必须读同一个源——r90 原貌、
-                // r91 内联版都这么写。绘制矩形 rect 目前与 s_rect 恒等，双栏落地后才会分岔。
-                // The hang reads the build rect s_rect: measurement (take_line) and drawing must
-                // read the same source — both the r90 original and r91's inline copy do. The draw
-                // rect equals s_rect today and only diverges once two columns land.
-                int target = justify_target_px(line_width, available, s_rect.x, line_px);
+                // 目标宽度取自 line_ink_width，与上面的反色矩形同源——两处各算一遍正是
+                // 26.9.11 那次「右边少盖半个字」的成因。
+                // The target comes from line_ink_width, the same value the inversion rect used:
+                // computing it twice is exactly what produced 26.9.11's half-glyph gap.
                 ttf_draw_text_px_fitted(fb, x, baseline, line_px, s_line, s_tracking_px,
-                                        target, 0, 15);
+                                        ink, fg, bg);
             } else if (s_tracking_px && !heading)
-                ttf_draw_text_px_spaced(fb, x, baseline, line_px, s_line, s_tracking_px, 0, 15);
+                ttf_draw_text_px_spaced(fb, x, baseline, line_px, s_line, s_tracking_px, fg, bg);
             else
-                ttf_draw_text_px(fb, x, baseline, line_px, s_line, EPD_DRAW_ALIGN_LEFT, 0, 15);
+                ttf_draw_text_px(fb, x, baseline, line_px, s_line, EPD_DRAW_ALIGN_LEFT, fg, bg);
             // 画完把游标还回去：页面其它文字、界面和状态栏都按系统字体走。
             // Hand the cursor back: every other page, the UI and the status bar use the system
             // face.
             ttf_draw_set_runs(NULL, 0);
+            ttf_draw_set_bionic(false);
             ttf_font_select(TTF_FONT_SLOT_SYSTEM);
         }
         used = advance_after_line(used, line_height, paragraph_end, heading, margin_after);
@@ -1308,6 +1537,10 @@ void book_layout_draw_page(uint8_t* fb, size_t page, EpdRect rect, int px) {
             return;
         }
     }
+    // 整页落墨完成才出一行暗号：seg = 本页加粗段数（十一格点核法沿用）。
+    // Emit the marker only when the whole page is inked: seg = bold segments this page.
+    if (app_settings_bionic())
+        ESP_LOGI(TAG, "bionic=on cov=50%% seg=%d", ttf_bionic_segments());
 }
 
 int book_layout_draw_slice(uint8_t *fb,size_t page,EpdRect rect,int px,book_layout_draw_cursor_t *cursor) {

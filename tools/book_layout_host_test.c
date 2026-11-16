@@ -194,6 +194,44 @@ int main(void) {
     assert(!book_layout_build(many, 4097, r, 10));
     assert(book_layout_page_count() == 0);
     free(many);
+    // ---- 31b 第 2 条 B′：字节偏移锚点的往返性（2026-11-01）------------------
+    // 拔卡后字面从卡上换成内置，页表整张重排。B′ 承诺的「不跳章、不跳文本位置」
+    // 全靠这一条：旧页起点的**字节偏移** off，在新版面里必须落进某一页 q，且
+    // q 的起点不超过 off、q 的下一页起点严格大于 off ——off 这个字节没有被丢掉，
+    // 也没有被后一页抢走。
+    // 这里换的是版面高度（模拟换字面后每页容纳的字节数变化），文字串逐字节不变。
+    // B' byte-offset anchor: the page table is rebuilt when the face changes, so the one
+    // thing that must survive is the offset itself. Whatever page q contains off must
+    // start at or before it and end strictly after it - the byte is neither lost nor
+    // stolen by the following page.
+    {
+        enum { ANCHOR_TOTAL = 1200 };
+        static char anchor_text[ANCHOR_TOTAL];
+        const size_t anchor_len = (ANCHOR_TOTAL - 1) / 3 * 3;   // 整字对齐，不留半个 UTF-8
+        for (size_t i = 0; i + 3 <= anchor_len; i += 3) memcpy(anchor_text + i, "甲", 3);
+        anchor_text[anchor_len] = 0;
+        const EpdRect wide = {0, 0, 20, 30};
+        assert(book_layout_build(anchor_text, anchor_len, wide, 10));
+        const size_t old_pages = book_layout_page_count();
+        assert(old_pages > 4);
+        const size_t probes[3] = {0, old_pages / 2, old_pages - 2};
+        for (int k = 0; k < 3; ++k) {
+            const size_t off = book_layout_page_start_offset(probes[k]);
+            assert(off < anchor_len);
+            // 换字面：同样的文字，每页能装的字节数变了。
+            const EpdRect tall = {0, 0, 20, 15};
+            assert(book_layout_build(anchor_text, anchor_len, tall, 10));
+            const size_t new_pages = book_layout_page_count();
+            assert(new_pages != old_pages);
+            const size_t q = book_layout_page_for_offset(off);
+            assert(q < new_pages);
+            assert(book_layout_page_start_offset(q) <= off);
+            if (q + 1 < new_pages) assert(book_layout_page_start_offset(q + 1) > off);
+            // 回到原版面，三段探测互不影响。
+            assert(book_layout_build(anchor_text, anchor_len, wide, 10));
+            assert(book_layout_page_count() == old_pages);
+        }
+    }
     assert(book_layout_build("a\r\n\r\nb", 6, (EpdRect){0,0,20,100}, 10));
     drawn[0] = 0;
     book_layout_draw_page(&fb, 0, (EpdRect){0,0,20,100}, 10);
@@ -907,3 +945,9 @@ int main(void) {
     test_heap_fail_after=-1;test_zero_width=false;book_layout_free();
     puts("book_layout_host_test: PASS; idle rows/columns equal full rendering, stale cursor rejected and large chapter supported");
 }
+
+// 替身字体没有 GPOS kern：返回 0 就是 [124] 细则 1 的静默降级路径。
+int ttf_kern_px(int px, uint32_t a, uint32_t b) { (void)px; (void)a; (void)b; return 0; }
+bool app_typography_enhanced(void) { return true; }
+bool app_settings_bionic(void) { return false; }  /* 宿主替身：仿生阅读关闭（默认态） */  /* 宿主替身：增强态（排版开关批的默认态） */
+

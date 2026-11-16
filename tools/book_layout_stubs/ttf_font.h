@@ -5,6 +5,9 @@
  * 冻结：仅供测试。/ Frozen: Tests only.
  */
 #pragma once
+/* 与真实头共用同一份对齐计划（单源；桩头不许把规则抄一遍）。 */
+#include "../../main/font/ttf_justify.h"
+#include "../../main/font/ttf_kern.h"
 #include "epdiy.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -28,6 +31,10 @@ void ttf_draw_text_px_spaced(uint8_t* fb, int x, int y, int px, const char* text
                              int tracking_px, uint8_t fg, uint8_t bg);
 void ttf_draw_text_px_fitted(uint8_t* fb, int x, int y, int px, const char* text,
                              int tracking_px, int target_width, uint8_t fg, uint8_t bg);
+/// 仿生阅读开关与段计数（宿主侧无字形，仅保留契约）。/ Bionic switch contract only.
+static inline void ttf_draw_set_bionic(bool on) { (void)on; }
+static inline void ttf_bionic_reset(void) { }
+static inline int ttf_bionic_segments(void) { return 0; }
 int ttf_draw_text_px_rotated(uint8_t* fb, int x, int y, int px, const char* text,
                              uint8_t fg, uint8_t bg);
 int ttf_draw_text_px_vertical(uint8_t* fb, int x, int y, int px, const char* text,

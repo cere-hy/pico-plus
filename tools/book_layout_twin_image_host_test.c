@@ -541,3 +541,9 @@ int main(void) {
     printf("twin_image_host_test: UNEXPECTED（红点分布非预期：对照/基线见红 = 新缺陷；大图红点不在几何层 = 非预期形态）\n");
     return 2;
 }
+
+// 替身字体没有 GPOS kern：返回 0 就是 [124] 细则 1 的静默降级路径。
+int ttf_kern_px(int px, uint32_t a, uint32_t b) { (void)px; (void)a; (void)b; return 0; }
+bool app_typography_enhanced(void) { return true; }
+bool app_settings_bionic(void) { return false; }  /* 宿主替身：仿生阅读关闭（默认态） */  /* 宿主替身：增强态（排版开关批的默认态） */
+
