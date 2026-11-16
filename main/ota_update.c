@@ -48,6 +48,20 @@ static esp_err_t read_candidate(FILE *file, esp_image_header_t *header, esp_app_
     return ESP_OK;
 }
 
+const char *pico_ota_resolve_path(void) {
+    /* 双名并存取前者：数组顺序即查找顺序，命中即返回，不再看第二个。 */
+    static const char *const kCandidates[] = {
+        PICO_OTA_UPDATE_PATH,           /* 原厂契约名（手册 / FAQ 沿用），优先 */
+        PICO_OTA_UPDATE_FALLBACK_PATH,  /* fork 发布名，未命中契约名时兜底 */
+    };
+    struct stat file_stat = {0};
+    for (size_t i = 0; i < sizeof(kCandidates) / sizeof(kCandidates[0]); ++i) {
+        if (stat(kCandidates[i], &file_stat) == 0) return kCandidates[i];
+    }
+    /* 都不存在：返回契约名，让 pico_ota_inspect 沿原路径报「未找到」（文案已带双名指引）。 */
+    return kCandidates[0];
+}
+
 esp_err_t pico_ota_inspect(const char *path, pico_ota_info_t *info) {
     if (!path || !info) return ESP_ERR_INVALID_ARG;
     memset(info, 0, sizeof(*info));
@@ -57,7 +71,7 @@ esp_err_t pico_ota_inspect(const char *path, pico_ota_info_t *info) {
 
     struct stat file_stat = {0};
     if (stat(path, &file_stat) != 0) {
-        set_message(info->message, sizeof(info->message), "TF 卡根目录未找到固件升级包");
+        set_message(info->message, sizeof(info->message), "未找到升级包：Pico-update.bin 或 Read_Pico.bin");
         return ESP_ERR_NOT_FOUND;
     }
     if (file_stat.st_size <= 0) {

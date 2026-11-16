@@ -22,6 +22,7 @@
 #include "ttf_font.h"
 #include "ui_font.h"
 #include "ui_image_dither.h"
+#include "ui_text_wrap.h"
 #include "settings.h"
 
 #define UI_SEL_INSET 4
@@ -309,6 +310,203 @@ void ui_text_box(uint8_t *fb, EpdRect box, int px, const char *text,
     ui_text_fixed_vc(fb,x,box.y+box.height/2,px,text,align,inverted);
 }
 
+/* gen30 伴读案 · 修复轮：多行块排版（右栏摘要专用）。
+ *
+ * 现场故障一（26.11.bandu2.txt + 实拍）：70/30 几何成立，但右栏摘要被压成一条线。
+ * 根因是控件语义误用——ui_text_box 是「单行自适应缩放」：它把整段文字当作一行
+ * 量宽，塞不进就按比例缩字号，直到塞进去为止。56 字中文放进右栏内宽（约 30% 版心
+ * 减 48px）时，这个循环只能把字号从 21 一路压到 1~3 px，于是「字体极小无法识别」。
+ * 这是构造性的：只要右栏宽度有限，用该控件渲染段落必然坍缩。
+ *
+ * 本控件改为块排版：按码点贪心断行（ui_text_wrap 纯逻辑）、固定行高、行数由控件
+ * 高度约束、溢出在末行补省略号，并把字号钉在下限之上，绝不无限缩。
+ * ui_text_box 的单行语义一字节不动（面板标题/副标题仍用它）。
+ *
+ * gen30 repair round: multi-line block layout for the companion summary column.
+ * Field fault #1: the 70/30 geometry was correct, but ui_text_box is a single-line
+ * auto-shrink control - it measures the whole paragraph as one line and scales the
+ * font down until it fits, driving 56 CJK characters to 1-3 px inside the column.
+ * That is structural, not incidental. This control does real block layout: greedy
+ * code-point wrapping, fixed line height, line count bounded by the box height, an
+ * ellipsis on overflow, and a hard floor on the font size. ui_text_box is untouched.
+ */
+
+/** 块排版字号下限：低于此值不再缩（现场 1~3 px 属不可识别区）。 */
+#define UI_TEXT_BLOCK_MIN_PX 14
+
+/** 行高固定补偿：与 ui_text_box 的 +2 奇偶留白同口径。 */
+#define UI_TEXT_BLOCK_LINE_PAD 2
+
+typedef struct {
+    int px;
+    bool reader;   /* true = 走 ui_text_reader 同源的矢量 TTF 后端（清晰渲染） */
+} ui_text_block_cb_ctx;
+
+/* UTF-8 码点解码：断行回调已给出码点起始与字节步长，直接按步长还原码点，
+   与 ui_text_reader 内部的 reader_utf8_cp 同口径（不改动后者，避免函数前移）。 */
+static uint32_t ui_text_block_cp(const char *s, size_t step) {
+    const unsigned char *p = (const unsigned char *)s;
+    if (step == 1) return p[0];
+    if (step == 2) return (uint32_t)((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu);
+    if (step == 3) return (uint32_t)((p[0] & 0x0Fu) << 12)
+                          | ((uint32_t)(p[1] & 0x3Fu) << 6) | (p[2] & 0x3Fu);
+    if (step == 4) return (uint32_t)((p[0] & 0x07u) << 18)
+                          | ((uint32_t)(p[1] & 0x3Fu) << 12)
+                          | ((uint32_t)(p[2] & 0x3Fu) << 6) | (p[3] & 0x3Fu);
+    return p[0];
+}
+
+/* 逐码点前进宽度：reader 后端必须与 ui_text_reader 绘制时用的 advance 完全同源，
+   否则断行算的和画出来的会漂移；旧后端仍走 ui_text_fixed_width_px。 */
+static int ui_text_block_advance(void *ctx, const char *cp, size_t step) {
+    const ui_text_block_cb_ctx *c = (const ui_text_block_cb_ctx *)ctx;
+    if (c->reader) return ui_text_reader_advance_px(c->px, ui_text_block_cp(cp, step));
+    char buf[8];
+    if (step >= sizeof(buf)) step = sizeof(buf) - 1;
+    memcpy(buf, cp, step);
+    buf[step] = 0;
+    return ui_text_fixed_width_px(c->px, buf);
+}
+
+/* 整行宽度：末行补省略号后的越界复核，口径必须与断行回调一致。 */
+static int ui_text_block_line_width_px(int px, const char *line, bool reader) {
+    if (!reader) return ui_text_fixed_width_px(px, line);
+    int width = 0;
+    const unsigned char *p = (const unsigned char *)line;
+    while (*p) {
+        const size_t step = *p < 0x80 ? 1u
+                          : (*p & 0xE0u) == 0xC0u ? 2u
+                          : (*p & 0xF0u) == 0xE0u ? 3u
+                          : (*p & 0xF8u) == 0xF0u ? 4u : 1u;
+        width += ui_text_reader_advance_px(px, ui_text_block_cp((const char *)p, step));
+        p += step;
+    }
+    return width;
+}
+
+/* 给定字号，算行高与断行结果（不绘制）。fit 与 block 共用这一份口径，
+   保证「试放得下」与「真画出来」是同一套账。 */
+static size_t ui_text_block_plan(int px, EpdRect box, const char *text, int line_gap,
+                                 bool reader,
+                                 size_t *off, size_t *len, int *trunc, int *out_line_h) {
+    /* 行高按整段文本量一次升降部：与绘制同一字体判据（内建点阵 / 矢量 TTF）。
+       reader 后端由 ui_text_reader 绘制，行高必须取同一份 TTF 度量；否则字号
+       自适应试出来的行数与真正画出来的行高会错开一档。 */
+    int above = 0, below = 0;
+    if (reader && ttf_font_ready()) {
+        ttf_measure_line_px(px, text, &above, &below);
+    } else {
+        const bool builtin = (!s_system_ttf || ttf_font_is_builtin()) && ui_font_has_text(text);
+        if (builtin) ui_font_measure_line_px(px, text, &above, &below);
+        else ttf_measure_line_px(px, text, &above, &below);
+    }
+    const int line_h = above + below + UI_TEXT_BLOCK_LINE_PAD + line_gap;
+    if (out_line_h) *out_line_h = line_h;
+    if (line_h <= 0) return 0;
+
+    size_t max_lines = (size_t)(box.height / line_h);
+    if (max_lines == 0) return 0;
+    if (max_lines > UI_TEXT_WRAP_MAX_LINES) max_lines = UI_TEXT_WRAP_MAX_LINES;
+
+    ui_text_block_cb_ctx cb = { px, reader };
+    return ui_text_wrap(text, box.width, max_lines,
+                        ui_text_block_advance, &cb, off, len, trunc);
+}
+
+static int ui_text_block_impl(uint8_t *fb, EpdRect box, int px, const char *text,
+                              int line_gap, bool reader) {
+    if (!fb || !text || !text[0] || box.width <= 0 || box.height <= 0) return 0;
+    if (px < UI_TEXT_BLOCK_MIN_PX) px = UI_TEXT_BLOCK_MIN_PX;
+    if (line_gap < 0) line_gap = 0;
+
+    size_t off[UI_TEXT_WRAP_MAX_LINES];
+    size_t len[UI_TEXT_WRAP_MAX_LINES];
+    int trunc = 0, line_h = 0;
+    const size_t lines = ui_text_block_plan(px, box, text, line_gap, reader,
+                                            off, len, &trunc, &line_h);
+    if (!lines) return 0;
+
+    char line[UI_TEXT_WRAP_MAX_LINE_BYTES + 4];
+    int y = box.y;
+    for (size_t i = 0; i < lines; ++i) {
+        size_t n = len[i] > UI_TEXT_WRAP_MAX_LINE_BYTES ? UI_TEXT_WRAP_MAX_LINE_BYTES : len[i];
+        memcpy(line, text + off[i], n);
+        line[n] = 0;
+        /* 溢出：仅在最后一行补省略号（U+2026，3 字节）。做法是回退一个完整码点，
+           在它的起始处写入省略号并截断——绝不从多字节序列中间切。补完超宽则退回
+           纯截断：「溢出截断」两种形态都合规，宁可少一个字也不越界。 */
+        if (trunc && i + 1 == lines && n > 0) {
+            size_t cut = n - 1;
+            while (cut > 0 && ((unsigned char)line[cut] & 0xc0u) == 0x80u) --cut;
+            if (cut + 3 <= sizeof(line)) {
+                memcpy(line + cut, "\xE2\x80\xA6", 3);
+                line[cut + 3] = 0;
+                if (ui_text_block_line_width_px(px, line, reader) > box.width) {
+                    memcpy(line, text + off[i], n);
+                    line[n] = 0;
+                }
+            }
+        }
+        /* 字体发糊根因（12:24 归因）：ui_text_fixed 在阅读页恒走内建点阵/24px
+           补充位图放大路径，笔画密集的汉字被插值 + 覆盖率抬升糊成一团；清晰渲染的
+           情景释义卡走 ui_text_reader（矢量 TTF 轮廓 + 灰阶抗锯齿）。reader 后端
+           在此逐行复用同一条绘制链，量宽/行高已在上面同源切换。 */
+        if (reader && ttf_font_ready())
+            ui_text_reader(fb, box.x, y, px, line);
+        else
+            ui_text_fixed(fb, box.x, y, px, line, EPD_DRAW_ALIGN_LEFT, false);
+        y += line_h;
+    }
+    return (int)lines;
+}
+
+int ui_text_block(uint8_t *fb, EpdRect box, int px, const char *text, int line_gap) {
+    return ui_text_block_impl(fb, box, px, text, line_gap, false);
+}
+
+/* 自适应块排版：在 [min_px, max_px] 内挑「能把整段文本完整放下」的最大字号，
+   逐 2 px 递减试点，命中即画；全不命中则以 min_px 画并截断（宁可小，不可溢出）。
+   右栏摘要用它：短摘要自动放大到上限，长摘要自动收到能容下的字号，不留白、
+   不缩成一条线、不靠调用方写死字号。
+   Adaptive block layout: pick the largest size in [min_px, max_px] that fits the
+   whole string without truncation, stepping down by 2 px; if none fits, draw at
+   min_px and truncate. This is what keeps a short summary large and a long one
+   merely smaller, instead of hard-coding a size or collapsing to one line. */
+static int ui_text_block_fit_impl(uint8_t *fb, EpdRect box, int max_px, int min_px,
+                                  const char *text, int line_gap, int *out_px,
+                                  bool reader) {
+    if (!fb || !text || !text[0] || box.width <= 0 || box.height <= 0) return 0;
+    if (max_px < UI_TEXT_BLOCK_MIN_PX) max_px = UI_TEXT_BLOCK_MIN_PX;
+    if (min_px < UI_TEXT_BLOCK_MIN_PX) min_px = UI_TEXT_BLOCK_MIN_PX;
+    if (min_px > max_px) min_px = max_px;
+    if (line_gap < 0) line_gap = 0;
+
+    size_t off[UI_TEXT_WRAP_MAX_LINES];
+    size_t len[UI_TEXT_WRAP_MAX_LINES];
+    int chosen = min_px;
+    for (int px = max_px; px >= min_px; px -= 2) {
+        int trunc = 0, line_h = 0;
+        const size_t lines = ui_text_block_plan(px, box, text, line_gap, reader,
+                                                off, len, &trunc, &line_h);
+        if (lines && !trunc) { chosen = px; break; }
+    }
+    if (out_px) *out_px = chosen;
+    return ui_text_block_impl(fb, box, chosen, text, line_gap, reader);
+}
+
+int ui_text_block_fit(uint8_t *fb, EpdRect box, int max_px, int min_px,
+                      const char *text, int line_gap, int *out_px) {
+    return ui_text_block_fit_impl(fb, box, max_px, min_px, text, line_gap, out_px, false);
+}
+
+int ui_text_block_fit_reader(uint8_t *fb, EpdRect box, int max_px, int min_px,
+                             const char *text, int line_gap, int *out_px) {
+    /* 无字体卡时 ttf_font_ready() 为假，ui_text_reader 自己也会退回 ui_text_fixed；
+       这里同步把整套量宽/行高口径退回旧后端，保持「算画同源」不被破坏。 */
+    const bool reader = ttf_font_ready();
+    return ui_text_block_fit_impl(fb, box, max_px, min_px, text, line_gap, out_px, reader);
+}
+
 void ui_text_fixed_ink_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
                           enum EpdFontFlags align, uint8_t gray) {
     if (!fb || !text || !*text || px <= 0) return;
@@ -521,6 +719,31 @@ void ui_text_vc(
     } else {
         ttf_measure_line_px(px, text, &above, &below);
         ttf_draw_text_px(framebuffer, x, center_y + (above - below) / 2, px, text, align, fg, bg);
+    }
+}
+
+// 26.9.26 M5-A S26-3：置灰字。与 ui_text_vc 唯一差别是墨色由调用方给，用来画
+// 「存在但按不动」的控件（框选动作栏的 AI 键）。置灰必须看起来就是置灰——把不可用
+// 的按钮画成和可用按钮一样、只在按下后弹一句「未开放」，那是视觉上的空头承诺。
+// Greyed text (S26-3): identical to ui_text_vc except the caller picks the ink level,
+// for controls that exist but cannot be pressed (the action bar's AI key). A disabled
+// button must LOOK disabled: drawing it like the others and explaining after the press
+// is a promise the pixels never made.
+void ui_text_gray_vc(
+    uint8_t* framebuffer, int x, int center_y, int px, const char* text,
+    enum EpdFontFlags align, uint8_t gray
+) {
+    px = ui_text_effective_px(px);
+    int above = 0;
+    int below = 0;
+    if ((!s_system_ttf || ttf_font_is_builtin()) && ui_font_has_text(text)) {
+        ui_font_measure_line_px(px, text, &above, &below);
+        ui_font_draw_text_px(framebuffer, x, center_y + (above - below) / 2, px, text,
+                             align, gray, UI_INK_WHITE, false);
+    } else {
+        ttf_measure_line_px(px, text, &above, &below);
+        ttf_draw_text_px(framebuffer, x, center_y + (above - below) / 2, px, text,
+                         align, gray, UI_INK_WHITE);
     }
 }
 

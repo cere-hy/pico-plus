@@ -119,6 +119,28 @@ int ui_text_effective_px(int px);
 /// Scale one line to the UI preference, fitting native glyphs within a control without loading another face.
 void ui_text_box(uint8_t *fb, EpdRect box, int px, const char *text,
                  enum EpdFontFlags align, bool inverted);
+/// gen30 伴读案修复轮：多行块排版（按码点断行、固定行高、行数受高度约束、溢出截断，
+/// 字号有下限不再无限缩）。与 ui_text_box 的单行自适应缩放语义相互独立。
+/// Returns the number of lines painted (0 when nothing fits).
+/// gen30 repair: multi-line block layout (code-point wrapping, fixed line height,
+/// line count bounded by box height, overflow ellipsis, hard font-size floor).
+/// Independent of ui_text_box's single-line auto-shrink.
+/// @param line_gap 行间额外像素（0 = 仅行高度量）/ extra pixels between lines
+int ui_text_block(uint8_t *fb, EpdRect box, int px, const char *text, int line_gap);
+/// 自适应块排版：在 [min_px, max_px] 内取「整段无截断放得下」的最大字号；全不命中
+/// 则用 min_px 绘制并截断。out_px 回填实际字号（可空）。返回绘制行数。
+/// Adaptive block layout: largest size in [min_px, max_px] that fits the whole
+/// string untruncated; falls back to min_px with truncation. out_px (nullable)
+/// reports the size actually used. Returns the number of lines painted.
+int ui_text_block_fit(uint8_t *fb, EpdRect box, int max_px, int min_px,
+                      const char *text, int line_gap, int *out_px);
+/// 12:24 字体发糊归因修复：与 ui_text_block_fit 同排版语义，但量宽/行高/绘制
+/// 全部切到 ui_text_reader 的同源链路（矢量 TTF 轮廓 + 灰阶抗锯齿），复用
+/// 「情景释义卡 / 段落翻译 AI 卡」的清晰渲染。无阅读字体时自动退回旧点阵后端。
+/// Same block layout, but the reader-face pipeline (vector TTF outlines, gray AA)
+/// used by the crisp scene cards; falls back to the bitmap face when no font card.
+int ui_text_block_fit_reader(uint8_t *fb, EpdRect box, int max_px, int min_px,
+                             const char *text, int line_gap, int *out_px);
 /// 灰阶图片在绘制时增强明暗差，原始缓存保持不变。/ Increase image contrast at draw time without altering cached pixels.
 uint8_t ui_contrast_gray(uint8_t gray);
 /// 将已画图片区域转为稳定黑白点阵，仅由本地主页面测试调用。/ Convert a painted image region to stable black/white dots; used only by the local main-page trial.
@@ -190,6 +212,12 @@ void ui_text_bw(
 void ui_text_vc(
     uint8_t* framebuffer, int x, int center_y, int px, const char* text,
     enum EpdFontFlags align, bool inverted
+);
+/// 置灰字：垂直居中的同一套排版，墨色由调用方给（画「存在但按不动」的控件）。
+/// Greyed, vertically centered text; the ink level comes from the caller (disabled controls).
+void ui_text_gray_vc(
+    uint8_t* framebuffer, int x, int center_y, int px, const char* text,
+    enum EpdFontFlags align, uint8_t gray
 );
 void ui_blit_bmp(
     uint8_t* framebuffer, int x, int y, const ui_fallback_bmp_t* bmp

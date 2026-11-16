@@ -430,6 +430,133 @@ public final class PushProtoTest {
         badTts[6] = (byte) 0xFF;
         check(PushProto.ttsText(badTts) == null, "0x19 len 越界拒收（坏帧不误收）");
 
+        // 13) gen30 伴读案 · 方案 B 裸帧（R0 冻结件 1，三端 fixture 互通）
+        //     Java 发送侧编解码逐字节对表 push_pico.py 参考实现（向量零手抄）。
+        check(PushProto.MODE_SET_LEN == vecInt(v, "g30_mode_set_len"), "gen30 MODE_SET 5B 常量一致");
+        check(PushProto.PAGE_BEGIN_LEN == vecInt(v, "g30_page_begin_len"), "gen30 PAGE_BEGIN 5B 常量一致");
+        check(PushProto.SUMMARY_LEN == vecInt(v, "g30_summary_len"), "gen30 SUMMARY 241B 常量一致");
+        check(PushProto.TTS_DONE_LEN == vecInt(v, "g30_tts_done_len"), "gen30 TTS_DONE 4B 常量一致");
+        check(PushProto.SUMMARY_TEXT_MAX == vecInt(v, "g30_summary_text_max"), "gen30 文本槽 233B 常量一致");
+        check(PushProto.CTRL_HDR_LEN == vecInt(v, "g30_ctrl_hdr_len"), "gen30 CTRL 头 4B 常量一致");
+        check(PushProto.GEN30_WIRE_CAP == vecInt(v, "g30_wire_cap"), "gen30 wire cap 244B 常量一致");
+        // 方案 B 算术：带 4B 头 245B 超帽、裸帧 241B 入帽（这是裁方案 B 的依据）
+        check(vecInt(v, "g30_hdr_plus_summary") > PushProto.GEN30_WIRE_CAP
+                && PushProto.SUMMARY_LEN <= PushProto.GEN30_WIRE_CAP,
+                "方案 B 算术：带 4B 头超帽、裸帧入帽");
+
+        // MODE_SET 0x1B（设备→手机）：编码逐字节 + 解码往返
+        check(hex(PushProto.encodeModeSet(3, 0)).equals(v.get("g30_mode_set")),
+                "0x1B MODE_SET 逐字节一致");
+        check(hex(PushProto.encodeModeSet(2, PushProto.MODE_SRC_INIT)).equals(v.get("g30_mode_set_cjk")),
+                "0x1B MODE_SET(source=init) 逐字节一致");
+        check(PushProto.modeSetMode(unhex(v.get("g30_mode_set"))) == vecInt(v, "g30_ms_mode"),
+                "0x1B mode 解码一致");
+        check(PushProto.modeSetSource(unhex(v.get("g30_mode_set"))) == vecInt(v, "g30_ms_source"),
+                "0x1B source 解码一致");
+
+        // PAGE_BEGIN 0x1C（设备→手机）：编码逐字节 + 解码往返 + 最大页号
+        check(hex(PushProto.encodePageBegin(0x1234, 2)).equals(v.get("g30_page_begin")),
+                "0x1C PAGE_BEGIN 逐字节一致");
+        check(hex(PushProto.encodePageBegin(0xFFFF, 3)).equals(v.get("g30_page_begin_max")),
+                "0x1C PAGE_BEGIN 最大页号逐字节一致");
+        check(PushProto.pageBeginPageNo(unhex(v.get("g30_page_begin"))) == vecInt(v, "g30_pb_pageno"),
+                "0x1C page_no 解码一致");
+        check(PushProto.pageBeginMode(unhex(v.get("g30_page_begin"))) == vecInt(v, "g30_pb_mode"),
+                "0x1C mode 解码一致");
+
+        // SUMMARY 0x0A（手机→设备）：241B 裸帧 + 中文 + ASCII + 空文本
+        check(hex(PushProto.encodeSummary("这是本页摘要", 0x1234, 2, 0, 1)).equals(v.get("g30_summary")),
+                "0x0A SUMMARY 中文逐字节一致（241B 裸帧不带魔数头）");
+        check(hex(PushProto.encodeSummary("Hello read-along", 1, 0, 0, 1)).equals(v.get("g30_summary_ascii")),
+                "0x0A SUMMARY ASCII 逐字节一致");
+        check(hex(PushProto.encodeSummary("", 0, 0, 0, 1)).equals(v.get("g30_summary_empty")),
+                "0x0A SUMMARY 空文本逐字节一致");
+        PushProto.Summary sm = PushProto.decodeSummary(unhex(v.get("g30_summary")));
+        check(sm.mode == vecInt(v, "g30_sm_mode") && sm.pageNo == vecInt(v, "g30_sm_pageno")
+                && sm.idx == vecInt(v, "g30_sm_idx") && sm.total == vecInt(v, "g30_sm_total")
+                && sm.text.equals(v.get("g30_sm_text")),
+                "0x0A SUMMARY 全字段解码一致（中文无损）");
+        check(hex(PushProto.encodeSummary(sm.text, sm.pageNo, sm.mode, sm.idx, sm.total))
+                .equals(v.get("g30_summary")), "0x0A SUMMARY 解码后重编 == 原帧（互逆）");
+        check(unhex(v.get("g30_summary"))[0] == (byte) 0x0A
+                && unhex(v.get("g30_summary"))[1] != (byte) PushProto.MAGIC0,
+                "0x0A SUMMARY 首字节是 op、不带 4B 魔数头（方案 B）");
+        // 56 字发送帽：56 汉字 = 168B ≤ 233B 槽，编解码无损
+        check(vecInt(v, "g30_cap56_bytes") == 168, "56 汉字 = 168B（≤ 233B 槽）");
+        check(hex(PushProto.encodeSummary(v.get("g30_cap56_text"), 0x00FF, 1, 0, 1))
+                .equals(v.get("g30_summary_cap56")), "0x0A SUMMARY 56 字帽帧逐字节一致");
+        check(PushProto.decodeSummary(unhex(v.get("g30_summary_cap56"))).text
+                .equals(v.get("g30_cap56_text")), "0x0A SUMMARY 56 字帽文本无损");
+
+        // 二轮：56 字帽解除，多帧分片（每帧 241B、idx 连续、UTF-8 不切半、拼回整段）
+        // 三轮：帽 250，750B 要 4 帧；直接按 250 字跑满，验帧号与拼装。
+        StringBuilder longText = new StringBuilder();
+        for (int i = 0; i < 250; i++) longText.append('伴');
+        java.util.List<byte[]> shards = PushProto.encodeSummaryShards(longText.toString(), 7, 2);
+        check(shards.size() == 4, "250 汉字分 4 帧（233B 槽）");
+        boolean allLen = true, allIdx = true;
+        StringBuilder back = new StringBuilder();
+        for (int i = 0; i < shards.size(); i++) {
+            byte[] f = shards.get(i);
+            allLen &= f.length == PushProto.SUMMARY_LEN;
+            allIdx &= (f[4] & 0xFF) == i && (f[5] & 0xFF) == shards.size();
+            back.append(PushProto.decodeSummary(f).text);
+        }
+        check(allLen, "每帧 241B（wire 帽 244B 内）");
+        check(allIdx, "idx 从 0 连续、total 一致");
+        check(back.toString().equals(longText.toString()), "多帧拼装还原整段");
+        check(PushProto.encodeSummaryShards("", 7, 2).size() == 1, "空摘要仍单帧");
+        check(250 * 3 <= PushProto.SUMMARY_TOTAL_MAX, "250 汉字 750B <= 1024B 拼装帽（三端同值）");
+        check(PushProto.SUMMARY_TOTAL_MAX == 1024, "拼装帽 = 1024（与设备侧 PUSH_SUMMARY_TOTAL_MAX 同值）");
+
+        // TTS_DONE 0x0B（手机→设备）：4B 裸帧 + status 枚举
+        check(hex(PushProto.encodeTtsDone(0x1234, 0)).equals(v.get("g30_tts_done")),
+                "0x0B TTS_DONE 逐字节一致");
+        check(hex(PushProto.encodeTtsDone(0xFFFF, PushProto.TTS_DONE_ABORT)).equals(v.get("g30_tts_done_abort")),
+                "0x0B TTS_DONE 中断态逐字节一致");
+        check(PushProto.ttsDonePageNo(unhex(v.get("g30_tts_done"))) == vecInt(v, "g30_td_pageno"),
+                "0x0B page_no 解码一致");
+        check(PushProto.ttsDoneStatus(unhex(v.get("g30_tts_done"))) == vecInt(v, "g30_td_status"),
+                "0x0B status 解码一致");
+
+        // 方案 B 白名单：合法裸帧命中、现制魔数帧/短帧/畸形帧不命中
+        check(PushProto.gen30CtrlBareOp(unhex(v.get("g30_summary"))) == vecInt(v, "g30_bare_summary"),
+                "白名单命中 SUMMARY 0x0A/241B");
+        check(PushProto.gen30CtrlBareOp(unhex(v.get("g30_tts_done"))) == vecInt(v, "g30_bare_tts"),
+                "白名单命中 TTS_DONE 0x0B/4B");
+        check(PushProto.gen30CtrlBareOp(new byte[] {(byte) PushProto.MAGIC0, (byte) PushProto.MAGIC1,
+                (byte) PushProto.OP_END, (byte) PushProto.VERSION}) == -1,
+                "白名单拒现制 4B 魔数 CTRL 帧（继续走魔数校验）");
+        check(PushProto.gen30CtrlBareOp(new byte[] {0x0A, 0x00}) == -1,
+                "白名单拒短 SUMMARY 帧（长度不符不误收）");
+
+        // 修复轮解耦：0x1D TTS_ENABLE（2B）——听书开关只管声音，摘要链由 0x19 无条件触发。
+        check(vecInt(v, "g30_tts_enable_len") == 2 && PushProto.TTS_ENABLE_LEN == 2,
+                "0x1D TTS_ENABLE 定长 2B");
+        check(hex(PushProto.encodeTtsEnable(true)).equals(v.get("g30_tts_enable_on")),
+                "0x1D 开 = 1d01（逐字节）");
+        check(hex(PushProto.encodeTtsEnable(false)).equals(v.get("g30_tts_enable_off")),
+                "0x1D 关 = 1d00（逐字节）");
+        check(PushProto.ttsEnableOn(unhex(v.get("g30_tts_enable_on")))
+                == (vecInt(v, "g30_tts_enable_on_bit") == 1)
+                && PushProto.ttsEnableOn(unhex(v.get("g30_tts_enable_off")))
+                == (vecInt(v, "g30_tts_enable_off_bit") == 1),
+                "0x1D 使能位往返（开/关）");
+        {
+            boolean[] out = new boolean[1];
+            check(PushProto.isTtsEnable(unhex(v.get("g30_tts_enable_off")), out)
+                    && !out[0], "0x1D 宽容判定：关帧返回 true 且 out=false");
+            check(!PushProto.isTtsEnable(new byte[] {(byte) PushProto.ST_TTS_ENABLE}, out),
+                    "0x1D 宽容判定：1B 短帧不命中（不抛异常、不误收）");
+            check(!PushProto.isTtsEnable(unhex(v.get("g30_page_begin")), out),
+                    "0x1D 宽容判定：0x1C 帧不命中（不串台）");
+        }
+        check(PushProto.ST_TTS_ENABLE == PushProto.ST_PAGE_BEGIN + 1,
+                "0x1D 顺移紧跟 0x1C（无空洞）");
+        check(PushProto.ST_TTS_ENABLE != PushProto.OP_SUMMARY
+                && PushProto.ST_TTS_ENABLE != PushProto.OP_TTS_DONE,
+                "0x1D 不与方案 B 白名单两枚裸帧 op 碰撞");
+
         System.out.println("结果 / result: " + pass + " passed, " + fail + " failed — "
                 + (fail == 0 ? "ALL PASS" : "HAS FAILURES"));
         System.exit(fail == 0 ? 0 : 1);

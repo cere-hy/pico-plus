@@ -27,9 +27,12 @@ javac --release 8 -encoding UTF-8 -nowarn \
     -classpath "$AJ" -d "$HERE/build/obj" \
     "$HERE/src/dev/readpico/push/PushProto.java" \
     "$HERE/src/dev/readpico/push/AiClient.java" \
+    "$HERE/src/dev/readpico/push/CompanionReqGuard.java" \
+    "$HERE/src/dev/readpico/push/UpdateChecker.java" \
     "$HERE/src/dev/readpico/push/AiKeepAlive.java" \
     "$HERE/src/dev/readpico/push/ListenKeepAliveService.java" \
     "$HERE/src/dev/readpico/push/TtsReassembler.java" \
+    "$HERE/src/dev/readpico/push/SceneReassembler.java" \
     "$HERE/src/dev/readpico/push/TtsKeepAliveService.java" \
     "$HERE/src/dev/readpico/push/TtsSpeaker.java" \
     "$HERE/src/dev/readpico/push/MainActivity.java"
@@ -55,6 +58,16 @@ echo "== 2d/7 TtsReassembler 宿主测试（0x19 页文本重组，纯逻辑，�
 javac --release 8 -encoding UTF-8 -nowarn \
     -cp "$HERE/build/obj" -d "$HERE/build/test" "$HERE/test/TtsReassemblerTest.java"
 java -cp "$HERE/build/test:$HERE/build/obj" dev.readpico.push.TtsReassemblerTest
+
+echo "== 2e/7 CompanionReqGuard 守卫测试（步 4 A1/A3/A4 页号错位修复，纯逻辑，零 android 依赖）"
+javac --release 8 -encoding UTF-8 -nowarn \
+    -cp "$HERE/build/obj" -d "$HERE/build/test" "$HERE/test/CompanionReqGuardTest.java"
+java -cp "$HERE/build/test:$HERE/build/obj" dev.readpico.push.CompanionReqGuardTest
+
+echo "== 2f/7 UpdateChecker 更新检测测试（步 5 最小集 + 失败口径，纯逻辑，零 android 依赖）"
+javac --release 8 -encoding UTF-8 -nowarn \
+    -cp "$HERE/build/obj" -d "$HERE/build/test" "$HERE/test/UpdateCheckerTest.java"
+java -cp "$HERE/build/test:$HERE/build/obj" dev.readpico.push.UpdateCheckerTest
 
 echo "== 3/7 d8 -> classes.dex"
 "$BT/d8" --release --min-api 26 --lib "$AJ" \

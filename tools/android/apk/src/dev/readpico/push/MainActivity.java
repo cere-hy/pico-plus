@@ -78,6 +78,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -204,12 +205,52 @@ public class MainActivity extends Activity {
     private Button btnTtsStop;
     /** 0x19 页文本重组器（只由 BLE 回调线程 touch：accept/reset 同线程，无锁）。 */
     private final TtsReassembler ttsReassembler = new TtsReassembler();
+    /** M3：0x1A 情景上下文重组器（同样只由 BLE 回调线程 touch）。 */
+    private final SceneReassembler sceneReassembler = new SceneReassembler();
     /** 朗读引擎封装（异步 init + 档位持久化 + 跟随/查词两个入口）。 */
     private final TtsSpeaker ttsSpeaker = new TtsSpeaker();
     /** 最近一页 0x19 收齐的时刻；0 = 本会话还没收到过页文本。 */
     private volatile long ttsLastPageMs = 0;
     /** 本会话已收齐并交朗读的页数（状态行展示）。 */
     private volatile int ttsPagesRead = 0;
+
+    /* ---- gen30 伴读案（R0 冻结件 1）：STATUS 0x1B/0x1C 对账态 ----
+     * 对账字段由 BLE 回调线程写、后台/UI 线程读（volatile）；摘要请求与回帧
+     * 一律切后台线程、状态行切 UI 线程。伴读态以「收到过 0x1B/0x1C」为界：
+     * 纯听书（只有 0x19、无 0x1C）不触发摘要请求，既有听书链零侵入。
+     * gen30 read-along reconciliation; the plain read-aloud path (0x19 with no
+     * 0x1C) never starts a summary request, so the existing chain is untouched.
+     * ---- */
+    /** 当前模式号（0 外语原著 / 1 小说网文 / 2 社科非虚构 / 3 古文诗词）。 */
+    private volatile int companionMode = PushProto.RIDE_MODE_FOREIGN;
+    /** 最近一次 PAGE_BEGIN 的页号；-1 = 本会话还没收到过对账帧。 */
+    private volatile int companionPageNo = -1;
+    /** 是否处于伴读态（收到过 0x1B 或 0x1C）。 */
+    private volatile boolean companionActive = false;
+    /** 0x1B 发出至新 PAGE_BEGIN 到达的在途窗：摘要请求挂起不串页（R0 §一）。 */
+    private volatile boolean companionModeSwitchInFlight = false;
+    /** 最近一次 0x19 组装完成的当前页正文（日志/朗读用；绝不作为回执比对基准——
+     *  它会被翻页覆写，14:26 裁定 A4 实现要点）。 */
+    private volatile String companionLastPage = null;
+    /** 同页同模式同正文去重键（pageNo:mode:正文指纹，见 CompanionReqGuard）；
+     *  旧摘要丢弃时清空。A3：含正文维度，同页异文不误判重复。 */
+    private volatile String companionReqKey = null;
+    /** 回执内容比对基准：每次真正发起请求时登记「该请求的正文快照」（局部引用的副本）。
+     *  A4 用它作「当前登记的最新请求」，而非回执时现读已被覆写的 companionLastPage。 */
+    private volatile String companionReqSnapshot = null;
+    /**
+     * 设备侧听书开关（0x1D 朗读使能位）。修复轮解耦的核心状态：
+     * 页文本到达时摘要请求恒触发，只有本值为真才朗读。
+     * <p>默认 {@code true}：与旧固件兼容——旧固件不发 0x1D，非伴读态又只在开关
+     * 打开时才推流，所以默认开不会造成「该静音却出声」。收到 0x1D 后以设备为准。
+     * <p>Device-side listening switch (0x1D enable bit). Summaries are always
+     * requested; playback happens only when this is true. Defaults to true for
+     * old-firmware compatibility (old firmware never sends 0x1D, and off-companion
+     * pushes only while the switch is on, so the default cannot cause unwanted
+     * audio). Once 0x1D arrives the device is authoritative.
+     */
+    private volatile boolean ttsEnableFromDevice = true;
+
     /** TTS 保活 FGS 运行态（最佳努力记录，与 ListenKeepAliveService 分开记）。 */
     private volatile boolean mTtsFgsRunning = false;
     /** 10 分钟无新页 → 停 TTS 保活。也作为「跟随朗读进行中」的判定窗。 */
@@ -283,6 +324,14 @@ public class MainActivity extends Activity {
                     public void run() {
                         stopTtsKeepAlive();
                         ttsReassembler.reset();
+                        // gen30：断链即清伴读对账态；重连后首个 PAGE_BEGIN 自然同步
+                        // （R0 §一「未连接时仅 NVS 记录，连接后首个 PAGE_BEGIN 同步」）。
+                        companionActive = false;
+                        companionPageNo = -1;
+                        companionModeSwitchInFlight = false;
+                        companionLastPage = null;
+                        companionReqKey = null;
+                        companionReqSnapshot = null;
                         refreshTtsStatus();
                     }
                 });
@@ -423,6 +472,17 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // 26.11.3-C：把未知 flags 位的喊话口挂上 android.util.Log。重组器本身零
+        // android 依赖（宿主可测），所以它不直接 Log——这一行是它和日志之间的桥。
+        // Bridge the reassembler's unknown-flag shout to android.util.Log (the class
+        // itself stays android-free so it can run on the host).
+        SceneReassembler.flagSink = new SceneReassembler.FlagSink() {
+            @Override
+            public void onUnknownFlags(int flags) {
+                android.util.Log.w("PicoPush", "scene: unknown flag bits 0x"
+                        + Integer.toHexString(flags) + " (this build ignores them)");
+            }
+        };
         // setTheme 必须在 super.onCreate 之前：快捷方式用透明无界面主题，
         // 用户看不到任何窗口，只有 Toast。/ setTheme must precede super.onCreate:
         // the shortcut uses a translucent no-display theme so only a Toast shows.
@@ -595,6 +655,25 @@ public class MainActivity extends Activity {
         root.addView(rowTts, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        // 步 5：更新检测入口（22:11 裁决 §四 最小集，UI 落点代码端自定，主界面独立一行）。
+        // 手动触发；非阻塞卡片提示；仅引导跳转，不做应用内下载/静默安装。
+        // Step5 update-check entry (verdict section 4): manual trigger, non-blocking
+        // card, guide-to-browser only, no in-app download / silent install.
+        LinearLayout rowUpdate = new LinearLayout(this);
+        rowUpdate.setOrientation(LinearLayout.HORIZONTAL);
+        Button btnUpdate = new Button(this);
+        btnUpdate.setText("检查更新");
+        btnUpdate.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                checkUpdate();
+            }
+        });
+        rowUpdate.addView(btnUpdate, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(rowUpdate, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
         logScroll = new ScrollView(this);
         logView = new TextView(this);
         logView.setTextSize(12);
@@ -622,6 +701,12 @@ public class MainActivity extends Activity {
         // Bring up the read-aloud engine asynchronously (a page that arrives
         // before onInit is stashed and read once init succeeds, so the
         // device's first push never races engine startup).
+        // gen30：先装播完回调再异步 init（onInit 成功时补装 utterance listener）。
+        ttsSpeaker.setFollowDoneListener(new TtsSpeaker.FollowDoneListener() {
+            @Override public void onFollowDone(int pageNo, int status) {
+                sendCompanionTtsDone(pageNo, status);
+            }
+        });
         ttsSpeaker.init(this);
         refreshTtsStatus();      // gen26.5 Step10：TTS 状态行
     }
@@ -651,7 +736,14 @@ public class MainActivity extends Activity {
         // Exit: stop the TTS keep-alive, shut the engine, reset the reassembler.
         stopTtsKeepAlive();
         ttsReassembler.reset();
-        ttsSpeaker.shutdown();
+        ttsSpeaker.shutdown();   // 内部清 followDoneListener，防回调打进已死 Activity
+        // gen30：退出即清伴读对账态（重连后首个 PAGE_BEGIN 自然同步，R0 §一）。
+        companionActive = false;
+        companionPageNo = -1;
+        companionModeSwitchInFlight = false;
+        companionLastPage = null;
+        companionReqKey = null;
+        companionReqSnapshot = null;
         closeQuietly();
         super.onDestroy();
     }
@@ -1054,6 +1146,124 @@ public class MainActivity extends Activity {
                 startListen();
             }
         }
+    }
+
+    /* ---- 步 5：更新检测（22:11 裁决 §四 最小集） ---- */
+
+    /**
+     * 「检查更新」按钮入口：手动触发。网络在工作线程，结果与弹窗回主线程。
+     * 仅检测＋提示＋跳转引导；不下载、不静默安装、不写入本地文件。
+     * Step5 manual update check (verdict section 4): detect + notify + guide only.
+     */
+    private void checkUpdate() {
+        uiLog("正在检查更新（版本源：" + UpdateChecker.FEED_URL + "）……");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                boolean fetchOk = false;
+                String body = null;
+                java.net.HttpURLConnection conn = null;
+                try {
+                    java.net.URL url = new java.net.URL(UpdateChecker.FEED_URL);
+                    conn = (java.net.HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(8000);
+                    conn.setReadTimeout(8000);
+                    conn.setInstanceFollowRedirects(true);
+                    int code = conn.getResponseCode();
+                    if (code >= 200 && code < 300) {
+                        body = readLimited(conn.getInputStream());
+                        fetchOk = body != null && !body.trim().isEmpty();
+                    }
+                } catch (Exception e) {
+                    fetchOk = false; // 网络不可用/超时：明确走「检查失败」，绝不误报最新
+                } finally {
+                    if (conn != null) {
+                        conn.disconnect();
+                    }
+                }
+                final int verdict = UpdateChecker.decide(body, fetchOk,
+                        UpdateChecker.CURRENT_VERSION_CODE);
+                final String latestName = (verdict == UpdateChecker.UPDATE_AVAILABLE)
+                        ? UpdateChecker.extractStringField(body, "versionName") : null;
+                final String jumpUrl = (verdict == UpdateChecker.UPDATE_AVAILABLE)
+                        ? UpdateChecker.extractStringField(body, "url") : null;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        showUpdateResult(verdict, latestName, jumpUrl);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 读上限 64KB，防异常响应占满内存；零第三方依赖。 */
+    private static String readLimited(InputStream in) throws java.io.IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[2048];
+        int n, total = 0;
+        while ((n = in.read(buf)) > 0) {
+            total += n;
+            if (total > 64 * 1024) {
+                break;
+            }
+            bos.write(buf, 0, n);
+        }
+        return new String(bos.toByteArray(), UTF8);
+    }
+
+    /**
+     * 三态结果上屏：卡片非阻塞、仅引导不装。失败态明确「检查失败」，
+     * 绝不显示「已是最新」——裁决 §四 失败口径，防「伪闭环按钮」。
+     */
+    private void showUpdateResult(int verdict, String latestName, String jumpUrl) {
+        if (verdict == UpdateChecker.CHECK_FAILED) {
+            uiLog("检查失败：版本源不可达或返回数据异常（未判定为最新）");
+            new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("检查失败")
+                    .setMessage("无法获取版本信息：网络不可用或版本源暂不可达。\n"
+                            + "本次未判定是否为最新版本，请稍后重试。\n\n"
+                            + "当前版本 v" + UpdateChecker.CURRENT_VERSION_NAME
+                            + "（versionCode " + UpdateChecker.CURRENT_VERSION_CODE + "）")
+                    .setPositiveButton("知道了", null)
+                    .show();
+            return;
+        }
+        if (verdict == UpdateChecker.UP_TO_DATE) {
+            uiLog("已是最新版本 v" + UpdateChecker.CURRENT_VERSION_NAME);
+            new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("已是最新版本")
+                    .setMessage("当前版本 v" + UpdateChecker.CURRENT_VERSION_NAME
+                            + "（versionCode " + UpdateChecker.CURRENT_VERSION_CODE
+                            + "）已是最新。")
+                    .setPositiveButton("知道了", null)
+                    .show();
+            return;
+        }
+        // UPDATE_AVAILABLE：仅提示版本号/当前号 + 跳转引导，不下载、不安装
+        final String target = (jumpUrl != null && jumpUrl.startsWith("http"))
+                ? jumpUrl : "https://github.com/cere-hy/pico-plus/releases";
+        uiLog("发现新版本 v" + (latestName == null ? "?" : latestName)
+                + "（当前 v" + UpdateChecker.CURRENT_VERSION_NAME + "）");
+        new AlertDialog.Builder(MainActivity.this)
+                .setTitle("发现新版本")
+                .setMessage("新版本：v" + (latestName == null ? "（见下载页）" : latestName)
+                        + "\n当前版本：v" + UpdateChecker.CURRENT_VERSION_NAME
+                        + "（versionCode " + UpdateChecker.CURRENT_VERSION_CODE + "）\n\n"
+                        + "本应用不下载、不自动安装，点击下方按钮在浏览器打开下载页。")
+                .setPositiveButton("前往下载页", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        try {
+                            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(target)));
+                        } catch (Exception e) {
+                            uiLog("打开下载页失败：" + e.getMessage());
+                        }
+                    }
+                })
+                .setNegativeButton("稍后", null)
+                .show();
     }
 
     /* ---- 等待原语（worker 线程） ---- */
@@ -1808,6 +2018,17 @@ public class MainActivity extends Activity {
             uiLog("订阅失败");
             return false;
         }
+        // 步5缺陷2：校时与「发送文本」解耦——纯监听/待机链路一旦订阅建成，
+        // 立即主动下发一次标准时间（0x05 SET_TIME），不再依赖用户发文本。
+        // 设备侧 0x05 是独立操作码、未武装也能收，由 time_service_poll 消费
+        // 并同步 PMU/漂移账本；写失败不阻断监听（与 pushThreadBody 口径一致）。
+        // Step5 D2: decouple time sync from text sending. As soon as the
+        // listen-only subscription is up, push one SET_TIME frame; no text needed.
+        // Firmware accepts 0x05 even when unarmed; a write failure is non-fatal.
+        byte[] listenSetTime = PushProto.encodeSetTime(
+                System.currentTimeMillis() / 1000L);
+        uiLog("校准设备时钟（连接即校时）……");
+        writeChar(cCtrl, listenSetTime);
         // gen26.5 能力使能（0x09）：订阅建立的同一时刻声明「本 APK 支持
         // 74B 上下文档」。设备默认发 66B legacy，收到本帧并置起
         // CAP_AI_CONTEXT 后才改发 74B；老固件不认 0x09 → 回 ERR(2)，
@@ -1817,10 +2038,22 @@ public class MainActivity extends Activity {
         // device emits 66B legacy by default and only upgrades after this
         // frame sets CAP_AI_CONTEXT; old firmware rejects 0x09 with ERR(2)
         // and both sides carry on (our legacy decode path still reads 66B).
+        // M4-A：补声明 CAP_AI_MULTI（0x08 释义分帧）。注意它与「双指手势」无关——
+        // 双指是纯设备侧闭环，不需要 APK 声明任何能力位；这里只是让 v1.6.x 的
+        // 声明与它的实际能力对齐（设备侧目前只记录该位、不消费它，行为零变化）。
+        // M4-A: also declare CAP_AI_MULTI (0x08 segmented definitions). Note it has
+        // nothing to do with two-finger gestures - those are device-side only and
+        // need no APK capability. This merely aligns v1.6.x's declaration with what
+        // it can actually do (the firmware records the bit but does not act on it,
+        // so behavior is unchanged).
         final byte[] capsEnable = PushProto.encodeAiCapsEnable(
-                PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT);
+                PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT | PushProto.CAP_AI_MULTI
+                        | PushProto.CAP_AI_SCENE
+                        | PushProto.CAP_AI_SCENE_VIEW);
         uiLog("声明 APK 能力（0x09，bits=0x"
-                + Long.toHexString(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT) + "）……");
+                + Long.toHexString(PushProto.CAP_AI_QUERY | PushProto.CAP_AI_CONTEXT
+                        | PushProto.CAP_AI_MULTI | PushProto.CAP_AI_SCENE
+                        | PushProto.CAP_AI_SCENE_VIEW) + "）……");
         if (!writeChar(cCtrl, capsEnable)) {
             uiLog("能力声明未送达，按旧帧（66B）工作");
         }
@@ -1885,6 +2118,299 @@ public class MainActivity extends Activity {
         if (op == PushProto.ST_TTS_TEXT) {
             dispatchTtsText(frame);
         }
+        // gen30 伴读案（R0 冻结件 1）：0x1B 模式广播 / 0x1C 页号对账前置帧。
+        // 与 0x19 同走 STATUS 特征、按首字节 op 分发；不受 listenMode 门控——
+        // 点词监听与伴读是两段独立会话（R0 §一）。
+        // gen30: MODE_SET / PAGE_BEGIN share the STATUS characteristic with 0x19.
+        if (op == PushProto.ST_MODE_SET) {
+            onCompanionModeSet(frame);
+        }
+        if (op == PushProto.ST_PAGE_BEGIN) {
+            onCompanionPageBegin(frame);
+        }
+        // 修复轮解耦：0x1D 朗读使能位。设备把「听书开关」作为独立事实传下来，
+        // 手机据此只控制声音——摘要请求照旧由页文本无条件触发。
+        // Repair-round decoupling: 0x1D carries the listening switch as its own
+        // fact; the phone gates playback on it while summaries stay unconditional.
+        if (op == PushProto.ST_TTS_ENABLE) {
+            onTtsEnable(frame);
+        }
+        // M3：0x1A 情景请求。M3-A 只验链路——重组完整后打一条日志（上下文字节数、
+        // 词偏移、截断/回退标志），情景提示词与视图在 M3-B 接。
+        // M3: 0x1A scene request. M3-A verifies the link only - a completed request
+        // logs its context bytes, word offset and flags; the prompt and view land
+        // in M3-B.
+        if (op == PushProto.ST_AI_SCENE) {
+            SceneReassembler.Scene scene = sceneReassembler.accept(frame);
+            if (scene != null) {
+                int bytes = scene.context.getBytes(StandardCharsets.UTF_8).length;
+                uiLog("收到情景上下文：" + scene.word + "（" + bytes + " 字节，偏移 "
+                        + scene.wordOffset + (scene.excerpt() ? "，整段" : "")
+                        + (scene.truncated() ? "，已截断" : "")
+                        + (scene.sentenceFallback() ? "，句界回退" : "") + "）");
+                // M3-B：链路验完就干活——四节分析请求，结果走 0x08 回帧（word 原样
+                // 回填，设备靠它认领）。失败不回帧：设备 16s 期限自己降级，
+                // 不把「抱歉」之类的占位文本塞进卡面。
+                // M3-B: the link is verified, now do the work - request the four
+                // sections and answer over 0x08 with the word echoed back (that is
+                // how the device claims it). No frame on failure: the device's 16s
+                // deadline degrades the card by itself, and placeholder apologies
+                // never reach the body.
+                // 26.11.3-C：bit2 = 整段选文。v1.6.2 没有这个分支，把段落当「单词 +
+                // 背景」解析了五张词卡（设备侧一直在发 0x04）。分派这一行就是修复本身。
+                // bit2 = whole passage. v1.6.2 had no such branch and answered word
+                // cards for passages the device had flagged 0x04 all along.
+                if (scene.excerpt()) {
+                    onExcerptRequest(scene.word, scene.context);
+                } else {
+                    onSceneRequest(scene.word, scene.context);
+                }
+            }
+        }
+    }
+
+    /* ================= gen30 伴读案 · APK 侧接线（R0 冻结件 1/2）=================
+     * 设备是单一真相源：0x1B 广播模式、0x1C 前置页号、0x19 流推页文本；APK
+     * 只对账 + 回两帧（CTRL 0x0A SUMMARY / 0x0B TTS_DONE），不缓存多页。
+     * 失败 / 超时 / 空回包回「空文本」0x0A 帧（dlen=0）：设备侧右栏三态由
+     * 「摘要生成中…」切到「本次未生成」。设备侧实测无 16s 自动降级，不回帧
+     * 会永久停在占位态——此处按设备侧实测接线（详见回执工程事实报备）。
+     * ==================================================================== */
+
+    /** 四模式编号 → 中文模式名（0x1B 回显；与 push_proto.h 注释逐字一致）。 */
+    private static String companionModeName(int mode) {
+        switch (mode) {
+            case PushProto.RIDE_MODE_FOREIGN: return "外语原著";
+            case PushProto.RIDE_MODE_NOVEL:   return "小说网文";
+            case PushProto.RIDE_MODE_SOCIAL:  return "社科非虚构";
+            case PushProto.RIDE_MODE_CLASSIC: return "古文诗词";
+            default: return "未知模式(" + mode + ")";
+        }
+    }
+
+    /** gen30 0x1B MODE_SET：回显模式名 + 置在途窗 + 旧摘要丢弃（等新 PAGE_BEGIN）。 */
+    private void onCompanionModeSet(byte[] frame) {
+        final int mode;
+        final int source;
+        try {
+            mode = PushProto.modeSetMode(frame);
+            source = PushProto.modeSetSource(frame);
+        } catch (IllegalArgumentException e) {
+            return; // 畸形 5B 裸帧静默丢弃，不打断既有 STATUS 分发
+        }
+        companionMode = mode;
+        companionActive = true;
+        companionModeSwitchInFlight = true; // 0x1B → 新 PAGE_BEGIN 之间挂起摘要请求
+        companionReqKey = null;             // 旧摘要作废
+        companionReqSnapshot = null;        // A4：模式切换使在途请求的登记作废
+        uiLog("伴读模式切换：" + companionModeName(mode)
+                + "（source=" + source + "，等页号对账后按新模式重取摘要）");
+        refreshCompanionMode();
+    }
+
+    /** gen30 0x1C PAGE_BEGIN：页号对账 + 丢弃在途半页 + 结束在途窗。 */
+    private void onCompanionPageBegin(byte[] frame) {
+        final int pageNo;
+        final int mode;
+        try {
+            pageNo = PushProto.pageBeginPageNo(frame);
+            mode = PushProto.pageBeginMode(frame);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        // mode 是快照冗余：与 0x1B 不一致时按 PAGE_BEGIN 覆盖并记日志（R0 §一）。
+        if (mode != companionMode) {
+            uiLog("伴读模式以 PAGE_BEGIN 为准覆盖：" + companionModeName(companionMode)
+                    + " → " + companionModeName(mode));
+            companionMode = mode;
+        }
+        companionPageNo = pageNo;
+        companionActive = true;
+        companionModeSwitchInFlight = false; // 在途窗结束，摘要请求解锁
+        companionReqKey = null;
+        companionReqSnapshot = null;        // A4：翻页使在途请求的登记作废
+        // PAGE_BEGIN 是每页 0x19 流的前置帧：丢弃在途半页，等下一页 seq==0
+        // 自然收敛（R0 §一「复用 seq==0 语义」）。accept/reset 同在 BLE 回调线程。
+        ttsReassembler.reset();
+        uiLog("伴读页号对账：page=" + pageNo + " · " + companionModeName(mode));
+        refreshCompanionMode();
+        /* A1（14:26 裁定）：0x1C 只做页号对账 + 在途状态重置，绝不发起摘要请求。
+           原「cached 重请求」用上一页正文配新页号发请求、去重键又吞掉 0x19 的
+           正确请求，正是 P1「张冠李戴」的构造性根因；模式切换兜底已由设备侧
+           s_tts_last_chapter/page=SIZE_MAX 强制重推 0x1C+0x19 覆盖，此分支整段删除。
+           摘要唯一发令点是 0x19 正文组装完成（dispatchTtsText）。
+           取证日志②：现场应恒见「cached触发=否」，且 cached前20字仍指向上一页
+           ——证明错配源仍在、但已不再据此发请求（P1 实锤回验）。 */
+        uiLog("取证 0x1C page=" + pageNo + " cached触发=否（A1）cached前20字="
+                + CompanionReqGuard.head(companionLastPage, 20));
+    }
+
+    /**
+     * 0x1D 朗读使能落点（修复轮解耦）。
+     * <p>设备把听书开关当独立事实发下来，手机只在这里更新一个布尔：此后页文本
+     * 到达仍无条件请求摘要（右栏恒更新），但只有该位为真才朗读。开关关闭时设备
+     * 仍推文本，所以摘要不会因关听书而停——这正是现场异议要的「只看不听」。
+     * <p>Link 断开时不在本地改这一位：设备在重连时会同步一次（见固件侧
+     * tts_follow_poll 的 up 边沿），本地乱猜只会制造「界面与设备不一致」。
+     */
+    private void onTtsEnable(byte[] frame) {
+        boolean[] on = new boolean[1];
+        if (!PushProto.isTtsEnable(frame, on)) {
+            return;
+        }
+        if (ttsEnableFromDevice == on[0]) {
+            return; // 无变化不刷 UI
+        }
+        ttsEnableFromDevice = on[0];
+        uiLog(on[0] ? "设备已开启听书：后续页文本将朗读（摘要链不受影响）"
+                : "设备已关闭听书：仅更新右栏摘要，不再朗读");
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                refreshTtsStatus();
+            }
+        });
+    }
+
+    /** 0x1B 回显落点：复用既有 TTS 状态行，不新增 UI 元素（控射程）。 */
+    private void refreshCompanionMode() {
+        refreshTtsStatus();
+    }
+
+    /**
+     * gen30 0x0A SUMMARY：后台线程调 DeepSeek，成功后回带文本的裸帧；
+     * 失败 / 超时 / 空回包回空文本帧（设备侧落「本次未生成」占位）。
+     * <p>步 4 A 组（14:26 裁定）：
+     * <ul>
+     *   <li><b>A1</b> 入口准入闸 mayIssueFrom(source)：唯一合法发令点是 0x19 正文组装
+     *       完成；0x1C-cached 恒拒，作 cached 分支绝迹的回归护栏；</li>
+     *   <li><b>A3</b> 去重键改为 pageNo:mode:正文指纹（CompanionReqGuard.reqKey），
+     *       同页异文不误判重复、同页同文仍去重；</li>
+     *   <li><b>A4</b> 回执在既有页号/模式复核之外，再比对「发起时捕获的正文快照」
+     *       与「当前登记的最新请求快照」，正文已变 / 断链复位一律丢弃迟到回执。</li>
+     * </ul>
+     * 禁令照登：加严页号丢弃条件不得做、只加延迟等待不得做——对账三层本就正确，
+     * 页号不匹配丢弃是既有逻辑，绝不因本次故障去加严它。
+     */
+    private void requestCompanionSummary(final String pageText, final int pageNo,
+                                          final int mode, final int source) {
+        // A1：发令来源准入闸（0x1C 绝迹护栏，纯逻辑、宿主可测）。
+        if (!CompanionReqGuard.mayIssueFrom(source)) {
+            uiLog("取证 摘要请求被准入闸拒绝 来源="
+                    + CompanionReqGuard.sourceLabel(source) + "（A1：仅 0x19 放令）");
+            return;
+        }
+        if (!companionActive || companionModeSwitchInFlight || pageText == null
+                || pageText.isEmpty()) {
+            return;
+        }
+        if (pageNo < 0 || pageNo != companionPageNo) {
+            return; // 既有页号对账：页号已翻走不发过期请求（非「加严」，原样保留）
+        }
+        // A3：去重键含正文指纹。
+        final String key = CompanionReqGuard.reqKey(pageNo, mode, pageText);
+        if (key.equals(companionReqKey)) {
+            return; // 同页同模式同正文已请求，去重防浪费
+        }
+        companionReqKey = key;
+        // A4 基准：发起请求时捕获的正文快照（局部 final 引用，不随 companionLastPage 覆写）。
+        // 登记为「当前有效请求」；回执时与之比对，而非现读已被覆写的 companionLastPage。
+        final String snapshot = pageText;
+        companionReqSnapshot = snapshot;
+        // 取证日志①：请求发起的页号 / 正文前 20 字 / 字数 / 来源。现场应恒见来源=0x19。
+        uiLog("取证 请求发起 page=" + pageNo
+                + " 正文前20字=" + CompanionReqGuard.head(pageText, 20)
+                + " 正文字数=" + pageText.length()
+                + " 来源=" + CompanionReqGuard.sourceLabel(source));
+        uiLog("伴读摘要生成中…（page=" + pageNo + " · " + companionModeName(mode) + "）");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                // Android 主线程禁网：整个 LLM 往返在后台线程（同 onAiQuery 范式）。
+                AiClient.Result r = AiClient.summarize(aiConfig(), snapshot, mode);
+                final String text = r.ok ? r.text : "";
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        // 既有迟到回执：页号或模式已变一律丢弃，不覆盖新页右栏。
+                        if (pageNo != companionPageNo || mode != companionMode) {
+                            return;
+                        }
+                        // A4 纵深防线：正文已变（翻页 / 同页异文重推 / 断链复位）→
+                        // 登记快照已被顶掉或清空，本次迟到回执绝不发帧。
+                        if (!CompanionReqGuard.receiptCurrent(snapshot, companionReqSnapshot)) {
+                            uiLog("取证 回执丢弃 正文已变 page=" + pageNo
+                                    + "（A4 内容比对不命中）");
+                            return;
+                        }
+                        sendCompanionSummary(text, pageNo, mode);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** 回 CTRL 0x0A SUMMARY 裸帧（方案 B，单帧 241B；二轮按 233B 槽分片）。
+     *  设备端只在「idx 从 0 连续且收齐 total」时整段交付，因此这里逐帧写、帧间
+     *  留 20 ms 让 notify 排空；任一片写失败即整段作废（设备侧会丢弃残片），
+     *  下一轮翻页重新请求，不会拼出半句冒充完整结论。 */
+    private void sendCompanionSummary(final String text, final int pageNo, final int mode) {
+        final BluetoothGattCharacteristic c = cCtrlAi;
+        if (c == null) {
+            uiLog("未持有 CTRL 特征，无法回传伴读摘要");
+            return;
+        }
+        final java.util.List<byte[]> frames;
+        try {
+            frames = PushProto.encodeSummaryShards(text, pageNo, mode);
+        } catch (IllegalArgumentException e) {
+            uiLog("伴读摘要帧参数越界，已丢弃：" + e.getMessage());
+            return;
+        }
+        final int shards = frames.size();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                synchronized (writeLock) {
+                    boolean ok = true;
+                    for (int i = 0; i < shards; i++) {
+                        if (!writeChar(c, frames.get(i))) { ok = false; break; }
+                        if (i + 1 < shards) {
+                            try { Thread.sleep(20); } catch (InterruptedException ignored) { }
+                        }
+                    }
+                    final boolean sent = ok;
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            uiLog(sent
+                                    ? (text.isEmpty()
+                                        ? "伴读摘要已回传（空文本 → 设备显示「本次未生成」）"
+                                        : "伴读摘要已回传（" + text.length() + " 字 · "
+                                            + shards + " 帧）")
+                                    : "伴读摘要回传失败（第 " + shards + " 片写入被拒，整段作废）");
+                        }
+                    });
+                }
+            }
+        }).start();
+    }
+
+    /** gen30 0x0B TTS_DONE：播完一律回，设备端按 NVS 设置自治消费（R0 §四）。 */
+    private void sendCompanionTtsDone(final int pageNo, final int status) {
+        final BluetoothGattCharacteristic c = cCtrlAi;
+        if (c == null) {
+            return;
+        }
+        final byte[] frame;
+        try {
+            frame = PushProto.encodeTtsDone(pageNo, status);
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                synchronized (writeLock) {
+                    writeChar(c, frame); // 静默账务：不刷新 UI、不弹错误
+                }
+            }
+        }).start();
     }
 
     /**
@@ -1908,9 +2434,32 @@ public class MainActivity extends Activity {
             public void run() {
                 ttsLastPageMs = System.currentTimeMillis();
                 ++ttsPagesRead;
-                // 跟随模式：打断当前读新页（"" = 静默）。/ Follow: interrupt
-                // and read the new page ("" = silence).
-                ttsSpeaker.speakFollow(page);
+                // gen30 伴读案：伴读态把 PAGE_BEGIN 对账页号绑进本次朗读（播完
+                // 回 TTS_DONE 用），并按该页号请求摘要；纯听书仍走无页号旧入口，
+                // 状态、回帧、请求三者全不变（R0 §一）。
+                final boolean comp = companionActive && companionPageNo >= 0
+                        && !companionModeSwitchInFlight;
+                final int compPageNo = comp ? companionPageNo : -1;
+                final int compMode = companionMode;
+                if (comp) {
+                    // A1 后 0x19 是摘要唯一发令点；显式传来源给准入闸与取证日志。
+                    companionLastPage = page;
+                    requestCompanionSummary(page, compPageNo, compMode,
+                            CompanionReqGuard.SRC_PAGE_TEXT);
+                }
+                // 修复轮解耦：摘要已在上面无条件请求（comp 分支），朗读在这里才被
+                // 0x1D 使能位门控——设备关掉听书后仍推页文本（摘要恒通、右栏照常
+                // 更新），只有声音停。空页（""）永远走停止分支，与使能位无关：
+                // 那是设备明确的「立即静默」语义，不能被 gating 掉。
+                // Repair-round decoupling: the summary is requested above
+                // unconditionally; playback is gated on the 0x1D enable bit. An
+                // empty page always reaches speakFollow - it is the device's
+                // explicit "silence now" signal and must never be gated away.
+                if (page.isEmpty() || ttsEnableFromDevice) {
+                    // 跟随模式：打断当前读新页（"" = 静默）。/ Follow: interrupt
+                    // and read the new page ("" = silence).
+                    ttsSpeaker.speakFollow(page, compPageNo);
+                }
                 // 来页即保活：点词监听与听书朗读是两段独立会话，两个 FGS 互不
                 // 抢占；激进 ROM 拒启时服务内降级不崩，状态行如实显示。
                 // A page arrives -> keep-alive. The listening and read-aloud
@@ -1972,6 +2521,10 @@ public class MainActivity extends Activity {
             sb.append(ttsSpeaker.ready() ? " · 引擎就绪" : " · 引擎不可用");
         } else {
             sb.append("已待机（10 分钟无新页，翻页自动续读）");
+        }
+        // gen30 0x1B 回显：伴读态在既有状态行末尾追加当前模式名（零新增 UI 元素）。
+        if (companionActive) {
+            sb.append(" · 伴读：").append(companionModeName(companionMode));
         }
         final String text = sb.toString();
         runOnUiThread(new Runnable() {
@@ -2079,6 +2632,89 @@ public class MainActivity extends Activity {
                 System.currentTimeMillis());
         mAiRetry = plan;
         runAiQueryAttempt(plan);
+    }
+
+    /**
+     * M3-B：情景分析请求。与点词释义**各走各的**：同一个 AiClient 通道、不同的
+     * system 提示与清洗，结果同样用 sendAiResult() 走 0x08 分帧（word 作关联键）。
+     * 不做重试：情景是用户当场发起的上下文查询，16s 内没等到就让他重按一次，
+     * 比在后台补一条已经过期的分析更有意义。
+     * M3-B scene analysis. Independent of the tap-to-define flow: same AiClient
+     * transport, different system prompt and cleanup, and the result goes out over
+     * 0x08 via sendAiResult() with the word as the correlation key. No retry: a
+     * scene request is a right-now question, and re-tapping beats delivering a
+     * stale analysis minutes later.
+     */
+    private void onSceneRequest(final String word, final String context) {
+        uiLog("情景请求：" + word + "（" + context.length() + " 字）");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final AiClient.Result r = AiClient.scene(aiConfig(), word, context);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!r.ok) {
+                            uiLog("情景失败：" + r.error + "（不回帧）");
+                            return;
+                        }
+                        uiLog("情景：" + word + " 共 " + r.text.length() + " 字");
+                        sendAiResult(word, r.text);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /**
+     * 26.11.3-C：整段选文的四节解析（bit2）。与 onSceneRequest 并列、不合并：
+     * 问的对象不同（段 vs 词），失败日志的措辞不同，回帧时回填的 word 也不同
+     * （段落模式回填的 word 只是设备认领用的锚点，不是卡面标题）。
+     *
+     * Four-section passage analysis (bit2). Sibling to onSceneRequest, not merged:
+     * different subject (passage vs word), different failure wording, and the word
+     * echoed back is only the device's claim anchor, not a card title.
+     */
+    private void onExcerptRequest(final String word, final String context) {
+        uiLog("选段请求：" + context.length() + " 字（锚点 " + word + "）");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final AiClient.Result r = AiClient.excerpt(aiConfig(), context);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!r.ok) {
+                            uiLog("选段失败：" + r.error + "（不回帧）");
+                            return;
+                        }
+                        // 26.11.3-C2：产出比判据的**机器可读**行。审计定的判据是
+                        // 「def 字节 / 输入字节 ≥ 3×（英文）/ ≥ 2×（中文）」，所以这里
+                        // 必须同时打出字节数——只打字符数时，中英混排的比值会失真，
+                        // 而这次事故正是「字」这个单位把 883→305 的萎缩减成了 0.35×。
+                        // 26.11.3-C2: the machine-readable line behind the output-ratio
+                        // criterion (>= 3x for English, >= 2x for Chinese, in BYTES).
+                        // Characters alone distort a mixed CJK/Latin ratio - and "chars"
+                        // is exactly the unit that hid 883 -> 305 as 0.35x.
+                        final int inChars = context.length();
+                        final int inBytes = context.getBytes(UTF8).length;
+                        final int outChars = r.text.length();
+                        final int outBytes = r.text.getBytes(UTF8).length;
+                        uiLog("选段：" + inChars + " 字 / " + inBytes + " B → "
+                                + outChars + " 字 / " + outBytes + " B"
+                                + "（truncated=" + (r.truncated ? 1 : 0) + "）");
+                        if (r.truncated) {
+                            // 撞帽必须喊出来：省略号不解释自己，日志必须解释。
+                            // Hitting the cap must be said out loud - an ellipsis does
+                            // not explain itself, the log has to.
+                            uiLog("选段被截断：输出超过 " + AiClient.EXCERPT_DEF_MAX_BYTES
+                                    + " B 上限（复测卡「输出顶到上限」档照此判读）");
+                        }
+                        sendAiResult(word, r.text);
+                    }
+                });
+            }
+        }).start();
     }
 
     /** M1.3：一次查询尝试（首发与重试共用）。结果回 UI 线程统一编排。 */

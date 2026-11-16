@@ -137,6 +137,30 @@ extern "C" {
 ///                        STATUS 空间（0x10 起）才守住「一个字节辨方向」的诊断纪律，
 ///                        故取 STATUS 空间下一个空位 **0x19**（0x10..0x18 已用）。
 ///                        0x0A 继续留作 CTRL 预留。
+///   gen30   0x1B/0x1C  伴读案（30 批，视听读三位一体；R0 冻结件 1）：四处新 opcode
+///   + 0x0A/0x0B        按「一代一行登记即冻结」登记。STATUS 0x1B/0x1C 为设备→手机，
+///                      CTRL 0x0A/0x0B 为手机→设备，守住「一个字节辨方向」。
+///                      · MODE_SET(STATUS 0x1B)：op1+mode1+source1+reserved2 = 5B。
+///                        mode 0=外语原著(默认)/1=小说网文/2=社科非虚构/3=古文诗词；
+///                        source 0=设备菜单/2=初始化（1=APK 端预留，一期不启用）。
+///                      · PAGE_BEGIN(STATUS 0x1C)：op1+page_no2(LE)+mode1+reserved1 = 5B。
+///                        每页 0x19 流前置的页号对账键；mode 与 0x1B 不一致时按本帧覆盖并记日志。
+///                      · SUMMARY(CTRL 0x0A)：op1+mode1+page_no2+idx1+total1+dlen2+
+///                        text233 = 241B；手机→设备摘要回包，同构 0x08 分帧，一期恒
+///                        total=1，二期多卡片用 idx/total 扩展、不改帧。
+///                      · TTS_DONE(CTRL 0x0B)：op1+page_no2+status1 = 4B；
+///                        status 0=播完/1=用户中断/2=失败；设备按 NVS 设置决定是否消费。
+///                      · 页号对账：PAGE_BEGIN/SUMMARY/TTS_DONE 的 page_no ≠ 设备当前页一律丢弃。
+///                      · 封帧口径（哨位裁定 2026-11-10 19:03 · 方案 B 裸帧对齐）：
+///                        四帧一律按冻结表 op 首字节起算裸帧；CTRL 方向为 gen30 新帧
+///                        开白名单分派——仅首字节 ∈ {0x0A,0x0B} 且总长恰等 241/4 B
+///                        才走裸帧，其余一律走现制 4B 魔数校验、失败→ERR(2)。
+///                        现制帧首字节固定 0x50 与白名单零交集，分派确定性成立；
+///                        wire 帽 244 B（MTU 247 − 3 写属性头）下裸帧 241 ≤ 244，
+///                        零 reinterpret、零改 R0 字段算术与 _Static_assert。
+///                      · 0x19 等既有冻结帧一字节不动；未登记 op 仍走 default→ERR(2)，
+///                        0x0A/0x0B 已登记故不再属「未登记」。Java/Python 参考实现同代
+///                        同步常量与裸帧口径；APK 发送侧编解码函数体属 APK 工作包（并行）。
 ///   gen26.5 0x08        AI contextual definitions + multi-frame (M2 closing round,
 ///                      registered and frozen across all three ends):
 ///                      · 0x17/0x06 gain context: word[64] + book_id(u32 LE) +
@@ -188,6 +212,39 @@ extern "C" {
 ///                        you the direction" diagnostic rule, so the next free
 ///                        STATUS slot **0x19** is taken (0x10..0x18 are used).
 ///                        0x0A stays reserved for CTRL.
+///   gen30   0x1B/0x1C  Read-along companion (batch 30, R0 frozen item 1): four new
+///   + 0x0A/0x0B        opcodes registered "one generation, one line, registration freezes".
+///                      STATUS 0x1B/0x1C are device-to-phone, CTRL 0x0A/0x0B are
+///                      phone-to-device, preserving the "one byte tells direction" rule.
+///                      · MODE_SET (STATUS 0x1B): op1+mode1+source1+reserved2 = 5 B;
+///                        mode 0=foreign (default)/1=novel/2=social/3=classical;
+///                        source 0=device menu/2=init (1=APK reserved, unused in phase 1).
+///                      · PAGE_BEGIN (STATUS 0x1C): op1+page_no2(LE)+mode1+reserved1 = 5 B;
+///                        precedes each 0x19 stream, the page-number reconciliation key;
+///                        a mode mismatch with 0x1B is overridden by this frame and logged.
+///                      · SUMMARY (CTRL 0x0A): op1+mode1+page_no2+idx1+total1+dlen2+
+///                        text233 = 241 B; phone-to-device summary, shaped like 0x08,
+///                        total=1 in phase 1, multi-card via idx/total in phase 2, no frame change.
+///                      · TTS_DONE (CTRL 0x0B): op1+page_no2+status1 = 4 B;
+///                        status 0=finished/1=user abort/2=failed; the device decides
+///                        whether to consume it from its NVS setting.
+///                      · Page reconciliation: any PAGE_BEGIN/SUMMARY/TTS_DONE whose
+///                        page_no differs from the device's current page is dropped.
+///                      · Framing (sentinel ruling 2026-11-10 19:03, plan B / bare-frame
+///                        alignment): all four frames are bare op-first frames per the
+///                        frozen table. CTRL-direction gen30 frames get a whitelist
+///                        dispatch - only a first byte in {0x0A,0x0B} with an exact
+///                        241/4 B length takes the bare path; everything else goes through
+///                        the legacy 4 B magic check, failing to ERR(2). Legacy frames
+///                        start with 0x50, disjoint from the whitelist, so dispatch is
+///                        deterministic. The 244 B wire cap (MTU 247 - 3 attribute
+///                        header) admits the 241 B bare frame: zero reinterpret, no
+///                        change to R0 field arithmetic or its _Static_asserts.
+///                      · All existing frozen frames (0x19 etc.) stay byte-unchanged;
+///                        unregistered ops still take default -> ERR(2), and 0x0A/0x0B
+///                        are registered hence no longer "unregistered". Java/Python
+///                        references sync constants and bare-frame codec now; the APK
+///                        send-side codec bodies belong to the APK work package (parallel).
 enum {
     PUSH_OP_BEGIN = 0x01,         ///< 开始一次会话 / start a session
     PUSH_OP_END = 0x02,           ///< 正文结束，请求校验 / body done, ask for verification
@@ -201,8 +258,12 @@ enum {
                                   ///< gen26.5: segmented AI definition (seg_total==1 == 0x07)
     PUSH_OP_AI_CAPS_ENABLE = 0x09, ///< gen26.5：手机→设备 AI 能力使能（bits u32 LE；收前 0x17 一律旧帧）/
                                   ///< gen26.5: phone-to-device AI capability enable (legacy 0x17 until seen)
-    PUSH_OP_RESERVED_FIRST = 0x0A, ///< gen25 预留区续（0x08/0x09 已由 gen26.5 启用）/
-                                  ///< gen25 reservation continues (0x08/0x09 taken by gen26.5)
+    PUSH_OP_SUMMARY = 0x0A,        ///< gen30 伴读：手机→设备摘要回包（241B 定长，同构 0x08 分帧）/
+                                  ///< gen30: phone-to-device AI summary (fixed 241 B)
+    PUSH_OP_TTS_DONE = 0x0B,       ///< gen30 伴读：手机→设备播完回执（4B）/
+                                  ///< gen30: phone-to-device playback-done receipt (4 B)
+    PUSH_OP_RESERVED_FIRST = 0x0C, ///< gen30 顺移：0x0A/0x0B 已由伴读案启用，预留区从 0x0C 起 /
+                                  ///< gen30: 0x0A/0x0B taken by read-along, reservation now starts at 0x0C
     PUSH_OP_RESERVED_LAST = 0x0F,  ///< gen25 预留区终点（STATUS 从 0x10 起，零重叠）/
                                    ///< gen25 reservation end (STATUS starts at 0x10, no overlap)
 };
@@ -222,6 +283,10 @@ enum {
     PUSH_ST_AI_QUERY = 0x17, ///< gen26：设备→手机，用户点词请算释义 / device to phone: define this word
     PUSH_ST_CAPS = 0x18,     ///< gen26：设备→手机，能力位图上报（连接后）/ device to phone: capability bitmap
     PUSH_ST_TTS_TEXT = 0x19, ///< gen26.5：设备→手机，当前页纯文本（TTS 听书，跟随模式）/ device to phone: page text for read-aloud
+    PUSH_ST_AI_SCENE = 0x1A, ///< M3：设备→手机，情景释义请求（词 + 上下文 + 词偏移，分片）/ device to phone: scene request (word + context + offset, segmented)
+    PUSH_ST_MODE_SET = 0x1B,  ///< gen30 伴读：设备→手机，模式广播（5B）/ device to phone: mode broadcast (5 B)
+    PUSH_ST_PAGE_BEGIN = 0x1C, ///< gen30 伴读：设备→手机，页号对账前置帧（5B）/ device to phone: page-begin marker (5 B)
+    PUSH_ST_TTS_ENABLE = 0x1D, ///< gen30 伴读修复轮：设备→手机，朗读使能（2B：op+使能位）/ device to phone: read-aloud enable (2 B)
 };
 
 /// 正文类型。/ Body types.
@@ -264,14 +329,33 @@ typedef struct {
 /* AI lookup frames (gen26, 0x06/0x07 + STATUS 0x17). */
 
 /// 单词 / 释义文本上限（UTF-8 字节，含结尾 0）。/ Word and definition text caps.
-#define PUSH_AI_WORD_MAX 64u  ///< 单词上限 / word cap
-#define PUSH_AI_DEF_MAX  1200u ///< gen26.6.4：释义槽 768→1200，承接 APK 1152B 帽（8 句例句+搭配）；仍受 0x08 重组器(4096B)与 ai_reader(1200B) 兜住 / def slot 768->1200 for the APK 1152B cap
-// gen26.6.4 契约（编译期钉死）：释义槽必须容下 1152B 的 APK 帽余量，缩回旧的 768 会让
+#define PUSH_AI_WORD_MAX 64u ///< 单词上限 / word cap
+
+// 26.11.3-C2（B 路线拆槽）：缓冲尺寸必须跟着它装的**东西**走，不跟最大的那个家伙走。
+// 26.11.3-D 之前只有一个 DEF_MAX，于是「结果槽 / 卡片缓存 / 弹卡段缓冲 / 生词批槽」
+// 四类语义完全不同的缓冲共用一个数——把段落抬到 8192 就等于让 8 条词义缓存各白占
+// 7 KB（55,936 B，见交付件内存账）。拆成两条之后每一条都有自己的上限，谁也不替谁
+// 说谎：纸条尺寸 = 它要装的内容的上界。
+//
+// 26.11.3-C2 (the B-route slot split): a buffer is sized by what it HOLDS, not by the
+// largest of its neighbours. Before this there was one DEF_MAX and four semantically
+// different buffers shared it, so widening passages to 8192 would have made eight
+// word-definition cache entries each waste 7 KB. Two budgets now: each buffer states
+// its own ceiling and nobody lies for anybody else.
+#define PUSH_AI_CARD_MAX 1200u ///< 词义路径上限：卡片 / 预取缓存 / 弹卡段缓冲 / 生词批槽，承接 APK 1152B 帽 / word-path cap (cards, cache, popup segments, vocab batch)
+#define PUSH_AI_DEF_MAX  8192u ///< 传输 / 显示槽：段落解析（bit2）也走这条槽，8192 ≈ 2,700 汉字，同时是 0x08 重组器与 ai_reader 的共同上界 / transport and display slot, passages included
+
+// gen26.6.4 契约（编译期钉死）：词义路径必须容下 1152B 的 APK 帽余量，缩回旧的 768 会让
 // 新预算下的长释义在协议层被截断。任何缩槽改动在此编译失败——常量族的有牙护栏。
-// gen26.6.4 contract (pinned at compile time): the def slot must hold the 1152B APK
+// gen26.6.4 contract (pinned at compile time): the word path must hold the APK's 1152B
 // cap; shrinking back to 768 truncates the new budget at the protocol layer.
-_Static_assert(PUSH_AI_DEF_MAX >= 1200u,
-               "gen26.6.4: PUSH_AI_DEF_MAX must stay >= 1200 (APK 1152B cap)");
+_Static_assert(PUSH_AI_CARD_MAX >= 1200u,
+               "gen26.6.4: PUSH_AI_CARD_MAX must stay >= 1200 (APK 1152B cap)");
+// 26.11.3-C2：槽 ≥ 卡片是**语义**要求（词义也要走同一条结果槽），不是余量裕度。
+// 26.11.3-C2: slot >= card is a semantic requirement (word answers ride the same slot),
+// not a headroom figure.
+_Static_assert(PUSH_AI_DEF_MAX >= PUSH_AI_CARD_MAX,
+               "26.11.3-C2: the result slot must hold a card-sized answer too");
 
 /// AI_QUERY（0x06）CTRL 载荷：手机→设备，触发离线队列回流或即时查询。
 /// AI_QUERY (0x06) CTRL payload: phone to device, flush the offline queue or ask now.
@@ -282,7 +366,12 @@ typedef struct {
 /// AI_RESULT（0x07）CTRL 载荷：手机→设备，单词 + 释义。/ AI_RESULT (0x07): word + definition.
 typedef struct {
     char word[PUSH_AI_WORD_MAX]; ///< 单词 / the word
-    char def[PUSH_AI_DEF_MAX];   ///< 释义文本（UTF-8，NUL 结尾）/ the definition, NUL-terminated
+    // 26.11.3-C2：0x07 **只载线格式**（def ≤169B，见 PUSH_AI_DEF_WIRE_MAX），本槽因此
+    // 按词义预算尺寸化、不跟传输槽膨胀——8192 会让这具静态解码目标白占 7 KB。
+    // 26.11.3-C2: the 0x07 frame carries wire-format text only (def <= 169B), so this
+    // slot is sized by the word-path budget and does NOT follow the transport slot -
+    // doing so would waste 7 KB on a static decode target.
+    char def[PUSH_AI_CARD_MAX]; ///< 释义文本（UTF-8，NUL 结尾）/ the definition, NUL-terminated
 } push_ai_result_t;
 
 /// 编 AI_QUERY 帧：out 至少 `PUSH_AI_QUERY_MAX` 字节，返回写入字节数（0 表示 cap 不够）。
@@ -335,9 +424,13 @@ _Static_assert(PUSH_AI_RESULT_WIRE_LEN == 241u,
 _Static_assert(PUSH_AI_DEF_WIRE_MAX == 170u,
                "0x07 wire def slot is frozen at 170B (169 + NUL)");
 // 容量必须容得下一条线格式释义（两链唯一合法的交汇点：容量 ≥ 线格式）。
+// 26.11.3-C2：交汇点钉在**词义路径**上——0x07 的解码目标就是 push_ai_result_t，
+// 它装的东西恒为线格式，故这一条对着 CARD 断言，不对着传输槽。
 // The only legal contact between the chains: capacity must hold a wire-sized def.
-_Static_assert(PUSH_AI_DEF_MAX >= PUSH_AI_DEF_WIRE_MAX,
-               "gen26.6.1: the buffer slot must hold a wire-sized definition");
+// 26.11.3-C2: the contact is pinned at the WORD path - the 0x07 decode target is
+// push_ai_result_t and it only ever holds wire-format text, so this asserts CARD.
+_Static_assert(PUSH_AI_CARD_MAX >= PUSH_AI_DEF_WIRE_MAX,
+               "gen26.6.1: the card slot must hold a wire-sized definition");
 
 /* ---- AI 语境帧（gen26.5，0x17/0x06 扩上下文）---- */
 /* AI contextual frames (gen26.5, 0x17/0x06 with context). */
@@ -428,6 +521,70 @@ size_t push_st_tts_text_encode(const push_tts_text_t *t, uint8_t *out, size_t ca
 /// Decode STATUS 0x19 (fixed 241B; validates seq < total, total >= 1, len < slot).
 bool push_st_tts_text_decode(const uint8_t *in, size_t len, push_tts_text_t *t);
 
+/* ---- 情景释义上下文分帧（M3，STATUS 0x1A）---- */
+/* Scene-lookup context segments (M3, STATUS 0x1A). */
+
+/// 上下文纯文本上限（UTF-8 字节，本页 ±1 页、词居中）。/ Context cap in UTF-8 bytes.
+#define PUSH_SCENE_CTX_MAX 1024u
+/// 被点词上限（与 PUSH_AI_WORD_MAX 同源）。/ Tapped word cap (same as PUSH_AI_WORD_MAX).
+#define PUSH_SCENE_WORD_MAX 64u
+/// 本帧上下文槽：241 - op1 - seq2 - total2 - len2。/ Per-frame context slot.
+#define PUSH_ST_SCENE_SLOT 234u
+/// 首帧元数据：word_len(1) + word(≤64) + word_off(2) + flags(1)。/ First-frame metadata.
+#define PUSH_ST_SCENE_META_MAX (1u + PUSH_SCENE_WORD_MAX + 2u + 1u) ///< = 68
+/// STATUS 0x1A 定长帧：= 241，落在 notify 244 帽内（与 0x19 同构）。/ Fixed 0x1A frame.
+#define PUSH_ST_SCENE_FRAME_MAX (1u + 2u + 2u + 2u + PUSH_ST_SCENE_SLOT) ///< = 241
+/// 帧数上界：首帧最坏 166B + 4×234B = 1102 ≥ 1024。/ Frame upper bound.
+#define PUSH_SCENE_MAX_FRAMES 5u
+
+/// flags 位。/ Flag bits.
+#define PUSH_SCENE_FLAG_CTX_TRUNCATED  (1u << 0) ///< 上下文被截断（1024B 协议上限或发送侧缓冲）/ context truncated (the 1024 B cap or the sender's buffer)
+#define PUSH_SCENE_FLAG_SENTENCE_FALLBACK (1u << 1) ///< 句界未找到、退回页界 / sentence boundary fell back to the page edge
+/// 26.9.26 M5-A S26-3：整段摘抄解析。APK 见 bit2 时把 word 当「首词锚点」、ctx 当
+/// 「整段待解析文本」，走整段解析而不是单词情景卡。登记与联调凭证见 docs/PROTOCOL.md。
+/// Excerpt analysis: with bit2 the APK treats word as the leading-word anchor and ctx as
+/// the whole passage. Registry and interop credentials live in docs/PROTOCOL.md.
+#define PUSH_SCENE_FLAG_EXCERPT        (1u << 2)
+
+/// 0x1A 单帧载荷（解码结果）。首帧（seq==0）带 word/word_off/flags；后续帧三者为零。
+/// Decoded 0x1A frame. The first frame (seq==0) carries word/word_off/flags;
+/// later frames leave those three zeroed.
+typedef struct {
+    uint16_t seq;                    ///< 本帧序号，从 0 起 / this frame's index, 0-based
+    uint16_t total;                  ///< 总帧数 / total frames
+    uint16_t len;                    ///< 本帧 ctx 有效字节 / valid context bytes
+    uint8_t word_len;                ///< 首帧词长，后续帧为 0 / word length (first frame only)
+    char word[PUSH_SCENE_WORD_MAX];  ///< 首帧词（无 NUL 语义，按 word_len 取）/ word (first frame)
+    uint16_t word_off;               ///< 词在完整 ctx 内的字节偏移 / word offset inside the full context
+    uint8_t flags;                   ///< PUSH_SCENE_FLAG_* / flag bits
+    char ctx[PUSH_ST_SCENE_SLOT];    ///< 本帧上下文片段 / this frame's context slice
+} push_scene_frame_t;
+
+_Static_assert(PUSH_ST_SCENE_FRAME_MAX == 241u, "0x1A frame must stay 241B");
+_Static_assert(PUSH_ST_SCENE_META_MAX <= PUSH_ST_SCENE_SLOT, "first-frame meta must fit the slot");
+_Static_assert(PUSH_SCENE_CTX_MAX <= PUSH_ST_SCENE_SLOT * PUSH_SCENE_MAX_FRAMES - PUSH_ST_SCENE_META_MAX,
+               "5 frames must carry the full 1024B context");
+
+/// 编 STATUS 0x1A（241B 零填充定长）。slice 为本帧 ctx 片段，slice_len ≤ 234-meta（首帧）。
+/// Encode a STATUS 0x1A (fixed 241B, zero-padded).
+size_t push_st_scene_encode(const char *word, uint16_t word_off, uint8_t flags,
+                            uint16_t seq, uint16_t total,
+                            const char *slice, size_t slice_len,
+                            uint8_t *out, size_t cap);
+/// 解 STATUS 0x1A（241B 定长；校验 seq < total、total ≤ PUSH_SCENE_MAX_FRAMES、len ≤ 槽）。
+/// Decode a STATUS 0x1A (fixed 241B; validates seq/total/len).
+bool push_st_scene_decode(const uint8_t *in, size_t len, push_scene_frame_t *f);
+
+/// 分片计划：给定词与完整 context，返回需要的帧数（1..PUSH_SCENE_MAX_FRAMES）。
+/// 首帧预算 = 234 - (4 + word_len)，后续帧预算 = 234；按 UTF-8 字符边界切分。
+/// Frame plan: frames needed for word+context; the first frame's budget is
+/// 234-(4+word_len), later frames get 234. Slices land on UTF-8 boundaries.
+uint16_t push_scene_frame_count(const char *word, const char *ctx, size_t ctx_len);
+/// 取第 i 帧的 ctx 切片；i 越界或参数非法返回 false。
+/// Fetch frame i's context slice; false when i is out of range.
+bool push_scene_frame_at(const char *word, const char *ctx, size_t ctx_len, uint16_t i,
+                         const char **slice, size_t *slice_len);
+
 /* ---- 能力位图（gen26 能力协商）---- */
 /* Capability bitmap (gen26 capability negotiation). */
 
@@ -438,6 +595,8 @@ typedef struct {
 #define PUSH_CAP_AI_QUERY  (1u << 0) ///< 设备支持 AI 查词（0x06/0x07 + 0x17）/ device supports AI lookup
 #define PUSH_CAP_AI_CONTEXT (1u << 1) ///< gen26.5：0x17/0x06 带书标识+位置上下文 / gen26.5: contextual 0x17/0x06
 #define PUSH_CAP_AI_MULTI   (1u << 2) ///< gen26.5：0x08 释义分帧 / gen26.5: segmented definitions (0x08)
+#define PUSH_CAP_AI_SCENE_VIEW (1u << 4) ///< M3-B：APK 能出四节情景分析（回答 0x1A）；未置位设备不发 0x1A，入口也不显示 / M3-B: APK answers 0x1A with four sections; the device stays silent without it
+#define PUSH_CAP_AI_SCENE   (1u << 3) ///< M3：APK 支持情景释义（0x1A 上下文 + 情景提示词）；未置位设备不发 0x1A / M3: APK understands scene lookup (0x1A); device stays silent without it
 
 /// 编能力位图 STATUS 帧（op 0x18 + 4 字节小端位掩码）。/ Encode a capability bitmap STATUS frame.
 size_t push_caps_encode(const push_caps_t *caps, uint8_t *out, size_t cap);
@@ -491,6 +650,20 @@ bool push_data_decode(const uint8_t *in, size_t len, uint16_t *seq, const uint8_
 /// is parsed in full by push_begin_decode instead.
 bool push_ctrl_header_decode(const uint8_t *in, size_t len, uint8_t *op);
 
+/* ---- gen30 伴读：CTRL 裸帧白名单分派（哨位裁定方案 B）---- */
+/* Read-along gen30: bare CTRL frame whitelist dispatch (sentinel ruling, plan B). */
+
+/// 仅当首字节为已登记的 gen30 CTRL opcode（0x0A SUMMARY / 0x0B TTS_DONE）且总长
+/// 恰等于该帧定长（241 / 4 B）时返回 true 并交出 op；否则一律 false，由调用方继续
+/// 走现制 4 B 公共头校验（失败→ERR(2)）。纯函数、无状态，宿主可逐字节断言。
+/// 与现制帧首字节 0x50 零交集，故分派确定性成立：既有 CTRL 路径逐字不变。
+/// Returns true only for a registered gen30 CTRL opcode (0x0A / 0x0B) whose total
+/// length equals that frame's fixed length (241 / 4 B); everything else returns
+/// false and the caller falls through to the legacy 4 B header check (ERR(2) on
+/// failure). Pure and stateless for host assertions. Disjoint from the legacy 0x50
+/// first byte, so dispatch is deterministic and the existing CTRL path stays intact.
+bool push_gen30_ctrl_bare_op(const uint8_t *in, size_t len, uint8_t *op);
+
 /* ---- STATUS 编解码 / STATUS codec ---- */
 
 #define PUSH_STATUS_MAX 16u ///< STATUS 帧上限 / STATUS frame cap
@@ -498,6 +671,96 @@ bool push_ctrl_header_decode(const uint8_t *in, size_t len, uint8_t *op);
 /// 编码一条 STATUS：opcode + 至多 12 字节 body，返回帧长（0 表示 cap 不够）。
 /// Encode one STATUS: opcode plus up to 12 body bytes; returns frame length (0 when out of cap).
 size_t push_status_encode(uint8_t opcode, const uint8_t *body, size_t body_len, uint8_t *out, size_t cap);
+
+/* ---- 伴读案帧（gen30，R0 冻结件 1；登记层常量）---- */
+/* Read-along companion frames (gen30, R0 frozen item 1; registry-layer constants). */
+/*
+ * 本节登记 R0 冻结的「opcode 编号 + 定长 + 字段宽度 + 枚举值」，全部为编译期常量。
+ * 步 1 为纯登记层；步 3 起按哨位裁定方案 B 启用：四帧一律 op 首字节裸帧，
+ * CTRL 方向由 push_gen30_ctrl_bare_op() 白名单分派（见下方声明与 push_proto.c），
+ * 现制 4 B 公共头路径一字节不动。封帧口径已裁定，不再属「未定死」项。
+ *
+ * This section registers the frozen opcode numbers, frame lengths, field widths
+ * and enum values as compile-time constants. Step 1 was registry-only; from step 3
+ * plan B (sentinel ruling) is in force: all four are bare op-first frames and the
+ * CTRL direction is dispatched by the push_gen30_ctrl_bare_op() whitelist (see the
+ * declaration below and push_proto.c). The legacy 4 B header path is byte-unchanged.
+ */
+
+/// 四模式 Prompt 编号（设备只传编号；模板与确定性截断全在 APK 端）。/ Four prompt mode ids.
+enum {
+    PUSH_RIDE_MODE_FOREIGN = 0,  ///< 外语原著（默认）/ foreign original (default)
+    PUSH_RIDE_MODE_NOVEL = 1,    ///< 小说网文 / web novel
+    PUSH_RIDE_MODE_SOCIAL = 2,   ///< 社科非虚构 / social non-fiction
+    PUSH_RIDE_MODE_CLASSIC = 3,  ///< 古文诗词 / classical poetry
+    PUSH_RIDE_MODE_COUNT = 4,    ///< 初始模式集大小 / initial mode-set size
+};
+
+/// MODE_SET.source 来源。/ MODE_SET source.
+enum {
+    PUSH_MODE_SRC_DEVICE = 0,    ///< 设备菜单切换 / device menu
+    /* 1 = APK 端预留，一期不启用 / 1 reserved for APK, unused in phase 1 */
+    PUSH_MODE_SRC_INIT = 2,      ///< 连接后初始化同步 / post-connect init sync
+};
+
+/// TTS_DONE.status 播完状态。/ TTS_DONE status.
+enum {
+    PUSH_TTS_DONE_FINISHED = 0,  ///< 播完 / finished
+    PUSH_TTS_DONE_ABORT = 1,     ///< 用户中断 / user aborted
+    PUSH_TTS_DONE_FAILED = 2,    ///< 失败 / failed
+};
+
+/// 四帧定长（R0 冻结表，op 首字节起算）。/ Four fixed frame lengths (op-first, frozen R0).
+#define PUSH_ST_MODE_SET_LEN   5u    ///< op1+mode1+source1+reserved2
+#define PUSH_ST_PAGE_BEGIN_LEN 5u    ///< op1+page_no2(LE)+mode1+reserved1
+#define PUSH_ST_TTS_ENABLE_LEN 2u    ///< op1+enable1（修复轮解耦）/ decoupling enable bit
+#define PUSH_OP_SUMMARY_LEN    241u  ///< op1+mode1+page_no2+idx1+total1+dlen2+text233
+#define PUSH_OP_TTS_DONE_LEN   4u    ///< op1+page_no2+status1
+
+/// SUMMARY 文本槽（UTF-8 字节）/ SUMMARY text slot (UTF-8 bytes).
+#define PUSH_SUMMARY_TEXT_MAX 233u
+/// 多帧摘要拼装上限（修复轮三轮：250 字帽）。250 个汉字约 750 B，分四帧；
+/// 取 1024 B 给英文、标点与 emoji 留余量，设备侧拼接缓冲因此是 1025 B（PSRAM 静态）。
+/// 分片语义：同一 page_no 下 idx 从 0 连续递增，收齐 idx+1==total 才交付；
+/// 乱序或缺片一律丢弃，等下一次翻页重新开始（不猜、不补、不显示半句）。
+/// Multi-frame summary assembly cap (round 3: 250-char cap). 250 CJK chars ≈ 750 B
+/// over four frames; 1024 B leaves room for Latin text, punctuation and emoji.
+/// Sharding: under one page_no, idx increments from 0 and only idx+1==total
+/// delivers; out-of-order or missing shards are dropped wholesale.
+#define PUSH_SUMMARY_TOTAL_MAX 1024u
+/// 页号字段为 u16 LE / page_no is a little-endian u16.
+#define PUSH_PAGE_NO_BYTES 2u
+/// CTRL 写属性 wire 帽：MTU 247 − 3 B 写属性头 = 244 B（哨位裁定方案 B 的算术依据；
+/// 方案 A 的 4B 头 + 241B = 245B 正由此超帽 1B）。/ CTRL write wire cap.
+#define PUSH_GEN30_WIRE_CAP 244u
+
+/* 冻结表算术自洽（编译期钉死，防登记漂移）/ Frozen-table arithmetic pinned at compile time. */
+_Static_assert(1u + 1u + 1u + 2u == PUSH_ST_MODE_SET_LEN, "gen30 MODE_SET must stay 5 B");
+_Static_assert(1u + PUSH_PAGE_NO_BYTES + 1u + 1u == PUSH_ST_PAGE_BEGIN_LEN, "gen30 PAGE_BEGIN must stay 5 B");
+_Static_assert(1u + 1u == PUSH_ST_TTS_ENABLE_LEN, "gen30 TTS_ENABLE must stay 2 B");
+_Static_assert(1u + 1u + PUSH_PAGE_NO_BYTES + 1u + 1u + 2u + PUSH_SUMMARY_TEXT_MAX == PUSH_OP_SUMMARY_LEN,
+               "gen30 SUMMARY fields must sum to 241 B");
+_Static_assert(1u + PUSH_PAGE_NO_BYTES + 1u == PUSH_OP_TTS_DONE_LEN, "gen30 TTS_DONE must stay 4 B");
+_Static_assert(PUSH_RIDE_MODE_COUNT == 4u, "gen30 initial mode set is four");
+/* 预留区顺移零空洞、STATUS 段零重叠；新帧编号紧接既有帧。 */
+_Static_assert(PUSH_OP_SUMMARY == PUSH_OP_AI_CAPS_ENABLE + 1, "gen30 SUMMARY 0x0A follows 0x09");
+_Static_assert(PUSH_OP_TTS_DONE == PUSH_OP_SUMMARY + 1, "gen30 TTS_DONE 0x0B follows 0x0A");
+_Static_assert(PUSH_OP_RESERVED_FIRST == PUSH_OP_TTS_DONE + 1, "gen30 reserved block starts at 0x0C");
+/* 两侧分属 CTRL/STATUS 两个匿名 enum，显式转整数比较，避开 -Wenum-compare。 */
+_Static_assert((int)PUSH_OP_RESERVED_LAST < (int)PUSH_ST_READY, "gen30 CTRL reserved block must not overlap STATUS");
+_Static_assert(PUSH_ST_MODE_SET == PUSH_ST_AI_SCENE + 1, "gen30 STATUS 0x1B follows 0x1A");
+_Static_assert(PUSH_ST_PAGE_BEGIN == PUSH_ST_MODE_SET + 1, "gen30 STATUS 0x1C follows 0x1B");
+/* 修复轮：朗读使能紧跟页号对账帧，顺移零空洞（0x1D）。 */
+_Static_assert(PUSH_ST_TTS_ENABLE == PUSH_ST_PAGE_BEGIN + 1, "gen30 STATUS 0x1D follows 0x1C");
+/* 方案 B 白名单确定性（哨位裁定生效条件 1/3）：现制魔数与两枚裸帧 op 零碰撞、
+ * 裸帧不超 wire 帽。两条都钉在编译期，宿主侧另有运行时长度闸门断言。 */
+_Static_assert(PUSH_MAGIC0 != PUSH_OP_SUMMARY && PUSH_MAGIC0 != PUSH_OP_TTS_DONE,
+               "gen30 bare CTRL first byte must never collide with legacy magic0");
+_Static_assert(PUSH_MAGIC1 != PUSH_OP_SUMMARY && PUSH_MAGIC1 != PUSH_OP_TTS_DONE,
+               "gen30 bare CTRL first byte must never collide with legacy magic1");
+_Static_assert(PUSH_OP_SUMMARY_LEN <= PUSH_GEN30_WIRE_CAP &&
+               PUSH_OP_TTS_DONE_LEN <= PUSH_GEN30_WIRE_CAP,
+               "gen30 bare CTRL frames must fit the 244 B wire cap");
 
 #ifdef __cplusplus
 }

@@ -19,6 +19,9 @@
 # Build artifacts and directories
 **/build/
 build/
+# 多树构建的对账目录（26.9.2x 起每轮 A/B/C 各一棵）/ per-round multi-tree build dirs
+build_269*/
+trees_269*/
 /_site/
 *.o
 *.a
@@ -111,3 +114,8 @@ Desktop.ini
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
 tools/idf_env.sh
+
+# Host-test core dumps and per-round scratch build trees (not source).
+core
+core.*
+build_26*/

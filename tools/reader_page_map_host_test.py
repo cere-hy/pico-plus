@@ -122,6 +122,13 @@ size_t book_layout_page_start_offset(size_t page);
    reader_page_start_offset reads. The map block itself never references it; only
    this Step6 entry does. */
 static size_t s_page;
+
+/* 伴读案 30 批 · 步 2 桩：伴读态由宿主可控驱动（产品侧是 app_book.c 的静态量），
+   关态恒 false，地图区块所有寻址与旧路径逐位一致。
+   Companion-state stub (step 2): host-controlled; off by default so every addressing
+   result stays bit-identical to the closed form. */
+static bool host_companion;
+bool reader_companion_active(void) { return host_companion; }
 '''
 
 MAIN = r'''
@@ -414,6 +421,40 @@ static int check_onform(const char* spec) {
     return ok ? 0 : 1;
 }
 
+/* 伴读案 30 批 · 步 2：伴读态右栏恒不占逻辑页（R0「返回 1」）。
+   故意在「地图仍按 2 栏配对」下验显式短路；输出走 printf 不进 emit，digest 保持
+   关态冻结值；用例内复位伴读态，确定性复跑与关态逐位不变同时成立。
+   Companion state (step 2): the right column never owns a logical page. The map is
+   deliberately left in paired 2-column form so the explicit short-circuit is what is
+   tested; output goes to printf (out of the digest) and the state is reset inside. */
+static int companion_case(void) {
+    fixture_load("......");
+    test_generation = 1;
+    reader_rebuild_page_map(2);
+    host_companion = 1;
+    size_t vc = reader_visual_count();
+    for (size_t v = 0; v < vc + 2; ++v) {
+        size_t left = 999, right = 0;
+        reader_logical_pages(v, &left, &right);
+        if (right != SIZE_MAX || left != reader_visual_start(v)) {
+            printf("companion: FAIL visual=%u left=%u right=%u\n",
+                   (unsigned)v, (unsigned)left, (unsigned)right);
+            host_companion = 0;
+            return 1;
+        }
+    }
+    host_companion = 0;
+    size_t l0 = 999, r0 = 999;
+    reader_logical_pages(0, &l0, &r0);
+    if (!(l0 == 0 && r0 == 1)) {
+        printf("companion: off-state identity FAIL left=%u right=%u\n",
+               (unsigned)l0, (unsigned)r0);
+        return 1;
+    }
+    printf("companion: PASS (right=SIZE_MAX on every visual page; off-state identity)\n");
+    return 0;
+}
+
 static int run_all(void) {
     for (size_t i = 0; i < sizeof(FIXTURES) / sizeof(FIXTURES[0]); ++i)
         for (int columns = 1; columns <= 2; ++columns)
@@ -425,6 +466,7 @@ static int run_all(void) {
     if (stale_case()) return 1;
     if (check_start_offset()) return 1;
     big_case();
+    if (companion_case()) return 1;
     return 0;
 }
 

@@ -1,12 +1,15 @@
 /*
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
- * 中文：HTTPS 分块下载、完整性校验和可取消升级任务。/ English: streamed HTTPS updates, integrity checks and cancellable workers.
- * 冻结：禁止覆盖当前槽；离页或锁屏先等待任务结束。/ Frozen: never overwrite the running slot; join before leaving or locking.
- * 用户修订：分段擦除并串行化闪存与屏幕推送，启动前检查连续内存，低内存安全失败。
- * User revision: erase incrementally and serialize flash with display output; require memory headroom and fail safely on shortage.
+ * 中文：HTTPS 分块下载到 TF 文件、流上完整性校验和可取消升级任务；安装由 ota_update.c 在 UI 确认后完成。/ English: HTTPS download to a TF file behind a streaming hash gate; ota_update.c installs after UI confirmation.
+ * 冻结：离页或锁屏先等待任务结束；用户确认安装前不碰任何 app 槽。/ Frozen: join before leaving or locking; no slot is touched before the user confirms.
+ * 门与诊断：下载专用门 16K（暂定，D1 自证）；门 FAIL 时四项实测值同帧上屏。/ Gates: 16K download-only gate (provisional, D1 self-check); four live readings shown on gate failure.
+ * 修订：刷屏推送由递归锁串行化，进度只追加变化像素。/ Revision: screen pushes are serialized by the recursive lock; progress appends changed pixels only.
+ * 本地化 OTA 批 26.11.25：在线链路只下载到 TF 文件，安装交回 ota_update.c；全程零 esp_ota_* 调用（第五件化石清除）。
+ * / Localized OTA: the online link downloads to the TF file only; the proven local installer flashes it. No esp_ota_* here.
  */
 #include "ota_online.h"
+#include "ota_update.h"  /* PICO_OTA_UPDATE_PATH：下载落点即安装器入口，不复制第二个家 */
 #include "esp_app_desc.h"
 #include "esp_app_format.h"
 #include "esp_crt_bundle.h"
@@ -30,7 +33,6 @@ static SemaphoreHandle_t s_mutex, s_done, s_flash_display;
 static pico_update_status_t *s_status;
 static atomic_bool s_cancel;
 static bool s_joinable, s_download;
-static const esp_partition_t *s_verified;
 
 static bool initialize(void) {
     if (!s_status) s_status = heap_caps_calloc(1, sizeof(*s_status), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -39,6 +41,10 @@ static bool initialize(void) {
     if (!s_flash_display) s_flash_display = xSemaphoreCreateRecursiveMutex();
     return s_status && s_mutex && s_done && s_flash_display;
 }
+// 递归锁壳保留：display.c 有 24 处刷屏串行化调用依赖 pico_online_display_*。
+// 本地化 OTA 后在线链路不再碰 flash，此锁退化为「刷屏自身互斥」，不再是 flash/显示互斥。
+// / The display/flash exclusion lock shell stays (display.c depends on it); the online link
+// / no longer touches flash, so it now only serializes screen pushes.
 bool pico_online_display_begin(void) {
     return s_flash_display && xSemaphoreTakeRecursive(s_flash_display, portMAX_DELAY) == pdTRUE;
 }
@@ -53,32 +59,27 @@ static bool memory_available(size_t internal_min, size_t internal_block, size_t 
         heap_caps_get_free_size(external) >= external_min &&
         heap_caps_get_largest_free_block(external) >= 32768;
 }
-// 锁只覆盖闪存操作，不覆盖网络等待、状态互斥锁或任务收尾，避免取消/刷屏互相等待。
-// Lock flash operations only, excluding network waits, status locks and joins to avoid cancellation/display deadlocks.
-static esp_err_t flash_begin(const esp_partition_t *target, esp_ota_handle_t *handle) {
-    bool held = pico_online_display_begin();
-    esp_err_t error = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, handle);
-    pico_online_display_end(held);
-    return error;
-}
-static esp_err_t flash_write(esp_ota_handle_t handle, const void *data, size_t size) {
-    bool held = pico_online_display_begin();
-    esp_err_t error = esp_ota_write(handle, data, size);
-    pico_online_display_end(held);
-    return error;
-}
-static esp_err_t flash_finish(esp_ota_handle_t handle, bool aborting) {
-    bool held = pico_online_display_begin();
-    esp_err_t error = aborting ? esp_ota_abort(handle) : esp_ota_end(handle);
-    pico_online_display_end(held);
-    return error;
-}
 static void state(pico_update_state_t value, const char *message) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_status->state = value;
     snprintf(s_status->message, sizeof(s_status->message), "%s", message);
     ++s_status->revision;
     xSemaphoreGive(s_mutex);
+}
+// 诊断批 26.11.24 硬约束保留：门 FAIL 时把四项实测值同帧写进提示串（数值前置抗 fit_value 截尾）。
+// 第五维 caps 与 memory_available() 完全一致（SPIRAM|8BIT），不照抄体检面板的裸 SPIRAM。
+// 门降到 16K 后 FAIL 概率更低，但 TLS 握手峰值无实测——25 的 D1 必须能自证，故一字不动。
+static void state_mem_failed(const char *reason) {
+    const unsigned internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const unsigned external = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    char message[96];  // == pico_update_status_t::message
+    snprintf(message, sizeof(message), "内存不足 内%uK/块%uK/PS%uM/PS块%uK %s",
+        (unsigned)(heap_caps_get_free_size(internal) / 1024),
+        (unsigned)(heap_caps_get_largest_free_block(internal) / 1024),
+        (unsigned)(heap_caps_get_free_size(external) / (1024u * 1024u)),
+        (unsigned)(heap_caps_get_largest_free_block(external) / 1024),
+        reason);
+    state(PICO_UPDATE_FAILED, message);
 }
 bool pico_online_busy(void) {
     if (!s_status || !s_mutex) return false;
@@ -98,8 +99,11 @@ static bool layout_valid(void) {
     const esp_partition_t *a = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
     const esp_partition_t *b = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
     const esp_partition_t *data = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
-    return a && b && data && a->address == 0x10000 && b->address == 0x910000 &&
-        a->size == 0x400000 && b->size == 0x400000 && data->address == 0xd10000 && data->size == 0x2000;
+    // 关系校验：两个 OTA 槽都在、等大、otadata 在即通过；地址 / 容量一律取自分区表
+    // （partition manager），不再硬编码任何数值——分区表改版不会让这里静默失效。
+    // / Relational check: both slots present, equal size, otadata present. All addresses
+    // / and sizes come from the partition manager; no hard-coded layout constants.
+    return a && b && data && a->size == b->size && a->size > 0;
 }
 static bool online(bool *owned) {
     read_pico_transfer_status_t status;
@@ -213,10 +217,10 @@ static int read_chunk(esp_http_client_handle_t client, uint8_t *buffer, int cap,
 static bool check_feed(void) {
     char *json = heap_caps_malloc(8193, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     pico_release_t *release = heap_caps_calloc(1, sizeof(*release), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!json || !release) { state(PICO_UPDATE_FAILED, "内存不足，请退出传书后重试"); goto failed; }
-    // 主站失败后回退已有 GitHub 更新源；同一缓冲区顺序请求，无并发 TLS 连接。
-    // Fall back to the existing GitHub source, reusing one buffer and one TLS connection at a time.
-    static const char *const feeds[] = {PICO_OTA_FEED_URL, PICO_OTA_FEED_FALLBACK_URL};
+    if (!json || !release) { state_mem_failed("请退出传书后重试"); goto failed; }
+    // 自家 Pages 单源；同一缓冲区顺序重试，无并发 TLS 连接、无原厂回退源。
+    // / Single self-hosted Pages feed; sequential retries in one buffer, no stock fallback.
+    static const char *const feeds[] = {PICO_OTA_FEED_URL};
     bool valid = false;
     for (size_t source = 0; source < sizeof(feeds) / sizeof(feeds[0]) && !atomic_load(&s_cancel); ++source) {
         char url[192]; snprintf(url, sizeof(url), "%s?t=%lld", feeds[source], (long long)time(NULL));
@@ -256,34 +260,28 @@ failed:
     heap_caps_free(json); heap_caps_free(release);
     return false;
 }
-static bool header_valid(const uint8_t *data, const pico_release_t *release) {
-    const esp_image_header_t *header = (const esp_image_header_t *)data;
-    const esp_app_desc_t *desc = (const esp_app_desc_t *)(data + sizeof(*header) + sizeof(esp_image_segment_header_t));
-    const esp_app_desc_t *current = esp_app_get_description();
-    return header->magic == ESP_IMAGE_HEADER_MAGIC && header->chip_id == ESP_CHIP_ID_ESP32S3 &&
-        desc->magic_word == ESP_APP_DESC_MAGIC_WORD &&
-        memchr(desc->project_name, 0, sizeof(desc->project_name)) && memchr(desc->version, 0, sizeof(desc->version)) &&
-        !strcmp(desc->project_name, current->project_name) && !strcmp(desc->version, release->version);
-}
+// 本地化 OTA 批 26.11.25：在线链路只做「下载到 TF 文件」，安装交回 ota_update.c 的成熟
+// pico_ota_install()。全程零 esp_ota_* 调用——用户确认安装前 flash 一个字节都没碰；
+// 「校验先于擦除」从纪律升级为结构。缓冲放 PSRAM，哈希闸在流上累计，流末比对 sha 通过才 READY。
+// 下载落点 = PICO_OTA_UPDATE_PATH，正是 pico_ota_resolve_path() 优先命中路径，安装链原生接得住。
+// 失败/取消一律 remove() 清理：残缺文件会挡住用户自己放进 TF 卡的同名/异名包。
+// / Localized OTA: the online link only downloads to the TF file; the proven local installer
+// / flashes after explicit UI confirmation. No esp_ota_* calls here, so no slot is touched
+// / before the user confirms. Hash gate stays on the stream; READY only after sha match.
 static bool download(void) {
     pico_release_t *release = heap_caps_malloc(sizeof(*release), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *buffer = heap_caps_malloc(4096, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    uint8_t *header = heap_caps_malloc(288, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!release || !buffer || !header) { state(PICO_UPDATE_FAILED, "内存不足，无法下载升级包"); goto failed; }
+    uint8_t *buffer = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!release || !buffer) { state_mem_failed("无法下载升级包"); goto failed; }
     xSemaphoreTake(s_mutex, portMAX_DELAY); *release = s_status->release; xSemaphoreGive(s_mutex);
-    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
-    if (!layout_valid() || !target || target == esp_ota_get_running_partition() || release->size > target->size) {
-        state(PICO_UPDATE_FAILED, "基础包不兼容，请通过官网完整刷机"); goto failed;
-    }
+    FILE *file = fopen(PICO_OTA_UPDATE_PATH, "wb");
+    if (!file) { state(PICO_UPDATE_FAILED, "需要 TF 卡，请插入后重试"); goto failed; }
     int code = -1; int64_t length = -1;
     esp_http_client_handle_t client = NULL;
     download_range_t range;
-    esp_ota_handle_t handle = 0;
     psa_hash_operation_t hash = PSA_HASH_OPERATION_INIT;
-    bool begun = false;
     esp_err_t error = ESP_OK;
     if (psa_crypto_init() != PSA_SUCCESS || psa_hash_setup(&hash, PSA_ALG_SHA_256) != PSA_SUCCESS) error = ESP_FAIL;
-    size_t total = 0, header_size = 0;
+    size_t total = 0;
     int64_t idle = esp_timer_get_time() + 30000000;
     int n = -1;
     unsigned retries = 0;
@@ -295,8 +293,8 @@ static bool download(void) {
                 if (atomic_load(&s_cancel) || retries++ >= 3) { error = ESP_FAIL; break; }
                 vTaskDelay(pdMS_TO_TICKS(250 * retries)); continue;
             }
-            // 续传必须严格匹配起点与全文件长度；最终仍验证整本镜像的 SHA256。
-            // Resumed responses must match their offset and full length; the whole image still gets SHA256 verification.
+            // 续传必须严格匹配起点与全文件长度；文件只 fopen 一次、顺序追加，天然对齐 total。
+            // / Resumed responses must match offset==total and full length; the whole image still gets SHA256.
             bool response_ok = total ? code == 206 && range.valid && range.start == total &&
                 range.size == release->size && range.end == release->size - 1 : code == 200;
             if (!response_ok || (length > 0 && (uint64_t)length != release->size - total)) {
@@ -315,20 +313,8 @@ static bool download(void) {
             continue;
         }
         if (total + n > release->size) { error = ESP_ERR_INVALID_SIZE; break; }
-        size_t used = 0;
-        if (!begun) {
-            size_t needed = 288 - header_size;
-            used = (size_t)n < needed ? (size_t)n : needed;
-            memcpy(header + header_size, buffer, used); header_size += used;
-            if (header_size == 288) {
-                if (!header_valid(header, release)) { error = ESP_ERR_INVALID_RESPONSE; break; }
-                error = flash_begin(target, &handle);
-                begun = error == ESP_OK;
-                if (begun) error = flash_write(handle, header, header_size);
-            }
-        }
-        if (error == ESP_OK && begun && (size_t)n > used) error = flash_write(handle, buffer + used, n - used);
-        if (error != ESP_OK || psa_hash_update(&hash, buffer, n) != PSA_SUCCESS) { error = ESP_FAIL; break; }
+        if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { error = ESP_FAIL; break; }
+        if (psa_hash_update(&hash, buffer, n) != PSA_SUCCESS) { error = ESP_FAIL; break; }
         total += n;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_status->received = total; ++s_status->revision;
@@ -336,8 +322,9 @@ static bool download(void) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (client) esp_http_client_cleanup(client);
+    if (fclose(file) != 0) error = ESP_FAIL;
     uint8_t digest[32]; size_t digest_size = 0; char hex[65];
-    if (error == ESP_OK && (!begun || n < 0 || !complete || total != release->size || atomic_load(&s_cancel))) error = ESP_FAIL;
+    if (error == ESP_OK && (n < 0 || !complete || total != release->size || atomic_load(&s_cancel))) error = ESP_FAIL;
     if (error == ESP_OK && psa_hash_finish(&hash, digest, sizeof(digest), &digest_size) != PSA_SUCCESS) error = ESP_FAIL;
     psa_hash_abort(&hash);
     if (error == ESP_OK) {
@@ -345,19 +332,14 @@ static bool download(void) {
         if (digest_size != 32 || strcasecmp(hex, release->sha256)) error = ESP_ERR_INVALID_RESPONSE;
     }
     if (error != ESP_OK) {
-        if (begun) flash_finish(handle, true);
+        remove(PICO_OTA_UPDATE_PATH);
         state(PICO_UPDATE_FAILED, "下载中断或校验失败，当前版本保持不变"); goto failed;
     }
-    error = flash_finish(handle, false);
-    if (error != ESP_OK) { state(PICO_UPDATE_FAILED, "固件校验失败，当前版本保持不变"); goto failed; }
-    // 后台仅验证镜像；主线程处理最终启动切换，取消时不影响当前槽。
-    // The worker verifies only; the main task commits boot, so cancellation cannot change the running slot.
-    xSemaphoreTake(s_mutex, portMAX_DELAY); s_verified = target; xSemaphoreGive(s_mutex);
-    state(PICO_UPDATE_READY, "校验通过，即将重启安装");
-    heap_caps_free(release); heap_caps_free(buffer); heap_caps_free(header);
+    state(PICO_UPDATE_READY, "下载完成，是否立即安装？");
+    heap_caps_free(release); heap_caps_free(buffer);
     return true;
 failed:
-    heap_caps_free(release); heap_caps_free(buffer); heap_caps_free(header);
+    heap_caps_free(release); heap_caps_free(buffer);
     return false;
 }
 static void worker(void *unused) {
@@ -369,8 +351,10 @@ static void worker(void *unused) {
         // 更新期间关闭无线省电；完成、取消和失败均恢复原策略。
         // Disable radio power saving for updates, then restore it on success, cancellation or failure.
         restore_ps = esp_wifi_get_ps(&previous_ps) == ESP_OK && esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK;
-        if (!memory_available(32768, 8192, 262144))
-            state(PICO_UPDATE_FAILED, "内存不足，请退出传书后重试");
+        // 下载专用门：缓冲移 PSRAM 后内部需求大降，16K 为暂定候选；TLS 握手峰值无实测，
+        // 25 的 D1 是它的验收。诊断打点全保留，不第三次用推理放行。
+        if (!memory_available(16384, 8192, 262144))
+            state_mem_failed("请退出传书后重试");
         else if (s_download) (void)download(); else (void)check_feed();
     }
     if (restore_ps) (void)esp_wifi_set_ps(previous_ps);
@@ -388,12 +372,13 @@ static esp_err_t start(bool downloading) {
     xSemaphoreGive(s_mutex);
     if (busy || (downloading && !available)) return ESP_ERR_INVALID_STATE;
     if (s_joinable) { xSemaphoreTake(s_done, portMAX_DELAY); s_joinable = false; }
-    if (!memory_available(49152, 16384, 524288)) {
-        state(PICO_UPDATE_FAILED, "内存不足，请退出传书后重试");
+    // 与 worker 门同值重校准（改一个点验全部家）：只动 internal_min 一个参数。
+    if (!memory_available(16384, 16384, 524288)) {
+        state_mem_failed("请退出传书后重试");
         return ESP_ERR_NO_MEM;
     }
     atomic_store(&s_cancel, false);
-    s_download = downloading; s_verified = NULL;
+    s_download = downloading;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_status->busy = true; s_status->received = 0;
     xSemaphoreGive(s_mutex);
@@ -401,7 +386,7 @@ static esp_err_t start(bool downloading) {
           downloading ? "正在下载，短暂断网会自动重连" : "正在连接并检查更新");
     if (xTaskCreate(worker, "kiikoread_ota", 12288, NULL, 4, NULL) != pdPASS) {
         xSemaphoreTake(s_mutex, portMAX_DELAY); s_status->busy = false; xSemaphoreGive(s_mutex);
-        state(PICO_UPDATE_FAILED, "内存不足，无法开始升级"); return ESP_ERR_NO_MEM;
+        state_mem_failed("无法开始升级"); return ESP_ERR_NO_MEM;
     }
     s_joinable = true;
     return ESP_OK;
@@ -423,16 +408,7 @@ void pico_online_cancel_join(void) {
         atomic_store(&s_cancel, true);
         xSemaphoreTake(s_done, portMAX_DELAY); s_joinable = false;
     }
-    s_verified = NULL;
     if (s_status && s_status->state == PICO_UPDATE_READY) state(PICO_UPDATE_CANCELLED, "已取消，当前版本保持不变");
 }
-esp_err_t pico_online_commit(void) {
-    if (s_joinable) { xSemaphoreTake(s_done, portMAX_DELAY); s_joinable = false; }
-    if (!s_verified || atomic_load(&s_cancel)) return ESP_ERR_INVALID_STATE;
-    bool held = pico_online_display_begin();
-    esp_err_t error = esp_ota_set_boot_partition(s_verified);
-    pico_online_display_end(held);
-    s_verified = NULL;
-    if (error != ESP_OK) state(PICO_UPDATE_FAILED, "启动切换失败，当前版本保持不变");
-    return error;
-}
+// 启动切换由 ota_update.c 的 pico_ota_install() 在 UI 确认后完成；在线链路不再持有
+// s_verified / 不再暴露 pico_online_commit()——流式写槽的第二真相已随第五件化石清除。

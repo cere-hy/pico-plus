@@ -12,6 +12,9 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#include "push_part.h"
 
 #include "push_proto.h"
 #include "push_session.h"
@@ -27,13 +30,17 @@
 
 static int s_checks;
 static int s_red;
+// 当前用例号：变异轮要能指名「红落在哪一条」，而不是只知道"某条红了"。
+// The running case id, so a mutation round can name WHICH case went red instead
+// of only knowing that something did.
+static const char *s_case = "-";
 
 #define CHECK(cond)                                                      \
     do {                                                                 \
         ++s_checks;                                                      \
         if (!(cond)) {                                                   \
             ++s_red;                                                     \
-            printf("RED line %d: %s\n", __LINE__, #cond);                \
+            printf("RED [%s] line %d: %s\n", s_case, __LINE__, #cond);    \
         }                                                                \
     } while (0)
 
@@ -161,9 +168,60 @@ static void test_ctrl_header(void) {
     // gen26.5：0x08/0x09 由 gen26.5 启用（分帧/使能），预留区首顺移 0x0A，仍无空洞。
     // gen26.5: 0x08/0x09 taken by gen26.5 (segments/enable); the reserved block
     // now starts at 0x0A, still gap-free.
-    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_AI_CAPS_ENABLE + 1); // 0x0A 紧接 0x09，无空洞
     CHECK(PUSH_OP_RESERVED_FIRST > PUSH_OP_AI_RESULT); // 0x08/0x09 已出预留区 / out of the reserved block
-    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen26 0x06/0x07 + gen26.5 0x08/0x09 registered, 0x0A-0x0F reserved ok\n");
+    // gen30 伴读案（R0 冻结件 1）：0x0A/0x0B 登记为 SUMMARY/TTS_DONE，预留区首再顺移
+    // 到 0x0C；0x1B/0x1C 落在 STATUS 段。步 3 起哨位裁定方案 B 生效：CTRL 方向新帧
+    // 按 op 首字节裸帧走白名单分派（见 test_gen30_bare_dispatch），帧头解码器仍原样
+    // 放行 op（长度不符的畸形帧继续走魔数校验并落 ERR(2)）；未登记 op 仍 default→ERR(2)。
+    // gen30 read-along (R0 frozen item 1): 0x0A/0x0B are SUMMARY/TTS_DONE and the
+    // reserved block starts at 0x0C; 0x1B/0x1C live in the STATUS space. From step 3
+    // plan B (sentinel ruling) applies: bare CTRL frames take a whitelist dispatch
+    // (see test_gen30_bare_dispatch); the header decoder still passes the op through
+    // so malformed frames fall through to the magic check and ERR(2).
+    CHECK(PUSH_OP_SUMMARY == 0x0A && PUSH_OP_TTS_DONE == 0x0B);
+    CHECK(PUSH_OP_RESERVED_FIRST == PUSH_OP_TTS_DONE + 1); // 0x0C 紧接 0x0B，无空洞
+    CHECK(PUSH_ST_MODE_SET == 0x1B && PUSH_ST_PAGE_BEGIN == 0x1C);
+    CHECK(PUSH_ST_PAGE_BEGIN >= PUSH_ST_READY); // 新 STATUS 帧在 STATUS 段内 / inside STATUS space
+    printf("ctrl header: END/RESUME/ABORT decode, bad frames refuse, gen26 0x06/0x07 + gen26.5 0x08/0x09 + gen30 0x0A/0x0B registered, 0x0C-0x0F reserved, gen30 STATUS 0x1B/0x1C ok\n");
+}
+
+/* 哨位裁定方案 B 生效条件 3：魔数帧与 gen30 裸帧零碰撞 + 长度闸门。
+ * 白名单只有两条（0x0A/241B、0x0B/4B）；其余（含畸形新帧）一律 false，
+ * 交回现制 4 B 魔数校验 → ERR(2)。纯函数 push_gen30_ctrl_bare_op 由宿主逐字节验。
+ * Sentinel ruling plan B condition 3: magic/bare zero-collision + length gate.
+ * Only two whitelist entries; everything else falls through to the legacy
+ * 4 B magic check and ERR(2). */
+static void test_gen30_bare_dispatch(void) {
+    uint8_t op = 0xFF;
+    uint8_t summary[PUSH_OP_SUMMARY_LEN];
+    memset(summary, 0, sizeof(summary));
+    summary[0] = PUSH_OP_SUMMARY;
+    uint8_t done[PUSH_OP_TTS_DONE_LEN] = {PUSH_OP_TTS_DONE, 0x34, 0x12, 0u};
+    // 精确命中两条 / both entries hit exactly
+    CHECK(push_gen30_ctrl_bare_op(summary, sizeof(summary), &op) && op == PUSH_OP_SUMMARY);
+    CHECK(push_gen30_ctrl_bare_op(done, sizeof(done), &op) && op == PUSH_OP_TTS_DONE);
+    // 长度闸门：短一字节 / 长一字节 / 空指针 / 零长度全部拒绝
+    CHECK(!push_gen30_ctrl_bare_op(summary, sizeof(summary) - 1, &op));
+    CHECK(!push_gen30_ctrl_bare_op(done, sizeof(done) - 1, &op));
+    CHECK(!push_gen30_ctrl_bare_op(done, sizeof(done) + 1, &op));
+    CHECK(!push_gen30_ctrl_bare_op(NULL, sizeof(summary), &op));
+    CHECK(!push_gen30_ctrl_bare_op(summary, 0, &op));
+    // 魔数零碰撞：现制 4 B 头帧（首字节 0x50）与预留区帧一律不进白名单
+    const uint8_t legacy[4] = {0x50, 0x43, PUSH_OP_END, PUSH_VERSION};
+    CHECK(!push_gen30_ctrl_bare_op(legacy, sizeof(legacy), &op));
+    const uint8_t reserved[4] = {0x50, 0x43, PUSH_OP_RESERVED_FIRST, PUSH_VERSION};
+    CHECK(!push_gen30_ctrl_bare_op(reserved, sizeof(reserved), &op));
+    // 首字节是 0x0A 但长度不符 → false（长度闸门对新帧同样有牙，仍走魔数校验）
+    const uint8_t short_summary[4] = {PUSH_OP_SUMMARY, 0x50, 0x43, PUSH_VERSION};
+    CHECK(!push_gen30_ctrl_bare_op(short_summary, sizeof(short_summary), &op));
+    // 取值级再验一遍（编译期断言在 push_proto.h，这里防的是「常量改了断言没跟上」）
+    CHECK(PUSH_MAGIC0 != PUSH_OP_SUMMARY && PUSH_MAGIC0 != PUSH_OP_TTS_DONE);
+    CHECK(PUSH_MAGIC1 != PUSH_OP_SUMMARY && PUSH_MAGIC1 != PUSH_OP_TTS_DONE);
+    CHECK(PUSH_OP_SUMMARY_LEN <= PUSH_GEN30_WIRE_CAP);
+    CHECK(PUSH_OP_TTS_DONE_LEN <= PUSH_GEN30_WIRE_CAP);
+    // 方案 A 的算术反证：4 B 魔数头 + 241 B = 245 B > 244 B wire 帽（故裁定 B）
+    CHECK(PUSH_CTRL_HDR_LEN + PUSH_OP_SUMMARY_LEN > PUSH_GEN30_WIRE_CAP);
+    printf("gen30 bare dispatch: magic zero-collision + length gate ok\n");
 }
 
 static void test_begin_codec(void) {
@@ -395,6 +453,233 @@ static void test_adopt(void) {
     CHECK(feed(PUSH_EVT_RESUME_QUERY) == PUSH_ACT_RESUME);
     CHECK(s_sess.state == PUSH_STATE_CONNECTED && !s_sess.has_part);
     printf("adopt: preload/resume-query->RECEIVING/DATA-after-resume ok\n");
+}
+
+/* ---- 16e/16f/16g：.part 账本与欠账（commit 5 的机器证明）----
+ * 这三条是 commit 4 §21.6 自己记下的缺口：当时「账本起点」与「欠账顺序」只有代码
+ * 与不变式，没有可指的用例。存储层抽到 push_part.c 之后它们才编得进宿主。
+ *
+ * These three are the gap commit 4 recorded for itself: the ledger's origin and
+ * the owed packet's order had code and an invariant but no nameable case. They
+ * only became buildable here after the storage layer moved to push_part.c.
+ */
+
+static long file_len(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (long)st.st_size : -1;
+}
+
+static bool file_eq(const char *path, size_t off, const uint8_t *want, size_t n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool ok = fseek(f, (long)off, SEEK_SET) == 0;
+    // 分块比：一次读进 256 B 的栈缓冲，别拿 n 当读长（10000 B 的前缀会直接溢出）。
+    // Chunked: never use n as the read length - a 10,000 B prefix would overflow.
+    uint8_t buf[256];
+    size_t done = 0;
+    while (ok && done < n) {
+        const size_t chunk = (n - done) < sizeof(buf) ? (n - done) : sizeof(buf);
+        ok = fread(buf, 1, chunk, f) == chunk && memcmp(buf, want + done, chunk) == 0;
+        done += chunk;
+    }
+    fclose(f);
+    return ok;
+}
+
+// 16e：续传起点。M121b 的靶是 push_part_adopt() 里的 `s_part_len = received`。
+// 16e: the resume origin. M121b's target is `s_part_len = received` in adopt.
+static void test_part_origin_adopt(void) {
+    s_case = "16e";
+    const char *dir = "/tmp/push_part_16e";
+    const char *path = "/tmp/push_part_16e/push.part";
+    uint8_t old[10000];
+    uint8_t pkt[241];
+    for (size_t i = 0; i < sizeof(old); i++) old[i] = (uint8_t)(i * 31u + 7u);
+    for (size_t i = 0; i < sizeof(pkt); i++) pkt[i] = (uint8_t)(0xA0u + (i & 0x0Fu));
+
+    push_part_test_reset(dir);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        CHECK(fwrite(old, 1, sizeof(old), f) == sizeof(old));
+        fclose(f);
+    }
+
+    // 上次收到 10000 B，账本必须同一时刻就到 10000。
+    CHECK(push_part_adopt(10000) == PUSH_PART_ADOPT_OK);
+    CHECK(push_part_len() == 10000);
+    CHECK(file_len(path) == 10000);
+
+    // 续传首包短写 3 B：回退的 truncate 参数必须是 10000，不是 0。
+    // 参数是 0 的话，前 10000 B 会被整段抹掉——这正是 M121b 复刻的现场。
+    push_part_test_short_next_write(3);
+    CHECK(push_part_append(pkt, sizeof(pkt)) == true);
+    CHECK(push_part_test_last_truncate() == 10000);
+    CHECK(file_len(path) == 10241);
+    CHECK(file_eq(path, 0, old, sizeof(old)));
+    CHECK(file_eq(path, 10000, pkt, sizeof(pkt)));
+
+    // 另两态：文件比账本短 = 损坏；卡不在 = 簿记原样留着。
+    CHECK(push_part_adopt(20000) == PUSH_PART_ADOPT_CORRUPT);
+    push_part_test_reset("/tmp/push_part_16e_nc");
+    CHECK(push_part_adopt(100) == PUSH_PART_ADOPT_NO_CARD);
+    printf("16e part origin (adopt): ledger 10000 kept, truncate=10000, prefix intact ok\n");
+}
+
+// 16f：全新会话起点。M121c 的靶是 push_part_open_fresh() 里的 `s_part_len = 0`。
+// 16f: the fresh-session origin. M121c's target is `s_part_len = 0` in open_fresh.
+static void test_part_origin_fresh(void) {
+    s_case = "16f";
+    const char *dir = "/tmp/push_part_16f";
+    const char *path = "/tmp/push_part_16f/push.part";
+    uint8_t old[10000];
+    uint8_t pkt[241];
+    for (size_t i = 0; i < sizeof(old); i++) old[i] = (uint8_t)(i * 17u + 1u);
+    for (size_t i = 0; i < sizeof(pkt); i++) pkt[i] = 0x5Au;
+
+    push_part_test_reset(dir);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f) {
+        CHECK(fwrite(old, 1, sizeof(old), f) == sizeof(old));
+        fclose(f);
+    }
+    CHECK(push_part_adopt(10000) == PUSH_PART_ADOPT_OK);
+
+    // 新会话：文件截到 0，账本必须一起归零。若账本残留 10000，下面的回退会把
+    // 文件延长成一段 0 填充（truncate(10000) 在 241 B 的文件上就是延长）。
+    CHECK(push_part_open_fresh() == true);
+    CHECK(push_part_len() == 0);
+    CHECK(file_len(path) == 0);
+
+    push_part_test_short_next_write(3);
+    CHECK(push_part_append(pkt, sizeof(pkt)) == true);
+    CHECK(push_part_test_last_truncate() == 0);
+    CHECK(file_len(path) == 241);
+    CHECK(file_eq(path, 0, pkt, sizeof(pkt)));
+    printf("16f part origin (fresh): ledger 0, truncate=0, no zero-padding ok\n");
+}
+
+// 16g：欠账顺序。M120 的靶是 part_append_locked() 开头的 push_part_drain()。
+// 16g: the owed packet's order. M120's target is push_part_drain() at the top of
+// part_append_locked().
+static void test_part_owed_order(void) {
+    s_case = "16g";
+    const char *dir = "/tmp/push_part_16g";
+    const char *path = "/tmp/push_part_16g/push.part";
+    uint8_t C[241], A[241], B[100], D[241];
+    memset(C, 0xCC, sizeof(C));
+    memset(A, 0xAA, sizeof(A));
+    memset(B, 0xBB, sizeof(B));
+    memset(D, 0xDD, sizeof(D));
+
+    push_part_test_reset(dir);
+    CHECK(push_part_open_fresh() == true);
+    CHECK(push_part_append(C, sizeof(C)) == true);
+    CHECK(file_len(path) == 241);
+
+    // A 连败两次（第一次触发重试，第二次把整包推进欠账槽）：返回值仍是 true，
+    // 数据没丢，只是不在盘上。
+    push_part_test_short_writes(241, 2);
+    CHECK(push_part_append(A, sizeof(A)) == true);
+    CHECK(file_len(path) == 241); // 只有 C
+
+    // 新包 B 到达：欠账必须先落盘，B 只能排在 A 后面。
+    CHECK(push_part_append(B, sizeof(B)) == true);
+    CHECK(file_len(path) == 241 + 241 + 100);
+    CHECK(file_eq(path, 241, A, sizeof(A)));
+    CHECK(file_eq(path, 482, B, sizeof(B)));
+
+    // END 前没有新包替它触发，必须能显式补上（push_part_drain 的第二个调用点）。
+    push_part_test_short_writes(241, 2);
+    CHECK(push_part_append(D, sizeof(D)) == true);
+    CHECK(file_len(path) == 582); // D 还在槽里
+    CHECK(push_part_drain() == true);
+    CHECK(file_len(path) == 582 + 241);
+    CHECK(file_eq(path, 582, D, sizeof(D)));
+    printf("16g part owed order: owed lands before the next packet, explicit drain ok\n");
+}
+
+// 16h：重试成功不重复不缺（出包门第 4 条「注入三案」之 1）。
+// 短写一次 = 瞬时忙；回退到本包起点重写一次必须救回来，且结果与「没失败过」
+// 逐字节相同：长度精确（多一字节就是重复）、前缀不动、偏移对得上。
+// 16h: a successful retry neither duplicates nor drops (injection case 1 of 3).
+// One short write = a transiently busy card; rewinding to this packet's start and
+// writing once more must land byte-identical to a clean run: exact length (one
+// extra byte is a duplicate), untouched prefix, correct offset.
+static void test_part_retry_clean(void) {
+    s_case = "16h";
+    const char *dir = "/tmp/push_part_16h";
+    const char *path = "/tmp/push_part_16h/push.part";
+    uint8_t C[100], A[241];
+    for (size_t i = 0; i < sizeof(C); i++) C[i] = 0xCC;
+    for (size_t i = 0; i < sizeof(A); i++) A[i] = (uint8_t)(i * 7u + 3u);
+
+    push_part_test_reset(dir);
+    CHECK(push_part_open_fresh() == true);
+    // 起点故意非 0：这样才能证明回退到的是「本包起点」而不是 0。
+    // The origin is deliberately non-zero: that is what proves the rewind targets
+    // this packet's start and not zero.
+    CHECK(push_part_append(C, sizeof(C)) == true);
+    CHECK(file_len(path) == 100);
+
+    push_part_test_short_next_write(1);
+    CHECK(push_part_append(A, sizeof(A)) == true);
+    CHECK(push_part_test_last_truncate() == 100);
+
+    CHECK(file_len(path) == 341);        // 多一字节 = 重复 / one extra byte = duplicate
+    CHECK(file_eq(path, 0, C, sizeof(C)));
+    CHECK(file_eq(path, 100, A, sizeof(A)));
+    CHECK(push_part_len() == 341);
+    printf("16h part retry clean: one short write recovered with exact length, no duplicate, no gap ok\n");
+}
+
+// 16i：槽接不住 = 会话必须终止（注入三案之 3）。返回值 false 就是调用方的
+// CANCEL+ERR 依据；配套三件事必须同时成立：槽作废（不重试）、句柄关闭（否则
+// adopt 的 truncate 被单开挡住）、半包能被下次 adopt 截回。
+// 16i: when the slot cannot take it the session must end (injection case 3). A
+// false return is what CANCEL+ERR keys off; three things must hold together: the
+// slot is voided (no retry), the handle is closed (or adopt's truncate hits the
+// single-open rule), and the partial bytes are cut back by the next adopt.
+static void test_part_owed_giveup(void) {
+    s_case = "16i";
+    const char *dir = "/tmp/push_part_16i";
+    const char *path = "/tmp/push_part_16i/push.part";
+    uint8_t C[241], A[241];
+    memset(C, 0xCC, sizeof(C));
+    memset(A, 0xAA, sizeof(A));
+
+    push_part_test_reset(dir);
+    CHECK(push_part_open_fresh() == true);
+    CHECK(push_part_append(C, sizeof(C)) == true);
+    CHECK(file_len(path) == 241);
+
+    // A 连败两次进槽（返回值仍 true：数据在槽里，没丢）。
+    push_part_test_short_writes(241, 2);
+    CHECK(push_part_append(A, sizeof(A)) == true);
+    CHECK(file_len(path) == 241);
+
+    // 槽补写也失败 → false，这是「接不住」的唯一信号。
+    push_part_test_short_next_write(1);
+    CHECK(push_part_drain() == false);
+    CHECK(push_part_is_open() == false);          // 句柄必须关 / handle must be closed
+    const long after_fail = file_len(path);
+    // 槽作废：再 drain 既不重试也不再报错，且**一个字节都不许再落盘**——
+    // 只看返回值不够（短写注入只生效一次，第二次会「成功」并掩盖槽没作废）。
+    // Voided: another drain neither retries nor fails again, and not a single byte
+    // more may land - the return value alone is not enough (the short-write
+    // injection fires once, so a second attempt would "succeed" and hide a slot
+    // that was never voided). M124 is exactly that shape.
+    CHECK(push_part_drain() == true);
+    CHECK(file_len(path) == after_fail);
+
+    // 短写落进文件的那 240 B 半包，由下次 ARM 的 adopt 按 NVS 记账截回。
+    // The 240 partial bytes the short write left behind are cut back by the next
+    // ARM's adopt, which truncates to the NVS ledger.
+    CHECK(push_part_adopt(241) == PUSH_PART_ADOPT_OK);
+    CHECK(file_len(path) == 241);
+    CHECK(file_eq(path, 0, C, sizeof(C)));
+    printf("16i part owed giveup: drain fails cleanly, slot voided, handle closed, partial cut back by adopt ok\n");
 }
 
 static void test_teeth(void) {
@@ -1339,9 +1624,77 @@ static void test_tts_plan(void) {
     printf("tts plan: budget 233, utf8-safe split, empty=1 frame, exact-fit edges ok\n");
 }
 
+/* ---- 26.11.5：三拍判据与「拔卡时手机还连着」 ---- */
+
+// B77 的真值表。原判据 `state == PUSH_STATE_IDLE` 把「连着」当「没停」，于是
+// APK 常驻的那台机器上拔卡永远不卸载。这一组的每一行都对应一个真机形状。
+static void test_quiesce_predicate(void) {
+    s_case = "quiesce-predicate";
+    // 26.11.4 现场：手机连着（CONNECTED）、没在传、零文件 -> 第 1 拍就必须放行。
+    CHECK(push_quiesce_idle(PUSH_STATE_CONNECTED, false, 0));
+    // 其余「握着链路或倒计时、不握介质」的状态同样放行。
+    CHECK(push_quiesce_idle(PUSH_STATE_IDLE, false, 0));
+    CHECK(push_quiesce_idle(PUSH_STATE_ARMED, false, 0));
+    CHECK(push_quiesce_idle(PUSH_STATE_WINDOW, false, 0));
+    CHECK(push_quiesce_idle(PUSH_STATE_COOLDOWN, false, 0));
+    // 真在传输：仍然等（放宽不能放到数据路径上）。
+    CHECK(!push_quiesce_idle(PUSH_STATE_RECEIVING, false, 0));
+    CHECK(!push_quiesce_idle(PUSH_STATE_PROCESSING, false, 0));
+    // 任何状态 + 还开着一个 FILE* 都不许放行（B51：只数 .part 会漏掉 verify 读句柄）。
+    for (int st = PUSH_STATE_IDLE; st <= PUSH_STATE_COOLDOWN; ++st)
+        CHECK(!push_quiesce_idle((push_state_t)st, false, 1u));
+    // 待武装 = 入口还开着，不算停。
+    CHECK(!push_quiesce_idle(PUSH_STATE_IDLE, true, 0));
+    CHECK(!push_quiesce_idle(PUSH_STATE_CONNECTED, true, 0));
+    printf("quiesce predicate: link!=medium, transfer still waits, any FILE* still waits\n");
+}
+
+// 最危险的一档（审计点 3）：**传输中拔卡**。RECEIVING、.part 开着、手机正发包。
+// detach 的两拍必须把它收拾到 IDLE：DISCONNECT 回窗口（.part 关、簿记存），
+// 再 CANCEL 收摊（不带 DROP——卡已不在，删 .part 只会换来一串 EIO）。
+// 收完之后 files 归零，三拍必须成功；半成品簿记保留，插回后照常重挂。
+static void test_media_detach_mid_transfer(void) {
+    s_case = "media-detach-mid-transfer";
+    push_session_init(&s_sess);
+    CHECK(feed_arm(0x1234, 60000, 5000, 1000) == PUSH_ACT_ADV_ON);
+    CHECK(feed(PUSH_EVT_ADV_UP) == 0);
+    CHECK(feed(PUSH_EVT_CONNECT) == 0);
+    push_begin_t b = make_begin(4096, 0x1234);
+    CHECK(feed_begin(&b) & PUSH_ACT_READY);
+    CHECK(feed_data(0, 128) & PUSH_ACT_APPEND);
+    CHECK(s_sess.state == PUSH_STATE_RECEIVING);
+    CHECK(s_sess.has_part);
+
+    // detach 第一拍：DISCONNECT -> 窗口。
+    CHECK(feed(PUSH_EVT_DISCONNECT) == 0);
+    CHECK(s_sess.state == PUSH_STATE_WINDOW);
+    // detach 第二拍：CANCEL -> IDLE（只有 ADV_OFF，没有 DROP）。
+    const uint32_t act = feed(PUSH_EVT_CANCEL);
+    CHECK(act == PUSH_ACT_ADV_OFF);
+    CHECK(!(act & PUSH_ACT_DROP));
+    CHECK(s_sess.state == PUSH_STATE_IDLE);
+    // 会话收干净了：三拍必须放行。
+    CHECK(push_quiesce_idle(s_sess.state, false, 0));
+    // 簿记还在（.part 在卡上），插回后 probe/remount 照常处理。
+    CHECK(s_sess.has_part);
+
+    // 对照：手机连着但**没在传**时拔卡，一拍就够（26.11.4 的那条路径）。
+    push_session_init(&s_sess);
+    CHECK(feed_arm(0x1234, 60000, 5000, 1000) == PUSH_ACT_ADV_ON);
+    CHECK(feed(PUSH_EVT_ADV_UP) == 0);
+    CHECK(feed(PUSH_EVT_CONNECT) == 0);
+    CHECK(feed(PUSH_EVT_DISCONNECT) == 0);
+    CHECK(s_sess.state == PUSH_STATE_WINDOW);
+    CHECK(push_quiesce_idle(s_sess.state, false, 0));
+    CHECK(feed(PUSH_EVT_CANCEL) == PUSH_ACT_ADV_OFF);
+    CHECK(s_sess.state == PUSH_STATE_IDLE);
+    printf("media detach: mid-transfer and connected-idle both settle to IDLE in two beats\n");
+}
+
 int main(void) {
     test_crc32();
     test_ctrl_header();
+    test_gen30_bare_dispatch(); // 哨位裁定方案 B：零碰撞 + 长度闸门 / plan B: zero-collision + length gate
     test_begin_codec();
     test_data_status_codec();
     test_py_cross_vector();
@@ -1353,6 +1706,17 @@ int main(void) {
     test_word_card();
     test_resume();
     test_adopt();
+    test_part_origin_adopt();
+    test_part_origin_fresh();
+    test_part_owed_order();
+    // 出包门第 4 条「注入三案」：1 = 重试成功不重复不缺（16h）、2 = 欠账保留整包
+    // （16g 的连败进槽 + 顺序 + 显式 drain）、3 = 槽接不住 → false/CANCEL+ERR（16i）。
+    // Gate #4's three injection cases: 1 = clean retry (16h), 2 = owed keeps the whole
+    // packet (16g), 3 = slot cannot take it -> false/CANCEL+ERR (16i).
+    test_part_retry_clean();
+    test_part_owed_giveup();
+    test_quiesce_predicate();
+    test_media_detach_mid_transfer();
     test_teeth();
     printf("push_sink_host_test: %d checks, %d red\n", s_checks, s_red);
     return s_red == 0 ? 0 : 1;

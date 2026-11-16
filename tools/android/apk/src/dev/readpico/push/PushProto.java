@@ -75,7 +75,8 @@ public final class PushProto {
     public static final int ST_CAPS = 0x18;
     // gen26.5 TTS 听书：设备→手机，当前页纯文本（STATUS notify，无 CTRL 头）。
     // 编号说明见 push_proto.h 变更记录块：STATUS 空间从 0x10 起，故取 0x19
-    // （0x0A 仍属 CTRL 预留区，手机→设备方向）。
+    // （0x0A 当时属 CTRL 预留区——gen30 起 0x0A 已登记为 SUMMARY，见下方伴读段）。
+    // gen26.5: page text on STATUS 0x19; 0x0A was CTRL-reserved then and is SUMMARY since gen30.
     public static final int ST_TTS_TEXT = 0x19;
 
     /* ---- gen26 AI 帧长与上限（与 push_proto.h 逐字一致）---- */
@@ -91,6 +92,41 @@ public final class PushProto {
     // segmented 0x08; an old APK without these keeps the byte-identical M1 path.
     public static final int CAP_AI_CONTEXT = 1 << 1;
     public static final int CAP_AI_MULTI = 1 << 2;
+    /** M3：APK 支持情景释义（0x1A 上下文 + 情景提示词）。未置位设备不发 0x1A。 */
+    public static final int CAP_AI_SCENE = 1 << 3;
+    /** M3-B：APK 能出四节情景分析（回答 0x1A）。bit3 只是「认识 0x1A」，bit4 才是
+     * 「答得上」——设备按 bit4 决定是否显示入口与是否发送。v1.6.2 起声明。
+     * M3-B: the APK answers 0x1A with four sections. bit3 only means "understands
+     * the frame"; bit4 means "can answer", and the device gates on it. Declared
+     * from v1.6.2. */
+    public static final int CAP_AI_SCENE_VIEW = 1 << 4;
+    // M3 情景请求帧：op1 + seq2 + total2 + len2 + 234B 槽，定长 241（与 0x19 同构）。
+    public static final int ST_AI_SCENE = 0x1A;
+    public static final int SCENE_FRAME_LEN = 241;
+    public static final int SCENE_SLOT = 234;
+    public static final int SCENE_CTX_MAX = 1024;
+    public static final int SCENE_WORD_MAX = 64;
+    public static final int SCENE_MAX_FRAMES = 5;
+    public static final int SCENE_FLAG_CTX_TRUNCATED = 1 << 0;
+    public static final int SCENE_FLAG_SENTENCE_FALLBACK = 1 << 1;
+    /**
+     * 26.11.3-C：整段摘抄解析。置位时 word 只是「段首词锚点」，ctx 是整段待解析
+     * 选文——回答走段落四节（段意/脉络/关键表达/作用），不是单词卡。
+     *
+     * 这个常量在 v1.6.2 里**根本不存在**：设备从 26.9.26 起一直在发 bit2，APK 读
+     * 到 flags 却按未知位丢掉，于是把整段当背景、拿首词当查询词，回了五张词卡
+     * （26.11.3-B 真机档② FAIL 的根因）。补上它不是新功能，是把协议的另一半补齐。
+     *
+     * Bit2 means "the ctx is a whole passage": word is the leading anchor only, and
+     * the answer is a four-section passage analysis. v1.6.2 had no such constant -
+     * the device has been setting bit2 since 26.9.26 and the APK silently dropped
+     * it, answering a word card from the passage's first token.
+     */
+    public static final int SCENE_FLAG_EXCERPT = 1 << 2;
+    /** 已知位全集：收到之外的位打 WARN（对端盲区第一时间喊出来）。
+     * All known bits; anything outside this mask raises a WARN at parse time. */
+    public static final int SCENE_FLAG_KNOWN =
+            SCENE_FLAG_CTX_TRUNCATED | SCENE_FLAG_SENTENCE_FALLBACK | SCENE_FLAG_EXCERPT;
     // gen26.5（M2）帧长：带上下文的查询与分帧。gen26.5 (M2) frame sizes.
     public static final int AI_CTX_QUERY_MAX = 4 + 1 + AI_WORD_MAX + 4 + 4;  // 0x06 带上下文 = 77
     public static final int AI_STATUS_CTX_QUERY_LEN = 1 + 1 + AI_WORD_MAX + 4 + 4; // 0x17 带上下文体 = 74
@@ -99,6 +135,47 @@ public final class PushProto {
     public static final int AI_CAPS_ENABLE_MAX = 4 + 4;                    // 0x09 = 8（头4 + bits u32）
     public static final int TTS_TEXT_MAX = 234;                            // 页文本槽（含 NUL）
     public static final int TTS_TEXT_FRAME_MAX = 1 + 2 + 2 + 2 + TTS_TEXT_MAX; // 0x19 = 241
+
+    /* ---- gen30 伴读案（R0 冻结件 1）：四处新 opcode + 定长/枚举，与 push_proto.h 一字不差。
+     * 步 3 起哨位裁定方案 B（裸帧对齐）生效：CTRL 方向 SUMMARY/TTS_DONE 发送侧发裸帧
+     * （不带 0x50 0x43 4B 魔数头），STATUS 方向 MODE_SET/PAGE_BEGIN 为 op 首字节裸帧；
+     * 设备侧白名单分派仅认 0x0A/241B、0x0B/4B，其余畸形帧继续走魔数校验并落 ERR(2)。
+     * 三端常量一致（步 1 登记）；本文件编解码函数体属 APK 工作包（并行），
+     * Python 参考实现 push_pico.py 已同步。
+     * gen30 read-along (R0 frozen item 1): four new opcodes + frame/enum constants,
+     * byte-identical to push_proto.h. From step 3 plan B (sentinel ruling) applies:
+     * CTRL SUMMARY/TTS_DONE go out bare (no 4 B magic header), STATUS MODE_SET/
+     * PAGE_BEGIN start at the op byte; the device dispatches via a whitelist
+     * (only 0x0A/241 B and 0x0B/4 B hit, malformed frames fall through to ERR(2)).
+     * Codec bodies here belong to the APK work package (parallel); the Python
+     * reference push_pico.py is in sync. ---- */
+    public static final int OP_SUMMARY = 0x0A;        // 手机→设备：摘要回包（241B 定长，同构 0x08）
+    public static final int OP_TTS_DONE = 0x0B;       // 手机→设备：播完回执（4B）
+    public static final int ST_MODE_SET = 0x1B;       // 设备→手机：模式广播（5B）
+    public static final int ST_PAGE_BEGIN = 0x1C;     // 设备→手机：页号对账前置帧（5B）
+    public static final int ST_TTS_ENABLE = 0x1D;     // 设备→手机：朗读使能（2B，修复轮解耦）
+    public static final int MODE_SET_LEN = 5;         // op1+mode1+source1+reserved2
+    public static final int PAGE_BEGIN_LEN = 5;       // op1+page_no2(LE)+mode1+reserved1
+    public static final int TTS_ENABLE_LEN = 2;       // op1+enable1
+    public static final int SUMMARY_LEN = 241;        // op1+mode1+page_no2+idx1+total1+dlen2+text233
+    public static final int TTS_DONE_LEN = 4;         // op1+page_no2+status1
+    public static final int SUMMARY_TEXT_MAX = 233;   // SUMMARY 文本槽（UTF-8 字节）
+    /** 多帧拼装帽：250 汉字 ≈ 750 B，四帧；与设备侧 PUSH_SUMMARY_TOTAL_MAX 同值。 */
+    public static final int SUMMARY_TOTAL_MAX = 1024;
+    public static final int PAGE_NO_BYTES = 2;        // page_no 为 u16 LE
+    public static final int GEN30_WIRE_CAP = 244;     // MTU 247 − 3 写属性头（方案 B 算术依据）
+    public static final int CTRL_HDR_LEN = 4;         // 现制 CTRL 公共头（magic2+op1+version1）
+    // 四模式编号（设备只传编号；模板与 56 字确定性截断全在 APK 端）/ four prompt mode ids
+    public static final int RIDE_MODE_FOREIGN = 0;    // 外语原著（默认）
+    public static final int RIDE_MODE_NOVEL = 1;      // 小说网文
+    public static final int RIDE_MODE_SOCIAL = 2;     // 社科非虚构
+    public static final int RIDE_MODE_CLASSIC = 3;    // 古文诗词
+    public static final int RIDE_MODE_COUNT = 4;
+    public static final int MODE_SRC_DEVICE = 0;      // 设备菜单（1=APK 预留，一期不启用）
+    public static final int MODE_SRC_INIT = 2;        // 连接后初始化同步
+    public static final int TTS_DONE_FINISHED = 0;    // 播完
+    public static final int TTS_DONE_ABORT = 1;       // 用户中断
+    public static final int TTS_DONE_FAILED = 2;      // 失败
 
     public static final int TYPE_TEXT = 0;
     public static final int TYPE_MARKDOWN = 1;
@@ -702,6 +779,260 @@ public final class PushProto {
             case ERR_FETCH:       return "URL 抓取失败";
             case ERR_NO_DICT:     return "设备无词典，无法显示单词卡";
             default:              return "未知错误码 " + code;
+        }
+    }
+
+    /* ---- gen30 伴读案 · 方案 B 裸帧编解码（APK 发送侧，R0 冻结件 1）----
+     * 逐字节对表参考实现 push_pico.py 的 encode_/decode_ 与 gen30_ctrl_bare_op。
+     * STATUS 方向 MODE_SET/PAGE_BEGIN 以 op 首字节起算（5B 裸帧）；CTRL 方向
+     * SUMMARY/TTS_DONE 发裸帧（不带 4B 魔数头）。设备侧白名单仅认 0x0A/241B、
+     * 0x0B/4B。UTF8 / putU16 / getU16 / copyOf 复用本文件既有私有工具。
+     * gen30 read-along plan-B bare-frame codecs (APK send side, frozen item 1).
+     * Byte-identical to push_pico.py; STATUS frames start at the op byte, CTRL
+     * SUMMARY/TTS_DONE go out bare with no 4 B magic header. ---- */
+
+    /** 方案 B 白名单：仅 0x0A/241B、0x0B/4B 命中返回 op；其余返回 -1（继续走现制魔数校验）。 */
+    public static int gen30CtrlBareOp(byte[] frame) {
+        if (frame == null || frame.length == 0) {
+            return -1;
+        }
+        int op = frame[0] & 0xFF;
+        if (op == OP_SUMMARY && frame.length == SUMMARY_LEN) {
+            return OP_SUMMARY;
+        }
+        if (op == OP_TTS_DONE && frame.length == TTS_DONE_LEN) {
+            return OP_TTS_DONE;
+        }
+        return -1;
+    }
+
+    /** STATUS 0x1C（设备→手机）：op1 + page_no2(LE) + mode1 + reserved1 = 5B。 */
+    public static byte[] encodePageBegin(int pageNo, int mode) {
+        if (pageNo < 0 || pageNo > 0xFFFF || mode < 0 || mode > 0xFF) {
+            throw new IllegalArgumentException("page_begin args out of range");
+        }
+        byte[] f = new byte[PAGE_BEGIN_LEN];
+        f[0] = (byte) ST_PAGE_BEGIN;
+        putU16(f, 1, pageNo);
+        f[3] = (byte) mode;
+        f[4] = 0;
+        return f;
+    }
+
+    /** 严格 5B 裸帧校验后取 page_no。 */
+    public static int pageBeginPageNo(byte[] frame) {
+        checkPageBegin(frame);
+        return getU16(frame, 1);
+    }
+
+    /** 严格 5B 裸帧校验后取 mode。 */
+    public static int pageBeginMode(byte[] frame) {
+        checkPageBegin(frame);
+        return frame[3] & 0xFF;
+    }
+
+    private static void checkPageBegin(byte[] frame) {
+        if (frame == null || frame.length != PAGE_BEGIN_LEN
+                || (frame[0] & 0xFF) != ST_PAGE_BEGIN) {
+            throw new IllegalArgumentException("not a gen30 PAGE_BEGIN frame (bare, 5B)");
+        }
+    }
+
+    /** STATUS 0x1B（设备→手机）：op1 + mode1 + source1 + reserved2 = 5B。 */
+    public static byte[] encodeModeSet(int mode, int source) {
+        if (mode < 0 || mode > 0xFF || source < 0 || source > 0xFF) {
+            throw new IllegalArgumentException("mode_set args out of range");
+        }
+        return new byte[] { (byte) ST_MODE_SET, (byte) mode, (byte) source, 0, 0 };
+    }
+
+    /** 严格 5B 裸帧校验后取 mode。 */
+    public static int modeSetMode(byte[] frame) {
+        checkModeSet(frame);
+        return frame[1] & 0xFF;
+    }
+
+    /** 严格 5B 裸帧校验后取 source。 */
+    public static int modeSetSource(byte[] frame) {
+        checkModeSet(frame);
+        return frame[2] & 0xFF;
+    }
+
+    private static void checkModeSet(byte[] frame) {
+        if (frame == null || frame.length != MODE_SET_LEN
+                || (frame[0] & 0xFF) != ST_MODE_SET) {
+            throw new IllegalArgumentException("not a gen30 MODE_SET frame (bare, 5B)");
+        }
+    }
+
+    /** STATUS 0x1D（设备→手机）：op1 + enable1 = 2B。修复轮解耦用。
+     *  <p>说明为什么需要它：页文本 0x19 原本同时承载「朗读文本源」与「摘要触发源」
+     *  双语义，手机收到即念，设备无论推不推都表达不了「这条只做摘要、不要念」。
+     *  本帧把「听书开关」作为独立事实传下来：手机端收到页文本一律请求摘要，
+     *  只有使能位为开时才朗读。开关关闭时设备仍推文本（摘要恒通）但手机静音。
+     *  <p>0x1D (device to phone): op 1 + enable 1 = 2B. Carries the listening-switch
+     *  state as its own fact so playback can be gated independently of the summary
+     *  chain (0x19 then carries text only). */
+    public static byte[] encodeTtsEnable(boolean on) {
+        return new byte[] { (byte) ST_TTS_ENABLE, (byte) (on ? 1 : 0) };
+    }
+
+    /** 严格 2B 裸帧校验后取使能位。 */
+    public static boolean ttsEnableOn(byte[] frame) {
+        if (frame == null || frame.length != TTS_ENABLE_LEN
+                || (frame[0] & 0xFF) != ST_TTS_ENABLE) {
+            throw new IllegalArgumentException("not a gen30 TTS_ENABLE frame (bare, 2B)");
+        }
+        return frame[1] != 0;
+    }
+
+    /** 宽容判定：是 TTS_ENABLE 帧则返回 true 并写 out[0]（0/1），否则 false。
+     *  分发处用它，避免对非本帧抛异常。 */
+    public static boolean isTtsEnable(byte[] frame, boolean[] out) {
+        if (frame == null || frame.length != TTS_ENABLE_LEN
+                || (frame[0] & 0xFF) != ST_TTS_ENABLE) {
+            return false;
+        }
+        if (out != null && out.length > 0) out[0] = frame[1] != 0;
+        return true;
+    }
+
+    /** gen30 SUMMARY 解码结果（mode / pageNo / idx / total / text）。 */
+    public static final class Summary {
+        public final int mode;
+        public final int pageNo;
+        public final int idx;
+        public final int total;
+        public final String text;
+        private Summary(int mode, int pageNo, int idx, int total, String text) {
+            this.mode = mode;
+            this.pageNo = pageNo;
+            this.idx = idx;
+            this.total = total;
+            this.text = text;
+        }
+    }
+
+    /** CTRL 0x0A（手机→设备）：op1 + mode1 + page_no2 + idx1 + total1 + dlen2 + text233 = 241B。
+     * 裸帧不带 4B 魔数头（方案 B）；UTF-8 字节硬截到 233B 槽、尾补 0。
+     * 单帧只承 233 B：250 字（≈750 B）走 encodeSummaryShards 切四帧，
+     * 本方法只负责「一帧」，不负责「一整段」。 */
+    public static byte[] encodeSummary(String text, int pageNo, int mode, int idx, int total) {
+        byte[] raw = (text == null) ? new byte[0] : text.getBytes(UTF8);
+        if (raw.length > SUMMARY_TEXT_MAX) {
+            raw = copyOf(raw, SUMMARY_TEXT_MAX);
+        }
+        if (pageNo < 0 || pageNo > 0xFFFF || mode < 0 || mode > 0xFF
+                || idx < 0 || total < 1 || idx >= total || total > 0xFF) {
+            throw new IllegalArgumentException("summary args out of range");
+        }
+        byte[] f = new byte[SUMMARY_LEN];
+        f[0] = (byte) OP_SUMMARY;
+        f[1] = (byte) mode;
+        putU16(f, 2, pageNo);
+        f[4] = (byte) idx;
+        f[5] = (byte) total;
+        putU16(f, 6, raw.length);
+        System.arraycopy(raw, 0, f, 8, raw.length);
+        return f; // 余下 text 槽由 new byte[] 的 0 填充
+    }
+
+    /** 分片发送（二轮）：整段摘要按 233 B 文本槽切成连续 idx 帧。
+     *  切点回退到 UTF-8 边界，绝不切半个码点；空文本仍回单帧 dlen=0。
+     *  设备端只认「idx 从 0 连续、收齐 total」的整段，乱序或丢片整段作废。
+     *  Shards the summary into 233 B slots with UTF-8-safe cuts; the device
+     *  accepts only a complete, in-order run starting at idx 0. */
+    public static java.util.List<byte[]> encodeSummaryShards(String text, int pageNo, int mode) {
+        byte[] raw = (text == null) ? new byte[0] : text.getBytes(UTF8);
+        java.util.ArrayList<byte[]> out = new java.util.ArrayList<byte[]>();
+        if (raw.length == 0) {
+            out.add(encodeSummary("", pageNo, mode, 0, 1));
+            return out;
+        }
+        java.util.ArrayList<Integer> offs = new java.util.ArrayList<Integer>();
+        java.util.ArrayList<Integer> lens = new java.util.ArrayList<Integer>();
+        int off = 0;
+        while (off < raw.length) {
+            int take = Math.min(SUMMARY_TEXT_MAX, raw.length - off);
+            // 回退到码点边界：下一个切点若是续行字节，就往前让出这个码点。
+            if (off + take < raw.length) {
+                while (take > 0 && (raw[off + take] & 0xC0) == 0x80) {
+                    take--;
+                }
+                if (take <= 0) {
+                    take = Math.min(SUMMARY_TEXT_MAX, raw.length - off);
+                }
+            }
+            offs.add(off);
+            lens.add(take);
+            off += take;
+        }
+        final int total = offs.size();
+        if (total > 0xFF) {
+            throw new IllegalArgumentException("summary needs more than 255 shards");
+        }
+        for (int i = 0; i < total; i++) {
+            final int o = offs.get(i), n = lens.get(i);
+            byte[] f = new byte[SUMMARY_LEN];
+            f[0] = (byte) OP_SUMMARY;
+            f[1] = (byte) mode;
+            putU16(f, 2, pageNo);
+            f[4] = (byte) i;
+            f[5] = (byte) total;
+            putU16(f, 6, n);
+            System.arraycopy(raw, o, f, 8, n);
+            out.add(f);
+        }
+        return out;
+    }
+
+    /** 严格 241B 裸帧校验后解码；dlen > 233 视为畸形。 */
+    public static Summary decodeSummary(byte[] frame) {
+        if (frame == null || frame.length != SUMMARY_LEN
+                || (frame[0] & 0xFF) != OP_SUMMARY) {
+            throw new IllegalArgumentException("not a gen30 SUMMARY frame (bare, 241B)");
+        }
+        int mode = frame[1] & 0xFF;
+        int pageNo = getU16(frame, 2);
+        int idx = frame[4] & 0xFF;
+        int total = frame[5] & 0xFF;
+        int dlen = getU16(frame, 6);
+        if (dlen > SUMMARY_TEXT_MAX) {
+            throw new IllegalArgumentException("summary dlen exceeds the 233B text slot");
+        }
+        int n = Math.min(dlen, SUMMARY_LEN - 8);
+        String text = new String(frame, 8, n, UTF8);
+        return new Summary(mode, pageNo, idx, total, text);
+    }
+
+    /** CTRL 0x0B（手机→设备）：op1 + page_no2 + status1 = 4B，裸帧。 */
+    public static byte[] encodeTtsDone(int pageNo, int status) {
+        if (pageNo < 0 || pageNo > 0xFFFF || status < 0 || status > 0xFF) {
+            throw new IllegalArgumentException("tts_done args out of range");
+        }
+        byte[] f = new byte[TTS_DONE_LEN];
+        f[0] = (byte) OP_TTS_DONE;
+        putU16(f, 1, pageNo);
+        f[3] = (byte) status;
+        return f;
+    }
+
+    /** 严格 4B 裸帧校验后取 page_no。 */
+    public static int ttsDonePageNo(byte[] frame) {
+        checkTtsDone(frame);
+        return getU16(frame, 1);
+    }
+
+    /** 严格 4B 裸帧校验后取 status。 */
+    public static int ttsDoneStatus(byte[] frame) {
+        checkTtsDone(frame);
+        return frame[3] & 0xFF;
+    }
+
+    private static void checkTtsDone(byte[] frame) {
+        if (frame == null || frame.length != TTS_DONE_LEN
+                || (frame[0] & 0xFF) != OP_TTS_DONE) {
+            throw new IllegalArgumentException("not a gen30 TTS_DONE frame (bare, 4B)");
         }
     }
 

@@ -195,8 +195,13 @@ typedef enum {
 /// / Drain the event queue without interpreting keys (drop boot/flash leftovers).
 void read_pico_pmu_drain_events(void);
 /// 抽干事件队列并返回本轮最高优先级按键动作；长按优先于短按。
+/// `held_out`（可空）回填**批内第一个短按**的 `arg0`（按压时长 ms）——分发结果
+/// 会被长按覆盖，载荷来源不会被覆盖（K4④）。产品侧两处既有调用点传 NULL；
+/// 测试必须传实参，否则这条判据没有咬点。
 /// / Drain the queue and return the highest-priority key action; long wins over short.
-read_pico_pmu_key_action_t read_pico_pmu_take_key_action(void);
+/// `held_out` (nullable) receives the **first short press** in the batch - the
+/// dispatch may be overridden by a long press, the payload source may not (K4④).
+read_pico_pmu_key_action_t read_pico_pmu_take_key_action(uint16_t* held_out);
 /// 抽干事件队列；若有电源键短按返回 true。
 /// / Drain the queue; true if a power-key short press was seen.
 bool read_pico_pmu_take_key_short(void);

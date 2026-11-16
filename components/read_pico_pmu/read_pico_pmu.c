@@ -368,6 +368,45 @@ esp_err_t read_pico_pmu_uid_get(uint8_t out[PMU_CHIP_UID_LEN]) {
     return ESP_OK;
 }
 
+// ---------------------------------------------------------------------------
+// 事件取载：COUNT → PEEK（26.11.19 解耦批）
+//
+// 这条路径以前整个借道 refresh_core(false)：每次取键都顺带把 identity / status /
+// quick battery 读一遍。于是「电量与充电状态新不新鲜」取决于**有没有人在取键**——
+// 静默期越长快照越旧，插线充电态尤其明显。解耦后它只读事件那几个寄存器，
+// 值链由主循环自己的 200 ms 节拍负责（见 main/app/pmu_bus.h 与采样支）。
+//
+// Event payload, two steps: COUNT then PEEK. This used to ride entirely on
+// refresh_core(false), so how fresh the battery/charger reading was depended on
+// whether anybody was taking keys. Now it touches the event registers only; the
+// value chain keeps its own 200 ms cadence in the main loop.
+//
+// 返回值：真 = 手上有一个可 ACK 的事件（s_snap.event 已填）。
+// 假 = 没事件 / 读失败 / 载荷校验不过——三种都不 ACK，留给下一拍或采样支重试。
+// Returns true when an ACKable event is in hand (s_snap.event filled). False for
+// no event, a read failure, or a payload that fails its CRC - none of which ACK.
+static bool peek_next_event(void) {
+    uint8_t count = 0;
+    if (pmu_read_reg(PMU_REG_EVENT_COUNT, &count, 1) != ESP_OK) {
+        s_snap.pending_events = 0;
+        s_snap.event_ok = false;
+        return false;
+    }
+    s_snap.pending_events = count;
+    if (count == 0) {
+        s_snap.event_ok = false;
+        memset(&s_snap.event, 0, sizeof(s_snap.event));
+        return false;
+    }
+    uint8_t ev[PMU_EVENT_SIZE];
+    if (pmu_read_reg(PMU_REG_EVENT_PEEK, ev, sizeof(ev)) != ESP_OK) {
+        s_snap.event_ok = false;
+        return false;
+    }
+    parse_event(ev);
+    return s_snap.event_ok;
+}
+
 esp_err_t read_pico_pmu_event_ack(uint16_t event_id) {
     uint8_t buf[4];
     wr16(&buf[0], event_id);
@@ -377,13 +416,24 @@ esp_err_t read_pico_pmu_event_ack(uint16_t event_id) {
     s_snap.last_op_code = PMU_REG_EVENT_ACK;
     if (err != ESP_OK) return err;
     vTaskDelay(pdMS_TO_TICKS(10));
-    return read_pico_pmu_poll();
+    // ACK 之后只需要「还剩几个」对齐，**不再拉整份快照**：那条 poll 是便车的最后
+    // 一截——留着它，取键路径的 refresh_core 计数就永远不是 0（K2a）。
+    // After an ACK only the remaining count has to be reconciled; the whole
+    // snapshot is no longer pulled. That poll was the last leg of the free ride:
+    // keeping it would make the key path's refresh_core count never zero (K2a).
+    uint8_t left = 0;
+    if (pmu_read_reg(PMU_REG_EVENT_COUNT, &left, 1) != ESP_OK) return ESP_ERR_INVALID_RESPONSE;
+    s_snap.pending_events = left;
+    if (left == 0) {
+        s_snap.event_ok = false;
+        memset(&s_snap.event, 0, sizeof(s_snap.event));
+    }
+    return ESP_OK;
 }
 
 void read_pico_pmu_drain_events(void) {
     for (int i = 0; i < PMU_EVENT_FIFO_DEPTH; i++) {
-        if (read_pico_pmu_poll() != ESP_OK) break;
-        if (!s_snap.event_ok || s_snap.pending_events == 0) break;
+        if (!peek_next_event()) break;
         uint16_t id = s_snap.event.event_id;
         if (id == 0) break;
         ESP_LOGI(TAG, "drain %s id=%u", pmu_event_name(s_snap.event.type), (unsigned)id);
@@ -391,14 +441,23 @@ void read_pico_pmu_drain_events(void) {
     }
 }
 
-read_pico_pmu_key_action_t read_pico_pmu_take_key_action(void) {
+read_pico_pmu_key_action_t read_pico_pmu_take_key_action(uint16_t* held_out) {
     read_pico_pmu_key_action_t action = READ_PICO_PMU_KEY_NONE;
+    // K4④：载荷取**批内第一个短按**的 arg0。分发可以被长按覆盖，载荷来源不行——
+    // 手按下 111 ms 又拖成 999 ms，产品要记的是「这一下是短按起手」。
+    // K4④: the payload is the batch's FIRST short press. Dispatch may be overridden
+    // by a long press; the payload source may not.
+    uint16_t first_short_arg0 = 0;
+    bool have_short = false;
     for (int i = 0; i < PMU_EVENT_FIFO_DEPTH; i++) {
-        if (read_pico_pmu_poll() != ESP_OK) break;
-        if (!s_snap.event_ok || s_snap.pending_events == 0) break;
+        if (!peek_next_event()) break;
         uint8_t type = s_snap.event.type;
         uint16_t id = s_snap.event.event_id;
         if (type == PMU_EVT_KEY_SHORT) {
+            if (!have_short) {
+                first_short_arg0 = (uint16_t)s_snap.event.arg0;
+                have_short = true;
+            }
             if (action == READ_PICO_PMU_KEY_NONE) action = READ_PICO_PMU_KEY_SHORT;
             ESP_LOGI(TAG, "KEY_SHORT id=%u held=%u", (unsigned)id, (unsigned)s_snap.event.arg0);
         } else if (type == PMU_EVT_KEY_LONG) {
@@ -408,11 +467,12 @@ read_pico_pmu_key_action_t read_pico_pmu_take_key_action(void) {
         if (id == 0) break;
         if (read_pico_pmu_event_ack(id) != ESP_OK) break;
     }
+    if (held_out != NULL) *held_out = have_short ? first_short_arg0 : 0;
     return action;
 }
 
 bool read_pico_pmu_take_key_short(void) {
-    return read_pico_pmu_take_key_action() == READ_PICO_PMU_KEY_SHORT;
+    return read_pico_pmu_take_key_action(NULL) == READ_PICO_PMU_KEY_SHORT;
 }
 
 bool read_pico_pmu_take_key_wakeup(void) {

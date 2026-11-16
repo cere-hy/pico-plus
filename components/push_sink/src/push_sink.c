@@ -25,7 +25,10 @@
  * of milliseconds and a spinlock would choke the main loop and the watchdog.
  */
 
+#include "push_part.h"
 #include "push_sink.h"
+
+#include "pico_bootbb.h" // 31b 第 1 条补账：hold 留痕进黑匣子 / hold leaves a blackbox note
 
 #include <errno.h>
 #include <stdio.h>
@@ -35,12 +38,14 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_attr.h" // EXT_RAM_BSS_ATTR：26.11.3-C2 起长文本槽落 PSRAM
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include "pico_heapdiag.h"
 
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -84,6 +89,17 @@ static const char *TAG = "push_sink";
 // one per packet would flood the ATT channel.
 #define PUSH_PROGRESS_MIN_GAP_MS 400u
 
+// 提交段封送（26.9.30 commit 2）：BLE 回调只投递请求，四拍由主循环在帧间执行。
+// 2 s 上界的起点是**投递时刻**（s_ui.commit_req_ms），不是取出时刻——从取出算起
+// 的上界会随主循环每帧重置，等于没有上界。
+// Commit hand-off: the BLE callback only posts; the four-beat dance runs on the main
+// loop between frames. The 2 s cap is anchored at POST time (s_ui.commit_req_ms),
+// not pickup time - a bound measured from pickup would restart every frame and bound
+// nothing.
+#define PUSH_COMMIT_WAIT_MS 2000u
+#define PUSH_COMMIT_CARRY_OPEN 0x01u // 同拍带的 OPEN_BOOK / carried OPEN_BOOK
+#define PUSH_COMMIT_CARRY_WORD 0x02u // 同拍带的 WORD_CARD / carried WORD_CARD
+
 // NVS 会话检查点节流：每 64 包落一次，断连/END 必落。/ NVS checkpoint cadence:
 // every 64 packets, plus mandatory on disconnect and END.
 #define PUSH_NVS_CHECKPOINT_EVERY 64u
@@ -111,6 +127,7 @@ static const char *TAG = "push_sink";
 #define PUSH_NVS_KEY_SESS "sess"
 #define PUSH_NVS_KEY_UNREAD "unread" // gen21 未读位（独立 u8 key，不动 sess blob 布局）
 #define PUSH_NVS_KEY_AI "ai_en"      // gen26 AI 查词开关位（独立 u8 key）
+#define PUSH_NVS_KEY_SCENE "sc_en"   // M3 情景解读开关位（独立 u8 key，缺省开）
 #define PUSH_NVS_MAGIC 0x50534E31u // 'P','S','N','1'
 
 // .part 回读算 CRC 的分块大小。/ Chunk size for the partial-file CRC read-back.
@@ -179,13 +196,81 @@ static bool s_remote_utc_pending;
 static char s_close_why[48];          // gen18：最近一次收摊原因（UI 取回展示）
                                      // gen18: the most recent close-up reason (read back by the UI)
 
-static FILE *s_part;                  // 打开中的 .part（append 模式）/ the open partial (append mode)
 static uint32_t s_last_prog_ms;       // PROGRESS 节流时钟 / the PROGRESS throttle clock
 static uint32_t s_pkts_since_ckpt;    // 距上次 NVS 检查点的包数 / packets since the last NVS checkpoint
 static uint32_t s_pmu_refresh_ms;     // 上次 PMU 刷新时刻 / last PMU refresh time
-
 static uint8_t s_last_status[PUSH_STATUS_MAX]; // 最近一条 STATUS（读特征的回退通道）
 static size_t s_last_status_len;               // the last STATUS (the read fallback)
+
+/* ---- gen30 伴读（R0 冻结件 1 · 方案 B 裸帧）：收帧对账与 take 槽 ----------
+ * 照 gen22 s_remote_utc / gen26 s_ui.ai_def 的「组件只存、app 轮询取」体例：
+ * 零新任务、零队列、组件不反向调用 main。长文本槽落 PSRAM（EXT_RAM_BSS_ATTR，
+ * 26.11.3-C2 先例），内部 RAM 只增几个标量。
+ * 页号对账基准 = 最近一次 PAGE_BEGIN 发出的页号；SUMMARY/TTS_DONE 的 page_no
+ * 与它不符一律丢弃（R0 §一对账规则），迟到回执不会误刷右栏、误翻页。
+ *
+ * gen30 companion: receive-side reconciliation + take slots. The component
+ * stores, the app polls - no new task/queue and never a call back into main.
+ * The long text slot lives in PSRAM; only scalars land in internal RAM. The
+ * reconciliation base is the page_no of the last PAGE_BEGIN emitted; mismatching
+ * SUMMARY/TTS_DONE frames are dropped (R0 frozen item 1), so a late receipt can
+ * never cross pages.
+ */
+static uint16_t s_companion_page_no;        // 最近 PAGE_BEGIN 的页号 / last PAGE_BEGIN page_no
+static bool s_companion_page_valid;         // 是否已发过 PAGE_BEGIN / a PAGE_BEGIN has been emitted
+static bool s_companion_conn_fair;          // 伴读活跃期 FAIR 档 / companion-active FAIR latch
+static EXT_RAM_BSS_ATTR char s_companion_summary_text[PUSH_SUMMARY_TOTAL_MAX + 1u]; // PSRAM 摘要槽
+/* 多帧拼装暂存（修复轮二轮）：同一页的 idx 连续片先落这里，收齐才搬进上面的交付槽。
+   两条槽都在 PSRAM，内部 RAM 仍只增几个标量（与「组件只存、app 轮询取」同体例）。 */
+static EXT_RAM_BSS_ATTR char s_summary_acc[PUSH_SUMMARY_TOTAL_MAX + 1u];
+static uint16_t s_summary_acc_len;          // 已拼字节数 / bytes accumulated
+static uint16_t s_summary_acc_page;         // 暂存所属页号 / page this accumulator belongs to
+static uint8_t s_summary_acc_next;          // 下一个期望的 idx / next expected idx
+static uint8_t s_companion_summary_mode, s_companion_summary_idx, s_companion_summary_total;
+static uint16_t s_companion_summary_page;
+static uint16_t s_companion_summary_len;
+static bool s_companion_summary_pending;    // 一条未取的有效 SUMMARY / one valid summary waiting
+static uint16_t s_companion_tts_page;
+static uint8_t s_companion_tts_status;
+static bool s_companion_tts_pending;        // 一条未取的有效 TTS_DONE / one valid receipt waiting
+
+/* ---- 31b 第 1 条：三拍封送（freeze / thaw） -------------------------------
+ * 冻结不是「暂停接收」，是「三拍区间内不许任何会话进来」——掉卡时 ARM 的
+ * adopt 会 truncate 一个正在被卸载的卷（扩句 B 的原话）。三个量缺一不可：
+ *
+ *   s_freeze_flags 入口闸 + 毒卷标记 + 一次性事件，压在同一个字节里：
+ *                  FRZ_FROZEN 三处判点读它（on_ctrl_write / on_data_write / try_adopt）
+ *                  FRZ_HOLD   毒卷显式保持：闩锁全败后，看门狗必须放过它（那不是卡死）
+ *                  FRZ_TIMEOUT 看门狗强制解冻的一次性事件，等 app 取走写黑匣子
+ *   s_frozen_ms    冻结时刻；看门狗触发时**改写为已冻结毫秒数**（复用，省 4 B）
+ *   s_verify_depth **判据②的测量值**：do_verify 的 FILE* 是局部变量，函数返回即
+ *                  消失，外部根本无从观测。进出各加减一次，它才从「顺序推断」
+ *                  变成「可查询事实」——这正是 B51 被降格时给的方向。
+ *
+ * 用 s_ui_lock（自旋锁）保护：BLE 回调栈上也要读，互斥锁在那里不能阻塞。
+ * The freeze is not "pause receiving": no session may enter while the three-beat
+ * runs. s_verify_depth is the measurement that turns the verify FILE* from an
+ * ordering inference into a fact an outsider can read.
+ */
+// 三个布尔压成一个标志字节、深度压成 uint8、时长复用 s_frozen_ms：
+// 这不是「省内存美学」，是 31b 的 +32 B 预算（第 2 条已用掉 16 B）。四个量分开写
+// 时段增量为 32 B，合并后 16 B——正好把整批压在预算内，不用回去重议。
+// Three booleans into one flag byte, the depth into a uint8, and the duration
+// reuses s_frozen_ms: the 31b budget is +32 B and item 2 already spent 16. Split
+// apart the section grew by 32 B; merged it grows by 16 and the batch fits.
+#define FRZ_FROZEN  0x01u
+#define FRZ_HOLD    0x02u
+#define FRZ_TIMEOUT 0x04u
+static uint8_t s_freeze_flags;
+static uint32_t s_frozen_ms;   // 冻结时刻；看门狗触发时改写为「已冻结多久」/ start, then the elapsed
+static uint8_t s_verify_depth;
+
+// 看门狗：闩锁最长 9 s（3 × (2 s quiesce + 1 s 间隔)）+ 卸卷余量。
+// 超时只抓「终态枚举漏项 / 流程卡死」，不碰合法的毒卷保持态。
+// Watchdog: the latch can legitimately take 9 s, plus room for the release. It
+// only catches a missing terminal branch or a stuck flow - never the legal
+// poisoned-volume hold.
+#define PUSH_FREEZE_WATCHDOG_MS 20000u
 
 // gen14：notify 空口失败重投。/ gen14: retry when a notify fails on air.
 // ble_gatts_notify_custom 返回 0 只代表 HCI 命令入了队，真正的空口结果在
@@ -224,9 +309,35 @@ static struct {
     char committed_title[PUSH_TITLE_MAX];
     uint8_t committed_type;
     bool unread; // gen21：正文已落盘且尚未被打开（首页「有新内容」徽章）/ a body landed and not yet opened (home "new content" badge)
+    // 26.9.30 commit 2：提交段的投递槽。BLE 回调写、主循环读即清，两者都在
+    // s_ui_lock 下；commit_carry 暂存同拍扣下的 OPEN_BOOK / WORD_CARD——
+    // 提交还没发生就开书，打开的是上一本（gen15 真机现象）。
+    // The commit hand-off slot: written by the BLE callback, read-and-cleared by the
+    // main loop, both under s_ui_lock. commit_carry parks the OPEN_BOOK / WORD_CARD
+    // bits withheld in the same beat - opening before the commit lands shows the
+    // PREVIOUS book (the gen15 hardware symptom).
+    bool commit_request;
+    uint32_t commit_req_ms; // 投递时刻，2 s 上界的起点 / post time, the 2 s anchor
+    uint8_t commit_carry;   // PUSH_COMMIT_CARRY_* / carried UI bits
+    // 26.9.30 commit 4（审计附注 1）：一次 take 只许一条终态出口。
+    // take 成功置位；run_commit 或 abort 任一条路都必须清掉，第二条到达者是 no-op。
+    // 没有它，死线外的 abort 只清 carry 不清「谁还欠这次提交」——泵每帧都进，
+    // 下一帧 now > deadline 仍成立，要么每帧重复 abort（重复 reply 破坏会话），
+    // 要么读者恰在此间释放、顺着 run_commit 走下去，abort 被静默绕过。
+    // One take, exactly one terminal exit. Set by a successful take; cleared by
+    // run_commit OR abort, and a second arrival is a no-op. Without it the abort
+    // outside the deadline cleared only the carry, not "who still owes this
+    // commit" - the pump runs every frame, so now > deadline keeps holding: either
+    // a repeated abort (a second reply wrecks the session) or the reader releases
+    // in between and run_commit runs anyway, silently bypassing the abort.
+    bool commit_live;
     bool ai_def;        // gen26：一条释义待展示（块 4 卡片框架入口）/ a definition pending display (block 4 card entry)
     char ai_word[PUSH_AI_WORD_MAX];    // 待展示单词 / the word to show
-    char ai_def_text[PUSH_AI_DEF_MAX]; // 待展示释义 / the definition to show
+    // 待展示释义**不在本结构里**（26.11.3-C2）：它装的是 8 KB 级的段落答案，会把这具
+    // 内部 RAM 结构整个撑大 7 KB，而内部 bss 只剩 112 B。见 s_ui_ai_def_text。
+    // The pending definition is NOT here (26.11.3-C2): it holds kilobyte-scale passage
+    // answers and would grow this internal-RAM struct by 7 KB with 112 B of bss left.
+    // See s_ui_ai_def_text.
 } s_ui;
 
 static bool (*s_dict_probe)(void); // 词典可用性探针 / the dictionary-availability probe
@@ -249,6 +360,7 @@ static size_t s_ai_buf_len;
 static uint16_t s_ai_cap;
 static bool s_ai_ready;   // 缓冲已挂接且 init 成功 / buffer attached and inited
 static bool s_ai_enabled; // 运行期开关（NVS 持久化）/ runtime on/off (NVS-persisted)
+static bool s_scene_enabled = true; // M3 情景解读（缺省开，NVS 覆盖）/ M3 scene lookup (default on)
 // gen26.5 协商状态：APK 用 CTRL 0x09 声明它支持的能力位。**默认 0（未使能）**——
 // 设备收使能前 STATUS 0x17 一律 66B legacy，旧 APK 不发 0x09 即零感知兼容；
 // 断连清零，重连后等 APK 重发（对端进程可能被杀，能力声明不可跨连接继承）。
@@ -262,21 +374,42 @@ static uint32_t s_apk_caps;
 // Is the device-side context source ready? (Step6 registers the book_id/pos
 // collector.) While false, 0x18 never advertises CAP_AI_CONTEXT - no false claims.
 static bool s_ai_ctx_ready;
+// 待展示释义槽（26.11.3-C2）：移出 s_ui、落 PSRAM 的**唯一理由**是尺寸——8,192 B
+// 在内部 RAM 无处安放。读写仍在 s_ui_lock 的临界区内，两条路径（写 ai_surface、
+// 读 push_sink_take_ai_def）语义与从前逐字等价，变的只有它躺在哪块内存里。
+// 临界区变长的代价要说清：8 KB memcpy 期间中断关闭约 0.2 ms，占 7.5 ms 连接间隔的
+// 3%——可接受，但它是这次搬家唯一的时序代价，记在交付件而不是埋在代码里。
+// The pending-definition slot (26.11.3-C2): moved out of s_ui and into PSRAM for one
+// reason - size; 8,192 B has nowhere to live in internal RAM. Reads and writes still
+// happen inside the s_ui_lock critical section, so both paths are word-for-word what
+// they were; only the address space changed. The cost of the longer critical section
+// is stated rather than buried: ~0.2 ms with interrupts off during the 8 KB copy, 3%
+// of a 7.5 ms connection interval - acceptable, and it is the only timing price.
+static EXT_RAM_BSS_ATTR char s_ui_ai_def_text[PUSH_AI_DEF_MAX];
+
 // gen26.5 Step7：0x08 分帧重组器（纯逻辑模块，宿主有断言；设备侧只管喂帧与取结果）。
-// gen26.5 Step7: the 0x08 reassembler (pure module with host assertions; the
-// device side only feeds frames and takes the result).
-static ai_segasm_t s_ai_segasm;
+// 26.11.3-C2：整具搬 PSRAM——它内嵌 8,192 B 缓冲，与上面同一笔账。
+// gen26.5 Step7: the 0x08 reassembler (pure module with host assertions; the device
+// side only feeds frames and takes the result). 26.11.3-C2: the whole struct lives in
+// PSRAM - it embeds an 8,192 B buffer, same ledger as above.
+static EXT_RAM_BSS_ATTR ai_segasm_t s_ai_segasm;
 
 // 预取释义缓存（块 3）：最近回流的释义，点词命中即秒出卡，不挤空口。
+// 26.11.3-C2：按**词义**预算尺寸化（PUSH_AI_CARD_MAX），不跟传输槽走。它只服务
+// 「点词秒出卡」一条路径，装的东西恒为一条词义；跟到 8192 就是 8 条 × 7 KB 的谎。
 // Prefetch cache (block 3): recent definitions; a tap on a cached word renders
-// instantly without touching the radio.
+// instantly without touching the radio. 26.11.3-C2: sized by the WORD budget
+// (PUSH_AI_CARD_MAX), not the transport slot - it only ever feeds the instant
+// word card, so following the slot would be eight 7 KB lies.
 #define AI_CACHE_N 8u
 typedef struct {
     char word[PUSH_AI_WORD_MAX];
-    char def[PUSH_AI_DEF_MAX];
+    char def[PUSH_AI_CARD_MAX];
     bool used;
 } ai_cache_t;
 static ai_cache_t s_ai_cache[AI_CACHE_N];
+_Static_assert(sizeof(s_ai_cache) < 16u * 1024u,
+               "26.11.3-C2: the prefetch cache must stay a word-sized cache");
 static uint8_t s_ai_cache_next;
 
 /* ---- 小助手 / Small helpers ---- */
@@ -310,6 +443,11 @@ static void ensure_init(void) {
             // after the user turns it on at least once).
             uint8_t ai = 0;
             if (nvs_get_u8(h, PUSH_NVS_KEY_AI, &ai) == ESP_OK) s_ai_enabled = ai != 0;
+            // M3：情景开关缺省开——没写过这个 key 就保持初始 true，写过才以 NVS 为准。
+            // M3: scene lookup defaults ON - absent key keeps the initial true, and
+            // only a written value overrides it.
+            uint8_t sc = 0;
+            if (nvs_get_u8(h, PUSH_NVS_KEY_SCENE, &sc) == ESP_OK) s_scene_enabled = sc != 0;
             nvs_close(h);
         }
     }
@@ -409,69 +547,13 @@ void push_sink_clear_unread(void) {
 }
 
 /* ---- .part 文件 / The partial file ---- */
-
-static void part_close(void) {
-    if (s_part) {
-        (void)fflush(s_part);
-        (void)fclose(s_part);
-        s_part = NULL;
-    }
-}
-
-// 追加模式打开：不存在则创建，存在则接着写（续传靠这个）。
-// Open in append mode: create when missing, continue when present (resume relies on it).
-static bool part_open_append(void) {
-    if (s_part) return true;
-    if (mkdir(PUSH_DIR, 0777) && errno != EEXIST) return false;
-    s_part = fopen(PUSH_PART_PATH, "ab");
-    return s_part != NULL;
-}
-
-// 截断新建：一次全新会话的起点。/ Truncating open: the start of a brand-new session.
-static bool part_open_fresh(void) {
-    part_close();
-    if (mkdir(PUSH_DIR, 0777) && errno != EEXIST) return false;
-    s_part = fopen(PUSH_PART_PATH, "wb");
-    return s_part != NULL;
-}
-
-// FATFS 上真正的「落地」是 f_sync（回写目录项的 size）；fflush 只到 f_write，
-// 目录项不动 —— stat()/回读看到的仍是旧长度（gen15 真机 err=4 的根因，详见 do_verify）。
-// On FATFS real durability is f_sync (it rewrites the size in the directory
-// entry); fflush() stops at f_write and leaves the entry stale, so stat() and
-// readback still see the old length (the gen15 err=4 root cause - see do_verify).
-static bool part_sync(void) {
-    if (!s_part) return false;
-    if (fflush(s_part) != 0) return false;
-    return fsync(fileno(s_part)) == 0;
-}
-
-static bool part_append(const uint8_t *data, size_t len) {
-    if (!part_open_append()) return false;
-    if (len == 0) return true;
-    const size_t n = fwrite(data, 1, len, s_part);
-    // 逐包把 newlib 缓冲推进 FATFS（f_write）。注意这不是 f_sync：目录项 size 未回写，
-    // 真正的落地由 part_sync() 在 NVS 检查点对齐执行 —— 崩溃后 .part 的可见长度
-    // 不会跑到 NVS 记账前面（只会停在更旧的检查点，续传因此安全）。
-    // Push the newlib buffer into FATFS (f_write) per packet. This is NOT f_sync:
-    // the directory entry is still stale. Real durability comes from part_sync()
-    // at the NVS checkpoints, so after a crash the visible length never runs
-    // ahead of the NVS counters (it only falls back to an older checkpoint, which
-    // is what makes resume safe).
-    (void)fflush(s_part);
-    return n == len;
-}
-
-static long part_size(void) {
-    struct stat st;
-    if (stat(PUSH_PART_PATH, &st) != 0) return -1;
-    return (long)st.st_size;
-}
-
-static void part_discard(void) {
-    part_close();
-    (void)remove(PUSH_PART_PATH);
-}
+// 26.9.30 commit 5：存储层搬到 push_part.c（账本 / 欠账槽 / 四步回退）。
+// 搬家的理由只有一个：那两条不变式（账本起点在 ARM 时刻就位、欠账先于新包）
+// 必须能被宿主用例咬住，而本文件依赖 BLE/NVS/esp_timer，宿主编不进去。
+// 行为一字未改，只是从这里消失。
+// Commit 5 moved the storage layer to push_part.c. One reason only: the two
+// invariants must be bitable by a host case, and this file needs BLE/NVS/esp_timer
+// which the host cannot build. Nothing else changed - the code simply left.
 
 /* ---- STATUS 通知与应答 / STATUS notify and replies ---- */
 
@@ -620,6 +702,19 @@ static void reply_err(int code) {
     portEXIT_CRITICAL(&s_ui_lock);
 }
 
+// 三合取③的入口闸：冻结期间任何会话入口都回 BUSY。返回 true = 已挡下。
+// 为什么是 BUSY 而不是 NOT_ARMED：会话可能还在（只是暂时不许进）。BUSY 让手机
+// 退避重试；NOT_ARMED 会让它以为用户取消了，直接放弃这次推送。
+// The entry gate for conjunct 3. BUSY, not NOT_ARMED: the session may still
+// exist, and BUSY makes the phone back off; NOT_ARMED reads as "user cancelled".
+static bool entry_frozen_reply(void) {
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool frozen = (s_freeze_flags & FRZ_FROZEN) != 0;
+    portEXIT_CRITICAL(&s_ui_lock);
+    if (frozen) reply_err(PUSH_ERR_BUSY);
+    return frozen;
+}
+
 static void reply_progress(void) {
     // KB 粒度：>64KB 也不溢出，进度条够用。/ KB granularity: no overflow past
     // 64 KB, enough for a progress bar.
@@ -639,6 +734,13 @@ static void reply_progress(void) {
 
 static void conn_params_apply(uint16_t itvl, uint16_t latency) {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    // gen30 伴读（R0 摊开项·conn 档位）：伴读活跃期全程 FAIR 15ms，以模式为档位
+    // 边界。既有 session 驱动的 DONE / ADV_OFF 回落 SLOW 不得把伴读档位带走；
+    // 退出伴读时 push_sink_companion_conn(false) 清标志并显式回 SLOW。
+    // gen30 companion: active tier stays FAIR for the whole mode. The legacy
+    // session-driven SLOW fallback must not steal it; leaving companion clears
+    // the latch and explicitly returns to SLOW.
+    if (itvl == PUSH_CONN_ITVL_SLOW && s_companion_conn_fair) return;
     // 外设角色请求参数更新，手机可拒；拒了也不影响传输，只是慢一点。
     // The peripheral requests an update; the phone may refuse. A refusal only
     // costs speed, never correctness.
@@ -749,6 +851,17 @@ static void adv_start(void) {
         return;
     }
     ESP_LOGI(TAG, "advertising as %s (svc in scan rsp)", s_adv_name);
+    // 26.9.13 P0-d：广播起来这一刻的堆快照。26.9.12 现场最刺眼的一条就是「面板判红
+    // 14.0 K，`advertising as` 却照打」——两行之间没有任何堆数字，读完只能猜闸门
+    // 是「判过了」还是「没参与」。这一份让两者可分辨：largest ≥ 闸门 = 真判过；
+    // largest < 闸门 = 走的不是闸门（见 push-bypass 站点）。
+    // 26.9.13 P0-d: heap at the moment advertising comes up. The most jarring pair in
+    // the 26.9.12 field log was the panel reading red at 14.0 K while `advertising as`
+    // printed anyway, with no heap figures between them - leaving "the gate passed" and
+    // "the gate never took part" indistinguishable. This dump separates them: largest at
+    // or above the gate means it really judged; below it means some other path armed
+    // (see the push-bypass site).
+    pico_heap_dump("push-adv", "push_sink:adv_start");
     if (s_sess.state == PUSH_STATE_ARMED) {
         exec_actions(push_session_event(&s_sess, PUSH_EVT_ADV_UP, NULL));
     }
@@ -947,10 +1060,34 @@ static void ui_post_committed(const char *title, uint8_t type) {
     portEXIT_CRITICAL(&s_ui_lock);
 }
 
+// 26.9.30 commit 2：COMMIT 只投递。这个函数可以在 BLE 回调栈上跑——它不碰任何
+// 文件、不 reply、不读会话；真正的四拍留给 push_sink_run_commit()。
+// COMMIT posts only. Safe on the BLE callback stack: no file I/O, no reply, no
+// session read; the four beats wait for push_sink_run_commit().
+static void ui_post_commit_request(uint8_t carry) {
+    const uint32_t now = ms_now(); // 临界区外取时：ms_now 不该在关中断的窗里跑
+    portENTER_CRITICAL(&s_ui_lock);
+    s_ui.commit_request = true;
+    s_ui.commit_req_ms = now;
+    s_ui.commit_carry = carry;
+    portEXIT_CRITICAL(&s_ui_lock);
+}
+
 // VERIFY：回读 .part 分段算 CRC，与 BEGIN 的 crc32/length 对账后喂 VERIFY 事件。
 // VERIFY: read the partial back in chunks, reconcile against the BEGIN crc32 and
 // length, then feed the VERIFY event.
 static void do_verify(void) {
+    // 判据②的测量点：verify 的 FILE* 是局部变量，函数返回即消失，外部无从观测。
+    // 进出各加减一次，它才成为「可查询事实」——B51 被降格时给的方向正是这个。
+    // **单出口**是这个计数的生命线：do_verify 全函数只有末尾一处返回。哪天有人在
+    // 中途加 return，计数就会虚高、quiesce 永远等不到 0，症状又是「push 永久死」。
+    // 静态牙 B55 咬这一条（含一枪「中途 return 不减」的变异）。
+    // The measurement point for conjunct 2. Single-exit is the lifeline: one
+    // mid-function return and the count never returns to zero.
+    portENTER_CRITICAL(&s_ui_lock);
+    ++s_verify_depth;
+    portEXIT_CRITICAL(&s_ui_lock);
+
     // s_part 为空说明簿记与文件脱节：直接判负（VERIFY 失败回 CONNECTED 保留
     // .part，行为安全）。fflush(NULL) 是 UB，绝不能让指针裸奔。
     // A NULL partial means the bookkeeping lost the file: fail the verdict
@@ -975,12 +1112,11 @@ static void do_verify(void) {
     // updates the inode size on write(), which is why 168 host checks missed it.
     // Fix: fclose before the readback (f_close runs f_sync internally), which
     // also removes the duplicate open that ffconf.h forbids under FS_LOCK=0.
-    bool ok = s_part != NULL;
+    bool ok = push_part_is_open();
     if (ok) {
-        (void)fflush(s_part);
-        part_close(); // f_close -> f_sync：目录项落盘 / commits the directory entry
+        push_part_close(); // f_close -> f_sync：目录项落盘 / commits the directory entry
     }
-    const long sz = part_size();
+    const long sz = push_part_size();
     uint32_t crc_file = 0;
     if (ok && sz != (long)s_sess.received) ok = false; // 文件与记账不符 / file disagrees with bookkeeping
     if (ok && sz == (long)s_sess.begin.total_len) {
@@ -1017,16 +1153,100 @@ static void do_verify(void) {
     memset(&evt, 0, sizeof(evt));
     evt.verify_ok = ok;
     exec_actions(push_session_event(&s_sess, PUSH_EVT_VERIFY, &evt));
+
+    // 与开头的 ++ 成对。放在 exec_actions 之后：整段 verify（含判定后的状态机
+    // 迁移）都算「verify 在跑」，比「FILE* 活着」更宽——宽只会让 quiesce 多等
+    // 几毫秒，窄才会放过一个正在读卡的句柄。
+    // Paired with the ++ above. Deliberately after exec_actions: the whole verify
+    // counts, which is wider than "the FILE* is alive" - wider only costs a few
+    // ms of waiting, narrower would let a live reader through.
+    portENTER_CRITICAL(&s_ui_lock);
+    --s_verify_depth;
+    portEXIT_CRITICAL(&s_ui_lock);
 }
 
 // COMMIT：正文原子改名成 push.txt；单词卡不落盘（title 即单词，UI 直接查词典）。
 // 返回 false = 提交失败（错误已回手机），调用方必须拦住开书动作。
+// ---- 提交舞蹈的前置：把 .bak 收敛掉 ----------------------------------------
+// .bak 只有一个合法存在理由：上一次提交在"旧书已挪开、新书没就位"之间被打断。
+// 两种残留要分开处置，**判据是成品在不在**，不是"哪一步失败"：
+//   text 在  -> bak 是更旧的一份，删掉（旧书正在位，bak 只是垃圾）；
+//   text 不在 -> bak 就是用户唯一的书，rename 回来（这就是"先捡后清"）。
+// 裸的 remove(BAK) 会在第二种情形删掉唯一幸存的书 —— 26.9.30 审计补丁一的原话
+// 按字面执行就是这个结果，所以这里必须按"成品尚在"分支。
+//
+// The only legitimate reason for .bak to exist is an interrupted commit. The
+// decision key is **whether the product exists**, not which step failed:
+// text present -> .bak is the older copy, delete it; text absent -> .bak is the
+// user's only book, rename it back.
+static bool recover_bak_if_needed(void) {
+    struct stat st;
+    if (stat(PUSH_TEXT_PATH, &st) == 0) return true;   // 成品在：bak 是垃圾，交给调用方清
+    if (errno != ENOENT) {
+        // 卷掉了 / IO 错：不猜，原样退出。这一支单独写，是为了不让 spurious
+        // stat 失败被记成"捡回失败"，那会把排错引到错的文件上。
+        ESP_LOGE(TAG, "recover: stat %s errno=%d", PUSH_TEXT_PATH, errno);
+        return false;
+    }
+    if (stat(PUSH_BAK_PATH, &st) != 0) {
+        if (errno == ENOENT) return true;              // 两者都不在：首推，正常
+        ESP_LOGE(TAG, "recover: stat %s errno=%d", PUSH_BAK_PATH, errno);
+        return false;
+    }
+    if (rename(PUSH_BAK_PATH, PUSH_TEXT_PATH) != 0) {
+        ESP_LOGE(TAG, "recover: rename bak->text errno=%d", errno);
+        return false;
+    }
+    ESP_LOGW(TAG, "recover: orphan %s restored to %s", PUSH_BAK_PATH, PUSH_TEXT_PATH);
+    return true;
+}
+
+// 四拍：把 .part 变成 push.txt，旧书全程不删（挪到 .bak，最后才清）。
+// 返回 false = 失败；调用方负责 reply_err，且此时旧书**一定还在**（原位或在 .bak）。
+// Four beats: .part becomes push.txt and the old book is never removed while the
+// new one is not in place. Returns false = failed; the caller replies the error
+// and the old book is guaranteed to still exist (in place, or in .bak).
+static bool commit_dance(void) {
+    // 拍 0：先捡后清，把状态收敛到"text 在 / bak 无"这一个干净前置态。
+    // 所有分支都从这里出发，所以四拍的前置条件是常量，不是调用者保证的。
+    if (!recover_bak_if_needed()) return false;
+    if (remove(PUSH_BAK_PATH) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "commit: clear stale bak errno=%d", errno);
+        return false;
+    }
+    // 拍 1：旧书挪开（不删）。首推时 text 不存在，ENOENT 是正常路径。
+    if (rename(PUSH_TEXT_PATH, PUSH_BAK_PATH) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "commit: park text errno=%d", errno);
+        return false;
+    }
+    // 拍 2：新书就位。这一拍失败是唯一会动到"用户唯一那份书"的分支，
+    // 所以回滚必须判返回值、且日志必须指名 .bak —— 现场只有"推送失败"一句时，
+    // 没人知道书还在。
+    if (rename(PUSH_PART_PATH, PUSH_TEXT_PATH) != 0) {
+        const int e = errno;                           // 回滚会覆盖 errno，先存
+        ESP_LOGE(TAG, "commit: install part errno=%d, rolling back", e);
+        if (rename(PUSH_BAK_PATH, PUSH_TEXT_PATH) != 0) {
+            ESP_LOGE(TAG, "commit: ROLLBACK FAILED errno=%d - old book is at %s, "
+                     "next commit or boot recovers it", errno, PUSH_BAK_PATH);
+        } else {
+            ESP_LOGW(TAG, "commit: rolled back, old book restored");
+        }
+        errno = e;
+        return false;
+    }
+    // 拍 3：清 BAK。失败不致命——下一次提交的拍 0 会再清一次。
+    if (remove(PUSH_BAK_PATH) != 0 && errno != ENOENT) {
+        ESP_LOGW(TAG, "commit: clear bak after install errno=%d (self-heals next commit)", errno);
+    }
+    return true;
+}
+
 // COMMIT: atomically rename the body to push.txt; word cards never land on disk
 // (the title is the word and the UI looks it up directly). Returns false = the
 // commit failed (the error is already replied); the caller must then suppress
 // the book-open action.
 static bool do_commit(void) {
-    part_close();
+    push_part_close();
     bool ok = true;
     if (s_sess.begin.type == PUSH_TYPE_WORD) {
         (void)remove(PUSH_PART_PATH);
@@ -1039,26 +1259,14 @@ static bool do_commit(void) {
             return false;
         }
     } else {
-        // gen16 根因：FatFs 的 f_rename **不覆盖已存在目标**（目标存在即 FR_EXIST
-        // → EEXIST）——POSIX 的「原子替换」语义它没有。首轮推送 push.txt 尚不存在
-        // 一切正常；**第二轮起 rename 必失败** → reply_err(ERR(5)) 被 APK 显示成
-        // 「TF 卡不可用」（文案误导，实际是 EEXIST）。gen15 真机铁证：
-        // `verify ok: sz=30 crc=0x15542824` 紧跟 `commit rename: File exists`。
-        // 修法：改名前先清掉旧目标。同目录 rename 只挪目录项，remove→rename 之间
-        // 的丢失窗口只在掉卡场景出现，可接受。
-        // gen16 root cause: FatFs's f_rename **never overwrites an existing
-        // target** (an existing name yields FR_EXIST -> EEXIST) - the POSIX
-        // "atomic replace" semantics simply are not there. The first push works
-        // (no push.txt yet); **every later one fails the rename** ->
-        // reply_err(ERR(5)), which the APK renders as "TF card unavailable" (a
-        // misleading label: it is really EEXIST). gen15 hardware proof:
-        // `verify ok: sz=30 crc=0x15542824` immediately followed by
-        // `commit rename: File exists`. Fix: clear the target before renaming.
-        // A same-directory rename only moves a directory entry, so the
-        // remove->rename loss window only materialises if the card is yanked.
-        (void)remove(PUSH_TEXT_PATH);
-        ok = rename(PUSH_PART_PATH, PUSH_TEXT_PATH) == 0;
-        if (!ok) ESP_LOGE(TAG, "commit rename: %s", strerror(errno));
+        // 26.9.30 起这里不再 remove 成品：旧书挪到 .bak、新书就位后才清 .bak。
+        // 原写法（gen16 修 EEXIST 时引入）是 `remove(push.txt)` 再 rename，
+        // 改名失败就把旧书弄丢了 —— 26.9.30 调查确认那是"文件消失"的唯一机制。
+        // 历史注释见 git：`commit rename: File exists` 是 gen15 的真机铁证。
+        // Since 26.9.30 the product is never removed here: the old book parks in
+        // .bak and is deleted only after the new one lands. The gen16 fix for
+        // EEXIST (remove-then-rename) is exactly what lost the old book.
+        ok = commit_dance();
     }
     nvs_clear_session();
     if (!ok) {
@@ -1073,21 +1281,28 @@ static bool do_commit(void) {
     return true;
 }
 
-static void exec_actions(uint32_t act) {
+static void exec_actions_body(uint32_t act) {
     if (act & PUSH_ACT_DROP) {
-        part_discard();
+        push_part_discard();
         nvs_clear_session();
         s_pkts_since_ckpt = 0;
     }
     if (act & PUSH_ACT_READY) {
-        if (!part_open_fresh()) {
+        if (!push_part_open_fresh()) {
             // .part 建不起来：取消会话回 ERR(5)，状态机不留半吊子簿记。
-            // The partial cannot be created: cancel the session with ERR(5) so
-            // the machine keeps no half-born bookkeeping.
+            // P0-2a ④：这里过去零日志，卡坏时现场只能看到"推送失败"。
+            // The partial cannot be created: cancel with ERR(5) so the machine
+            // keeps no half-born bookkeeping. P0-2a ④: this used to log nothing,
+            // leaving "push failed" as the only field evidence.
+            ESP_LOGE(TAG, "part open(%s) errno=%d", PUSH_PART_PATH, errno);
             exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
             reply_err(PUSH_ERR_NO_CARD);
             return;
         }
+        // 全新会话的账本归零在 push_part_open_fresh() 内部（M121c 的靶）；
+        // 这里只剩检查点计数。
+        // The fresh-session ledger reset lives inside push_part_open_fresh() (that
+        // is M121c's target); only the checkpoint counter is left here.
         s_pkts_since_ckpt = 0;
         nvs_save_session();
         conn_params_apply(PUSH_CONN_ITVL_FAIR, PUSH_CONN_LATENCY_FAST);
@@ -1107,10 +1322,25 @@ static void exec_actions(uint32_t act) {
         reply_resume();
     }
     if (act & PUSH_ACT_APPEND) {
-        if (!part_append(s_rx_payload, s_rx_len)) {
+        // 欠账先补：顺序追加一旦乱序就是永久损坏。补不上就终止会话，绝不
+        // 「先把新包写了再说」。
+        // Drain first: append-only storage is permanently corrupt once out of
+        // order, so a stuck owed packet ends the session - never "write the new
+        // one first and sort it out later".
+        if (!push_part_drain()) {
+            exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+            reply_err(PUSH_ERR_NO_CARD);
+            return;
+        }
+        if (!push_part_append(s_rx_payload, s_rx_len)) {
             // 写盘失败：簿记已经前进，唯独取消能让 offset 重新诚实。
+            // P0-2a ②：设备端必须留痕——"失败而不留痕"本身就是缺陷。
             // The write failed: the counters already moved, and only a cancel
-            // makes the offset honest again.
+            // makes the offset honest again. P0-2a ②: the device must leave a
+            // trace - a silent failure is a defect of its own.
+            ESP_LOGE(TAG, "append seq=%u errno=%d, %u B lost at offset %u",
+                     (unsigned)s_sess.next_seq, errno, (unsigned)s_rx_len,
+                     (unsigned)push_part_len());
             exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
             reply_err(PUSH_ERR_NO_CARD);
             return;
@@ -1118,14 +1348,22 @@ static void exec_actions(uint32_t act) {
         if (++s_pkts_since_ckpt >= PUSH_NVS_CHECKPOINT_EVERY) {
             s_pkts_since_ckpt = 0;
             // gen15：NVS 与 .part 的**可见长度**必须同步推进。FATFS 下可见长度只有
-            // f_sync 才会回写目录项，所以这里补一次 part_sync()。顺序固定为「先 NVS
+            // f_sync 才会回写目录项，所以这里补一次 push_part_sync()。顺序固定为「先 NVS
             // 后 sync」：崩溃后 .part 的可见长度只会落后于记账、绝不会超前，续传安全。
             // gen15: NVS and the **visible length** of the partial must advance
             // together. On FATFS only f_sync rewrites the directory entry, hence
-            // part_sync(). Order is fixed - NVS first, then sync - so after a crash
+            // push_part_sync(). Order is fixed - NVS first, then sync - so after a crash
             // the visible length can only lag behind the counters, never run ahead.
             nvs_save_session();
-            (void)part_sync();
+            if (!push_part_sync()) {
+                // P0-2a ③：检查点的 fflush+fsync 失败过去被吞。这里只警告不终止：
+                // 文件本身还在，续传锚是 NVS 记账，最坏是退回上一个检查点重收。
+                // P0-2a ③: a failed checkpoint sync used to vanish. Warn, do not
+                // abort: the file is still there and the resume anchor is the NVS
+                // bookkeeping, so the worst case is re-receiving from the previous
+                // checkpoint.
+                ESP_LOGW(TAG, "checkpoint sync failed, errno=%d", errno);
+            }
         }
     }
     if (act & PUSH_ACT_PROGRESS) {
@@ -1137,28 +1375,26 @@ static void exec_actions(uint32_t act) {
     }
     if (act & PUSH_ACT_VERIFY) do_verify();
     if (act & PUSH_ACT_COMMIT) {
-        // gen16：提交失败必须拦住开书。do_verify() 递归进入 exec_actions 时 act 里
-        // COMMIT 与 OPEN_BOOK/WORD_CARD 同位携带——此前 rename 失败（EEXIST）只回了
-        // ERR(5)，OPEN_BOOK 照样把**旧的** push.txt 弹出来（gen15 真机现象：
-        // 「弹出的永远是首次写入的内容」）。提交不掉 = 内容没落盘 = 无书可开。
-        // gen16: a failed commit must not open the book. do_verify() re-enters
-        // exec_actions with COMMIT and OPEN_BOOK/WORD_CARD carried together -
-        // previously a failed rename (EEXIST) only replied ERR(5) while OPEN_BOOK
-        // still popped the OLD push.txt (gen15 on hardware: "it always opens the
-        // first push's content"). No commit = nothing landed = nothing to open.
-        if (!do_commit()) act &= ~(uint32_t)(PUSH_ACT_OPEN_BOOK | PUSH_ACT_WORD_CARD);
-        else if (s_sess.begin.type != PUSH_TYPE_WORD) {
-            ui_post_committed(s_sess.begin.title, s_sess.begin.type);
-            // gen21：正文落盘即置未读（单词卡瞬时消费不置位）。若本拍 OPEN_BOOK
-            // 同拍自动开书，阅读器 open_book_impl 会随即清位——即推即读不亮假牌；
-            // 用户在首页/别处时无人清位，回首页徽章亮起。
-            // gen21: a landed body marks unread (word cards are consumed inline
-            // and never set it). If this same round auto-opens the book,
-            // open_book_impl clears it right away - push-and-read never shows a
-            // false badge; with the user elsewhere nobody clears it, so the home
-            // badge lights up.
-            unread_set(true);
-        }
+        // 26.9.30 commit 2（封送）：提交段从这里搬走了。BLE 回调只投递一个请求，
+        // 主循环（app_loop → transfer_pump_commit → push_sink_run_commit）在帧间
+        // 安全点执行四拍。理由不是洁癖：rename/remove 跑在 BLE 回调栈上，和读者
+        // 的 fread 抢同一个卷，而回调栈上根本没有「读者已释放」这个前提。
+        // gen16 的约束照旧：提交没成就没有书可开——所以同拍携带的 OPEN_BOOK /
+        // WORD_CARD 必须一起扣下，由执行体在成功之后补发。此前 rename 失败时
+        // OPEN_BOOK 照样把**旧的** push.txt 弹出来（gen15 真机现象：「弹出的永远
+        // 是首次写入的内容」）。扣下而不是丢弃：成功路径仍然要开书。
+        // Commit moved out (hand-off): the BLE callback only posts; the main loop
+        // runs the four beats between frames. Not fastidiousness - rename/remove on
+        // the BLE callback stack contends with the reader's fread for the same
+        // volume, and that stack carries no "reader released" precondition.
+        // gen16 still holds: no commit, no book to open - so the carried
+        // OPEN_BOOK / WORD_CARD bits are withheld here and re-posted by the executor
+        // on success. Withheld, not dropped: the success path still opens the book.
+        const uint8_t carry =
+            (uint8_t)(((act & PUSH_ACT_OPEN_BOOK) ? PUSH_COMMIT_CARRY_OPEN : 0u) |
+                      ((act & PUSH_ACT_WORD_CARD) ? PUSH_COMMIT_CARRY_WORD : 0u));
+        ui_post_commit_request(carry);
+        act &= ~(uint32_t)(PUSH_ACT_OPEN_BOOK | PUSH_ACT_WORD_CARD);
     }
     if (act & PUSH_ACT_ERR) {
         // gen14 诊断：session 层拒绝（token/type/total_len/跳号/校验）留痕。
@@ -1178,6 +1414,139 @@ static void exec_actions(uint32_t act) {
     if (act & PUSH_ACT_WORD_CARD) ui_post_word(s_sess.begin.title);
 }
 
+// 所有 BLE 回调与主循环都经由这里进状态机。收口放在 wrapper 而不是 body 的
+// 每个 return 前：事件出口有 8 个、还会增加，而"之后还会不会写 .part"是状态的
+// 函数——判状态比判事件稳（同族：摘抄四分法判"卡上可见内容"而不是"哪个调用失败"）。
+// All callers enter the state machine through here. The close is in the wrapper
+// rather than before every return in the body: there are eight event exits and
+// counting, while "will .part be written again" is a function of the state.
+static void exec_actions(uint32_t act) {
+    exec_actions_body(act);
+    // 只关不删：.part 与 NVS 簿记都要留给续传（关闭时 f_close 会 f_sync，
+    // 把可见长度推进到已写字节，对续传只有好处）。
+    // Close without removing: both .part and the NVS bookkeeping are what resume
+    // depends on. f_close runs f_sync, which brings the visible length up to the
+    // bytes actually written - strictly helpful for a resume.
+    if (s_sess.state != PUSH_STATE_RECEIVING && s_sess.state != PUSH_STATE_PROCESSING) {
+        push_part_close();
+    }
+}
+
+/* ---- 26.9.30 commit 2：提交段的封送出口 / the commit hand-off ---- */
+
+bool push_sink_take_commit_request(void) {
+    if (s_lock == NULL) return false; // 未 init：没有人投递过请求
+    bool pending = false;
+    bool expired = false;
+    lock();
+    if (s_ui.commit_request) {
+        // 读即清：失败不回写。app 层若此刻不能提交（commit 3 的读者释放），重试
+        // 的所有权在它手里；把请求塞回这个槽会把「一次投递」变成「无限重投」，
+        // 而 2 s 上界正是用来禁止无界重投的。
+        // Read-and-clear: a failure is never written back. If the app layer cannot
+        // commit right now (commit 3's reader release) it owns the retry - putting
+        // the request back would turn one hand-off into an unbounded re-post, which
+        // is exactly what the 2 s cap forbids.
+        s_ui.commit_request = false;
+        expired = (uint32_t)(ms_now() - s_ui.commit_req_ms) >= PUSH_COMMIT_WAIT_MS;
+        pending = !expired;
+        // 只有真正交到 app 层手里的这一次才算「活的提交」；过期作废的不置位。
+        // Only a hand-off that really reaches the app layer counts as live; an
+        // expired post is void and must not open the gate.
+        if (pending) s_ui.commit_live = true;
+    }
+    unlock();
+    if (expired) {
+        // 超时 = 主循环 2 s 没取走（泵没跑，或被长任务堵住）。回 ERR(7) 而不是
+        // ERR(5)：手机端必须能分开「忙」与「无卡」，否则现场只能靠猜。
+        // Expiry means the main loop did not pick it up within 2 s (pump stalled or
+        // blocked). Reply ERR(7), not ERR(5): the phone must be able to tell "busy"
+        // from "no card", or the field has nothing but guesses.
+        ESP_LOGW(TAG, "commit request expired after %u ms -> ERR(BUSY)",
+                 (unsigned)PUSH_COMMIT_WAIT_MS);
+        reply_err(PUSH_ERR_BUSY);
+    }
+    return pending;
+}
+
+bool push_sink_run_commit(void) {
+    if (s_lock == NULL) return false;
+    char title[PUSH_TITLE_MAX];
+    uint8_t type = 0;
+    lock();
+    // 26.9.30 commit 4（审计附注 1 第 2 条）：首行自证凭据。
+    // 四拍只许在「这一次 take 仍欠着终态」的会话里跑；没有凭据就 no-op——否则
+    // 任何一条误调（或 abort 之后的补跑）都会在没有任何推送的情况下 rename /
+    // remove，那正是「幽灵提交」的形态。凭据在这里消费（不是留到末尾），
+    // 保证同一次 take 只可能有一次 run_commit。
+    // First line: prove the session is actually in the commit phase. The four
+    // beats may only run while this take still owes a terminal exit; without the
+    // proof it is a no-op - otherwise any stray call (or a re-run after abort)
+    // would rename/remove with no push in flight, which is exactly a ghost
+    // commit. The ticket is consumed here, not at the end, so one take can never
+    // produce two runs.
+    if (!s_ui.commit_live) {
+        unlock();
+        ESP_LOGW(TAG, "run_commit without a live request -> no-op");
+        return false;
+    }
+    s_ui.commit_live = false;
+    // 先拷出来：do_commit() 会清会话簿记，标题与类型不该在它之后再从 s_sess 读。
+    // Copy first: do_commit() clears the session bookkeeping, so the title and type
+    // must not be read from s_sess afterwards.
+    snprintf(title, sizeof(title), "%s", s_sess.begin.title);
+    type = s_sess.begin.type;
+    const uint8_t carry = s_ui.commit_carry;
+    s_ui.commit_carry = 0;
+    const bool ok = do_commit();
+    if (ok) {
+        if (type != PUSH_TYPE_WORD) {
+            ui_post_committed(title, type); // gen19：首页「最近推送」同步
+            unread_set(true);               // gen21：落盘即置未读（单词卡不置位）
+        }
+        // 同拍扣下的两个 UI 位在这里补发——成功才发，失败一个字都不发。
+        // The two withheld UI bits are re-posted here, and only on success.
+        if (carry & PUSH_COMMIT_CARRY_OPEN) ui_post_open(title, type);
+        if (carry & PUSH_COMMIT_CARRY_WORD) ui_post_word(title);
+    }
+    unlock();
+    return ok;
+}
+
+// 26.9.30 commit 3：请求已被 take 取走、但 app 层判断这一拍不能提交（读者的书
+// 关不干净）。**不回写请求**——回写会把一次投递变回无限重投，2 s 上界正是用来
+// 禁止它的；app 层持有自己的有界重试，放大到死线外就调到这里，明确回 ERR(7)。
+// 扣下的两个 UI 位随之作废：失败一个字都不发（与 run_commit 的失败分支同一条）。
+// The request was already taken, but the app layer says this frame cannot commit
+// (the reader's book will not close cleanly). The request is **never** written
+// back - that would turn one post into unbounded re-posting, which the 2 s cap
+// exists to forbid; the app layer owns its bounded retry and lands here once past
+// its deadline, replying ERR(7) explicitly. The two withheld UI bits die with it:
+// a failure sends nothing, same as run_commit's failure branch.
+void push_sink_commit_abort(int err) {
+    if (s_lock == NULL) return;
+    lock();
+    // 26.9.30 commit 4（审计附注 1 第 3 条）：幂等。
+    // 没有活着的请求 = 这次提交已经有终态了（run_commit 或上一次 abort），
+    // 再回一个 ERR 就是第二次破坏会话：手机侧会把一个已完成/已失败的提交
+    // 再记一笔失败，现场也无法分辨「真忙」与「重复 abort」。
+    // Idempotent: no live request means this commit already reached a terminal
+    // exit (run_commit, or an earlier abort). A second ERR would wreck the
+    // session a second time - the phone would log another failure for a commit
+    // that already ended, and the field could not tell "really busy" from a
+    // duplicate abort.
+    if (!s_ui.commit_live) {
+        unlock();
+        ESP_LOGW(TAG, "commit abort ignored: no live request (err=%d)", err);
+        return;
+    }
+    s_ui.commit_live = false;
+    s_ui.commit_carry = 0;
+    unlock();
+    ESP_LOGW(TAG, "commit aborted by the app layer: err=%d", err);
+    reply_err(err);
+}
+
 /* ---- CTRL / DATA 写入处理 / CTRL and DATA write handling ---- */
 
 // BEGIN 的胶水前置闸门：词典（单词卡）、电量、.part 可建。都在喂状态机之前，
@@ -1187,7 +1556,7 @@ static void exec_actions(uint32_t act) {
 static int begin_precheck(const push_begin_t *b) {
     if (b->type == PUSH_TYPE_WORD && !dict_available()) return PUSH_ERR_NO_DICT;
     if (!battery_ok()) return PUSH_ERR_LOW_BATTERY;
-    if (!part_open_append()) return PUSH_ERR_NO_CARD;
+    if (!push_part_probe()) return PUSH_ERR_NO_CARD;
     return PUSH_ERR_NONE;
 }
 
@@ -1199,6 +1568,26 @@ static int begin_precheck(const push_begin_t *b) {
 // stringop-truncation -Werror (strncpy trips it on GCC 15.2).
 static void ai_str_put(char *dst, size_t cap, const char *src) {
     size_t n = strnlen(src, cap - 1);
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+// 26.9.9 诊断：把 UTF-8 文本截到至多 max_bytes 字节并退到字符边界，末尾补 NUL。
+// 只给 0x07 取证日志的 def_head 用，不参与任何产品路径：多字节字符被切一半时日志里
+// 会出现半个汉字，审计拿到的就是乱码而不是证据。
+// 26.9.9 diagnostics: truncate UTF-8 text to at most max_bytes, backing off to a
+// character boundary, then NUL-terminate. Used only by the 0x07 evidence log's
+// def_head and by nothing on the product path: a multi-byte rune cut in half turns
+// the auditor's evidence into mojibake.
+static void ai_log_utf8_head(char *dst, size_t cap, const char *src, size_t max_bytes) {
+    if (dst == NULL || cap == 0) return;
+    if (src == NULL) { dst[0] = 0; return; }
+    size_t n = strnlen(src, cap - 1);
+    if (n > max_bytes) n = max_bytes;
+    // src[n] 落在续字节上 = 切进了字符内部，回退到该字符首字节之后。
+    // A continuation byte at src[n] means we cut inside a rune: back off to just
+    // past that rune's lead byte.
+    while (n > 0 && ((unsigned char)src[n] & 0xC0u) == 0x80u) --n;
     memcpy(dst, src, n);
     dst[n] = 0;
 }
@@ -1226,7 +1615,7 @@ static void ai_surface(const char *word, const char *def) {
     portENTER_CRITICAL(&s_ui_lock);
     s_ui.ai_def = true;
     ai_str_put(s_ui.ai_word, sizeof(s_ui.ai_word), word);
-    ai_str_put(s_ui.ai_def_text, sizeof(s_ui.ai_def_text), def);
+    ai_str_put(s_ui_ai_def_text, sizeof(s_ui_ai_def_text), def);
     portEXIT_CRITICAL(&s_ui_lock);
 }
 
@@ -1244,6 +1633,16 @@ static void ai_send_caps(void) {
     // MULTI：0x08 重组器已落地，收得住长释义，故如实上报（报了就得收）。
     // MULTI: the 0x08 reassembler exists, so long definitions are accepted.
     if (s_ai_enabled) caps.bits |= PUSH_CAP_AI_MULTI;
+    // M3：情景位只在「AI 开 + 情景开」时报——设备确实能发 0x1A 才敢报，报了就得能发。
+    // M3: advertise SCENE only with both switches on - claim it only when the
+    // device can actually emit 0x1A.
+    if (s_ai_enabled && s_scene_enabled) {
+        caps.bits |= PUSH_CAP_AI_SCENE;
+        // M3-B：设备自己能渲染情景视图，如实上报（APK 据此决定要不要显示入口）。
+        // M3-B: the device can render the scene view; advertise it so the APK can
+        // decide whether to offer the entry.
+        caps.bits |= PUSH_CAP_AI_SCENE_VIEW;
+    }
     uint8_t frame[5];
     const size_t n = push_caps_encode(&caps, frame, sizeof(frame));
     if (n) notify_status(frame, n);
@@ -1353,6 +1752,35 @@ void push_sink_set_ai_enabled(bool on) {
     }
 }
 
+void push_sink_set_scene_enabled(bool on) {
+    if (s_scene_enabled == on) return;
+    s_scene_enabled = on;
+    nvs_handle_t h = 0;
+    if (nvs_open(PUSH_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, PUSH_NVS_KEY_SCENE, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    // 能力位随开关变化，重报一次让 APK 立刻看到（与 context_ready 同一理由）。
+    // The capability bit follows the switch; re-advertise so the APK sees it now.
+    if (s_status_subscribed) {
+        lock();
+        ai_send_caps();
+        unlock();
+    }
+}
+
+bool push_sink_scene_enabled(void) { return s_scene_enabled; }
+
+// M3-B：对面的 APK 是否真能出四节情景分析（bit4）。入口显示用这个谓词，不要用
+// 本地开关——本地开着但对面是 v1.6.1 时，点进去只会等一场空。
+// M3-B: whether the peer APK can actually answer with four sections (bit4). Use
+// this for the entry's visibility, not the local switch: with v1.6.1 on the other
+// side, tapping would only wait for an answer that never comes.
+bool push_sink_ai_scene_view_enabled(void) {
+    return (s_apk_caps & PUSH_CAP_AI_SCENE_VIEW) != 0;
+}
+
 void push_sink_ai_set_context_ready(bool ready) {
     s_ai_ctx_ready = ready;
     // 就绪状态变了要重报能力：APK 可能正等着 CONTEXT 位才发 0x09。
@@ -1384,7 +1812,19 @@ void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos)
     // regression (pinned by the wiring guard and a mutation).
     {
         const char *cached = ai_cache_find(word);
-        if (cached) { ai_surface(word, cached); return; } // 命中预取缓存：秒出卡
+        if (cached) {
+            // 26.9.9 取证：命中即出卡、**不发 0x17**——这一行是「为何反复点都一样」的
+            // 直接证据：第 2、3 次点击日志里没有 notify 时，只有它能说明卡从哪来。
+            // 26.9.9 evidence: a hit renders WITHOUT sending 0x17 - this line is the
+            // direct proof for "why every tap shows the same thing": with no notify on
+            // the 2nd/3rd tap, only this explains where the card came from.
+            ESP_LOGI(TAG, "ai tap: cache=HIT klen=%u key=\"%s\" dlen=%u",
+                     (unsigned)strlen(word), word, (unsigned)strlen(cached));
+            ai_surface(word, cached);
+            return; // 命中预取缓存：秒出卡
+        }
+        ESP_LOGI(TAG, "ai tap: cache=MISS klen=%u key=\"%s\"",
+                 (unsigned)strlen(word), word);
     }
     lock();
     const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
@@ -1422,13 +1862,117 @@ bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap) {
         s_ui.ai_def = false;
         got = true;
         ai_str_put(word, wcap, s_ui.ai_word);
-        ai_str_put(def, dcap, s_ui.ai_def_text);
+        ai_str_put(def, dcap, s_ui_ai_def_text);
     }
     portEXIT_CRITICAL(&s_ui_lock);
     return got;
 }
 
+/* ---- gen30 伴读：CTRL 裸帧白名单分派（哨位裁定方案 B）---- */
+/* Read-along gen30: bare CTRL frame whitelist dispatch (sentinel ruling, plan B). */
+/*
+ * 白名单 + 长度闸门都在纯函数 push_gen30_ctrl_bare_op() 里（宿主有逐字节断言）：
+ * 只有首字节 0x0A/0x0B 且总长恰等 241/4 B 才进这里；其余一律交回现制 4 B
+ * 魔数校验、失败 → ERR(2)。现制帧首字节固定 0x50，与白名单零交集，故既有
+ * CTRL 路径逐字不变，「未登记 op 走 ERR(2)」纪律零破坏。
+ * 有效帧按 R0 §一对账规则核对 page_no（基准 = 最近 PAGE_BEGIN），不符静默丢弃；
+ * 合规帧落 take 槽，由 app 层轮询消费（渲染 / 自动翻页），组件不反向调用 main。
+ *
+ * The whitelist and length gate live in the pure push_gen30_ctrl_bare_op() (host
+ * asserts bite byte by byte): only a 0x0A/0x0B first byte with an exact 241/4 B
+ * length gets here; everything else falls through to the legacy 4 B magic check
+ * and ERR(2). Legacy frames start with 0x50 (disjoint), so the existing CTRL path
+ * is unchanged. Valid frames are reconciled against the last PAGE_BEGIN page_no
+ * and dropped on mismatch; accepted ones land in take slots for the app to poll.
+ */
+static bool gen30_ctrl_dispatch(const uint8_t *data, size_t len) {
+    uint8_t op = 0u;
+    if (!push_gen30_ctrl_bare_op(data, len, &op)) return false;
+    if (op == PUSH_OP_TTS_DONE) {
+        // op1 + page_no2(LE) + status1 = 4 B
+        const uint16_t page_no = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+        const uint8_t status = data[3];
+        portENTER_CRITICAL(&s_ui_lock);
+        const bool valid = s_companion_page_valid && page_no == s_companion_page_no;
+        if (valid) {
+            s_companion_tts_page = page_no;
+            s_companion_tts_status = status;
+            s_companion_tts_pending = true;
+        }
+        portEXIT_CRITICAL(&s_ui_lock);
+        ESP_LOGI(TAG, "gen30 tts_done: page=%u status=%u %s",
+                 (unsigned)page_no, (unsigned)status,
+                 valid ? "accepted" : "dropped(page mismatch)");
+        return true;
+    }
+    // op == PUSH_OP_SUMMARY：op1+mode1+page_no2+idx1+total1+dlen2+text233 = 241 B
+    const uint8_t mode = data[1];
+    const uint16_t page_no = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
+    const uint8_t idx = data[4], total = data[5];
+    const uint16_t dlen = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
+    const uint8_t *text = data + 8;
+    const uint16_t clen = dlen > PUSH_SUMMARY_TEXT_MAX
+                              ? (uint16_t)PUSH_SUMMARY_TEXT_MAX : dlen;
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool valid = s_companion_page_valid && page_no == s_companion_page_no;
+    bool delivered = false, rejected = false;
+    if (valid) {
+        if (total < 1u || idx >= total) {
+            rejected = true;    /* 畸形 idx/total：不收 / malformed shard header */
+        } else {
+            /* 只认「从 0 开始、idx 连续」的片。idx==0 或与暂存断链都从零重来：
+               手机重发整段时不会接在上一次的半句后面。乱序、缺片、超长一律
+               丢弃整段——半句摘要比没有更糟（会冒充完整结论）。
+               Only shards starting at 0 and continuing in order are accepted. A
+               fresh idx==0 or a broken chain restarts the accumulator, so a
+               re-sent summary never appends to an orphaned half-sentence. */
+            if (idx == 0u || s_summary_acc_page != page_no || s_summary_acc_next != idx) {
+                s_summary_acc_len = 0;
+                s_summary_acc_page = page_no;
+                s_summary_acc_next = 0;
+            }
+            if (idx == s_summary_acc_next &&
+                (size_t)s_summary_acc_len + (size_t)clen <= PUSH_SUMMARY_TOTAL_MAX) {
+                memcpy(s_summary_acc + s_summary_acc_len, text, clen);
+                s_summary_acc_len = (uint16_t)(s_summary_acc_len + clen);
+                s_summary_acc_next = (uint8_t)(idx + 1u);
+                if (s_summary_acc_next >= total) {
+                    memcpy(s_companion_summary_text, s_summary_acc, s_summary_acc_len);
+                    s_companion_summary_text[s_summary_acc_len] = 0;
+                    s_companion_summary_len = s_summary_acc_len;
+                    s_companion_summary_mode = mode;
+                    s_companion_summary_idx = idx;
+                    s_companion_summary_total = total;
+                    s_companion_summary_page = page_no;
+                    s_companion_summary_pending = true;
+                    delivered = true;
+                }
+            } else {
+                rejected = true;    /* 乱序 / 跨页残片 / 超出总量帽 */
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    ESP_LOGI(TAG, "gen30 summary: page=%u mode=%u idx=%u/%u dlen=%u %s",
+             (unsigned)page_no, (unsigned)mode, (unsigned)idx, (unsigned)total,
+             (unsigned)dlen,
+             !valid ? "dropped(page mismatch)"
+                    : delivered ? "accepted(complete)"
+                    : rejected ? "dropped(shard)"
+                    : "shard buffered");
+    return true;
+}
+
 static void on_ctrl_write(const uint8_t *data, size_t len) {
+    // 31b 第 1 条：三拍（卸卷/格式化/深睡）期间入口冻结。ARM 的 adopt 会 truncate
+    // 一个正在被卸载的卷，而它是无句柄操作——判据②的计数看不见它，只能靠这道闸。
+    // Three-beat window: the gate is closed. ARM's adopt truncates with no
+    // handle, which conjunct 2 can never see - only this guard can stop it.
+    if (entry_frozen_reply()) return;
+    // gen30 哨位裁定方案 B：CTRL 方向新帧按 op 首字节裸帧，白名单分派。仅
+    // {0x0A,0x0B} 且长度恰等定长才命中；其余（含畸形新帧）一律继续走现制
+    // 4 B 魔数校验，失败 → ERR(2)。既有 CTRL 路径逐字不变。
+    if (gen30_ctrl_dispatch(data, len)) return;
     uint8_t op;
     if (!push_ctrl_header_decode(data, len, &op)) {
         // gen14 诊断：把拒帧现场全打出来——真机一测便知是 len 短了、魔数歪了还是
@@ -1480,9 +2024,33 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         // GATT write callback runs serially on the NimBLE host task (no re-entry).
         static push_ai_result_t r;
         if (!push_ai_result_decode(data, len, &r)) {
-            ESP_LOGW(TAG, "ai result decode rejected: len=%u", (unsigned)len);
+            // 26.9.9：失败路径也留现场——帧长 + 头四字节足以区分「短帧」「魔数歪」
+            // 「版本不符」，而这三类在 26.9.8 的真机排障里全靠猜。
+            // 26.9.9: the failure path keeps its scene too - frame length plus the
+            // first four bytes separates short-frame / bad-magic / bad-version,
+            // which on 26.9.8 hardware were pure guesswork.
+            ESP_LOGW(TAG, "ai rx: op=07 len=%u decode=FAIL head=%02x %02x %02x %02x",
+                     (unsigned)len, len > 0 ? data[0] : 0, len > 1 ? data[1] : 0,
+                     len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
             reply_err(PUSH_ERR_BAD_FRAME);
             return;
+        }
+        // 26.9.9 取证：**解码之后**的 word/def 实测值。26.9.8 只能拿「设备显示了什么」
+        // 反推「APK 发了什么」，而解码截断或字段错位时这两者并不等价——本条把设备真正
+        // 收到的词与释义首段钉进现场，与 APK 日志对时即可定责。长度一律字节数：中文一
+        // 个字 3 字节，字符数会把截断抹平。
+        // 26.9.9 evidence: the DECODED word/def as actually received. On 26.9.8 the only
+        // way to infer "what the APK sent" was "what the device showed", and the two
+        // diverge under truncation or field misalignment. This line pins what the device
+        // really got, so a timestamp join with the APK log assigns blame. Lengths are
+        // bytes throughout (one CJK rune = 3 bytes; char counts hide truncation).
+        {
+            char def_head[40];
+            ai_log_utf8_head(def_head, sizeof(def_head), r.def, 32u);
+            ESP_LOGI(TAG,
+                     "ai rx: op=07 len=%u decode=OK wlen=%u word=\"%s\" dlen=%u def_head=\"%s\"",
+                     (unsigned)len, (unsigned)strlen(r.word), r.word,
+                     (unsigned)strlen(r.def), def_head);
         }
         ai_on_result(r.word, r.def);
         return;
@@ -1537,11 +2105,23 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
         // Only the negotiation bits this build knows: a future APK declaring new
         // bits cannot pollute old firmware - unknown bits are ignored, i.e. behave
         // exactly like "not declared".
-        s_apk_caps = caps.bits & (PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI);
-        ESP_LOGI(TAG, "apk caps enable: bits=0x%08x (ctx=%d multi=%d)",
-                 (unsigned)s_apk_caps,
+        // M4-A 自纠：新增 SCENE 位时**必须同步本掩码**——漏了就等于「APK 声明了也被
+        // 静默清掉」，而且因为这里打印的是采纳值，版本判据会被一起污染（v1.5.2 的
+        // 0x03 与 v1.6.0 的 0x0b 过滤后逐字相同，都打印成 0x02，上两轮据此误判过）。
+        // 现在 raw 与 adopted 双打印：raw 定 APK 版本，adopted 定本固件实际认可的能力。
+        // M4-A correction: adding the SCENE bit **must** update this mask - omitting it
+        // means "declared then silently cleared", and because the log printed the
+        // adopted value it poisoned the version evidence too (v1.5.2's 0x03 and
+        // v1.6.0's 0x0b both print as 0x02 after filtering; two rounds mis-read it).
+        // Both raw and adopted are now printed: raw tells the APK version, adopted
+        // tells what this firmware actually honours.
+        s_apk_caps = caps.bits & (PUSH_CAP_AI_CONTEXT | PUSH_CAP_AI_MULTI | PUSH_CAP_AI_SCENE |
+                                  PUSH_CAP_AI_SCENE_VIEW);
+        ESP_LOGI(TAG, "apk caps enable: raw=0x%08x adopted=0x%08x (ctx=%d multi=%d scene=%d)",
+                 (unsigned)caps.bits, (unsigned)s_apk_caps,
                  (s_apk_caps & PUSH_CAP_AI_CONTEXT) ? 1 : 0,
-                 (s_apk_caps & PUSH_CAP_AI_MULTI) ? 1 : 0);
+                 (s_apk_caps & PUSH_CAP_AI_MULTI) ? 1 : 0,
+                 (s_apk_caps & PUSH_CAP_AI_SCENE) ? 1 : 0);
         return;
     }
     // 未武装：任何 CTRL 写入都回 ERR(1)，状态机看都不看。/ Unarmed: every CTRL
@@ -1602,6 +2182,15 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
             reply_err(PUSH_ERR_BUSY);
             return;
         }
+        // 最后一包若还欠着，必须在收官之前补上：END 之后不再有 DATA，欠账槽
+        // 里那 241 B 就是这篇的全部缺口。
+        // A packet still owed must land before the closing beat: no DATA follows
+        // END, so those 241 B would be the article's only hole.
+        if (!push_part_drain()) {
+            exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+            reply_err(PUSH_ERR_NO_CARD);
+            return;
+        }
         exec_actions(push_session_event(&s_sess, PUSH_EVT_END, NULL));
         return;
     case PUSH_OP_RESUME_QUERY:
@@ -1628,6 +2217,7 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
 }
 
 static void on_data_write(const uint8_t *data, size_t len) {
+    if (entry_frozen_reply()) return; // 31b：三拍期间入口冻结 / frozen entry gate
     if (s_sess.state == PUSH_STATE_IDLE) {
         reply_err(PUSH_ERR_NOT_ARMED);
         return;
@@ -1727,10 +2317,34 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
         // yet and every notify would be dropped (see ai_on_subscribed). They are
         // delivered in the SUBSCRIBE event instead.
         unlock();
+        // 26.9.13 P0-d：连接建立后的堆快照。放在 unlock 之后：上面那段持着 s_lock，
+        // printf 几十行不该占着这把锁。真机上「连上就断」若源于进连接时的分配失败，
+        // 这一份是唯一能对上号的定格（NimBLE 自己的 alloc 失败不打堆数字）。
+        // 26.9.13 P0-d: heap at connection establishment, after unlock - the section
+        // above holds s_lock and dozens of printf lines have no business holding it.
+        // If "connects then drops" is an allocation failure at connect time, this is
+        // the only freeze-frame that lines up (NimBLE's own alloc failure prints no
+        // heap figures).
+        pico_heap_dump("push-connect", "push_sink:connect");
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnected: %d", event->disconnect.reason);
+        // 26.9.13 P0-d：断开这一刻的堆快照。26.9.12 的日志里**没有任何断开行**，
+        // 于是「连接失效」到底是分配失败、8 s 监督超时还是应用收摊，只能猜三选一。
+        // 这里把 reason 与当时的 free/largest 定格在同一行附近：reason=8（监督超时）
+        // 与 reason=19/22（对端/本地主动断）在判读上是完全不同的两条路，而 largest
+        // 低于 NimBLE 单次分配需求则指向「控制器分配失败」。**先有这一行，才允许谈
+        // 是否要动 BLE 参数**——参数盲调是本仓库反复付学费的同一类错误。
+        // 26.9.13 P0-d: the heap at the instant of disconnect. The 26.9.12 log had NO
+        // disconnect line at all, so "the link fails sometimes" could only be guessed
+        // among three causes. Freezing reason and free/largest together separates them:
+        // reason=8 (supervision timeout) and reason=19/22 (peer/local terminated) are
+        // different paths, and a largest block below NimBLE's allocation need points at
+        // controller allocation failure. **This line has to exist before anyone touches
+        // a BLE parameter** - blind parameter tuning is the mistake this repo keeps
+        // paying tuition for.
+        pico_heap_dump("push-disc", "push_sink:disconnect");
         lock();
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_status_subscribed = false;
@@ -1825,21 +2439,31 @@ static int push_gap_cb(struct ble_gap_event *event, void *arg) {
 // nothing is touched: the NVS bookkeeping is the cross-reboot anchor and must
 // not be torn up for a late card; reconcile on the next arm once it is back.
 static void try_adopt(void) {
+    // 31b：冻结期间不 adopt。truncate 无句柄，句柄计数看不见它（扩句 B 的原话）。
+    // No adopt while frozen: the truncate carries no handle, so the file count
+    // can never see it.
+    if (push_sink_frozen()) return;
     push_nvs_session_t nv;
+    // .bak 捡回先于会话判定：.bak 是上一次提交被打断留下的旧书，与 .part 的
+    // 会话簿记无关。失败不阻断后续——.part 的处置不依赖 .bak 的归宿。
+    // Recover .bak before looking at the session: it belongs to an interrupted
+    // commit, not to the .part bookkeeping. A failure here does not block.
+    if (!recover_bak_if_needed()) ESP_LOGW(TAG, "boot: bak recovery failed, continuing");
     if (!nvs_load_session(&nv)) {
-        part_discard(); // 孤儿 .part：没有会话就不留 / an orphan partial: no session, no file
+        push_part_discard(); // 孤儿 .part：没有会话就不留 / an orphan partial: no session, no file
         return;
     }
-    const long sz = part_size();
-    if (sz < 0) return; // 卡不在：簿记原样留着 / no card: the bookkeeping stays as is
-    if ((uint32_t)sz < nv.received) {
+    // 26.9.30 commit 5：文件与账本的对齐整个下沉到 push_part_adopt()，三态显式。
+    // 「账本在 ARM 时刻就位」那一行现在住在 push_part.c 里——宿主用例 16e 能咬住
+    // 它，而它留在这里时谁也咬不住（本文件编不进宿主）。
+    // Commit 5: the file/ledger alignment moved into push_part_adopt() with three
+    // explicit outcomes. The "ledger in place at ARM time" line now lives in
+    // push_part.c, where host case 16e can bite it; here nothing could.
+    const push_part_adopt_t adopted = push_part_adopt(nv.received);
+    if (adopted == PUSH_PART_ADOPT_NO_CARD) return; // 簿记原样留着 / bookkeeping stays
+    if (adopted == PUSH_PART_ADOPT_CORRUPT) {
         nvs_clear_session();
-        part_discard();
-        return;
-    }
-    if ((uint32_t)sz > nv.received && truncate(PUSH_PART_PATH, (off_t)nv.received) != 0) {
-        nvs_clear_session();
-        part_discard();
+        push_part_discard();
         return;
     }
     push_session_adopt(&s_sess, &nv.begin, nv.received, nv.next_seq);
@@ -1917,6 +2541,199 @@ bool push_sink_turner_paused(void) {
 }
 
 /* ---- 公共 API / Public API ---- */
+
+/* ---- 三拍封送 / Three-beat quiesce (31b 第 1 条) ---- */
+
+// 判据②的读数：`.part` 写句柄 + verify 读句柄。两处都必须数——只数 .part 会
+// 漏掉 do_verify 的 fopen("rb")，那正是 B51 当年被判「不可见」的地方。
+// 调用方须持 s_ui_lock。
+// The reading for conjunct 2: both the .part writer and the verify reader. Only
+// counting the writer is exactly the blind spot B51 was demoted for.
+static unsigned live_files_locked(void) {
+    unsigned files = s_verify_depth;
+    if (push_part_is_open()) ++files;
+    return files;
+}
+
+bool push_sink_quiesce(unsigned timeout_ms) {
+    ensure_init();
+    const uint32_t started = ms_now();
+    portENTER_CRITICAL(&s_ui_lock);
+    s_freeze_flags = FRZ_FROZEN; // 新的三拍区间：上一轮的毒卷标记与旧事件一并作废
+    s_frozen_ms = started;
+    portEXIT_CRITICAL(&s_ui_lock);
+
+    // 先把「冻结」写在前面、等待放在后面：入口从这一刻起就关了，等待期间进来的
+    // BLE 写会被三处判点挡下。顺序反过来会留一个「等待中还能开新会话」的洞。
+    // Freeze first, wait second: the gate closes at this instant, so anything the
+    // BLE stack delivers while we wait hits the three guards.
+    for (;;) {
+        lock();
+        const int state = (int)s_sess.state;
+        const int pending = (int)s_pending_arm;
+        const bool pending_arm = s_pending_arm;
+        unlock();
+        // 两把锁各管各的：会话状态在 s_lock 下读，FILE* 计数在 s_ui_lock 下读。
+        // 先各自取值、再合成判据——判据本身是纯函数（B77 咬它），不跨锁。
+        // Two locks, two readings: session state under s_lock, FILE* count under
+        // s_ui_lock; they are combined afterwards by a pure predicate (B77).
+        portENTER_CRITICAL(&s_ui_lock);
+        const unsigned files = live_files_locked();
+        portEXIT_CRITICAL(&s_ui_lock);
+        // 26.11.5：判据搬进 push_session.c 的纯函数，宿主测试可全边覆盖。
+        // 「在传」按枚举序 = >= RECEIVING；CONNECTED 只握着链路，不握介质。
+        // 26.11.5: the predicate moved into a pure function so the host test can cover
+        // every edge. "Mid-transfer" is enum-ordered (>= RECEIVING); CONNECTED holds
+        // a link, not the medium.
+        const bool idle = push_quiesce_idle((push_state_t)state, pending_arm, files);
+
+        const uint32_t waited = ms_now() - started;
+        if (idle) {
+            ESP_LOGI(TAG, "quiesce ok in %u ms (state=%d files=%u)", (unsigned)waited, state, files);
+            return true;
+        }
+        if (waited >= timeout_ms) {
+            // 留痕：谁没停、卡在哪。真机验收要看这一行。/ Who refused to stop.
+            ESP_LOGW(TAG, "quiesce timeout after %u ms: state=%d pending_arm=%d files=%u",
+                     (unsigned)waited, state, pending, files);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void push_sink_thaw(const char *why) {
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool was = (s_freeze_flags & FRZ_FROZEN) != 0;
+    s_freeze_flags = 0; // 解冻同时清掉毒卷标记：下一次三拍从干净状态起算
+    portEXIT_CRITICAL(&s_ui_lock);
+    if (was) ESP_LOGI(TAG, "thaw: %s", why ? why : "?");
+}
+
+/* ---- 26.11.5 介质离开 / 插回：链路的所有权与对称义务 ---- */
+// 谁拥有链路，谁负责断；断了就要负责把它接回来。
+// Whoever owns the link owns cutting it - and owns reconnecting it.
+//
+// 场景（26.11.4 真机）：手机 APK 常驻、BLE 长连，用户拔卡。手机还连着，
+// 于是 quiesce 的原判据（state == IDLE）永远不成立——判据本身在 26.11.5 已修
+// （push_quiesce_idle），但只放行卸载还不够：卷走了，这个会话再收到 BEGIN 就会
+// 往不存在的介质里写。所以要当场把链路与广播一起收掉，语义也干净：「卡走了，
+// 这个会话没有意义了」。
+// The 26.11.4 field scene: a resident APK keeps the link up while the user pulls
+// the card, so the old quiesce predicate never held (fixed in 26.11.5). Letting the
+// unmount through is still not enough - with the volume gone, a later BEGIN would
+// write into nothing. So the link and the advertisement are dropped together.
+//
+// 顺序：先让状态机走 DISCONNECT（关 .part、回窗口、存 NVS 簿记），再 CANCEL 到
+// IDLE（停下广播），最后 terminate 链路。**不能只发 DISCONNECT**：会话停在 WINDOW，
+// 真机的 GAP 断连回调会按「state != IDLE」把广播重新拉起来，手机立刻能再连上一个
+// 正在被卸载的卷——那是把故障挪个位置，不是修。
+// Order: DISCONNECT first (closes .part, returns to the window, saves the NVS
+// bookkeeping), then CANCEL to IDLE (advertising off), then terminate the link.
+// DISCONNECT alone is not enough: the session would sit in WINDOW and the real GAP
+// disconnect callback would restart advertising for a volume that is being unmounted.
+static bool s_media_detached; // 我们断过链，插回时要还一次可连性 / we cut it, we owe a reconnect
+
+void push_sink_detach_media(const char *why) {
+    ensure_init();
+    lock();
+    const uint16_t handle = s_conn_handle;
+    const bool live = handle != BLE_HS_CONN_HANDLE_NONE || s_sess.state != PUSH_STATE_IDLE;
+    if (live) s_media_detached = true;
+    // 与真机 GAP 断连回调同一套清扫，只是由我们主动发起。
+    // The same sweep the real GAP disconnect does, only initiated by us.
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_status_subscribed = false;
+    s_apk_caps = 0u;
+    ai_segasm_reset(&s_ai_segasm);
+    notify_retry_cancel();
+    exec_actions(push_session_event(&s_sess, PUSH_EVT_DISCONNECT, NULL));
+    // 断连即存档：.part 已逐包落盘，簿记对齐到这一刻（同 DISCONNECT 回调）。
+    // Checkpoint on drop: the partial is flushed per packet, bookkeeping aligns here.
+    if (s_sess.has_part) nvs_save_session();
+    // 回不到 IDLE 就再推一拍 CANCEL——**不带 DROP**：卡已不在，删 .part 只会换来
+    // 一串 EIO；.part 留在卡上，插回后 probe/remount 照常处理。
+    // A second beat to IDLE, without DROP: the card is gone, removing .part only buys
+    // EIO noise; the partial stays on the card and the remount handles it.
+    if (s_sess.state != PUSH_STATE_IDLE) exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+    adv_stop();
+    const int state_after = (int)s_sess.state;
+    unlock();
+    if (handle != BLE_HS_CONN_HANDLE_NONE) {
+        // 0x13 = remote user terminated connection（同 ble_page_turner 的用法）。
+        const int rc = ble_gap_terminate(handle, 0x13);
+        ESP_LOGW(TAG, "detach media: link terminated rc=%d state=%d (%s)", rc, state_after,
+                 why ? why : "?");
+    } else {
+        ESP_LOGI(TAG, "detach media: no live link, session=%d (%s)", state_after, why ? why : "?");
+    }
+}
+
+bool push_sink_resume_after_media(void) {
+    ensure_init();
+    lock();
+    const bool owed = s_media_detached;
+    s_media_detached = false;
+    const push_state_t st = s_sess.state;
+    const bool pending = s_pending_arm;
+    const bool stack = s_stack_up;
+    if (owed && stack && st != PUSH_STATE_IDLE && !ble_gap_adv_active()) adv_start();
+    unlock();
+    if (!owed) return false;
+    if (st == PUSH_STATE_IDLE && !pending) {
+        // 会话已经收官（窗口到期或被取消）：重开一个默认窗口，手机才连得回来。
+        // 用与传书页进场相同的窗口长度，语义是「恢复被我们打断的那一回合」。
+        // The round already closed (window expired or cancelled): reopen a default
+        // window so the phone can reconnect - same length as the transfer page's
+        // entry window, since this restores the round we interrupted.
+        const esp_err_t err = push_sink_arm(0, PUSH_WINDOW_DEFAULT_MS);
+        ESP_LOGI(TAG, "re-arm after media: %s", esp_err_to_name(err));
+        return err == ESP_OK;
+    }
+    ESP_LOGI(TAG, "re-arm after media: session=%d still live, advertising restored", (int)st);
+    return true;
+}
+
+
+void push_sink_quiesce_hold(const char *why, push_hold_why_t why_code) {
+    portENTER_CRITICAL(&s_ui_lock);
+    s_freeze_flags = FRZ_FROZEN | FRZ_HOLD;
+    s_frozen_ms = ms_now(); // 重新起算：这是「有意保持」，不是「卡了 20 s」/ a deliberate hold, not a stuck flow
+    const unsigned still_open = live_files_locked();
+    portEXIT_CRITICAL(&s_ui_lock);
+    ESP_LOGW(TAG, "quiesce hold: %s (live files=%u, frozen until a remount edge or a reboot)",
+             why ? why : "?", still_open);
+    // 进黑匣子：串口日志会随会话消失，这一条要活到下次开机。
+    // 带 b = 当时还开着的 FILE* 数——它是「卡在哪一拍」的直接读数。
+    // Into the blackbox: the UART capture dies with the session, this has to survive to
+    // the next boot. `b` is the live FILE* count, i.e. which beat was still holding on.
+    pico_bootbb_note(PICO_BOOTBB_NOTE_PUSH_HOLD, (uint8_t)why_code, (uint16_t)still_open);
+}
+
+bool push_sink_frozen(void) {
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool frozen = (s_freeze_flags & FRZ_FROZEN) != 0;
+    portEXIT_CRITICAL(&s_ui_lock);
+    return frozen;
+}
+
+unsigned push_sink_live_files(void) {
+    portENTER_CRITICAL(&s_ui_lock);
+    const unsigned files = live_files_locked();
+    portEXIT_CRITICAL(&s_ui_lock);
+    return files;
+}
+
+bool push_sink_take_freeze_timeout(unsigned *frozen_ms) {
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool had = (s_freeze_flags & FRZ_TIMEOUT) != 0;
+    if (had) {
+        s_freeze_flags &= (uint8_t)~FRZ_TIMEOUT;
+        if (frozen_ms) *frozen_ms = s_frozen_ms; // 看门狗已把它改写成时长
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    return had;
+}
 
 void push_sink_init(void) {
     ensure_init();
@@ -2111,6 +2928,28 @@ void push_sink_progress(uint32_t *received, uint32_t *total) {
 void push_sink_poll(void) {
     ensure_init();
     const uint32_t now = ms_now();
+
+    // 31b：冻结看门狗。三拍区间正常 ≤ 9 s（3 × (2 s quiesce + 1 s 间隔)）+ 卸卷余量；
+    // 超过 20 s 说明终态枚举漏了项，或者流程卡死。31a 五环死锁的教训就是：没有保底，
+    // 症状是「只有重启能出」。毒卷保持态（s_freeze_hold）是**有意**的冻结，放过。
+    // The freeze watchdog. 20 s means a missing terminal branch or a stuck flow.
+    // A poisoned-volume hold is deliberate and is passed over.
+    portENTER_CRITICAL(&s_ui_lock);
+    const bool freeze_expired = (s_freeze_flags & FRZ_FROZEN) != 0 &&
+                                (s_freeze_flags & FRZ_HOLD) == 0 &&
+                                (now - s_frozen_ms >= PUSH_FREEZE_WATCHDOG_MS);
+    uint32_t forced_ms = 0;
+    if (freeze_expired) {
+        forced_ms = now - s_frozen_ms;
+        s_frozen_ms = forced_ms;          // 复用：此刻它存的是时长，供 take 取走
+        s_freeze_flags = FRZ_TIMEOUT;     // 解冻 + 置一次性事件（HOLD 一并清掉）
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    if (freeze_expired) {
+        ESP_LOGW(TAG, "freeze watchdog: forced thaw after %u ms (no terminal state reached)",
+                 (unsigned)forced_ms);
+    }
+
     lock();
     // 待武装超时：栈起不来就放弃，UI 收 start_failed。/ Pending-arm timeout: give
     // up when the stack never comes up and let the UI take start_failed.
@@ -2318,5 +3157,170 @@ bool push_sink_tts_send_page(const char *text, size_t len) {
         }
     }
     unlock();
+    return ok;
+}
+
+/* ---- gen30 伴读：STATUS 方向两帧 + CTRL 方向 take 槽 + conn 档位 ---------- */
+/* Read-along gen30: two STATUS frames, two CTRL take slots, connection tier. */
+/*
+ * 本段只提供「设备端协议能力」：发帧、收帧对账、落 take 槽、连接档位。调用时机
+ * （进/出伴读动作、翻页流、模式切换、TTS_DONE 消费）属产品码接线，步 3 熔断
+ * 简报另案报裁，本段不预设、不反向调用 main。
+ * This section supplies device-side protocol capability only. The wiring timing
+ * (enter/exit, page stream, mode switch, receipt consumption) is product-code
+ * glue, reported separately in the step-3 circuit-breaker brief.
+ */
+
+bool push_sink_companion_page_begin(uint16_t page_no, uint8_t mode) {
+    ensure_init();
+    // op1 + page_no2(LE) + mode1 + reserved1 = 5 B
+    const uint8_t body[4] = {(uint8_t)page_no, (uint8_t)(page_no >> 8), mode, 0u};
+    uint8_t frame[PUSH_STATUS_MAX];
+    const size_t n = push_status_encode(PUSH_ST_PAGE_BEGIN, body, sizeof(body),
+                                        frame, sizeof(frame));
+    if (!n) return false;
+    // 对账基准先落再投递：帧序即页序，回包到达时基准必已就位；同时清掉上一页
+    // 未取的回包，防旧页 SUMMARY/TTS_DONE 在新页被取走。
+    portENTER_CRITICAL(&s_ui_lock);
+    s_companion_page_no = page_no;
+    s_companion_page_valid = true;
+    s_companion_summary_pending = false;
+    s_companion_tts_pending = false;
+    /* 换页即弃半段：多帧摘要不跨页拼装，旧页残留片绝不能接进新页。 */
+    s_summary_acc_len = 0;
+    s_summary_acc_next = 0;
+    portEXIT_CRITICAL(&s_ui_lock);
+    return notify_status(frame, n);
+}
+
+bool push_sink_companion_mode_set(uint8_t mode, uint8_t source) {
+    ensure_init();
+    // op1 + mode1 + source1 + reserved2 = 5 B
+    const uint8_t body[4] = {mode, source, 0u, 0u};
+    uint8_t frame[PUSH_STATUS_MAX];
+    const size_t n = push_status_encode(PUSH_ST_MODE_SET, body, sizeof(body),
+                                        frame, sizeof(frame));
+    if (!n) return false;
+    return notify_status(frame, n);
+}
+
+bool push_sink_tts_enable_send(bool on) {
+    ensure_init();
+    // op1 + enable1 = 2 B。修复轮解耦：把「听书开关」作为独立事实发给手机，
+    // 0x19 从此只承载文本，手机端「念/不念」由本帧决定，摘要链与朗读彻底解耦。
+    // Repair-round decoupling: the listening switch travels as its own fact, so
+    // 0x19 carries text only and playback is decided by this bit; the summary
+    // chain is fully independent of read-aloud.
+    const uint8_t body[1] = {on ? 1u : 0u};
+    uint8_t frame[PUSH_STATUS_MAX];
+    const size_t n = push_status_encode(PUSH_ST_TTS_ENABLE, body, sizeof(body),
+                                        frame, sizeof(frame));
+    if (!n) return false;
+    const bool sent = notify_status(frame, n);
+    /* 现场判读用：开关到底把哪个方向发下去了，一行看清。上一轮没有这条，
+       只能靠手感判「接反」，白跑一轮。 */
+    ESP_LOGI(TAG, "tts_enable: on=%d sent=%d", on ? 1 : 0, sent ? 1 : 0);
+    return sent;
+}
+
+bool push_sink_take_companion_summary(uint8_t *mode, uint16_t *page_no,
+                                      uint8_t *idx, uint8_t *total,
+                                      char *text, size_t cap) {
+    ensure_init();
+    bool got = false;
+    portENTER_CRITICAL(&s_ui_lock);
+    if (s_companion_summary_pending) {
+        s_companion_summary_pending = false;
+        got = true;
+        if (mode) *mode = s_companion_summary_mode;
+        if (page_no) *page_no = s_companion_summary_page;
+        if (idx) *idx = s_companion_summary_idx;
+        if (total) *total = s_companion_summary_total;
+        if (text && cap) {
+            const size_t n = s_companion_summary_len < cap - 1u
+                                 ? s_companion_summary_len : cap - 1u;
+            memcpy(text, s_companion_summary_text, n);
+            text[n] = 0;
+        }
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    return got;
+}
+
+bool push_sink_take_companion_tts_done(uint16_t *page_no, uint8_t *status) {
+    ensure_init();
+    bool got = false;
+    portENTER_CRITICAL(&s_ui_lock);
+    if (s_companion_tts_pending) {
+        s_companion_tts_pending = false;
+        got = true;
+        if (page_no) *page_no = s_companion_tts_page;
+        if (status) *status = s_companion_tts_status;
+    }
+    portEXIT_CRITICAL(&s_ui_lock);
+    return got;
+}
+
+void push_sink_companion_conn(bool on) {
+    ensure_init();
+    portENTER_CRITICAL(&s_ui_lock);
+    s_companion_conn_fair = on;
+    portEXIT_CRITICAL(&s_ui_lock);
+    conn_params_apply(on ? PUSH_CONN_ITVL_FAIR : PUSH_CONN_ITVL_SLOW,
+                      on ? PUSH_CONN_LATENCY_FAST : PUSH_CONN_LATENCY_SLOW);
+}
+
+bool push_sink_ai_scene_send(const char *word, const char *ctx, size_t ctx_len,
+                             uint16_t word_off, uint8_t flags) {
+    if (!word || !*word) return false;
+    if (!ctx || ctx_len == 0 || ctx_len > PUSH_SCENE_CTX_MAX) return false;
+    if (word_off > ctx_len) return false;
+    // 三道门，缺一不发：AI 总开关 / 情景开关 / APK 已声明 CAP_AI_SCENE。
+    // 老 APK 不发 0x09 → 位不置 → 设备零 0x1A，零感知兼容（与 0x19 同一模型）。
+    // Three gates, all required: AI switch, scene switch, and the APK's
+    // CAP_AI_SCENE declaration. An old APK never sends 0x09, so the bit stays
+    // clear and the device emits no 0x1A - silent compatibility (same model as 0x19).
+    if (!s_ai_enabled || !s_scene_enabled) return false;
+    // bit3 = APK 认识 0x1A；bit4 = APK 真能出四节分析。两个都要：只认 bit3 的
+    // v1.6.1 会「收下请求、永不回答」，用户看到的是卡片一直转到超时。
+    // bit3 = the APK understands 0x1A; bit4 = it can actually answer with four
+    // sections. Both are required: v1.6.1 declares bit3 only and would take the
+    // request without ever answering - a card spinning until timeout.
+    if (!(s_apk_caps & PUSH_CAP_AI_SCENE)) return false;
+    if (!(s_apk_caps & PUSH_CAP_AI_SCENE_VIEW)) return false;
+
+    lock();
+    const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
+    if (!live) {
+        unlock();
+        return false;
+    }
+    const uint16_t total = push_scene_frame_count(word, ctx, ctx_len);
+    bool ok = true;
+    for (uint16_t i = 0; i < total && ok; ++i) {
+        const char *slice = NULL;
+        size_t slice_len = 0;
+        if (!push_scene_frame_at(word, ctx, ctx_len, i, &slice, &slice_len)) {
+            ok = false; // 计划器自相矛盾（防御性失败）
+            break;
+        }
+        uint8_t frame[PUSH_ST_SCENE_FRAME_MAX];
+        const size_t n = push_st_scene_encode(word, word_off, flags, i, total,
+                                              slice, slice_len, frame, sizeof(frame));
+        if (!n || !notify_status(frame, n)) {
+            // 与 0x19 同口径：不投缺帧请求，对端在 seq==0 重置。
+            // Same stance as 0x19: never air a gapped request; the peer resets at seq==0.
+            ESP_LOGW(TAG, "scene frame %u/%u not delivered", (unsigned)i, (unsigned)total);
+            ok = false;
+        }
+    }
+    unlock();
+    if (ok) {
+        // 真机 smoke 的装锚：帧数、词长、偏移、标志位一次可查。
+        // On-device anchor: frames, word length, offset and flags in one line.
+        ESP_LOGI(TAG, "scene send: word=%u bytes off=%u frames=%u flags=0x%02x",
+                 (unsigned)strnlen(word, PUSH_SCENE_WORD_MAX), (unsigned)word_off,
+                 (unsigned)total, (unsigned)flags);
+    }
     return ok;
 }

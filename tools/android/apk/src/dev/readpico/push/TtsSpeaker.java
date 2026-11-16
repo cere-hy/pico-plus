@@ -33,6 +33,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 
 public final class TtsSpeaker {
@@ -49,15 +50,43 @@ public final class TtsSpeaker {
     private static final int RATE_DEFAULT = 1;  // 1.0
     private static final int PITCH_DEFAULT = 1; // 1.0
 
+    /**
+     * gen30 伴读案：跟随朗读的播完回调（R0 §四「APK 播完一律回 TTS_DONE」）。
+     * 设备端按 NVS 设置自治消费（仅 FINISHED + 自动翻页开才翻页；ABORT/FAILED 忽略），
+     * 所以 APK 侧如实上报三种终态即可，无需查询设备使能态。
+     * gen30 read-along: follow-read completion callback. The device consumes it
+     * autonomously (only FINISHED with auto-turn on advances); the APK reports the
+     * three outcomes honestly and never queries the device's enable flag.
+     */
+    public interface FollowDoneListener {
+        /**
+         * @param pageNo 本次朗读发起时绑定的 PAGE_BEGIN 页号（>=0 才有对账基准）
+         * @param status 与 PushProto.TTS_DONE_* 对齐：0 播完 / 1 中断 / 2 失败
+         */
+        void onFollowDone(int pageNo, int status);
+    }
+
+    /** utteranceId 前缀：把页号编进 id，QUEUE_FLUSH 打断上一页时不与新页串号。 */
+    private static final String FOLLOW_UTTERANCE_PREFIX = "tts_page:";
+
     private TextToSpeech tts;
     private volatile boolean ready;
     /** onInit 之前到达的待补读页（latch；init 成功后立即消费）。 */
     private String pendingFollow;
+    /** latch 页对应的 PAGE_BEGIN 页号；-1 = 纯听书（无对账基准，不回 TTS_DONE）。 */
+    private int pendingFollowPageNo = -1;
+    /** 播完回调（MainActivity 持有；shutdown 时清空，防回调打进已死 Activity）。 */
+    private FollowDoneListener followDoneListener;
     /** 应用上下文（只用于读档位 prefs；不持 Activity）。/ App ctx for prefs only. */
     private Context appCtx;
 
     /** 创建（不初始化引擎）：init() 做异步构造。/ Create without initializing. */
     public TtsSpeaker() {
+    }
+
+    /** gen30：注册播完回调（MainActivity 在 init() 之前调用）。/ Register the callback. */
+    public void setFollowDoneListener(FollowDoneListener l) {
+        followDoneListener = l;
     }
 
     /** 异步初始化引擎。onInit 成功前 speak* 只暂存不丢。/ Async engine init. */
@@ -74,10 +103,13 @@ public final class TtsSpeaker {
                 }
                 ready = true;
                 applyRatePitch(sp);
+                installFollowDoneListener();
                 String stash = pendingFollow;
+                final int stashPageNo = pendingFollowPageNo;
                 pendingFollow = null;
+                pendingFollowPageNo = -1;
                 if (stash != null) {
-                    speakFollow(stash); // 补读 init 期间到达的页 / catch-up page
+                    speakFollow(stash, stashPageNo); // 补读 init 期间到达的页 / catch-up page
                 }
             }
         });
@@ -87,6 +119,8 @@ public final class TtsSpeaker {
     public void shutdown() {
         ready = false;
         pendingFollow = null;
+        pendingFollowPageNo = -1;
+        followDoneListener = null; // 先清回调，下面的 tts.stop() 不会打进已死 Activity
         appCtx = null;
         if (tts != null) {
             try {
@@ -112,6 +146,19 @@ public final class TtsSpeaker {
      * defensive twin of that rule).
      */
     public void speakFollow(String page) {
+        speakFollow(page, -1);
+    }
+
+    /**
+     * gen30 重载：绑定 PAGE_BEGIN 页号，播完回调据此回 TTS_DONE（page_no 对账用）。
+     * 不传页号（纯听书，无 0x1C 前置帧）时 utteranceId 不带页号，回调静默不回帧
+     * ——设备端仅伴读态有 PAGE_BEGIN 对账基准，纯听书回帧本就会被丢弃（R0 §一）。
+     * 每次朗读把页号编进 utteranceId：QUEUE_FLUSH 打断上一页时，旧朗读的 onStop
+     * 仍带旧页号，不与新页串号；设备端「page_no ≠ 当前页忽略」再兜一层。
+     * gen30 overload: bind the PAGE_BEGIN page number into the utterance id so a
+     * flushed (interrupted) page cannot be mistaken for the new page.
+     */
+    public void speakFollow(String page, int pageNo) {
         if (page == null) {
             return;
         }
@@ -121,11 +168,63 @@ public final class TtsSpeaker {
         }
         if (!ready) {
             pendingFollow = page; // init latch：不丢页 / do not drop the page
+            pendingFollowPageNo = pageNo;
             return;
         }
         tts.setSpeechRate(rate(appCtx));
         tts.setPitch(pitch(appCtx));
-        tts.speak(page, TextToSpeech.QUEUE_FLUSH, null, "tts_page");
+        final String utteranceId = (pageNo >= 0)
+                ? (FOLLOW_UTTERANCE_PREFIX + pageNo) : "tts_page";
+        tts.speak(page, TextToSpeech.QUEUE_FLUSH, null, utteranceId);
+    }
+
+    /**
+     * gen30：安装播完 / 中断 / 失败监听。只处理 "tts_page:&lt;no&gt;" 前缀；speakWord
+     * 的 "tts_word" 与无页号的 "tts_page" 都不触发 TTS_DONE。回调线程由引擎决定，
+     * 故调用方（MainActivity）自行切线程写帧，本类不碰 UI、不碰协议常量。
+     */
+    private void installFollowDoneListener() {
+        if (tts == null) {
+            return;
+        }
+        int rc = tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+            @Override public void onStart(String utteranceId) { }
+
+            @Override public void onDone(String utteranceId) {
+                fireFollowDone(utteranceId, 0); // TTS_DONE_FINISHED
+            }
+
+            @Override public void onError(String utteranceId) {
+                fireFollowDone(utteranceId, 2); // TTS_DONE_FAILED
+            }
+
+            @Override public void onStop(String utteranceId, boolean interrupted) {
+                fireFollowDone(utteranceId, 1); // TTS_DONE_ABORT
+            }
+        });
+        if (rc != TextToSpeech.SUCCESS) {
+            Log.w(TAG, "setOnUtteranceProgressListener failed rc=" + rc);
+        }
+    }
+
+    /** 解析 utteranceId 里的页号并上报；无页号 / 非法一律静默（不伪造回执）。 */
+    private void fireFollowDone(String utteranceId, int status) {
+        if (utteranceId == null || !utteranceId.startsWith(FOLLOW_UTTERANCE_PREFIX)) {
+            return;
+        }
+        final int pageNo;
+        try {
+            pageNo = Integer.parseInt(utteranceId.substring(FOLLOW_UTTERANCE_PREFIX.length()));
+        } catch (NumberFormatException e) {
+            return;
+        }
+        if (pageNo < 0) {
+            return;
+        }
+        FollowDoneListener l = followDoneListener;
+        if (l != null) {
+            l.onFollowDone(pageNo, status);
+        }
     }
 
     /**

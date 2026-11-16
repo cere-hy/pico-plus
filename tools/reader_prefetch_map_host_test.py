@@ -108,6 +108,10 @@ GEOMETRY = ['reader_column_gutter', 'reader_column_width', 'reader_column_offset
 AFTER_MAP = ['reader_column_count', 'reader_prep_target', 'reader_prep_slice',
              'invalidate_prep', 'reader_prefetch_buffer', 'reader_prefetch_step',
              'kick_prep', 'reader_prefetch_idle']
+# gen30 步 3 接线 7：产品侧纯判据函数，供门槛临时覆盖真值表断言抽取。
+# gen30 step 3 item 7: the product-side pure predicate, extracted for the
+# temporary-override truth-table assertion.
+COMPANION_WIRING = ['reader_tts_active']
 
 PRELUDE = r'''
 #include <assert.h>
@@ -130,6 +134,9 @@ typedef struct{bool consumed,request_app,request_menu,request_return;touch_t *to
 enum{READING,SHELF,READER_PANEL_NONE,READER_PANEL_FONT};
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT 2
+/* 既有桩缺口补齐：kick_prep 抽取体用 BOOK_PREP_STACK_SZ（产品 app_book.c:621 为 6*1024）。
+   Fill a pre-existing stub gap: the extracted kick_prep references BOOK_PREP_STACK_SZ. */
+#define BOOK_PREP_STACK_SZ (6*1024)
 #define BOOK_PREP_RESERVE (1024u*1024u)
 #define BOOK_PREP_IDLE_US 4000
 #define portMAX_DELAY 999999
@@ -180,6 +187,18 @@ static const char* app_settings_book_background_path(void){return "";}
 static int host_landscape=0,host_two_column=0;
 bool app_settings_reader_landscape(void){return host_landscape!=0;}
 bool app_settings_reader_two_column(void){return host_two_column!=0;}
+/* 伴读案 30 批 · 步 2 桩：伴读态宿主可控驱动（产品侧是 app_book.c 的静态量），
+   关态恒 false，栏几何/栏数/页地图与旧路径逐位一致。
+   Companion-state stub (step 2): off by default so geometry stays bit-identical. */
+static bool host_companion;
+bool reader_companion_active(void){return host_companion;}
+/* gen30 伴读案 · 步 3 接线 7：门槛判据 reader_tts_active() 的跟读开关桩。
+   关态 reader_tts_active() 必须逐位等于 host_tts_switch；伴读态由 host_companion
+   临时覆盖为真。/ gen30 read-along step 3 item 7: the follow-switch stub for the
+   gate predicate reader_tts_active(). Off-state must equal host_tts_switch
+   bit-for-bit; companion mode temporarily overrides it to true. */
+static bool host_tts_switch;
+bool tts_switch_on(void){return host_tts_switch;}
 
 /* 页表 fixture：页型由 spec 装入——'.' 纯文字；'i' 页内混排插图（image>=0 且 slots>0，
    普通页）；'I' 整页插图（JOINT：image>=0 且 slots==0）。与互证测试同款语义。
@@ -208,6 +227,9 @@ size_t book_layout_page_for_offset(size_t off){
     size_t page=off/100;
     return page<test_page_count?page:test_page_count-1;
 }
+/* 既有桩缺口补齐：地图区块 reader_page_start_offset 依赖页 k 的起始字节偏移。
+   Fill a pre-existing stub gap: the map block's reader_page_start_offset needs it. */
+size_t book_layout_page_start_offset(size_t page){return page*100;}
 
 /* prep 状态（上游 harness 同款字段）/ prep state (the upstream harness's fields) */
 static int s_view=READING;
@@ -520,10 +542,116 @@ int main(void){
        the real settings from step 4, so it runs unconditionally. */
     open_form_guard();
 
+    /* ---- 伴读案 30 批 · 步 2：70/30 几何 + 页语义换轨 + 关态恒等 ----
+       Companion geometry: 70/30 with the gutter, one logical page per visual page,
+       left-only prefetch, and a bit-identical off state. */
+    {
+        const int gutter=reader_column_gutter();
+        const int avail=AREA.width-gutter;
+        const int want_left=avail*70/100;
+        const int want_right=avail-want_left;
+        /* 关态：50/50 逐位不变（与既有 COL0/COL1 常量同源）。 */
+        host_companion=0;host_landscape=1;host_two_column=1;
+        CHECK(reader_column_width(AREA,2)==avail/2,"CM0: off-state 50/50 width identity");
+        CHECK(reader_column_rect(AREA,2,1).x==COL1.x,"CM0: off-state right offset identity");
+        /* 伴读态：70/30 扣 gutter，主栏 + 右栏 + gutter 恰填满版心，零 1px 空洞。 */
+        host_companion=1;
+        CHECK(reader_column_count()==2,"CM1: companion geometry is two columns");
+        CHECK(reader_column_width(AREA,2)==want_left,"CM1: main column = 70% of (width-gutter)");
+        EpdRect L=reader_column_rect(AREA,2,0),R=reader_column_rect(AREA,2,1);
+        CHECK(L.x==AREA.x&&L.width==want_left,"CM1: main rect at body left, 70% wide");
+        CHECK(R.x==AREA.x+want_left+gutter,"CM1: right rect starts at main width + gutter");
+        CHECK(R.width==want_right,"CM1: right rect = 30% remainder");
+        CHECK(R.x+R.width==AREA.x+AREA.width,"CM1: two columns + gutter fill the body with no gap");
+        /* 页语义：relayout 出口按 1 建图 → 视觉页 = 逻辑页，右栏恒不占逻辑页。 */
+        scenario("....",2,0);
+        host_companion=1;
+        reader_rebuild_page_map(1);
+        CHECK(reader_visual_count()==4,"CM2: companion map is single-column");
+        for(size_t v=0;v<reader_visual_count();++v){
+            size_t l=999,r=0;
+            reader_logical_pages(v,&l,&r);
+            CHECK(r==SIZE_MAX,"CM2: companion right column owns no logical page");
+            CHECK(l==v,"CM2: companion visual page maps 1:1 to its logical page");
+        }
+        /* 预绘切片：伴读态只画左栏，矩形为 70% 主栏宽。 */
+        CHECK(kick_prep(),"CM3: companion prefetch allowed");
+        size_t target=(size_t)s_prep_page;
+        complete_prep();
+        CHECK(slice_calls==TEST_ROWS,"CM3: companion prep paints only the left column");
+        EpdRect want_main=(EpdRect){AREA.x,AREA.y,want_left,AREA.height};
+        check_rows(0,TEST_ROWS,target,want_main,"CM3: companion prep rect is the 70% main column");
+        /* 关态复位：栏数回到设置驱动、几何回到 50/50。 */
+        host_companion=0;host_landscape=0;host_two_column=0;
+        CHECK(reader_column_count()==1,"CM4: off-state returns to the setting-driven count");
+        CHECK(reader_column_width(AREA,2)==avail/2,"CM4: off-state 50/50 restored");
+        printf("companion geometry: PASS (70/30, one logical page per visual, prep left-only, off-state identity)\n");
+    }
+
+    /* ---- gen30 伴读案 · 步 3 接线 7：两条新断言 ----
+       gen30 read-along step 3 item 7: the two new guard groups. */
+    {
+        /* 断言一 · 门槛临时覆盖真值表（格 1 终裁 A + 临时覆盖）：抽产品真实函数
+           reader_tts_active()，跑伴读开/关 × 跟读开/关四态。关态逐位不变；伴读态
+           永久覆盖；退出伴读恢复持久关态（NVS 一字节不动的代码层证据）。
+           Assertion 1 - the gate's temporary-override truth table (ruling grid 1
+           plan A + override): the real product function reader_tts_active() over
+           four combinations. Off-state is bit-identical; companion always wins;
+           leaving companion restores the persisted off state. */
+        host_companion=0;host_tts_switch=0;
+        CHECK(reader_tts_active()==false,"GT0: off-state, follow off -> gate closed (bit-identical)");
+        host_tts_switch=1;
+        CHECK(reader_tts_active()==true,"GT1: off-state, follow on -> gate open (bit-identical)");
+        host_companion=1;host_tts_switch=0;
+        CHECK(reader_tts_active()==true,"GT2: companion on, follow off -> temporary override");
+        host_tts_switch=1;
+        CHECK(reader_tts_active()==true,"GT3: companion on, follow on -> override stays true");
+        host_companion=0;
+        CHECK(reader_tts_active()==true,"GT4: companion off keeps the persisted follow-on value");
+        host_tts_switch=0;
+        CHECK(reader_tts_active()==false,"GT5: off-state gate closes again (exit restores)");
+        printf("companion tts gate: PASS (off-state bit-identical, companion override, exit restores)\n");
+
+        /* 断言二 · 验收第 11 格配合：伴读态点词右栏无正文命中。宿主镜像
+           app_book.c:6927 的分支判据（产品既有命中路径一字节不改），用产品真实
+           reader_logical_pages() 的 right=SIZE_MAX 与 70% 主栏边界推演：从旧 50%
+           阈值到右缘的每一处都不产生右栏逻辑页命中，重点覆盖 50~70% 过渡条带与
+           70~100% 右栏覆盖层；主栏 0~70% 仍照常命中一个逻辑页。
+           Assertion 2 - acceptance grid 11: no body hit in the companion right
+           column. The host mirrors the branch predicate at app_book.c:6927 (the
+           product path is byte-identical) and combines it with the product's real
+           right=SIZE_MAX and the 70% main-column edge: nowhere from the legacy 50%
+           line to the right edge can a right-column logical page be hit, covering
+           the 50~70% transition band and the 70~100% overlay. The 0~70% main
+           column still owns exactly one logical page. */
+        host_companion=1;host_landscape=1;host_two_column=1;
+        scenario("....",2,0);
+        reader_rebuild_page_map(1);
+        const int g2=reader_column_gutter();
+        const int main_edge=AREA.x+(AREA.width-g2)*70/100;
+        const int legacy_mid=AREA.x+AREA.width/2;
+        CHECK(main_edge>legacy_mid,"G11: a 50~70% transition band exists between the legacy line and the 70% edge");
+        CHECK(main_edge<AREA.x+AREA.width,"G11: the 70% main column leaves a 30% right band");
+        const size_t v=reader_visual_index(0);
+        for(int x=legacy_mid;x<AREA.x+AREA.width;x+=10){
+            const bool enters_right_branch=(reader_column_count()>1 && x>=legacy_mid);
+            size_t r=0;
+            reader_logical_pages(v,NULL,&r);
+            CHECK(!(enters_right_branch && r!=SIZE_MAX),
+                  "G11: no right-column body hit from the 50% legacy line to the right edge");
+        }
+        size_t left=999,r2=0;
+        reader_logical_pages(0,&left,&r2);
+        CHECK(left==0&&r2==SIZE_MAX,"G11: main column still owns one logical page, right owns none");
+        host_companion=0;host_landscape=0;host_two_column=0;host_tts_switch=0;
+        printf("companion tap grid 11: PASS (50~70%% band and right 30%% overlay own no body text)\n");
+    }
+
     printf("PASS: prefetch target addressing through the visual page map "
            "(C1 pair/JOINT mapping and stitch geometry, C2 image guard, C3 degenerate identity, "
            "C4 idle gate mapping and budget, C5 last visual page, C6 right-cursor reset on re-kick, "
-           "ID1-ID6 closed-form identity chain steps 1-4 with M2/M3 degenerate guards)\n");
+           "ID1-ID6 closed-form identity chain steps 1-4 with M2/M3 degenerate guards, "
+           "gen30 step-3 gate truth table GT0-GT5 and acceptance grid 11 G11)\n");
     return 0;
 }
 '''
@@ -535,6 +663,7 @@ def build_unit() -> str:
     parts += [function(name, BOOK) + '\n' for name in GEOMETRY]
     parts.append(map_block(src))
     parts += [function(name, BOOK) + '\n' for name in AFTER_MAP]
+    parts += [function(name, BOOK) + '\n' for name in COMPANION_WIRING]
     parts.append(MAIN)
     return ''.join(parts)
 

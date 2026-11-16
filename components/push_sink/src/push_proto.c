@@ -123,6 +123,37 @@ bool push_ctrl_header_decode(const uint8_t *in, size_t len, uint8_t *op) {
     return true;
 }
 
+/* ---- gen30 伴读：CTRL 裸帧白名单分派（哨位裁定方案 B）---- */
+/* Read-along gen30: bare CTRL frame whitelist dispatch (sentinel ruling, plan B). */
+/*
+ * 白名单只有两条：op 必须是 0x0A/0x0B，且总长必须恰等于该帧 R0 定长（241/4 B）。
+ * 长度不符（哪怕首字节是 0x0A）一律返回 false，交回现制 4 B 魔数校验并落 ERR(2)——
+ * 这就是「长度闸门」，也是「未登记 op 走 ERR(2)」纪律零破坏的关键：0x0A/0x0B 已
+ * 登记，但只有合规裸帧才被认，畸形帧仍按坏帧处理。现制帧首字节固定 0x50，
+ * 与本白名单零交集，故既有 CTRL 路径逐字不变（编译期零碰撞断言见 push_proto.h）。
+ *
+ * The whitelist has exactly two entries: op is 0x0A/0x0B and the total length
+ * equals that frame's frozen R0 length (241/4 B). Any other length - even with a
+ * 0x0A first byte - returns false, falls through to the legacy 4 B magic check and
+ * lands in ERR(2): this is the length gate, and why the "unregistered op -> ERR(2)"
+ * discipline survives (0x0A/0x0B are registered, but only well-formed bare frames
+ * are accepted). Legacy frames start with 0x50, disjoint from this whitelist, so
+ * the existing CTRL path is byte-for-byte unchanged (compile-time non-collision
+ * asserts in push_proto.h).
+ */
+bool push_gen30_ctrl_bare_op(const uint8_t *in, size_t len, uint8_t *op) {
+    if (!in || len == 0u) return false;
+    if (in[0] == (uint8_t)PUSH_OP_SUMMARY && len == PUSH_OP_SUMMARY_LEN) {
+        if (op) *op = (uint8_t)PUSH_OP_SUMMARY;
+        return true;
+    }
+    if (in[0] == (uint8_t)PUSH_OP_TTS_DONE && len == PUSH_OP_TTS_DONE_LEN) {
+        if (op) *op = (uint8_t)PUSH_OP_TTS_DONE;
+        return true;
+    }
+    return false;
+}
+
 /* ---- STATUS / STATUS codec ---- */
 
 size_t push_status_encode(uint8_t opcode, const uint8_t *body, size_t body_len, uint8_t *out, size_t cap) {
@@ -346,6 +377,135 @@ bool push_ai_caps_enable_decode(const uint8_t *in, size_t len, push_caps_t *caps
     if (in[0] != PUSH_MAGIC0 || in[1] != PUSH_MAGIC1 || in[2] != PUSH_OP_AI_CAPS_ENABLE) return false;
     if (in[3] != PUSH_VERSION) return false;
     caps->bits = get_u32(in + 4);
+    return true;
+}
+
+/* ---- M3 情景释义分帧 / scene lookup segments (M3) ---- */
+
+// UTF-8 安全切分：从 text 起最多 budget 字节，整字符边界收刀。首字节非法返回 0，
+// 调用方强制前进 1 字节保进度（与 0x19 的分片器同一策略）。
+// UTF-8 safe slice: at most budget bytes, cut on a character boundary. An illegal
+// lead byte returns 0 and the caller forces 1 byte of progress (same policy as 0x19).
+static size_t scene_utf8_fit(const char *text, size_t len, size_t budget) {
+    if (!text || budget == 0) return 0;
+    if (len > budget) len = budget;
+    size_t n = 0;
+    while (n < len) {
+        const unsigned char c = (unsigned char)text[n];
+        size_t char_len = 0;
+        if ((c & 0x80u) == 0x00u) char_len = 1;
+        else if ((c & 0xE0u) == 0xC0u) char_len = 2;
+        else if ((c & 0xF0u) == 0xE0u) char_len = 3;
+        else if ((c & 0xF8u) == 0xF0u) char_len = 4;
+        else break;
+        if (n + char_len > len) break;
+        n += char_len;
+    }
+    return n;
+}
+
+// 词长钳到 63：留一格给 decode 侧的 NUL 语义（槽 64）。/ Clamp to 63, keeping the slot NUL-safe.
+static size_t scene_word_len(const char *word) {
+    if (!word) return 0;
+    size_t n = strnlen(word, PUSH_SCENE_WORD_MAX);
+    if (n >= PUSH_SCENE_WORD_MAX) n = PUSH_SCENE_WORD_MAX - 1u;
+    return n;
+}
+
+/// 首帧 ctx 预算 = 234 - (word_len1 + word + off2 + flags1)。/ First-frame context budget.
+static size_t scene_first_budget(const char *word) {
+    return PUSH_ST_SCENE_SLOT - (4u + scene_word_len(word));
+}
+
+uint16_t push_scene_frame_count(const char *word, const char *ctx, size_t ctx_len) {
+    if (!ctx || ctx_len == 0) return 1; // 空上下文一帧（调用方决定发不发）/ empty = one frame
+    size_t off = 0;
+    uint16_t count = 0;
+    size_t budget = scene_first_budget(word);
+    while (off < ctx_len && count < PUSH_SCENE_MAX_FRAMES) {
+        const size_t step = scene_utf8_fit(ctx + off, ctx_len - off, budget);
+        off += step ? step : 1;
+        ++count;
+        budget = PUSH_ST_SCENE_SLOT;
+    }
+    return count ? count : 1;
+}
+
+bool push_scene_frame_at(const char *word, const char *ctx, size_t ctx_len, uint16_t i,
+                         const char **slice, size_t *slice_len) {
+    if (!ctx) return false;
+    size_t off = 0;
+    uint16_t idx = 0;
+    size_t budget = scene_first_budget(word);
+    while (off < ctx_len && idx < PUSH_SCENE_MAX_FRAMES) {
+        const size_t step = scene_utf8_fit(ctx + off, ctx_len - off, budget);
+        const size_t take = step ? step : 1;
+        if (idx == i) {
+            if (slice) *slice = ctx + off;
+            if (slice_len) *slice_len = take;
+            return true;
+        }
+        off += take;
+        ++idx;
+        budget = PUSH_ST_SCENE_SLOT;
+    }
+    return false;
+}
+
+size_t push_st_scene_encode(const char *word, uint16_t word_off, uint8_t flags,
+                            uint16_t seq, uint16_t total,
+                            const char *slice, size_t slice_len,
+                            uint8_t *out, size_t cap) {
+    if (!out || cap < PUSH_ST_SCENE_FRAME_MAX) return 0;
+    if (total == 0 || total > PUSH_SCENE_MAX_FRAMES || seq >= total) return 0;
+    const size_t wl = scene_word_len(word);
+    if (slice_len > PUSH_ST_SCENE_SLOT) return 0;
+    const size_t payload = (seq == 0) ? (4u + wl + slice_len) : slice_len;
+    if (payload > PUSH_ST_SCENE_SLOT) return 0;
+
+    memset(out, 0, PUSH_ST_SCENE_FRAME_MAX);
+    out[0] = PUSH_ST_AI_SCENE;
+    put_u16(out + 1, seq);
+    put_u16(out + 3, total);
+    put_u16(out + 5, (uint16_t)payload);
+
+    uint8_t *p = out + 7;
+    if (seq == 0) {
+        p[0] = (uint8_t)wl;
+        if (wl) memcpy(p + 1, word, wl);
+        put_u16(p + 1 + wl, word_off);
+        p[3 + wl] = flags;
+        if (slice_len) memcpy(p + 4 + wl, slice, slice_len);
+    } else if (slice_len) {
+        memcpy(p, slice, slice_len);
+    }
+    return PUSH_ST_SCENE_FRAME_MAX;
+}
+
+bool push_st_scene_decode(const uint8_t *in, size_t len, push_scene_frame_t *f) {
+    if (!in || !f || len < PUSH_ST_SCENE_FRAME_MAX) return false;
+    if (in[0] != PUSH_ST_AI_SCENE) return false;
+    memset(f, 0, sizeof(*f));
+    f->seq = get_u16(in + 1);
+    f->total = get_u16(in + 3);
+    const uint16_t payload = get_u16(in + 5);
+    if (f->total == 0 || f->total > PUSH_SCENE_MAX_FRAMES || f->seq >= f->total) return false;
+    if (payload > PUSH_ST_SCENE_SLOT) return false;
+    const uint8_t *p = in + 7;
+    if (f->seq == 0) {
+        if (payload < 4) return false;
+        const uint8_t wl = p[0];
+        if (wl >= PUSH_SCENE_WORD_MAX || 4u + wl > payload) return false;
+        f->word_len = wl;
+        if (wl) memcpy(f->word, p + 1, wl);
+        f->word_off = get_u16(p + 1 + wl);
+        f->flags = p[3 + wl];
+        f->len = (uint16_t)(payload - (4u + wl));
+        if (f->len) memcpy(f->ctx, p + 4 + wl, f->len);
+    } else {
+        f->len = payload;
+        if (payload) memcpy(f->ctx, p, payload);
+    }
     return true;
 }
 

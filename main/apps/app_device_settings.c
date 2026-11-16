@@ -280,7 +280,7 @@ static EpdRect upgrade_confirm_button(bool online, bool accept) {
     return (EpdRect){accept ? 364 : 60, online ? 842 : 613, 260, 64};
 }
 static void upgrade_open(void) {
-    (void)pico_ota_inspect(PICO_OTA_UPDATE_PATH, &s_local_update);
+    (void)pico_ota_inspect(pico_ota_resolve_path(), &s_local_update);
     pico_online_get_status(&s_update);
     s_upgrade_confirm = s_local_pending = s_upgrade_restart = false;
     s_upgrade_offer_pending = false;
@@ -450,7 +450,11 @@ static void time_open(void) {
     }
     if (now < 1704067200) {
         char month[4] = "Jan"; int day = 1, year = 2024;
-        if (sscanf(__DATE__, "%3s %d %d", month, &day, &year) != 3) {
+        // 用固定的构建戳而不是 __DATE__：后者会把编译当天写进镜像，同源重编就换 SHA。
+        // PICO_BUILD_DATE 由 CMakeLists 从 SOURCE_DATE_EPOCH 折出，格式与 __DATE__ 一致。
+        // Use the fixed build stamp instead of __DATE__, which leaks the compile day into the
+        // image and breaks reproducibility. PICO_BUILD_DATE mirrors __DATE__'s layout.
+        if (sscanf(PICO_BUILD_DATE, "%3s %d %d", month, &day, &year) != 3) {
             strcpy(month, "Jan"); day = 1; year = 2024;
         }
         static const char *const months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
@@ -1175,18 +1179,25 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_text(fb, 60, 224, 22, "当前版本", EPD_DRAW_ALIGN_LEFT, false);
         ui_text(fb, 60, 264, 29, esp_app_get_description()->version, EPD_DRAW_ALIGN_LEFT, false);
         if (s_upgrade_confirm) {
+            // 本地化 OTA：READY = 下载完成待确认安装（复用 s_upgrade_online 的在线框版式）。
+            bool downloaded = s_upgrade_online && s_update.state == PICO_UPDATE_READY;
             settings_card(fb, (EpdRect){36, 356, 612, s_upgrade_online ? 574 : 344}, 22, UI_GRAY_WHITE, 0x70);
-            ui_text_fixed(fb, 60, 383, 31, s_upgrade_online ? "发现新版本" : "确认 TF 卡升级", EPD_DRAW_ALIGN_LEFT, false);
+            ui_text_fixed(fb, 60, 383, 31, downloaded ? "下载完成" :
+                    (s_upgrade_online ? "发现新版本" : "确认 TF 卡升级"), EPD_DRAW_ALIGN_LEFT, false);
             ui_text_fixed(fb, 60, 447, 28, s_upgrade_online ? s_update.release.version : s_local_update.candidate_version,
                     EPD_DRAW_ALIGN_LEFT, false);
-            if (s_upgrade_online) {
+            if (s_upgrade_online && !downloaded) {
                 ui_text_fixed(fb, 60, 494, 26, "本次更新", EPD_DRAW_ALIGN_LEFT, false);
                 draw_upgrade_notes(fb);
+            } else if (downloaded) {
+                ui_text_fixed(fb, 60, 494, 26, "固件已下载到 TF 卡并校验通过", EPD_DRAW_ALIGN_LEFT, false);
+                ui_text_fixed(fb, 60, 533, 22, "立即安装将关闭 WiFi，升级后自动重启", EPD_DRAW_ALIGN_LEFT, false);
             }
             ui_text_fixed(fb, 60, s_upgrade_online ? 770 : 513, 24, "升级期间请保持供电", EPD_DRAW_ALIGN_LEFT, false);
             ui_text_fixed(fb, 60, s_upgrade_online ? 806 : 560, 23, "设置、阅读记录与 TF 卡文件保留", EPD_DRAW_ALIGN_LEFT, false);
             ui_draw_button(fb, upgrade_confirm_button(s_upgrade_online, false), s_upgrade_online ? "稍后" : "取消", false);
-            ui_draw_button(fb, upgrade_confirm_button(s_upgrade_online, true), s_upgrade_online ? "开始更新" : "确认升级", true);
+            ui_draw_button(fb, upgrade_confirm_button(s_upgrade_online, true), downloaded ? "立即安装" :
+                    (s_upgrade_online ? "开始更新" : "确认升级"), true);
         } else {
             settings_card(fb, (EpdRect){36, 356, 612, 278}, 22, UI_GRAY_WHITE, 0x70);
             if (PICO_ONLINE_UPDATES_DISABLED) {
@@ -1211,8 +1222,8 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
             // The TF-card card must be drawn outside the switch; it is the only update path left.
             settings_card(fb, (EpdRect){36, 662, 612, 262}, 22, UI_GRAY_WHITE, 0x70);
             ui_text(fb, 60, 689, 29, "TF 卡升级", EPD_DRAW_ALIGN_LEFT, false);
-            ui_text(fb, 60, 739, 23, "升级包放在 TF 卡根目录", EPD_DRAW_ALIGN_LEFT, false);
-            ui_text(fb, 60, 786, 21, s_local_update.ready ? s_local_update.candidate_version : "把官网升级包放入 TF 卡根目录", EPD_DRAW_ALIGN_LEFT, false);
+            ui_text(fb, 60, 739, 23, "升级包放入 TF 卡根目录", EPD_DRAW_ALIGN_LEFT, false);
+            ui_text(fb, 60, 786, 21, s_local_update.ready ? s_local_update.candidate_version : "文件名：Pico-update.bin 或 Read_Pico.bin", EPD_DRAW_ALIGN_LEFT, false);
             ui_draw_button(fb, (EpdRect){60, 840, 564, 62}, s_local_pending ? "正在安装，请勿断电" :
                 s_local_update.ready ? "安装 TF 卡升级包" : "重新检查 TF 卡", s_local_update.ready);
         }
@@ -1601,14 +1612,17 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         if (s_upgrade_job != UPGRADE_JOB_NONE) return upgrade_start_pending();
         if (s_local_pending) {
             s_local_pending = false;
-            esp_err_t error = pico_ota_install(PICO_OTA_UPDATE_PATH, s_upgrade_notice, sizeof(s_upgrade_notice));
+            esp_err_t error = pico_ota_install(pico_ota_resolve_path(), s_upgrade_notice, sizeof(s_upgrade_notice));
             s_upgrade_restart = error == ESP_OK;
             return APP_REDRAW_PAGE;
         }
         pico_online_get_status(&s_update);
-        if (s_update.state == PICO_UPDATE_READY && !s_update.busy) {
-            if (pico_online_commit() == ESP_OK) { esp_restart(); return APP_REDRAW_NONE; }
-            pico_online_get_status(&s_update);
+        // 本地化 OTA 批 26.11.25：READY = 下载到 TF 完成、哈希校验通过。此帧不再自动
+        // commit+重启，而是首次跃迁一次性弹「下载完成，是否立即安装？」确认框；用户确认
+        // 后关 WiFi 走成熟 pico_ota_install()。用 drawn_state 判首次，避免反复弹。
+        if (s_update.state == PICO_UPDATE_READY && !s_update.busy &&
+            s_update_drawn_state != PICO_UPDATE_READY && !s_upgrade_confirm) {
+            s_upgrade_confirm = s_upgrade_online = true;
         }
         uint32_t now = esp_timer_get_time() / 1000;
         app_redraw_t redraw = upgrade_status_redraw(now);
@@ -1808,7 +1822,12 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
                 s_upgrade_confirm = false;
                 s_upgrade_offer_pending = false;
                 if (accept) {
-                    if (s_upgrade_online) {
+                    if (s_upgrade_online && s_update.state == PICO_UPDATE_READY) {
+                        // 本地化 OTA：下载完成待确认 → 关 WiFi 让出内存 → 走成熟 TF 安装链
+                        // （s_local_pending 在下一 tick 调 pico_ota_install(pico_ota_resolve_path())）。
+                        read_pico_transfer_stop();
+                        s_local_pending = true;
+                    } else if (s_upgrade_online) {
                         upgrade_schedule(true, esp_timer_get_time() / 1000);
                     } else s_local_pending = true;
                 }
@@ -1836,7 +1855,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             return APP_REDRAW_PAGE;
         }
         if (y >= 840 && y < 902 && !s_update.busy) {
-            (void)pico_ota_inspect(PICO_OTA_UPDATE_PATH, &s_local_update);
+            (void)pico_ota_inspect(pico_ota_resolve_path(), &s_local_update);
             if (s_local_update.ready) { s_upgrade_confirm = true; s_upgrade_online = false; }
             else snprintf(s_upgrade_notice, sizeof(s_upgrade_notice), "%s", s_local_update.message);
             return APP_REDRAW_PAGE;

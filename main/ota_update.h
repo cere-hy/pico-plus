@@ -17,7 +17,15 @@
 extern "C" {
 #endif
 
+/* 原厂契约名：手册与 FAQ 沿用，优先命中；双名并存时取它。 */
 #define PICO_OTA_UPDATE_PATH "/sdcard/Pico-update.bin"
+/* fork 发布名：出包即 Read_Pico.bin，未命中契约名时兜底接受。 */
+#define PICO_OTA_UPDATE_FALLBACK_PATH "/sdcard/Read_Pico.bin"
+
+/// 解析 TF 卡根目录实际存在的升级包路径：先原厂契约名，未命中再认 fork 发布名。
+/// 双名并存取前者；两者都不存在时返回契约名，交给 pico_ota_inspect 走「未找到」分支。
+/// 返回静态字符串常量，调用方不必释放。本函数只「找文件」，不做检查或烧写。
+const char *pico_ota_resolve_path(void);
 
 typedef struct {
     char current_version[33];

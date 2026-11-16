@@ -117,7 +117,7 @@ void lock_screen_authenticate(EpdiyHighlevelState *hl,cst836u_handle_t touch,sc7
         while(!cancel){
             int64_t now=esp_timer_get_time()/1000;
             if(now-active_at>=30000){cancel=true;break;}
-            if(now-last_poll>=40){last_poll=now;(void)read_pico_pmu_poll();if(read_pico_pmu_take_key_action()!=READ_PICO_PMU_KEY_NONE){cancel=true;break;}}
+            if(now-last_poll>=40){last_poll=now;(void)read_pico_pmu_poll();if(read_pico_pmu_take_key_action(NULL)!=READ_PICO_PMU_KEY_NONE){cancel=true;break;}}
             if(pad.blocked&&lock_pin_available()&&now>=retry_at){ui_pinpad_reset(&pad,NULL,"请重新输入");ui_pinpad_paint(fb,&pad,ui_pinpad_entry_area());present(hl,ui_pinpad_entry_area());}
             cst836u_touch_t sample={0};esp_err_t error=cst836u_read(touch,&sample);
             bool down=error==ESP_OK&&sample.touched;

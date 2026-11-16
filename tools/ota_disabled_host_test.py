@@ -1,9 +1,9 @@
-"""中文：联网 OTA 的停用开关必须保持默认开启，且两个入口在停用时不得建任务。
-English: the online-OTA kill switch must stay on by default and both entries must refuse without a worker.
+"""中文：联网 OTA 默认启用自家 Pages 源；kill switch 保留，且不得再冒出原厂回退源。
+English: online OTA defaults to the self-hosted Pages feed; the kill switch stays, and no
+stock fallback source may reappear.
 SPDX-License-Identifier: Apache-2.0
-原由：官方清单指向原厂固件，装上会覆盖本地词典、生词本和飞行模式。
-Why: the upstream feed points at the stock image, which overwrites the local dictionary, vocabulary
-book and flight mode.
+R5：宏默认改 0 后，本守卫从「停用状态守卫」转型「自家源守卫」——编码当前真不变量
+（宏==0 && feed/白名单==自家前缀），并继续守住 kill switch 断开路径。
 """
 from pathlib import Path
 import re
@@ -11,17 +11,31 @@ import re
 root = Path(__file__).resolve().parents[1]
 header = (root / "main/ota_online.h").read_text()
 source = (root / "main/ota_online.c").read_text()
+release = (root / "main/ota_release.c").read_text()
 failures = []
 
-# 1. 默认值必须是 1；用 #ifndef 包住，测试才能用 -D 覆盖成 0 继续验证管线本身。
-# Must default to 1 behind #ifndef so tests can override it with -D and keep the pipeline covered.
+# 1. 默认值必须是 0（启用自家源）；仍用 #ifndef 包住，runner 才能 -D=1 单编验证断开路径。
 if not re.search(r"#ifndef PICO_ONLINE_UPDATES_DISABLED\s*\n"
-                 r"#define PICO_ONLINE_UPDATES_DISABLED 1\s*\n#endif", header):
-    failures.append("ota_online.h: PICO_ONLINE_UPDATES_DISABLED must default to 1 behind an #ifndef guard")
-# 2. 两个入口在停用时必须直接拒绝，而不是去 start() 建任务。
-# Both entries must refuse outright instead of calling start().
-# 按大括号配平取函数体：正则会被「一行写完的函数」骗过去，跨到下一个函数上。
-# Take the body by brace matching: a regex spills into the next function when the body is one line.
+                 r"#define PICO_ONLINE_UPDATES_DISABLED 0\s*\n#endif", header):
+    failures.append("ota_online.h: PICO_ONLINE_UPDATES_DISABLED must default to 0 behind an #ifndef guard")
+# 2. feed 常量指向自家 update.json，且旧的 fallback 常量不得再出现。
+if '#define PICO_OTA_FEED_URL "https://cere-hy.github.io/pico-plus/update.json"' not in header:
+    failures.append("ota_online.h: PICO_OTA_FEED_URL must be the self-hosted update.json")
+if "PICO_OTA_FEED_FALLBACK_URL" in header or "PICO_OTA_FEED_FALLBACK_URL" in source:
+    failures.append("ota_online.h/.c: the stock fallback feed constant must stay removed")
+# 3. check_feed() 的 feeds[] 必须是单元素自家源，不允许第二个家。
+if not re.search(r"static const char \*const feeds\[\]\s*=\s*\{PICO_OTA_FEED_URL\};", source):
+    failures.append("ota_online.c: feeds[] must be a single self-hosted source (no fallback)")
+# 4. bin URL 白名单收缩为自家单前缀；原厂两域名不得残留。
+prefix = '"https://cere-hy.github.io/pico-plus/firmware/"'
+if prefix not in release:
+    failures.append("ota_release.c: the single self-hosted firmware prefix is missing")
+if "kiikoread.com" in release or "wegooo-cell.github.io" in release:
+    failures.append("ota_release.c: a stock origin leaked back into the URL whitelist")
+m = re.search(r"static const char \*const prefixes\[\]\s*=\s*\{(.*?)\};", release, re.S)
+if not m or len(re.findall(r'"[^"]+"', m.group(1))) != 1:
+    failures.append("ota_release.c: prefixes[] must contain exactly one prefix")
+# 5. kill switch 断开路径仍在：两个入口在禁用时直接拒绝，而不是去 start() 建任务。
 def entry_body(name):
     match = re.search(r"^esp_err_t " + name + r"\(void\)\s*\{", source, re.M)
     if not match:
@@ -43,8 +57,7 @@ for name in ("pico_online_check", "pico_online_download"):
         continue
     if "PICO_ONLINE_UPDATES_DISABLED" not in body or "ESP_ERR_NOT_SUPPORTED" not in body:
         failures.append("ota_online.c: %s() must refuse with ESP_ERR_NOT_SUPPORTED while disabled" % name)
-# 3. 除升级页外不得再冒出新的联网任务发起者（升级页那条链路已被后端拒绝兜住）。
-# No new caller outside the upgrade page; the upgrade page is already refused at the backend.
+# 6. 除升级页外不得再冒出新的联网任务发起者。
 for path in sorted((root / "main").rglob("*.c")):
     text = path.read_text()
     if "pico_online_check(" not in text and "pico_online_download(" not in text:
@@ -55,4 +68,4 @@ for path in sorted((root / "main").rglob("*.c")):
 
 if failures:
     raise SystemExit("\n".join("FAIL: " + item for item in failures))
-print("PASS: online OTA stays disabled by default; both entries refuse without a worker; no new callers")
+print("PASS: online OTA defaults enabled on the self-hosted single feed; whitelist is our prefix only; fallback stays removed; kill switch still cuts both entries; no new callers")

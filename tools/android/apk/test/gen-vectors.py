@@ -210,6 +210,88 @@ def main() -> int:
                       ("tts_single", v["tts_frame_len"])):
         assert len(v[key]) == want * 2, f"{key} 向量长度 {len(v[key]) // 2}B != {want}B"
 
+    # ---- gen30 伴读案 · 方案 B 裸帧（R0 冻结件 1，三端 fixture 互通）----
+    # 全部由 push_pico.py 参考实现产生，Java 发送侧编解码只做逐字节断言、零手抄。
+    # gen30 read-along plan-B bare frames: all vectors come from push_pico.py.
+    v["g30_mode_set_len"] = pp.PUSH_ST_MODE_SET_LEN            # 5
+    v["g30_page_begin_len"] = pp.PUSH_ST_PAGE_BEGIN_LEN        # 5
+    v["g30_summary_len"] = pp.PUSH_OP_SUMMARY_LEN              # 241
+    v["g30_tts_done_len"] = pp.PUSH_OP_TTS_DONE_LEN            # 4
+    v["g30_summary_text_max"] = pp.PUSH_SUMMARY_TEXT_MAX       # 233
+    v["g30_ctrl_hdr_len"] = pp.PUSH_CTRL_HDR_LEN               # 4
+    v["g30_wire_cap"] = pp.PUSH_GEN30_WIRE_CAP                 # 244
+    # 方案 B 算术：带 4B 头必超帽、裸帧必入帽（这正是裁方案 B 的依据）。
+    v["g30_hdr_plus_summary"] = pp.PUSH_CTRL_HDR_LEN + pp.PUSH_OP_SUMMARY_LEN  # 245 > 244
+
+    # MODE_SET 0x1B（设备→手机）：mode/source 往返
+    v["g30_mode_set"] = pp.encode_mode_set(3, 0).hex()
+    v["g30_mode_set_cjk"] = pp.encode_mode_set(2, pp.PUSH_MODE_SRC_INIT).hex()
+    ms_mode, ms_src = pp.decode_mode_set(pp.encode_mode_set(3, 0))
+    v["g30_ms_mode"], v["g30_ms_source"] = ms_mode, ms_src
+
+    # PAGE_BEGIN 0x1C（设备→手机）：page_no/mode 往返 + 大页号
+    v["g30_page_begin"] = pp.encode_page_begin(0x1234, 2).hex()
+    v["g30_page_begin_max"] = pp.encode_page_begin(0xFFFF, 3).hex()
+    pb_pn, pb_mode = pp.decode_page_begin(pp.encode_page_begin(0x1234, 2))
+    v["g30_pb_pageno"], v["g30_pb_mode"] = pb_pn, pb_mode
+
+    # SUMMARY 0x0A（手机→设备）：241B 裸帧 + 中文 + 233B 槽边界
+    sm = pp.encode_summary("这是本页摘要", 0x1234, mode=2)
+    v["g30_summary"] = sm.hex()
+    v["g30_summary_ascii"] = pp.encode_summary("Hello read-along", 1, mode=0).hex()
+    v["g30_summary_empty"] = pp.encode_summary("", 0, mode=0).hex()
+    smd = pp.decode_summary(sm)
+    v["g30_sm_mode"], v["g30_sm_pageno"] = smd["mode"], smd["page_no"]
+    v["g30_sm_idx"], v["g30_sm_total"] = smd["idx"], smd["total"]
+    v["g30_sm_text"] = smd["text"]
+    # 56 字发送帽：56 汉字 = 168B ≤ 233B 槽，编解码无损
+    cap56 = "摘" * 56
+    v["g30_cap56_bytes"] = len(cap56.encode("utf-8"))         # 168
+    v["g30_summary_cap56"] = pp.encode_summary(cap56, 0x00FF, mode=1).hex()
+    v["g30_cap56_text"] = pp.decode_summary(
+        pp.encode_summary(cap56, 0x00FF, mode=1))["text"]
+    # 56 字帽是发送侧确定性保证：正常入参恒 ≤168B，不触发 233B 字节硬截；
+    # 设备侧 reader_companion_clip56() 另有二次码点截断兜底（R0 冻结件 2 两级截断）。
+
+    # TTS_DONE 0x0B（手机→设备）：4B 裸帧 + 三种 status
+    v["g30_tts_done"] = pp.encode_tts_done(0x1234, pp.PUSH_TTS_DONE_FINISHED).hex()
+    v["g30_tts_done_abort"] = pp.encode_tts_done(0xFFFF, pp.PUSH_TTS_DONE_ABORT).hex()
+    td_pn, td_st = pp.decode_tts_done(pp.encode_tts_done(0x1234, 0))
+    v["g30_td_pageno"], v["g30_td_status"] = td_pn, td_st
+
+    # 方案 B 白名单：合法裸帧命中、畸形/现制魔数帧不命中
+    v["g30_bare_summary"] = pp.gen30_ctrl_bare_op(sm)          # 0x0A
+    v["g30_bare_tts"] = pp.gen30_ctrl_bare_op(pp.encode_tts_done(1, 0))  # 0x0B
+    v["g30_bare_legacy"] = str(pp.gen30_ctrl_bare_op(pp.encode_ctrl(pp.PUSH_OP_END)))  # None
+    v["g30_bare_short"] = str(pp.gen30_ctrl_bare_op(bytes([0x0A, 0x00])))            # None
+
+    # 修复轮解耦：TTS_ENABLE 0x1D（设备→手机，2B）——听书开关只控制声音，
+    # 摘要链由 0x19 无条件触发，两者互不干涉。
+    v["g30_tts_enable_len"] = pp.PUSH_ST_TTS_ENABLE_LEN        # 2
+    v["g30_tts_enable_on"] = pp.encode_tts_enable(True).hex()  # 1d01
+    v["g30_tts_enable_off"] = pp.encode_tts_enable(False).hex()  # 1d00
+    v["g30_tts_enable_on_bit"] = 1 if pp.decode_tts_enable(bytes.fromhex(v["g30_tts_enable_on"])) else 0
+    v["g30_tts_enable_off_bit"] = 1 if pp.decode_tts_enable(bytes.fromhex(v["g30_tts_enable_off"])) else 0
+
+    # 有牙：gen30 定长帧向量长度绝不能短一字节
+    for key, want in (("g30_summary", v["g30_summary_len"]),
+                      ("g30_summary_ascii", v["g30_summary_len"]),
+                      ("g30_summary_empty", v["g30_summary_len"]),
+                      ("g30_summary_cap56", v["g30_summary_len"]),
+                      ("g30_tts_done", v["g30_tts_done_len"]),
+                      ("g30_tts_done_abort", v["g30_tts_done_len"]),
+                      ("g30_mode_set", v["g30_mode_set_len"]),
+                      ("g30_page_begin", v["g30_page_begin_len"]),
+                      ("g30_tts_enable_on", v["g30_tts_enable_len"]),
+                      ("g30_tts_enable_off", v["g30_tts_enable_len"])):
+        assert len(v[key]) == want * 2, f"{key} 向量长度 {len(v[key]) // 2}B != {want}B"
+    assert v["g30_hdr_plus_summary"] > v["g30_wire_cap"] >= v["g30_summary_len"], \
+        "方案 B 算术不成立：带 4B 头须超帽、裸帧须入帽"
+    # 0x1D 顺移无空洞、且不与方案 B 白名单两枚裸帧 op 碰撞（否则手机分发会串台）。
+    assert pp.PUSH_ST_TTS_ENABLE == pp.PUSH_ST_PAGE_BEGIN + 1, "0x1D 必须紧跟 0x1C"
+    assert pp.PUSH_ST_TTS_ENABLE not in (pp.PUSH_OP_SUMMARY, pp.PUSH_OP_TTS_DONE), \
+        "0x1D 与裸帧白名单碰撞"
+
     with open(OUT, "w", encoding="utf-8") as f:
         for k in sorted(v):
             f.write(f"{k}={v[k]}\n")

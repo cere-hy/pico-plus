@@ -93,6 +93,40 @@ PUSH_ST_CAPS = 0x18       # 设备 -> 手机：能力位图上报 / device to ph
 PUSH_ST_TTS_TEXT = 0x19   # gen26.5 设备 -> 手机：当前页纯文本（TTS 听书）/ device to phone: page text
 PUSH_TTS_TEXT_MAX = 234   # 页文本槽（含 NUL）：241 - op1 - seq2 - total2 - len2 / page-text slot
 PUSH_ST_TTS_TEXT_FRAME_MAX = 1 + 2 + 2 + 2 + PUSH_TTS_TEXT_MAX  # = 241
+
+# gen30 伴读案（R0 冻结件 1）：四处新 opcode 与定长/枚举常量，与 push_proto.h 一字不差。
+# 步 3 起哨位裁定方案 B（裸帧对齐）生效：CTRL 方向两帧发裸帧（不带 4B 魔数头），
+# STATUS 方向两帧为 op 首字节裸帧；编解码实现见下方 encode_/decode_ 一组。
+# gen30 read-along (R0 frozen item 1): four new opcodes + frame/enum constants,
+# byte-identical to push_proto.h. From step 3 plan B (sentinel ruling) applies:
+# CTRL frames are bare (no magic header), STATUS frames start at the op byte;
+# the codecs below are the reference implementation.
+PUSH_OP_SUMMARY = 0x0A         # 手机 -> 设备：摘要回包（241B 定长，同构 0x08）/ phone->device summary
+PUSH_OP_TTS_DONE = 0x0B        # 手机 -> 设备：播完回执（4B）/ phone->device playback-done
+PUSH_ST_MODE_SET = 0x1B        # 设备 -> 手机：模式广播（5B）/ device->phone mode broadcast
+PUSH_ST_PAGE_BEGIN = 0x1C      # 设备 -> 手机：页号对账前置帧（5B）/ device->phone page-begin marker
+PUSH_ST_TTS_ENABLE = 0x1D      # 设备 -> 手机：朗读使能（2B，修复轮解耦）/ device->phone read-aloud enable
+PUSH_ST_MODE_SET_LEN = 5       # op1+mode1+source1+reserved2
+PUSH_ST_PAGE_BEGIN_LEN = 5     # op1+page_no2(LE)+mode1+reserved1
+PUSH_ST_TTS_ENABLE_LEN = 2     # op1+enable1
+PUSH_OP_SUMMARY_LEN = 241      # op1+mode1+page_no2+idx1+total1+dlen2+text233
+PUSH_OP_TTS_DONE_LEN = 4       # op1+page_no2+status1
+PUSH_SUMMARY_TEXT_MAX = 233    # SUMMARY 文本槽（UTF-8 字节）/ summary text slot (bytes)
+PUSH_SUMMARY_TOTAL_MAX = 1024  # 多帧拼装上限（250 汉字 ≈ 750 B，四帧，留余量）/ assembly cap
+PUSH_PAGE_NO_BYTES = 2         # page_no 为 u16 LE / page_no is a little-endian u16
+PUSH_CTRL_HDR_LEN = 4          # 现制 CTRL 公共头（magic2+op1+version1）/ legacy CTRL header
+PUSH_GEN30_WIRE_CAP = 244      # MTU 247 − 3 写属性头（方案 B 算术依据）/ CTRL write wire cap
+# 四模式编号（设备只传编号；模板与确定性截断全在 APK 端）/ four prompt mode ids
+PUSH_RIDE_MODE_FOREIGN = 0     # 外语原著（默认）/ foreign original (default)
+PUSH_RIDE_MODE_NOVEL = 1       # 小说网文 / web novel
+PUSH_RIDE_MODE_SOCIAL = 2      # 社科非虚构 / social non-fiction
+PUSH_RIDE_MODE_CLASSIC = 3     # 古文诗词 / classical poetry
+PUSH_RIDE_MODE_COUNT = 4
+PUSH_MODE_SRC_DEVICE = 0       # 设备菜单切换（1=APK 预留，一期不启用）/ device menu
+PUSH_MODE_SRC_INIT = 2         # 连接后初始化同步 / post-connect init sync
+PUSH_TTS_DONE_FINISHED = 0     # 播完 / finished
+PUSH_TTS_DONE_ABORT = 1        # 用户中断 / user aborted
+PUSH_TTS_DONE_FAILED = 2       # 失败 / failed
 PUSH_AI_WORD_MAX = 64
 PUSH_AI_DEF_MAX = 170
 PUSH_CAP_AI_QUERY = 1 << 0   # 设备支持 AI 查词 / device supports AI lookup
@@ -618,6 +652,142 @@ class PushClient:
 # Self-test — byte-for-byte against push_proto.h; no Bluetooth needed.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# gen30 伴读案 · 方案 B 裸帧编解码（参考实现）。与 push_proto.h 的定长算术、
+# push_sink.c 的 PAGE_BEGIN/MODE_SET 编码与白名单分派逐字节一致。三端（C/py/Java）
+# 常量已在步 1 登记一致；Java 发送侧编解码函数体属 APK 工作包（并行）。
+# gen30 read-along, plan B bare-frame codecs (reference). Byte-identical to the
+# frozen field arithmetic in push_proto.h and the PAGE_BEGIN/MODE_SET encoders
+# plus whitelist dispatch in push_sink.c. Java send-side codec bodies belong to
+# the APK work package (parallel).
+# --------------------------------------------------------------------------
+
+def gen30_ctrl_bare_op(frame: bytes):
+    """哨位裁定方案 B 白名单（与 C push_gen30_ctrl_bare_op 同口径）：
+    仅 0x0A/241B、0x0B/4B 命中并返回 op，其余返回 None（继续走现制魔数校验）。
+    Plan-B whitelist: only 0x0A/241 B and 0x0B/4 B hit; everything else is None
+    and falls through to the legacy 4 B magic check (ERR(2) on failure)."""
+    if not frame:
+        return None
+    if frame[0] == PUSH_OP_SUMMARY and len(frame) == PUSH_OP_SUMMARY_LEN:
+        return PUSH_OP_SUMMARY
+    if frame[0] == PUSH_OP_TTS_DONE and len(frame) == PUSH_OP_TTS_DONE_LEN:
+        return PUSH_OP_TTS_DONE
+    return None
+
+
+def encode_page_begin(page_no: int, mode: int) -> bytes:
+    """STATUS 0x1C（设备→手机）：op1+page_no2(LE)+mode1+reserved1 = 5 B。"""
+    if not (0 <= page_no <= 0xFFFF) or not (0 <= mode <= 0xFF):
+        raise ValueError("page_no/mode out of range")
+    return struct.pack("<BHBB", PUSH_ST_PAGE_BEGIN, page_no, mode, 0)
+
+
+def decode_page_begin(frame: bytes):
+    """返回 (page_no, mode)。严格 5 B 裸帧。/ Returns (page_no, mode)."""
+    if len(frame) != PUSH_ST_PAGE_BEGIN_LEN or frame[0] != PUSH_ST_PAGE_BEGIN:
+        raise ValueError("not a gen30 PAGE_BEGIN frame (bare, 5 B)")
+    return struct.unpack("<H", frame[1:3])[0], frame[3]
+
+
+def encode_mode_set(mode: int, source: int) -> bytes:
+    """STATUS 0x1B（设备→手机）：op1+mode1+source1+reserved2 = 5 B。"""
+    if not (0 <= mode <= 0xFF) or not (0 <= source <= 0xFF):
+        raise ValueError("mode/source out of range")
+    return bytes([PUSH_ST_MODE_SET, mode, source, 0, 0])
+
+
+def decode_mode_set(frame: bytes):
+    """返回 (mode, source)。严格 5 B 裸帧。/ Returns (mode, source)."""
+    if len(frame) != PUSH_ST_MODE_SET_LEN or frame[0] != PUSH_ST_MODE_SET:
+        raise ValueError("not a gen30 MODE_SET frame (bare, 5 B)")
+    return frame[1], frame[2]
+
+
+def encode_tts_enable(on: bool) -> bytes:
+    """STATUS 0x1D（设备→手机）：op1 + enable1 = 2 B。修复轮解耦用。
+
+    页文本 0x19 原本同时承载「朗读文本源」与「摘要触发源」双语义，手机收到即念，
+    设备无法表达「这条只做摘要、不要念」。本帧把听书开关作为独立事实传下去：
+    手机端收到页文本一律请求摘要，只有使能位为开时才朗读。
+    """
+    return bytes([PUSH_ST_TTS_ENABLE, 1 if on else 0])
+
+
+def decode_tts_enable(frame: bytes) -> bool:
+    """返回使能位。严格 2 B 裸帧。/ Returns the enable bit; strict 2 B frame."""
+    if len(frame) != PUSH_ST_TTS_ENABLE_LEN or frame[0] != PUSH_ST_TTS_ENABLE:
+        raise ValueError("not a gen30 TTS_ENABLE frame (bare, 2 B)")
+    return frame[1] != 0
+
+
+def encode_summary(text: str, page_no: int, mode: int = 0,
+                   idx: int = 0, total: int = 1) -> bytes:
+    """CTRL 0x0A（手机→设备）：op1+mode1+page_no2+idx1+total1+dlen2+text233 = 241 B，
+    裸帧不带 4 B 魔数头（方案 B）。UTF-8 字节硬截到 233 B 槽，尾补 0。
+    Bare phone-to-device summary; UTF-8 bytes hard-capped at the 233 B slot."""
+    raw = text.encode("utf-8")[:PUSH_SUMMARY_TEXT_MAX]
+    if not (0 <= page_no <= 0xFFFF) or not (0 <= mode <= 0xFF) or total < 1 or idx >= total:
+        raise ValueError("summary args out of range")
+    head = (bytes([PUSH_OP_SUMMARY, mode]) + struct.pack("<H", page_no) +
+            bytes([idx & 0xFF, total & 0xFF]) + struct.pack("<H", len(raw)))
+    return head + raw + b"\x00" * (PUSH_SUMMARY_TEXT_MAX - len(raw))
+
+
+def encode_summary_shards(text: str, page_no: int, mode: int = 0):
+    """整段摘要按 233 B 文本槽分片（二轮：解除 56 字帽）。切点回退到 UTF-8
+    边界，绝不切半个码点；空文本仍回单帧 dlen=0。设备端只认「idx 从 0 连续、
+    收齐 total」的整段。Shard a summary into 233 B slots with UTF-8-safe cuts."""
+    raw = text.encode("utf-8")[:PUSH_SUMMARY_TOTAL_MAX]
+    if not raw:
+        return [encode_summary("", page_no, mode, 0, 1)]
+    spans, off = [], 0
+    while off < len(raw):
+        take = min(PUSH_SUMMARY_TEXT_MAX, len(raw) - off)
+        if off + take < len(raw):
+            while take > 0 and (raw[off + take] & 0xC0) == 0x80:
+                take -= 1
+            if take <= 0:
+                take = min(PUSH_SUMMARY_TEXT_MAX, len(raw) - off)
+        spans.append((off, take))
+        off += take
+    if len(spans) > 0xFF:
+        raise ValueError("summary needs more than 255 shards")
+    out = []
+    for i, (o, n) in enumerate(spans):
+        head = (bytes([PUSH_OP_SUMMARY, mode]) + struct.pack("<H", page_no) +
+                bytes([i, len(spans)]) + struct.pack("<H", n))
+        out.append(head + raw[o:o + n] + b"\x00" * (PUSH_SUMMARY_TEXT_MAX - n))
+    return out
+
+
+def decode_summary(frame: bytes):
+    """返回 dict(mode,page_no,idx,total,text)。严格 241 B 裸帧。"""
+    if len(frame) != PUSH_OP_SUMMARY_LEN or frame[0] != PUSH_OP_SUMMARY:
+        raise ValueError("not a gen30 SUMMARY frame (bare, 241 B)")
+    page_no = struct.unpack("<H", frame[2:4])[0]
+    idx, total = frame[4], frame[5]
+    dlen = struct.unpack("<H", frame[6:8])[0]
+    if dlen > PUSH_SUMMARY_TEXT_MAX:
+        raise ValueError("summary dlen exceeds the 233 B text slot")
+    return {"mode": frame[1], "page_no": page_no, "idx": idx, "total": total,
+            "text": frame[8:8 + dlen].decode("utf-8", "replace")}
+
+
+def encode_tts_done(page_no: int, status: int = PUSH_TTS_DONE_FINISHED) -> bytes:
+    """CTRL 0x0B（手机→设备）：op1+page_no2+status1 = 4 B，裸帧。"""
+    if not (0 <= page_no <= 0xFFFF) or not (0 <= status <= 0xFF):
+        raise ValueError("page_no/status out of range")
+    return bytes([PUSH_OP_TTS_DONE]) + struct.pack("<H", page_no) + bytes([status])
+
+
+def decode_tts_done(frame: bytes):
+    """返回 (page_no, status)。严格 4 B 裸帧。/ Returns (page_no, status)."""
+    if len(frame) != PUSH_OP_TTS_DONE_LEN or frame[0] != PUSH_OP_TTS_DONE:
+        raise ValueError("not a gen30 TTS_DONE frame (bare, 4 B)")
+    return struct.unpack("<H", frame[1:3])[0], frame[3]
+
+
 def _selftest() -> int:
     import os
     ok = True
@@ -789,6 +959,68 @@ def _selftest() -> int:
         check(False, "TTS_TEXT 坏 op 应抛错")
     except ValueError:
         check(True, "TTS_TEXT 坏 op 抛 ValueError（不误收 0x18）")
+
+    # 10) gen30 伴读案 · 方案 B 裸帧（哨位裁定 2026-11-10 19:03）
+    check(PUSH_OP_SUMMARY_LEN == 241 and PUSH_OP_TTS_DONE_LEN == 4, "gen30 定长 241/4")
+    check(PUSH_CTRL_HDR_LEN + PUSH_OP_SUMMARY_LEN > PUSH_GEN30_WIRE_CAP and
+          PUSH_OP_SUMMARY_LEN <= PUSH_GEN30_WIRE_CAP,
+          "方案 A 245B 超帽、方案 B 241B 在帽内（裁定算术）")
+    sm = encode_summary("这是本页摘要", 0x1234, mode=2)
+    check(len(sm) == 241 and sm[0] == PUSH_OP_SUMMARY, "SUMMARY 裸帧 241B / op=0x0A")
+    check(sm[:2] != bytes([PUSH_MAGIC0, 0x43]), "SUMMARY 不带 4B 魔数头（方案 B）")
+    smd = decode_summary(sm)
+    check(smd["page_no"] == 0x1234 and smd["mode"] == 2 and smd["idx"] == 0 and
+          smd["total"] == 1 and smd["text"] == "这是本页摘要", "SUMMARY 往返")
+    # 11) 二轮：56 字帽解除，多帧分片 + 整段还原
+    long_text = "伴读摘要多帧拼装校验" * 20   # 220 字 / 660 B -> 3 帧
+    shards = encode_summary_shards(long_text, 0x1234, mode=3)
+    check(len(shards) == 3 and all(len(s) == 241 for s in shards), "多帧摘要 3 帧 × 241B")
+    check(all(s[4] == i and s[5] == len(shards) for i, s in enumerate(shards)),
+          "多帧 idx 从 0 连续、total 一致")
+    check(all(s[0] == PUSH_OP_SUMMARY and s[1] == 3 for s in shards), "多帧 op=0x0A / mode 透传")
+    check("".join(decode_summary(s)["text"] for s in shards) == long_text,
+          "多帧拼装还原整段（UTF-8 边界无切半）")
+    check(len(encode_summary_shards("", 0x1234)) == 1, "空摘要仍单帧 dlen=0")
+    td = encode_tts_done(0x1234, PUSH_TTS_DONE_FINISHED)
+    check(len(td) == 4 and td[0] == PUSH_OP_TTS_DONE, "TTS_DONE 裸帧 4B / op=0x0B")
+    check(decode_tts_done(td) == (0x1234, PUSH_TTS_DONE_FINISHED), "TTS_DONE 往返")
+    pb = encode_page_begin(0x1234, 1)
+    check(len(pb) == 5 and pb[0] == PUSH_ST_PAGE_BEGIN and
+          decode_page_begin(pb) == (0x1234, 1), "PAGE_BEGIN 5B 往返")
+    ms = encode_mode_set(3, PUSH_MODE_SRC_DEVICE)
+    check(len(ms) == 5 and ms[0] == PUSH_ST_MODE_SET and
+          decode_mode_set(ms) == (3, PUSH_MODE_SRC_DEVICE), "MODE_SET 5B 往返")
+    # 修复轮解耦：0x1D 朗读使能（2B）。开关关＝只看不听；摘要链由 0x19 无条件触发。
+    te_on = encode_tts_enable(True)
+    te_off = encode_tts_enable(False)
+    check(len(te_on) == 2 and te_on == bytes([PUSH_ST_TTS_ENABLE, 1]),
+          "TTS_ENABLE 2B / 开 = 0x1D 0x01")
+    check(len(te_off) == 2 and te_off == bytes([PUSH_ST_TTS_ENABLE, 0]),
+          "TTS_ENABLE 2B / 关 = 0x1D 0x00")
+    check(decode_tts_enable(te_on) is True and decode_tts_enable(te_off) is False,
+          "TTS_ENABLE 往返（开/关）")
+    try:
+        decode_tts_enable(bytes([PUSH_ST_TTS_ENABLE]))
+        check(False, "TTS_ENABLE 坏长度应抛错")
+    except ValueError:
+        check(True, "TTS_ENABLE 严格 2B（1B 拒）")
+    check((int(PUSH_ST_TTS_ENABLE) == int(PUSH_ST_PAGE_BEGIN) + 1) and
+          int(PUSH_ST_TTS_ENABLE) not in (int(PUSH_OP_SUMMARY), int(PUSH_OP_TTS_DONE)),
+          "0x1D 顺移无空洞且不与裸帧白名单碰撞")
+    # 白名单 + 长度闸门（与 C 宿主 test_gen30_bare_dispatch 同口径）
+    check(gen30_ctrl_bare_op(sm) == PUSH_OP_SUMMARY, "白名单命中 SUMMARY")
+    check(gen30_ctrl_bare_op(td) == PUSH_OP_TTS_DONE, "白名单命中 TTS_DONE")
+    check(gen30_ctrl_bare_op(sm[:-1]) is None and
+          gen30_ctrl_bare_op(td + b"\x00") is None, "长度闸门：±1B 全拒")
+    check(gen30_ctrl_bare_op(encode_ctrl(PUSH_OP_END)) is None, "魔数帧零碰撞")
+    check(gen30_ctrl_bare_op(bytes([PUSH_OP_SUMMARY, 0x50, 0x43, 1])) is None,
+          "0x0A 畸形短帧仍拒（落 ERR(2)）")
+    for bad_len_frame in (sm[:-1], td + b"\x00"):
+        try:
+            decode_summary(bad_len_frame) if bad_len_frame[0] == PUSH_OP_SUMMARY else decode_tts_done(bad_len_frame)
+            check(False, "gen30 坏长度帧应抛错")
+        except ValueError:
+            check(True, "gen30 坏长度帧抛 ValueError（严格定长）")
 
     print("自检结果 / result:", "ALL PASS" if ok else "HAS FAILURES")
     return 0 if ok else 1

@@ -43,6 +43,13 @@ extern "C" {
 #define PUSH_DIR "/sdcard/.readpico"
 #define PUSH_PART_PATH PUSH_DIR "/push.part"
 #define PUSH_TEXT_PATH PUSH_DIR "/push.txt"
+/// 旧书的暂存名：提交时先 rename 到这里，新书就位成功才删。成品路径永不 remove
+/// （见 26.9.30 不变式），所以"旧书消失"只可能发生在 .bak 上的两种岔路，
+/// 而 .bak 还能被下一次提交或开机捡回。
+/// The previous book parks here during commit; it is removed only after the new
+/// one lands. The product path is never removed, so an old book can only be
+/// missing while it sits in .bak - and .bak is recoverable.
+#define PUSH_BAK_PATH PUSH_DIR "/push.bak"
 
 /// 待武装超时：点了接收但栈迟迟起不来（内存闸门/失败退避）就放弃，
 /// 别让界面干等。/ Pending-arm timeout: give up when the stack never comes up
@@ -153,6 +160,104 @@ void push_sink_on_stack_stop(void);
 /// its reconnect target kept, so leaving arm reconnects automatically.
 bool push_sink_turner_paused(void);
 
+/* ---- 三拍封送 / Three-beat quiesce (31b 第 1 条) ---- */
+
+/// SD 侧要动卷之前调（掉卡卸载 / 格式化 / USB 挂载 / 深睡）。冻结会话入口，
+/// 并等待三合取同时成立：**状态机空闲 ∧ BLE 路径存活 FILE\* 数为 0 ∧ 入口已冻结**。
+///
+/// 返回 true = 可以动卷，**冻结保持**，直到 app 层观测到三拍终态后调
+/// `push_sink_thaw()`；返回 false = 有一方 2 s 内没停，调用方**不得动卷**，
+/// 冻结同样保持（仍在三拍区间内，闩锁会重试；全败则调 `push_sink_quiesce_hold()`）。
+///
+/// 为什么超时不解冻：解冻会让新会话进来的那一刻正好撞上正在进行的卸卷——正是三拍
+/// 要避免的东西。解冻只有两条权威通道，都由 app 层观测后打（SD 只发布事实，
+/// 组件不反向读 SD）：
+///   ① 卸卷完成（三拍终态成功）；
+///   ② 插回后重新挂载（mount 边沿，解冻的**主通道**，不是兜底）。
+///
+/// 超时不留悬：冻结超过 `PUSH_FREEZE_WATCHDOG_MS` 且未到任何终态，poll 会强制
+/// 解冻并通过 `push_sink_take_freeze_timeout()` 交出一条事件（app 写黑匣子）。
+/// Call before touching the volume. Freezes the session entry and waits for the
+/// conjunction: machine idle AND zero live FILE* on the BLE path AND entry frozen.
+/// true = safe to move the volume, and the freeze STAYS until the app sees a
+/// three-beat terminal state and calls push_sink_thaw(). false = someone did not
+/// stop within the timeout; do NOT move the volume, and the freeze stays too.
+bool push_sink_quiesce(unsigned timeout_ms);
+
+/// 解冻（app 层在观测到终态后调用）。幂等；未冻结时静默。
+/// Thaw, called by the app after observing a terminal state. Idempotent.
+void push_sink_thaw(const char *why);
+
+/* ---- 介质离开 / 插回：链路的所有权与对称义务（26.11.5） ---- */
+
+/// 介质要走时，由 push_sink 自己把链路与广播一起收掉。**必须在 `push_sink_quiesce()`
+/// 之前调用**（序关系由 B78 咬住）：只放行卸载而不收链路，手机下一次 BEGIN 会写向
+/// 一个不存在的卷；只发 DISCONNECT 而不落到 IDLE，GAP 回调又会按「state != IDLE」
+/// 把广播重新拉起来，等于把故障挪了个位置。
+///
+/// 收尾顺序写死：DISCONNECT（关 `.part`、存 NVS 簿记）→ CANCEL 到 IDLE（广播停）→
+/// `ble_gap_terminate`。返回后 `push_sink_state()` 为 IDLE。
+///
+/// 代价（R1 申报）：拔卡瞬间正在等的 AI 回流（0x08）再也回不来，走既有超时口径
+/// 诚实报「未收到」，不出假卡。罕见、可重试、失败诚实。
+/// Cut the link and the advertisement when the medium goes, **before** the quiesce
+/// call (B78 pins the order). Returns with the session machine in IDLE.
+/// Cost: an in-flight AI reply (0x08) is lost and surfaces through the existing
+/// timeout path as "not received" - rare, retryable, honest.
+void push_sink_detach_media(const char *why);
+
+/// 插回边沿：把上一次 `push_sink_detach_media()` 欠下的**可连性**还回去。
+///
+/// 没有它，detach 会把「插回不认卡」修成「插回认卡但手机再也连不上」——31a 家族
+/// 的第三个入口（同一个终点、又一个入口）。会话还活着就把广播找回来；已经收官
+/// （窗口到期/被取消）就按默认窗口重新武装。
+///
+/// 只在真的断过链时动作（内部欠账标志），所以正常插卡不会平白开一个接收窗口。
+/// The reattach edge repays the connectivity the detach took away. Without it,
+/// "the card is not recognised" would become "the card works but the phone can
+/// never connect again" - the third entrance to the same 31a dead end. Only acts
+/// when a detach actually happened, so a normal insert opens no window.
+bool push_sink_resume_after_media(void);
+
+/// hold 的原因码：写进黑匣子 `PICO_BOOTBB_NOTE_PUSH_HOLD` 的 `a` 字段。
+/// **数值是账本的一部分**（日志里只出现数字），改语义必须先改这里。
+/// 为什么要码：串口日志会丢，会话一结束就只剩黑匣子里那 3 个字节；没有原因码，
+/// 下次开机看到「冻结保持」也还是不知道是哪一拍烂了。
+/// Reason code for a hold, stored in the blackbox `a` field. The numbers are ledger
+/// entries: the blackbox keeps only bytes, so the meaning has to live here.
+typedef enum {
+    PUSH_HOLD_WHY_QUIESCE = 1,  ///< 三合取一直等不到（卡在谁身上由 `b` 说明）
+                                ///< the conjunction never closed; `b` says who was late
+    PUSH_HOLD_WHY_RELEASE = 2,  ///< 卸卷一直失败（卷在，但放不掉）
+                                ///< unmount kept failing: the volume is there but will not go
+} push_hold_why_t;
+
+/// 显式标记「保持冻结」：闩锁全败 = 卷挂着但逻辑已失效（毒卷）。此时解冻等于
+/// 给新会话开一扇通往毒卷的门，所以**合法地**保持冻结，并留一条显式标记，
+/// 让看门狗知道这不是卡死。只有插回挂载边沿或重启能出去。
+///
+/// 留痕：本函数**一定**写一条黑匣子（`PICO_BOOTBB_NOTE_PUSH_HOLD`，a = why_code，
+/// b = 此刻仍未关闭的 FILE\\* 数）。只有日志没有黑匣子的「失败」在下次开机时等于没发生。
+/// Explicitly hold the freeze: every latch retry failed, the volume is mounted
+/// but logically poisoned. Thawing would open the gate onto it, so the freeze is
+/// kept on purpose and marked. This call ALWAYS records a blackbox note: a failure
+/// that only ever reached the UART did not happen as far as the next boot is concerned.
+void push_sink_quiesce_hold(const char *why, push_hold_why_t why_code);
+
+/// 当前是否冻结（诊断 + 宿主牙）。
+bool push_sink_frozen(void);
+
+/// BLE 路径当前存活的 FILE\* 数：`.part` 写句柄（经 push_part 只读 API）+
+/// verify 读句柄深度。这是三合取②的**测量值**，不是推断。
+/// Live FILE* count on the BLE path: the .part writer (via push_part's read-only
+/// API) plus the verify reader depth. This is the measured value for conjunct 2.
+unsigned push_sink_live_files(void);
+
+/// 取走一次看门狗强制解冻事件（app 写黑匣子用）。frozen_ms 为被强制解冻前
+/// 已冻结的毫秒数。
+/// Take the one-shot watchdog event; frozen_ms is how long it had been frozen.
+bool push_sink_take_freeze_timeout(unsigned *frozen_ms);
+
 /* ---- 主循环 / Main loop ---- */
 
 /// 主循环每轮调一次：喂 TICK 驱动窗口/宽限到期，看守充电常开的拔电即退，
@@ -160,6 +265,30 @@ bool push_sink_turner_paused(void);
 /// and grace expiry, watches the charger-held unplug exit and the pending-arm
 /// timeout.
 void push_sink_poll(void);
+
+/// 提交段封送（26.9.30）：BLE 回调里的 COMMIT 只投递请求，不碰存储、不 reply。
+/// 主循环每帧调一次取走；**读即清**（失败不回写，重试的所有权在 app 层），
+/// 投递超过 2 s 未被取走则丢弃并回 ERR(BUSY)——上界从投递时刻算起。
+/// The commit hand-off: COMMIT inside the BLE callback only posts - it touches no
+/// storage and replies nothing. The main loop takes it once per frame;
+/// read-and-clear (a failure is never written back - the app layer owns the retry),
+/// and a request older than 2 s is dropped with ERR(BUSY), measured from post time.
+bool push_sink_take_commit_request(void);
+
+/// 执行四拍（`part_close` + rename 舞蹈），成功后补发被扣下的 OPEN_BOOK /
+/// WORD_CARD 与「最近推送」/未读位。只在主循环帧间安全点调用。返回 false 时
+/// 错误已经 reply 过，调用方只需保持旧书可读。
+/// Runs the four beats, then re-posts the withheld OPEN_BOOK / WORD_CARD plus the
+/// "last push" and unread bits. Main-loop safe point only. On false the error has
+/// already been replied; the caller only has to keep the old book readable.
+bool push_sink_run_commit(void);
+
+/// 请求已取走但这一拍不能提交（commit 3：读者的书关不干净，越过死线后由 app 层
+/// 调用）。**不回写请求**，只作废扣下的两个 UI 位并明确回 err（通常 ERR(BUSY)）。
+/// Taken but not committable this frame (commit 3: the reader's book will not
+/// close cleanly; the app layer calls this past its deadline). The request is
+/// never written back; the withheld UI bits die and `err` is replied explicitly.
+void push_sink_commit_abort(int err);
 
 /* ---- UI 一次性事件 / One-shot UI events ---- */
 
@@ -290,6 +419,70 @@ bool push_sink_link_up(void);
 /// The text must already be domain-cleaned by the caller (image placeholders
 /// etc.); the splitter only guarantees UTF-8 boundaries (push_tts.c).
 bool push_sink_tts_send_page(const char *text, size_t len);
+
+/* ---- M3 情景释义（STATUS 0x1A 上下文分帧）---- */
+/* M3 scene lookup (STATUS 0x1A context segments). */
+
+/// 情景解读开关（NVS 持久化，缺省开）。关掉后不再上报 CAP_AI_SCENE、不发 0x1A；
+/// 现有 0x17 词典释义链路零变化。/ Scene-lookup switch (NVS-persisted, on by
+/// default). Off drops CAP_AI_SCENE and 0x1A; the existing 0x17 path is untouched.
+void push_sink_set_scene_enabled(bool on);
+bool push_sink_scene_enabled(void);
+/// M3-B：对面 APK 是否声明了「能出四节情景分析」（CAP bit4）。入口显示用它，
+/// 而不是本地开关——本地开关只表示用户愿意，不表示对面答得上来。
+/// M3-B: whether the peer APK declared "answers with four sections" (CAP bit4).
+/// Use it for the entry's visibility instead of the local switch, which only says
+/// the user would like it, not that the peer can answer.
+bool push_sink_ai_scene_view_enabled(void);
+
+/// 发送一次情景请求：word（≤63B）+ ctx（≤1024B，词在 ctx 内的字节偏移 word_off）
+/// + flags（PUSH_SCENE_FLAG_*）。发送前置条件全不满足时返回 false 且一帧不发：
+/// AI 关 / 情景关 / APK 未声明 CAP_AI_SCENE / 链路未订阅 / 参数非法。
+/// 任一帧未交付即整体失败（与 0x19 同口径：不投缺帧请求，对端在 seq==0 重置）。
+/// Send one scene request. Returns false and airs nothing unless every
+/// precondition holds: AI on, scene on, APK declared CAP_AI_SCENE, link
+/// subscribed, arguments valid. Any undelivered frame fails the whole request
+/// (same stance as 0x19: never air a gapped request; the peer resets at seq==0).
+bool push_sink_ai_scene_send(const char *word, const char *ctx, size_t ctx_len,
+                             uint16_t word_off, uint8_t flags);
+
+/* ---- gen30 伴读（R0 冻结件 1 · 方案 B 裸帧）：设备端链路能力（步 3）---- */
+/* Read-along gen30 (R0 frozen item 1, plan B bare frames): device link capability. */
+
+/// 发一帧 PAGE_BEGIN(STATUS 0x1C)：每页 0x19 流前置的页号对账键。调用后组件把
+/// page_no 记为对账基准，后续 SUMMARY/TTS_DONE 页号不符一律丢弃；同时清掉上一页
+/// 未取的回包。返回帧是否投递成功。/ Emit PAGE_BEGIN; it becomes the reconciliation
+/// base and clears stale receipts; returns whether the frame was delivered.
+bool push_sink_companion_page_begin(uint16_t page_no, uint8_t mode);
+/// 发一帧 MODE_SET(STATUS 0x1B)：模式广播（source 取 PUSH_MODE_SRC_*）。
+/// Emit MODE_SET, the mode broadcast (source is a PUSH_MODE_SRC_* value).
+bool push_sink_companion_mode_set(uint8_t mode, uint8_t source);
+/// 取一条通过页号对账的 SUMMARY；无待取回包返回 false。text 由调用方给缓冲，
+/// 组件按 cap 截断并补 NUL（右栏渲染与二次截断属步 4 显示层，本函数只交付文本）。
+/// Take one page-reconciled SUMMARY; text is copied into the caller's buffer.
+/// Rendering / second-pass truncation belongs to step 4 (display layer).
+bool push_sink_take_companion_summary(uint8_t *mode, uint16_t *page_no,
+                                      uint8_t *idx, uint8_t *total,
+                                      char *text, size_t cap);
+/// 取一条通过页号对账的 TTS_DONE；无待取回执返回 false。设备端按 NVS 设置决定
+/// 是否消费（自动翻页或忽略），组件不查询使能态（R0 拍板格 5：设备端自治）。
+/// Take one page-reconciled TTS_DONE. The device side decides whether to consume
+/// it from its NVS setting; the component never queries that flag.
+bool push_sink_take_companion_tts_done(uint16_t *page_no, uint8_t *status);
+/// 伴读活跃期连接档位：on=true 请求 FAIR 15ms 并抑制既有 session 驱动的 SLOW
+/// 回落；on=false 解除抑制并回 SLOW 500ms（R0「以模式为档位边界，不做页级抖动」）。
+/// Companion-active connection tier: on requests FAIR 15 ms and suppresses the
+/// legacy session-driven SLOW fallback; off releases it and returns to SLOW.
+void push_sink_companion_conn(bool on);
+/// 发一帧 TTS_ENABLE(STATUS 0x1D)：朗读使能（op1 + 使能位1 = 2 B）。
+/// 修复轮解耦用：设备端把「听书开关」这一事实单独告知手机，手机据此只控制声音；
+/// 页文本推送（0x19）本身不再承载「念不念」的语义，摘要链因此与朗读解耦。
+/// 返回帧是否投递成功；链路未就绪时返回 false，调用方在下次变化时重发。
+/// Emit TTS_ENABLE (STATUS 0x1D, 2 B): the read-aloud enable bit. Decoupling fact
+/// from the repair round - the device tells the phone the listening switch state
+/// separately, so 0x19 carries text only and the summary chain is independent of
+/// playback. Returns whether the frame was delivered.
+bool push_sink_tts_enable_send(bool on);
 
 #ifdef __cplusplus
 }

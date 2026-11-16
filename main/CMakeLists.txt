@@ -23,6 +23,11 @@ set(main_requires
     # ble_page_turner (peripheral role + radio mutex) and must stay in the
     # dependency graph for the same Kconfig reason.
     push_sink
+    # 26.9.13 P0-d：内部堆取证的公共实现（原来埋在 ble_page_turner.c 里且是 static，
+    # 只在翻页器那条路上触发，抓不到手机推送那条）。/ 26.9.13 P0-d: the shared
+    # internal-heap dump (it used to be a static inside ble_page_turner.c and only fired
+    # on the page-turner path, never on the phone-push one).
+    pico_heapdiag
     continuous_du
     e0470_epaper_waveform
     e0470_page_turn
@@ -64,11 +69,14 @@ idf_component_register(
         "app/crash_note.c"
         "app/app_registry.c"
         "ui/ui_kit.c"
+        "ui/ui_bionic.c"
+        "ui/ui_text_wrap.c"
         "ui/ui_text_edit.c"
         "ui/ui_text_input.c"
         "ui/ui_ime.c"
         "ui/ui_keyboard.c"
         "ui/ui_gesture.c"
+        "ui/ui_dualgesture.c"
         "ui/ui_pinpad.c"
         "ui/ui_power_dialog.c"
         "ui/ui_quick_menu.c"
@@ -79,6 +87,7 @@ idf_component_register(
         "ui/datamatrix.c"
         "ui/ui_menu.c"
         "ui/ui_nav.c"
+        "ui/nav_status_watch.c"
         "ui/ui_home_widget.c"
         "ui/ui_home_clock.c"
         "ui/ui_image_dither.c"
@@ -89,13 +98,17 @@ idf_component_register(
         "apps/app_book.c"
         "apps/dict_popup.c"
         "apps/ai_reader.c"
+        "apps/scene_req.c"
         "apps/book_toc.c"
         "apps/app_dashboard.c"
+        "apps/home_gesture.c"
         "apps/app_files.c"
         "apps/file_tree.c"
         "apps/app_device_settings.c"
         "apps/app_image.c"
         "apps/app_transfer.c"
+        # 26.11.1：两拍提交泵独立成文件（宿主测试编同一份，见 transfer_commit.h 头注）。
+        "apps/transfer_commit.c"
         "apps/usb_storage.c"
         "book/book_store.c"
         "book/book_progress.c"
@@ -115,12 +128,18 @@ idf_component_register(
         "book/zip_reader.c"
         "book/html_text.c"
         "book/book_layout.c"
+        "book/hyphen.c"
+        "book/hyph_en_us_data.c"
+        "book/book_select.c"
+        "book/excerpt_store.c"
+        "book/excerpt_section.c"
         "book/book_id.c"
         "book/gbk.c"
         "dict/dict_lookup.c"
         "dict/vocab_log.c"
         "tts/tts_page.c"
         "font/ttf_font.c"
+        "font/kern_pairs.c"
         "font/app_font_context.c"
         "font/ui_font.c"
         "font/ui_hanzi.c"
@@ -143,6 +162,14 @@ idf_component_register(
 # that is the only place it survives. The option hangs off main, whose INTERFACE carries it into
 # the final link; a global property set after project() is too late for the linker to see it.
 target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
+
+# 固定构建时刻（顶层 CMakeLists 由 SOURCE_DATE_EPOCH 折出）：可复现构建下 esp_app_desc 的
+# date/time 是空串，界面与时间编辑器改用这两个宏，同一个 epoch 必得同一串。
+# Fixed build instant (derived from SOURCE_DATE_EPOCH at the top level): with a reproducible
+# build esp_app_desc carries an empty date/time, so the UI and the time editor use these macros.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    "PICO_BUILD_DATE=\"${PICO_BUILD_DATE}\""
+    "PICO_BUILD_TIME=\"${PICO_BUILD_TIME}\"")
 
 # 本地 USB 测时入口，普通构建不包含。/ Local USB timing probe, omitted from ordinary product builds.
 if("$ENV{KIIKO_LOCAL_LATENCY}" STREQUAL "1")
