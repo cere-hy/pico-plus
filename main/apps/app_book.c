@@ -227,6 +227,9 @@ static app_redraw_t boxsel_exit(boxsel_exit_t why);
 // timeout: 15s without a phone answer degrades the card to a failure notice.
 // The card shows a real state and must never fake forever.
 #define DICT_AI_PENDING_TIMEOUT_US 15000000
+// 26.11.31：AI 键离线武装的等待卡用 60s 广播窗口判超时（与 device 侧
+// DICT_AI_ARM_WINDOW_MS 对齐），避免 15s 卡片先回退、广播还在、0x07 回来被丢。
+#define DICT_AI_ARMED_TIMEOUT_US 60000000
 
 typedef enum { SHELF, READING, TOC, MANAGE, BULK, IMPORT, SEARCH, EDIT } book_view_t;
 typedef enum {
@@ -7896,9 +7899,17 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
             // was already checked above - a disabled AI never reaches here - so no
             // second check. vocab_log_ai_flush() lands the batch 5s later.
             vocab_log_ai_queue(wbuf);
-            // 命中预取缓存秒出 / 连上即时发 0x17 / 离线入搭车队列
-            dict_popup_force_ai(wbuf);     // 卡切查询态并标记 over_dict（超时回退词典）
-            ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);
+            // 26.11.31：push_sink_ai_tap_word_ctx 内部已分流——已连接即发 0x17，
+            // 未连接则入挂起缓存 + 启动 60s 广播武装。据此选卡面：挂起词在位说明走
+            // 了武装路径，卡切「等待手机连接…」（60s 超时）；否则连上直查，卡切
+            // 「AI 查询中…」（15s 超时）。两态共用同一 pending 状态机与 over_dict 回退。
+            if (push_sink_dict_ai_pending()) {
+                dict_popup_force_ai_armed(wbuf);
+                ESP_LOGI(TAG, "ai force armed \"%s\": dict card AI entry (offline)", wbuf);
+            } else {
+                dict_popup_force_ai(wbuf);
+                ESP_LOGI(TAG, "ai force \"%s\": dict card AI entry", wbuf);
+            }
             invalidate_prep();
             return APP_REDRAW_PAGE;
         }
@@ -10824,10 +10835,21 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     // the "AI querying..." card, a phone that never answers within 15s (query
     // failed / link down) must not leave the card faking forever - close the
     // card and show the failure, the same "real state, not a fake card" stance.
+    // 26.11.31 退出路径单点收敛：挂起词还在、但卡片已不处于 armed 等待态
+    // （翻页/换书/关卡通/用户取消都会 reset 卡片、清掉 armed_wait）→ 设备侧取消
+    // 挂起并停广播，杜绝关卡后残留挂在空中、下次连接误发。连接建成 take 后 pending
+    // 已为 false，不走此路；正常 armed 等待 pending=true && armed_wait=true 也不走。
+    if (push_sink_dict_ai_pending() && !dict_popup_armed_wait()) {
+        push_sink_cancel();
+    }
+    // 26.11.31：armed 等待卡按 60s 广播窗口判超时，连上直查卡仍按 15s。
+    const int64_t dict_timeout_us = dict_popup_armed_wait()
+                                        ? DICT_AI_ARMED_TIMEOUT_US
+                                        : DICT_AI_PENDING_TIMEOUT_US;
     if (s_view == READING && s_reader_panel == READER_PANEL_DICT &&
-        dict_popup_pending_expired(DICT_AI_PENDING_TIMEOUT_US)) {
-        ESP_LOGW(TAG, "ai pending card timed out after %llds",
-                 (long long)(DICT_AI_PENDING_TIMEOUT_US / 1000000));
+        dict_popup_pending_expired(dict_timeout_us)) {
+        ESP_LOGW(TAG, "ai pending card timed out after %llds (armed=%d)",
+                 (long long)(dict_timeout_us / 1000000), (int)dict_popup_armed_wait());
         // gen26.4：查询态由词典命中卡的「AI」入口强制触发时——失败不丢词典内容，
         // 回退重开词典释义卡（该词此前命中，必再命中），面板保持 DICT。
         // gen26.4: when the querying state was forced from the dict card's AI entry,

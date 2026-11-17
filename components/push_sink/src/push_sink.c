@@ -27,6 +27,7 @@
 
 #include "push_part.h"
 #include "push_sink.h"
+#include "dict_ai_arm.h" // 26.11.31 词典卡 AI 键武装挂起态纯逻辑 / dict-card AI-arm stash logic
 
 #include "pico_bootbb.h" // 31b 第 1 条补账：hold 留痕进黑匣子 / hold leaves a blackbox note
 
@@ -361,6 +362,9 @@ static uint16_t s_ai_cap;
 static bool s_ai_ready;   // 缓冲已挂接且 init 成功 / buffer attached and inited
 static bool s_ai_enabled; // 运行期开关（NVS 持久化）/ runtime on/off (NVS-persisted)
 static bool s_scene_enabled = true; // M3 情景解读（缺省开，NVS 覆盖）/ M3 scene lookup (default on)
+// 26.11.31 词典卡 AI 键武装挂起槽：点 AI 未连接时存词＋上下文，连接建成锚点 flush。
+// 纯逻辑见 dict_ai_arm.c；此处仅持实例，所有变更在 s_lock 内进行。
+static dict_ai_arm_t s_dict_ai_arm;
 // gen26.5 协商状态：APK 用 CTRL 0x09 声明它支持的能力位。**默认 0（未使能）**——
 // 设备收使能前 STATUS 0x17 一律 66B legacy，旧 APK 不发 0x09 即零感知兼容；
 // 断连清零，重连后等 APK 重发（对端进程可能被杀，能力声明不可跨连接继承）。
@@ -1718,6 +1722,26 @@ static void ai_on_subscribed(void) {
     if (!s_ai_enabled) return;
     ai_send_caps();
     ai_flush_queue();
+    // 26.11.31 词典卡 AI 键武装：连接建成锚点（订阅 = peer 可收帧首个时刻）flush
+    // 挂起词。复用既有 0x17 帧（push_st_ai_query_emit）、零新帧、APK 零改动；take
+    // 即清槽实现「发出即清、防重发」。此函数在 s_lock 内调用，take/notify 均安全。
+    {
+        char dw[DICT_AI_ARM_WORD_MAX];
+        uint32_t dbid = 0u, dpos = 0u;
+        if (dict_ai_arm_take(&s_dict_ai_arm, dw, sizeof(dw), &dbid, &dpos)) {
+            uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
+            const size_t n = push_st_ai_query_emit(dw, dbid, dpos,
+                                                   ai_ctx_enabled(), frame, sizeof(frame));
+            if (n) {
+                (void)notify_status(frame, n); // STATUS 0x17，自动携带词条＋上下文
+                ESP_LOGI(TAG, "dict_ai=sent word=1");
+            } else {
+                // 编码失败极罕见（词已截断到 63B < 64）；take 已清槽，留日志如实记账。
+                ESP_LOGW(TAG, "dict_ai=sent word=0 encode_fail wlen=%u",
+                         (unsigned)strlen(dw));
+            }
+        }
+    }
 }
 
 // 释义回流（0x07）：进预取缓存 + 交 UI 槽出卡。/ Definition result (0x07): into
@@ -1829,29 +1853,26 @@ void push_sink_ai_tap_word_ctx(const char *word, uint32_t book_id, uint32_t pos)
     lock();
     const bool live = s_conn_handle != BLE_HS_CONN_HANDLE_NONE && s_status_subscribed;
     if (live) {
-        // gen26.5：帧格式由协商结果决定（未使能 → 66B legacy，旧 APK 零感知）。
+        // 已连接：走既有直查路径，零改。帧格式由协商结果决定（未使能 → 66B legacy）。
         // gen26.5: the frame format follows the negotiation (legacy until enabled).
         uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
         const size_t n = push_st_ai_query_emit(word, book_id, pos, ai_ctx_enabled(),
                                                frame, sizeof(frame));
         if (n) notify_status(frame, n); // 即时：STATUS 0x17
+        unlock();
+    } else {
+        // 26.11.31 谕令：未连接点 AI → 词条＋上下文入挂起缓存 + 启动蓝牙广播武装。
+        // 取代 gen26.6 的「离线直接丢弃」（图 25207 五步链路痛点）。挂起词在锁内存，
+        // push_sink_arm 自带锁、必须在解锁后调用（锁序 s_lock 单向，杜绝自锁）。
+        // 搭车队列 ai_raloc 仍退役、ai_flush_queue 仍空转——挂起槽是独立机制，
+        // 0x06 冻结位与搭车宿主测试零动。
+        (void)dict_ai_arm_arm(&s_dict_ai_arm, word, book_id, pos, (int64_t)ms_now());
+        unlock();
+        // 已在其它武装窗口时 push_sink_arm 返回 INVALID_STATE——广播本就在跑、
+        // 连接建成锚点照样 flush，语义仍是「已武装」，故暗号照打。
+        (void)push_sink_arm(0, DICT_AI_ARM_WINDOW_MS);
+        ESP_LOGI(TAG, "dict_ai=armed word=%s", word);
     }
-    // gen26.6 裁定：离线 miss 词**直接丢弃，不再入搭车队列**。FGS 落地后息屏
-    // 也能查词，断线补查的窗口价值归零——「错过的词让它过去」。UI 侧 15s 超时
-    // 回退词典照旧（离线本就发不出 0x17，弹卡超时行为前后一致），重连后零回流
-    // 零打扰。该设计在无 FGS 时代是合理决策，条件变了自然收敛（账本已记）。
-    // 队列基础设施保留（0x06 协议位「登记即冻结」、ai_raloc 宿主测试照跑），
-    // 只是从此没有生产者——ai_flush_queue 恒为空转。
-    // gen26.6 ruling: an offline miss is **dropped outright, no longer queued**
-    // for the ride-along reflow. With the FGS keep-alive landed, screen-off
-    // lookups work, so the offline re-query window is worthless - a missed word
-    // is allowed to pass. The UI still times out after 15s into the dictionary
-    // fallback (offline never sent 0x17 anyway, so the card behavior is
-    // identical), and reconnects stay silent. The design was reasonable in the
-    // pre-FGS era and retires naturally. The queue infrastructure stays (the
-    // frozen 0x06 opcode, the ai_raloc host tests) - just with no producer, so
-    // ai_flush_queue is a permanent no-op.
-    unlock();
 }
 
 bool push_sink_take_ai_def(char *word, size_t wcap, char *def, size_t dcap) {
@@ -2835,6 +2856,11 @@ void push_sink_cancel_why(const char *why) {
     ensure_init();
     lock();
     close_why_set(why);
+    // 26.11.31 退出路径（用户取消/翻页/换书/关卡通都收敛到这里）：清词典卡
+    // AI 武装挂起词，杜绝停广播后残留待发词在下次连接误触发。
+    if (dict_ai_arm_cancel(&s_dict_ai_arm)) {
+        ESP_LOGI(TAG, "dict_ai=cancel why=%s", why ? why : "?");
+    }
     if (s_sess.state != PUSH_STATE_IDLE || s_pending_arm) {
         ESP_LOGI(TAG, "armed canceled by %s (state=%d pending=%d)",
                  why ? why : "?", (int)s_sess.state, (int)s_pending_arm);
@@ -2860,6 +2886,13 @@ bool push_sink_armed(void) {
     const bool armed = s_sess.state != PUSH_STATE_IDLE;
     unlock();
     return armed;
+}
+
+bool push_sink_dict_ai_pending(void) {
+    lock();
+    const bool pending = dict_ai_arm_active(&s_dict_ai_arm);
+    unlock();
+    return pending;
 }
 
 // gen24.2：待武装查询——UI 的 R2 回退判定与「正在启动蓝牙…」渲染同源。
@@ -2951,6 +2984,17 @@ void push_sink_poll(void) {
     }
 
     lock();
+    // 26.11.31 词典卡 AI 武装：60 s 广播窗口到期仍无连接 → 清挂起词 + 停广播，
+    // 词典卡由 UI 侧 pending 超时回退原态。暗号 dict_ai=timeout 供点核。
+    // 按挂起槽自身时间戳判定（与会话窗口解耦，take 后 active=false 自然不再触发）。
+    if (dict_ai_arm_expired(&s_dict_ai_arm, (int64_t)now, DICT_AI_ARM_WINDOW_MS)) {
+        (void)dict_ai_arm_cancel(&s_dict_ai_arm);
+        ESP_LOGI(TAG, "dict_ai=timeout after %u ms", DICT_AI_ARM_WINDOW_MS);
+        if (s_sess.state != PUSH_STATE_IDLE) {
+            close_why_set("等待手机连接超时");
+            exec_actions(push_session_event(&s_sess, PUSH_EVT_CANCEL, NULL));
+        }
+    }
     // 待武装超时：栈起不来就放弃，UI 收 start_failed。/ Pending-arm timeout: give
     // up when the stack never comes up and let the UI take start_failed.
     if (s_pending_arm && now - s_pending_at_ms >= PUSH_PENDING_ARM_TIMEOUT_MS) {

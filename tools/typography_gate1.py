@@ -451,6 +451,9 @@ def build(tmp: pathlib.Path) -> pathlib.Path:
         str(ROOT / "main/font/ui_font.c"),
         str(ROOT / "main/font/ui_hanzi.c"),
         str(ROOT / "main/ui/ui_gray_lut.c"),
+        # 仿生阅读（26.11.16 起）：ttf_font.c 的绘制路径调用 br_bold_feed/br_fixation_len，
+        # 宿主门禁也必须链上同一份纯逻辑，否则 undefined reference。
+        str(ROOT / "main/ui/ui_bionic.c"),
         str(tmp / "font_blob.o"),
         str(tmp / "hanzi_blob.o"),
         "-lm", "-lz",

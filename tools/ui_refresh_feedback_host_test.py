@@ -286,6 +286,14 @@ for _rect_fn in ("shelf_excerpt_rect", "shelf_manage_rect", "shelf_import_rect")
 shelf += function("main/apps/app_book.c", "paint_control") + "\n"
 # 词典弹层：翻页时会关闭它，这里只需空实现。/ Dictionary popup: turns close it; a no-op suffices here.
 shelf += "static void dict_popup_reset(void){}\n"
+# 伴读翻页即清（A2）：turn_page 抽进来的真实调用及其桩。reader_companion_active 恒 false，
+# 与本用例「掉盘闸不参与」一致；companion_turn_clear 取产品同一份 static inline（零依赖）。
+# / Companion clear-on-turn: the real inline plus stubs pulled in with turn_page.
+shelf += "static bool s_test_companion_active;\n"
+shelf += "static bool reader_companion_active(void){return s_test_companion_active;}\n"
+shelf += "static bool s_companion_summary_has;\n"
+shelf += "static char s_companion_summary[256];\n"
+shelf += function("main/apps/app_companion_state.h", "companion_turn_clear") + "\n"
 # r93 把预排收口搬进 present：结束函数取产品真实实现（started 恒假时立即返回，与旧桩等价），
 # 并让 xSemaphoreTake/s_prep_done 两个既有替身重新被引用。/ r93 folds prefetch teardown
 # into present: take the product's real teardown (it returns at once when started is false,

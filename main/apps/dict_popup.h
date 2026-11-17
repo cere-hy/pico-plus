@@ -180,6 +180,15 @@ dict_popup_tap_t dict_popup_tap(uint16_t x, uint16_t y);
 /// (same state machine as show_pending) and marking over_dict so a timeout falls
 /// back to the dictionary definition. False on an empty word or a staging failure.
 bool dict_popup_force_ai(const char* word);
+/// 26.11.31：AI 键按下但设备未连接、已转入蓝牙武装挂起时的卡面——与 force_ai
+/// 同一状态机（词头 + 状态行 + over_dict 回退），只把状态行换成「等待手机连接…」，
+/// 并置 armed 标记让调用方用 60s 广播窗口而非 15s 查询超时判回退。连接建成后 0x17
+/// 自动发出、0x07 到达原地更新为释义。/ 26.11.31: the waiting-for-link card shown
+/// after an AI tap while offline and BLE-armed; same state machine as force_ai, only
+/// the status line differs and an armed flag switches the caller to the 60s window.
+bool dict_popup_force_ai_armed(const char* word);
+/// 26.11.31：当前查询卡是否处于「等待连接」武装态（决定超时用 60s 还是 15s）。
+bool dict_popup_armed_wait(void);
 /// gen26.4 谓词：查询态是否由词典命中卡的「AI」入口强制触发——超时时据此回退词典
 /// 释义而非失败提示。/ gen26.4 predicate: whether the querying state was forced
 /// from the dict card's AI entry - on timeout this decides the fall-back to the

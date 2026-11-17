@@ -59,8 +59,15 @@ MOD_H = ROOT / "main/apps/home_gesture.h"
 # Re-baselined again for the 26.11.19 decoupling batch: the sampling branch became its own
 # block, the key gate now uses `last_key_ms`, and the gate predicate comes from pmu_bus.h.
 # The dual-gesture dispatch block is still untouched and still guarded below.
+#
+# 26.11.31 再重定（app_loop.c）：4ba71cc「导航仲裁 D/C 落码、文件页提速归位」改了
+# app_loop.c 218+/13- 行，但 `git show | grep -i gesture|dual|dispatch|retract` 为空——
+# 手势派发块逐字未动，`dual dispatch block still in the loop` 守卫仍 PASS。属正当落码后
+# 的基线到期（脚注定义），按纪律重签；不变式本体未变。
+# Re-baselined for 4ba71cc (nav arbitration D/C): 218+/13- lines changed in app_loop.c
+# but none touch the gesture/dual/dispatch block (grep clean, dispatch guard still green).
 HOST_BASELINE = {
-    "main/app/app_loop.c": "655a4a9ce87c9ae0abcd1a03209317a970fddf052894b678bbe347b9b12cfd38",
+    "main/app/app_loop.c": "e4499bc09825001bdef7cf74e87441362fcfcf0b0a3d4c729043d57263fafea4",
     "main/ui/ui_dualgesture.c": "5f1bd101cf69e913fa5fc440f669debf588145501f58ae2045014bc4e355c04c",
     "main/ui/ui_gesture.c": "86dbf6d7442405f8f45f7f82d84381fdf8a8c8289e7f04586d24b3c021baab26",
 }

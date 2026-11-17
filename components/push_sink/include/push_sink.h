@@ -122,6 +122,10 @@ const char *push_sink_adv_name(void);
 /// means no timeout or already closed.
 uint32_t push_sink_window_left_ms(void);
 
+/// 26.11.31 词典卡 AI 键武装：是否有挂起词等待连接建成后自动发查询。
+/// UI 据此在词典卡显示「等待手机连接…」挂起提示；连接建成 flush 或取消/超时后为 false。
+bool push_sink_dict_ai_pending(void);
+
 /// 传输进度（RECEIVING 时有效）。/ Transfer progress, valid while RECEIVING.
 void push_sink_progress(uint32_t *received, uint32_t *total);
 

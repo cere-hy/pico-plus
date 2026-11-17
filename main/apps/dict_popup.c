@@ -121,6 +121,8 @@ _Static_assert(DICT_POPUP_AI_SEG > PUSH_AI_CARD_MAX,
 // M3-B: the scene request's waiting label, kept apart so the card says truthfully
 // what it is waiting for.
 #define DICT_POPUP_PENDING_SCENE_TEXT "情景解读中…"
+// 26.11.31：AI 键离线武装、等待手机连接时的卡面状态行。/ Waiting-for-link label.
+#define DICT_POPUP_PENDING_ARMED_TEXT "等待手机连接…"
 // gen26.4「AI」入口 chip：放在保存 chip 左侧（同在卡片头部右侧），只在词典释义卡
 // 上可点。/ gen26.4 "AI" entry chip: left of the save chip, both in the card
 // header; tappable only on a dictionary definition card.
@@ -165,6 +167,9 @@ static char* s_full;
 // dict-hit card" mark (fall back to the dict definition on timeout).
 static bool s_ai_on;
 static bool s_ai_over_dict;
+// 26.11.31：查询态是「等待手机连接」武装态（true→调用方按 60s 广播窗口判超时，
+// false→按既有 15s 查询超时）。与 s_pending 同生命周期，reset / show_def 清零。
+static bool s_armed_wait;
 static bool s_scene_on; ///< M3 情景入口可点性 / M3 scene entry tappability
 // 26.9.5 入口卡：本地无释义时的静态入口（词头 + 状态行 + AI/情景 chip）。
 // 与 s_pending **互斥**：入口卡没发过请求，所以不挂超时、不被 0x07 认领；
@@ -324,6 +329,7 @@ void dict_popup_reset(void) {
     s_pending = false;
     s_pending_since_us = 0;
     s_ai_over_dict = false;
+    s_armed_wait = false; // 26.11.31：武装等待态随卡一起清
     s_ai_on = false;
     s_entry = false; // 26.9.5：入口态随卡一起清——生命周期唯一出口
     s_word[0] = 0;
@@ -672,6 +678,19 @@ bool dict_popup_force_ai(const char* word) {
     ESP_LOGI(TAG, "ai force over dict \"%s\"", s_word);
     return true;
 }
+
+// 26.11.31：AI 键离线武装的等待卡。复用 show_pending_with 同一状态机，状态行换成
+// 「等待手机连接…」，并置 s_armed_wait（调用方据此用 60s 广播窗口判超时）。顺序
+// 与 force_ai 同族：show_pending_with 入口 reset 已清 s_armed_wait，成功后置位。
+bool dict_popup_force_ai_armed(const char* word) {
+    if (!show_pending_with(word, DICT_POPUP_PENDING_ARMED_TEXT)) return false;
+    s_ai_over_dict = true;   // 超时同样回退词典释义，不弄丢词典内容
+    s_armed_wait = true;     // 60s 窗口（与 device 侧 60s 广播对齐）
+    ESP_LOGI(TAG, "ai force armed \"%s\"", s_word);
+    return true;
+}
+
+bool dict_popup_armed_wait(void) { return s_armed_wait; }
 
 // gen26.3 ④ 谓词：查询态且查的是本词——app_book 双门判定的核心。word=NULL 只问
 // 查询态；词长超过词头缓冲时按截断词头匹配（卡面显示的就是这个词的截断形）。

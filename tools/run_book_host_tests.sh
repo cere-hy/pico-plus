@@ -44,6 +44,10 @@ build/book-tests/ui_text_wrap
 # 2026-11-16 bionic reading: the v2 50% rule and the tokenizer (pure logic, no stubs).
 gcc "${flags[@]}" -Imain/ui tools/ui_bionic_host_test.c main/ui/ui_bionic.c -o build/book-tests/ui_bionic
 build/book-tests/ui_bionic
+# 26.11.31 词典卡 AI 键一键武装：挂起态纯逻辑五路径（武装/超时/取消/连接即发/防重发）。
+# 2026-11-31 dict-card AI arming: stash-state pure-logic five paths (zero stubs).
+gcc "${flags[@]}" -Icomponents/push_sink/include tools/dict_ai_arm_host_test.c components/push_sink/src/dict_ai_arm.c -o build/book-tests/dict_ai_arm
+build/book-tests/dict_ai_arm
 # 步 4 A2「翻页即清」守卫（14:26 裁定 §三守卫面 ④）：include 的是 app_book.c 同一份
 # app_companion_state.h（static inline，零 stub、零平台依赖，独立二进制）。
 # Step-4 A2 "clear on page turn" guard: includes the exact static-inline header
