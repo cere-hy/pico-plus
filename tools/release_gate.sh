@@ -112,6 +112,7 @@ echo "########## 3/4 门禁 ##########"
 GATES=(
     "tools/check_refresh_ghost.py|刷新牙 B79/B80/B82/B83"
     "tools/check_pkg_validity.py|台账与产物一致性"
+    "tools/check_ota_manifest.py|OTA清单过设备解析器判据（字段cap/版本/URL白名单/size）"
     "tools/check_hotplug.py|插拔边沿"
     "tools/run_push_sink_host_tests.sh|push sink 宿主用例"
     "tools/ui_refresh_feedback_host_test.py|刷新回执宿主用例"
