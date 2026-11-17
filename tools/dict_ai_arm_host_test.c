@@ -110,6 +110,37 @@ int main(void) {
         CHECK(bid == 0x1234u && pos == 0x5678u, "ctx-only take context matches");
     }
 
+    /* ---- 路径 6（真机第⑧格修复·方案 A）：双锚点幂等 ----
+     * SUBSCRIBE 用 peek 试发：词交付但槽保留 → 0x09 用 take 补发并清槽 →
+     * 0x07 回流的 cancel 变 no-op（不重复查词）。 */
+    dict_ai_arm_reset(&st);
+    CHECK(dict_ai_arm_arm(&st, "dissuade", 0xdeadbeefu, 2048u, 1000), "arm for dual-anchor");
+    {
+        char p[DICT_AI_ARM_WORD_MAX];
+        uint32_t bid = 0, pos = 0;
+        /* SUBSCRIBE peek：交付但不清槽 */
+        CHECK(dict_ai_arm_peek(&st, p, sizeof(p), &bid, &pos), "subscribe peek true");
+        CHECK(strcmp(p, "dissuade") == 0, "peek word matches");
+        CHECK(bid == 0xdeadbeefu && pos == 2048u, "peek context matches");
+        CHECK(dict_ai_arm_active(&st), "peek KEEPS slot (vs take)");
+        CHECK(dict_ai_arm_peek(&st, p, sizeof(p), &bid, &pos), "second peek still true");
+        /* 0x09 take：补发并清槽 */
+        memset(p, 0, sizeof(p)); bid = pos = 0;
+        CHECK(dict_ai_arm_take(&st, p, sizeof(p), &bid, &pos), "caps take true");
+        CHECK(strcmp(p, "dissuade") == 0, "caps take word matches");
+        CHECK(bid == 0xdeadbeefu && pos == 2048u, "caps take context matches");
+        CHECK(!dict_ai_arm_active(&st), "caps take clears slot");
+        /* 0x07 回流 cancel：no-op，不重复 */
+        CHECK(!dict_ai_arm_cancel(&st), "0x07 cancel after caps-take is no-op");
+        CHECK(!dict_ai_arm_peek(&st, NULL, 0, NULL, NULL), "peek after cleared false");
+    }
+    /* 另一条收敛序：SUBSCRIBE peek 侥幸奏效 → 0x07 cancel 清槽 → 0x09 take no-op */
+    dict_ai_arm_reset(&st);
+    CHECK(dict_ai_arm_arm(&st, "lucid", 9u, 9u, 0), "arm for ack-first order");
+    CHECK(dict_ai_arm_peek(&st, NULL, 0, NULL, NULL), "peek before ack");
+    CHECK(dict_ai_arm_cancel(&st), "0x07 ack cancels slot");
+    CHECK(!dict_ai_arm_take(&st, NULL, 0, NULL, NULL), "later 0x09 take no-op after ack (no resend)");
+
     printf("DICT_AI_ARM_PASS checks=%d fail=%d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

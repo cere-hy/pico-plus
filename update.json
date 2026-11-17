@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "0.3.9-pico26.11.31",
+  "version": "0.3.9-pico26.11.32",
   "project": "Read_Pico",
   "board": "RDP-G01-W",
   "layout": "pico-dual-4m-v1",
   "minimum_base_version": "0.3.9-pico26.11.19",
-  "url": "https://cere-hy.github.io/pico-plus/firmware/Read_Pico-0.3.9-pico26.11.31-91bbe81f.bin",
-  "sha256": "91bbe81f019a13e06b0c759cb6c6af1cb45a27645ce5f0f0126af69a4d7cb9f8",
-  "notes": "26.11.31 一次批正式版：仿生阅读 50% 半词块加粗（英文词首 ceil(len/2)、开关默认关、NVS 持久化）；词典卡 AI 键一键蓝牙武装——未连接点 AI 即广播待连，连上自动携带词条发起查询。App v1.6.6 零改动配套。在线链路只下载到 TF 卡并校验，UI 确认后由成熟 TF 安装链升级。",
-  "size": 4388224
+  "url": "https://cere-hy.github.io/pico-plus/firmware/Read_Pico-0.3.9-pico26.11.32-037a4ffa.bin",
+  "sha256": "037a4ffa55e1c694eb74af85d4d253a8c9ad0f1cad9ac0c6241e9620b9f99266",
+  "notes": "26.11.32 一次批返工件：修复词典卡 AI 键连上后卡面卡死「等待手机连接…」——0x17 改双锚点幂等重发（SUBSCRIBE peek 试发保留槽、0x09 能力帧锚点 take 清槽补发、0x07 回流兜底清槽），对端就绪后再查词；APK v1.6.6 零改动配套。含 26.11.31 的仿生阅读 50% 与 AI 键一键武装。在线链路只下载到 TF 卡并校验，UI 确认后由成熟 TF 安装链升级。",
+  "size": 4388432
 }
