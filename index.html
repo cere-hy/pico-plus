@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#F2EFE7">
-<meta name="description" content="Pico-Plus 墨水屏极客副屏固件 · 网页一键刷机与刷机后必装附件（安卓 App v1.6.6、离线词典 dict.bin）。固件版本 0.3.9-pico26.11.32，ESP32-S3。">
+<meta name="description" content="Pico-Plus 墨水屏极客副屏固件 · 网页一键刷机与刷机后必装附件（安卓 App v1.6.6、离线词典 dict.bin）。固件版本 0.3.9-pico26.11.33，ESP32-S3。">
 <title>Pico-Plus · 一键刷机与必备附件</title>
 <style>
 /* ============================================================
@@ -349,7 +349,7 @@ footer .kicker{margin-bottom:18px}
   <div class="topbar__in">
     <div class="brand">
       <span class="brand__name">Pico-Plus</span>
-      <span class="brand__ver">0.3.9-pico26.11.32</span>
+      <span class="brand__ver">0.3.9-pico26.11.33</span>
     </div>
     <span class="topbar__label">刷完之后必装 ↓</span>
     <a class="btn btn--sm btn--red" href="apk/ReadPicoPush-v1.6.6-d5ca0e71.apk" download="ReadPicoPush-v1.6.6.apk"><span class="btn__arrow">↓</span><span class="t-long"> 安卓 App v1.6.6</span><span class="t-short">App v1.6.6</span></a>
@@ -378,7 +378,7 @@ footer .kicker{margin-bottom:18px}
   <div class="wrap">
     <div class="hero__grid">
       <div class="rise d1">
-        <div class="kicker">Firmware 0.3.9 · pico26.11.32 · 2026-11-17</div>
+        <div class="kicker">Firmware 0.3.9 · pico26.11.33 · 2026-11-17</div>
         <h1>把这台墨水屏，<br>刷成趁手的阅读器。</h1>
         <p class="dek">横屏双栏、离线词典与生词本、手机蓝牙推流副屏，以及首页／阅读页双指手势与框选摘抄。一根数据线，浏览器里点一下就能刷。</p>
 
@@ -465,34 +465,34 @@ footer .kicker{margin-bottom:18px}
   </div>
 </section>
 
-<!-- ============ 26.11.32 正式版（一次批返工：第⑧格连上刷新修复） ============ -->
-<section class="band" id="v1132" style="padding:52px 0">
+<!-- ============ 26.11.33 正式版（修复 0x09 回调自锁死锁） ============ -->
+<section class="band" id="v1133" style="padding:52px 0">
   <div class="wrap">
-    <div class="sec__head"><span class="sec__no">NEW / 26.11.32</span><h2>26.11.32 正式版 · 固件与 App</h2></div>
-    <p class="sec__dek">26.11.31 真机返工件：修复词典卡 AI 键「连上后卡面卡死等待手机连接…不刷新」。0x17 改双锚点幂等重发——订阅瞬间先试发但保留挂起槽，等 APK 能力帧（0x09，对端确已就绪）到达再补发并清槽，收到释义（0x07）兜底清槽。首次整片刷机用上方一键刷机（26.11.29 基线）；已刷 26.11.31 的设备请用本件经 TF 卡或 OTA 升级（版本串已升，可覆盖）。</p>
+    <div class="sec__head"><span class="sec__no">NEW / 26.11.33</span><h2>26.11.33 正式版 · 固件与 App</h2></div>
+    <p class="sec__dek">26.11.32 真机返工件：修复词典卡 AI 键「连上后设备卡死、停在等待手机连接…」。根因是设备收到手机能力声明（0x09）时，在已持锁的写回调里又取了一次同一把互斥锁，自锁死锁——手机等不到写回执报「能力声明未送达」，设备界面再也刷新不了。修复就是去掉那次重复加锁（调用方本就持锁）。连上即自动查词恢复正常，APK 仍是 v1.6.6、无需更新。首次整片刷机用上方一键刷机（26.11.29 基线）；已刷旧版的设备请用本件经 TF 卡或 OTA 升级（版本串已升，可覆盖）。</p>
 
     <div class="facts">
-      <div class="fact"><div class="fact__k">固件版本</div><div class="fact__v">0.3.9-pico26.11.32</div></div>
-      <div class="fact"><div class="fact__k">固件 SHA-256</div><div class="fact__v"><b>037a4ffa</b>…</div></div>
+      <div class="fact"><div class="fact__k">固件版本</div><div class="fact__v">0.3.9-pico26.11.33</div></div>
+      <div class="fact"><div class="fact__k">固件 SHA-256</div><div class="fact__v"><b>7e9ca485</b>…</div></div>
       <div class="fact"><div class="fact__k">配套 App</div><div class="fact__v">v1.6.6 / 18（零改动）</div></div>
-      <div class="fact"><div class="fact__k">固件大小</div><div class="fact__v">4,388,432 B</div></div>
+      <div class="fact"><div class="fact__k">固件大小</div><div class="fact__v">4,388,720 B</div></div>
     </div>
 
     <div class="cards" style="margin-top:26px">
       <article class="card">
         <div class="card__top"><span class="card__step">FIRMWARE / 固件</span><span class="card__tag">TF 卡升级 · 独立命名件</span></div>
         <div class="card__body">
-          <h3>固件正式件 26.11.32</h3>
-          <p class="card__sub">Read_Pico-0.3.9-pico26.11.32-037a4ffa.bin · 4,388,432 B</p>
+          <h3>固件正式件 26.11.33</h3>
+          <p class="card__sub">Read_Pico-0.3.9-pico26.11.33-7e9ca485.bin · 4,388,720 B</p>
           <div class="card__dl">
-            <a class="btn btn--lg btn--red" href="firmware/Read_Pico-0.3.9-pico26.11.32-037a4ffa.bin" download><span class="btn__arrow">↓</span> 下载固件（26.11.32）</a>
+            <a class="btn btn--lg btn--red" href="firmware/Read_Pico-0.3.9-pico26.11.33-7e9ca485.bin" download><span class="btn__arrow">↓</span> 下载固件（26.11.33）</a>
           </div>
           <div class="card__how">
             <div class="kicker">本版修复 + 沿用能力</div>
             <ol class="steps">
-              <li><b>第⑧格修复</b>：词典卡 AI 键连上后自动查词、释义直接落卡右栏，卡面不再停在「等待手机连接…」；双锚点幂等重发，不重复查词。APK 零改动、零新帧。</li>
-              <li><b>仿生阅读 50%</b>（沿用 26.11.31）：阅读设置第 11 槽开启后，英文词首按半数做等宽加粗（<span class="mono">ceil(len/2)</span>），中文直通、行宽不变；默认关、重启保持。</li>
-              <li><b>词典卡 AI 键一键武装</b>（沿用 26.11.31）：未连接时点 AI 即广播待连；60s 无连接自动关闭、翻页换书取消挂起。</li>
+              <li><b>连接卡死修复</b>：点词典卡 AI 键 → 手机连上 → 卡面自动刷新为释义，不再停在「等待手机连接…」，也不再出现手机侧「能力声明未送达」。</li>
+              <li><b>仿生阅读 50%</b>（沿用）：阅读设置第 11 槽开启后，英文词首按半数做等宽加粗（<span class="mono">ceil(len/2)</span>），中文直通、行宽不变；默认关、重启保持。</li>
+              <li><b>词典卡 AI 键一键武装</b>（沿用）：未连接时点 AI 即广播待连；60s 无连接自动关闭、翻页换书取消挂起。</li>
             </ol>
           </div>
           <div class="card__how" style="margin-top:14px">
@@ -504,12 +504,23 @@ footer .kicker{margin-bottom:18px}
             </ol>
           </div>
           <p class="card__desc">独立命名件用于 TF 卡升级；<b>下载后请重命名</b>为 <span class="mono">Read_Pico.bin</span> 再放卡。联网 OTA 走 URL 直链，不受文件名约束。配套 App 仍是 v1.6.6，无需更新。</p>
-          <div class="card__warn"><b>判别新件在机</b>：系统升级页「当前版本」显示 <span class="mono">0.3.9-pico26.11.32</span>；设置第 11 槽「英文词首加粗 50%」、日志含 <span class="mono">cov=50%</span> 与 <span class="mono">dict_ai=</span>。</div>
+          <div class="card__warn"><b>判别新件在机</b>：系统升级页「当前版本」显示 <span class="mono">0.3.9-pico26.11.33</span>；设置第 11 槽「英文词首加粗 50%」、日志含 <span class="mono">cov=50%</span> 与 <span class="mono">dict_ai=</span>。</div>
         </div>
       </article>
     </div>
     <div class="note" style="margin-top:22px">
-      <b>固件 SHA-256（26.11.32）：</b><span class="mono">037a4ffa55e1c694eb74af85d4d253a8c9ad0f1cad9ac0c6241e9620b9f99266</span> · 4,388,432 B
+      <b>固件 SHA-256（26.11.33）：</b><span class="mono">7e9ca4851b7507aae5cb85e058d897404dbab6ea62a2a6184bd4fdcb4fd9f617</span> · 4,388,720 B
+    </div>
+  </div>
+</section>
+
+<!-- ============ 26.11.32 已撤回（含连接死锁缺陷，勿用） ============ -->
+<section class="band" id="v1132" style="padding:52px 0">
+  <div class="wrap">
+    <div class="sec__head"><span class="sec__no">WITHDRAWN / 26.11.32</span><h2>26.11.32 已撤回 · 请勿使用</h2></div>
+    <p class="sec__dek">本版在真机上存在连接死锁缺陷：词典卡 AI 键连上手机后设备卡死、卡面停在「等待手机连接…」，手机侧报「能力声明未送达」。已由上方 <b>26.11.33</b> 修复，请直接升级到 26.11.33，不要刷本版。归档件仅留档追溯。</p>
+    <div class="note" style="margin-top:14px">
+      <b>固件 SHA-256（26.11.32 · 已撤回）：</b><span class="mono">037a4ffa55e1c694eb74af85d4d253a8c9ad0f1cad9ac0c6241e9620b9f99266</span> · 4,388,432 B
     </div>
   </div>
 </section>
@@ -518,7 +529,7 @@ footer .kicker{margin-bottom:18px}
 <section class="band" id="v1131" style="padding:52px 0">
   <div class="wrap">
     <div class="sec__head"><span class="sec__no">ARCHIVE / 26.11.31</span><h2>26.11.31 历史版 · 固件与 App</h2></div>
-    <p class="sec__dek">仿生阅读 50% 判据关账 + 词典卡 AI 键一键武装首版。真机发现第⑧格「连上后卡面卡死」问题，已由上方 26.11.32 修复；已刷本版的设备请升级到 26.11.32。</p>
+    <p class="sec__dek">仿生阅读 50% 判据关账 + 词典卡 AI 键一键武装首版。真机发现第⑧格「连上后卡面卡死」问题，已由上方 26.11.33 修复；已刷本版的设备请升级到 26.11.33。</p>
     <div class="note" style="margin-top:14px">
       <b>固件 SHA-256（26.11.31）：</b><span class="mono">91bbe81f019a13e06b0c759cb6c6af1cb45a27645ce5f0f0126af69a4d7cb9f8</span> · 4,388,224 B · <a href="firmware/Read_Pico-0.3.9-pico26.11.31-91bbe81f.bin" download>下载归档件</a>
     </div>
