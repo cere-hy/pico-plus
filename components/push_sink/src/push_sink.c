@@ -1722,62 +1722,24 @@ static void ai_on_subscribed(void) {
     if (!s_ai_enabled) return;
     ai_send_caps();
     ai_flush_queue();
-    // 26.11.31 词典卡 AI 键武装 → 真机第⑧格修正（19:31 裁定方案 A）：
-    // 订阅 = peer 可收帧首时刻，但**不是** APK 可应答时刻——真机实证 APK 的
-    // listenMode 在订阅之后才发完 0x05/0x09 才置 true，故此处的 0x17 必被 APK
-    // 应用层的 if(!listenMode)return 静默丢弃（空口 rc=0，设备无从得知）。
-    // 因此 SUBSCRIBE 锚点改为 **peek 试发、不清槽**：词留到 0x09 能力帧锚点
-    // （对端确实就绪）再 take 清槽补发；若本帧侥幸奏效、0x07 回流，ai_on_result
-    // 也会清槽——两处都清，天然幂等，不重复查词。复用既有 0x17、零新帧、APK 零改。
-    // 此函数在 s_lock 内调用，peek/notify 均安全。
+    // 26.11.31 词典卡 AI 键武装：连接建成锚点（订阅 = peer 可收帧首个时刻）flush
+    // 挂起词。复用既有 0x17 帧（push_st_ai_query_emit）、零新帧、APK 零改动；take
+    // 即清槽实现「发出即清、防重发」。此函数在 s_lock 内调用，take/notify 均安全。
     {
         char dw[DICT_AI_ARM_WORD_MAX];
         uint32_t dbid = 0u, dpos = 0u;
-        if (dict_ai_arm_peek(&s_dict_ai_arm, dw, sizeof(dw), &dbid, &dpos)) {
+        if (dict_ai_arm_take(&s_dict_ai_arm, dw, sizeof(dw), &dbid, &dpos)) {
             uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
             const size_t n = push_st_ai_query_emit(dw, dbid, dpos,
                                                    ai_ctx_enabled(), frame, sizeof(frame));
             if (n) {
                 (void)notify_status(frame, n); // STATUS 0x17，自动携带词条＋上下文
-                ESP_LOGI(TAG, "dict_ai=sent word=1 via=subscribe");
+                ESP_LOGI(TAG, "dict_ai=sent word=1");
             } else {
-                // 编码失败极罕见（词已截断到 63B < 64）；槽仍留待 0x09 补发，如实记账。
-                ESP_LOGW(TAG, "dict_ai=sent word=0 encode_fail wlen=%u via=subscribe",
+                // 编码失败极罕见（词已截断到 63B < 64）；take 已清槽，留日志如实记账。
+                ESP_LOGW(TAG, "dict_ai=sent word=0 encode_fail wlen=%u",
                          (unsigned)strlen(dw));
             }
-        }
-    }
-}
-
-// 0x09 能力帧锚点：APK 在 writeChar(0x09) 之后紧接着 listenMode=true，故设备收到
-// 0x09 时对端已确实可应答。此处 take 清槽补发挂起词——真机第⑧格根因的修复点。
-// 复用既有 0x17 帧、零新帧、APK 零改动不 bump。
-//
-// **锁契约：调用方必须已持有 s_lock。** 本函数不再自行 lock（26.11.33 修复）：
-// 旧版在此 lock()，而唯一调用点 on_ctrl_write(:2353) 的前一层 push_access_cb 已在
-// 入口 lock()(:2330)、出口 unlock()(:2354)，同一任务对同一把非递归互斥锁二次
-// xSemaphoreTake(portMAX_DELAY) = 永久自锁——真机表现为 0x09 写回调不返回
-// （APK 报「能力声明未送达」）＋ UI tick 拿不到锁（卡面停在「等待手机连接…」）。
-// 两条相关路径的锁状态，供后续维护者核对，勿在函数内补锁：
-//   - 0x09 caps 路径：push_access_cb lock → on_ctrl_write → 本函数（已持锁）
-//   - 0x17 订阅路径：push_gap_cb SUBSCRIBE 分支 lock → ai_on_subscribed →（已持锁，
-//     该路径走 peek 内联，不经本函数；若将来改经本函数，同样已持锁）
-static void ai_replay_armed_on_caps(void) {
-    if (!s_ai_enabled) return;
-    char dw[DICT_AI_ARM_WORD_MAX];
-    uint32_t dbid = 0u, dpos = 0u;
-    const bool got = dict_ai_arm_take(&s_dict_ai_arm, dw, sizeof(dw), &dbid, &dpos);
-    if (got) {
-        // s_apk_caps 已在 0x09 处理里置位（见下），ai_ctx_enabled() 此刻为真 → 74B 上下文。
-        uint8_t frame[PUSH_ST_AI_CTX_QUERY_LEN];
-        const size_t n = push_st_ai_query_emit(dw, dbid, dpos,
-                                               ai_ctx_enabled(), frame, sizeof(frame));
-        if (n) {
-            (void)notify_status(frame, n); // STATUS 0x17（不取 s_lock，锁内调用安全）
-            ESP_LOGI(TAG, "dict_ai=sent word=1 via=caps");
-        } else {
-            ESP_LOGW(TAG, "dict_ai=sent word=0 encode_fail wlen=%u via=caps",
-                     (unsigned)strlen(dw));
         }
     }
 }
@@ -1785,12 +1747,6 @@ static void ai_replay_armed_on_caps(void) {
 // 释义回流（0x07）：进预取缓存 + 交 UI 槽出卡。/ Definition result (0x07): into
 // the prefetch cache and to the UI slot.
 static void ai_on_result(const char *word, const char *def) {
-    // 真机第⑧格修复（方案 A）：0x07 到达 = 某次 0x17（SUBSCRIBE peek 或 0x09
-    // take）已被 APK 应答。清挂起槽，杜绝随后 0x09 锚点再补发一次造成重复查词/出卡。
-    // 若槽已被 0x09 锚点 take 清掉，此调用 no-op——两条清理路径都幂等。
-    if (dict_ai_arm_cancel(&s_dict_ai_arm)) {
-        ESP_LOGI(TAG, "dict_ai=done word=1 (0x07 ack, slot cleared)");
-    }
     ai_cache_put(word, def);
     ai_surface(word, def);
 }
@@ -2187,10 +2143,6 @@ static void on_ctrl_write(const uint8_t *data, size_t len) {
                  (s_apk_caps & PUSH_CAP_AI_CONTEXT) ? 1 : 0,
                  (s_apk_caps & PUSH_CAP_AI_MULTI) ? 1 : 0,
                  (s_apk_caps & PUSH_CAP_AI_SCENE) ? 1 : 0);
-        // 真机第⑧格修复（方案 A）：0x09 到达即 APK 应用层就绪（listenMode 紧随其后
-        // 置位），此处 take 清槽补发挂起词。SUBSCRIBE 那次是 peek 试发、槽仍留着——
-        // 若词已由 0x07 回流清掉（SUBSCRIBE 侥幸奏效）则本调用 no-op，防重复查词。
-        ai_replay_armed_on_caps();
         return;
     }
     // 未武装：任何 CTRL 写入都回 ERR(1)，状态机看都不看。/ Unarmed: every CTRL

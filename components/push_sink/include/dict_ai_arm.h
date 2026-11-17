@@ -44,14 +44,6 @@ bool dict_ai_arm_active(const dict_ai_arm_t *st);
 /// 窗口是否到期（window_ms==0 恒不到期）。/ Whether the window expired.
 bool dict_ai_arm_expired(const dict_ai_arm_t *st, int64_t now_ms, uint32_t window_ms);
 
-/// 只读窥视挂起词（不清槽）。供 SUBSCRIBE 锚点「先试着发、槽留到 0x09 再确认清」——
-/// 真机第⑧格根因：SUBSCRIBE 时刻 APK listenMode 尚未置位、0x17 必被丢，若此处 take
-/// 清槽则 0x09 到达时无词可补。peek 让词留到对端确实就绪的 0x09 锚点再 take。
-/// Peek without clearing: the SUBSCRIBE anchor sends speculatively but keeps the
-/// slot for the 0x09 (peer-ready) anchor, where it is finally taken.
-bool dict_ai_arm_peek(const dict_ai_arm_t *st, char *word, size_t wcap,
-                      uint32_t *book_id, uint32_t *pos);
-
 /// 连接建成时取走挂起词并清槽（防重发）；二次调用返回 false。
 /// Hand out the stashed word on link-up and clear the slot (no resend).
 bool dict_ai_arm_take(dict_ai_arm_t *st, char *word, size_t wcap,

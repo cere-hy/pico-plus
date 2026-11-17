@@ -37,21 +37,6 @@ bool dict_ai_arm_expired(const dict_ai_arm_t *st, int64_t now_ms, uint32_t windo
     return (now_ms - st->armed_at_ms) >= (int64_t)window_ms;
 }
 
-bool dict_ai_arm_peek(const dict_ai_arm_t *st, char *word, size_t wcap,
-                      uint32_t *book_id, uint32_t *pos) {
-    if (!st || !st->active) return false;
-    if (word && wcap) {
-        size_t n = strlen(st->word);
-        if (n >= wcap) n = wcap - 1;
-        memcpy(word, st->word, n);
-        word[n] = '\0';
-    }
-    if (book_id) *book_id = st->book_id;
-    if (pos) *pos = st->pos;
-    // 只读：不清槽（与 take 唯一区别）。SUBSCRIBE 锚点用它先试发。
-    return true;
-}
-
 bool dict_ai_arm_take(dict_ai_arm_t *st, char *word, size_t wcap,
                       uint32_t *book_id, uint32_t *pos) {
     if (!st || !st->active) return false;
@@ -63,7 +48,7 @@ bool dict_ai_arm_take(dict_ai_arm_t *st, char *word, size_t wcap,
     }
     if (book_id) *book_id = st->book_id;
     if (pos) *pos = st->pos;
-    // 取走即清槽：防重发（0x09 锚点确认发出、或收到 0x07 确认后清）。
+    // 取走即清槽：防重发（连接建成只 flush 一次，二次 take 空）。
     dict_ai_arm_reset(st);
     return true;
 }
